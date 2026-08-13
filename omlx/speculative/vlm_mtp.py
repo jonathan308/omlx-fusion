@@ -183,6 +183,61 @@ def _patch_qwen35_mtp_config_for_moe() -> None:
 _patch_qwen35_mtp_config_for_moe()
 
 
+# ---------------------------------------------------------------------------
+# mlx-vlm compat patch: mx.random.state sentinel (mlx PR #3828)
+# ---------------------------------------------------------------------------
+# mlx commit ce3073389 replaced the plain-list ``mx.random.state`` with a
+# process-global ``_RandomState`` sentinel exposing only
+# ``__len__``/``__getitem__``/``__iter__`` — no ``__setitem__``, and assigning
+# ``mx.random.state = ...`` only shadows the module attribute without touching
+# the C++ key. mlx-vlm's ``_SpeculativeSamplerRNG`` restores its captured
+# state with ``mx.random.state[i] = value`` (speculative/common.py), which
+# raises ``TypeError: ... does not support item assignment`` on the new API.
+# The capture side only iterates/reads the state, so it works unchanged on
+# both APIs; only the restore needs a compat shim.
+#
+# A key-managed redesign (split a subkey per draft call, no restore) is not
+# shim-able from here: the RNG consumers live inside mlx-vlm's draft fns and
+# sampler closures, which draw from the global state. Emulating the restore
+# is exact instead: ``mx.random.seed`` maps a uint64 directly onto the key's
+# two uint32 words (``key(seed) == array([seed >> 32, seed], uint32)``), so
+# reseeding with the captured ``state[0]`` words is a bit-exact restore.
+
+
+def _patch_mlx_vlm_rng_state_restore() -> None:
+    """Make mlx-vlm's speculative RNG restore work on both mlx RNG APIs.
+
+    Replaces ``mlx_vlm.speculative.common._restore_rng_state`` with a
+    both-APIs version: the original in-place item assignment when
+    ``mx.random.state`` supports it (old list API), and a bit-exact reseed
+    from the captured key words on the new ``_RandomState`` sentinel API.
+    Idempotent — safe to call on every import of this module.
+    """
+    try:
+        import mlx_vlm.speculative.common as vlm_spec_common
+    except ImportError:
+        return  # mlx-vlm unavailable; nothing to patch
+
+    def _restore_rng_state_compat(state: list[mx.array]) -> None:
+        if not state:
+            return
+        random_state = mx.random.state
+        if hasattr(random_state, "__setitem__"):
+            # Old list API: in-place item assignment (mlx-vlm's original).
+            for i, value in enumerate(state):
+                random_state[i] = value
+            return
+        # New sentinel API: the state is a single key array of two uint32
+        # words; ``seed`` restores it bit-exactly.
+        key = state[0]
+        mx.random.seed((int(key[0]) << 32) | int(key[1]))
+
+    vlm_spec_common._restore_rng_state = _restore_rng_state_compat
+
+
+_patch_mlx_vlm_rng_state_restore()
+
+
 class VLMMTPDrafter:
     """Holds a loaded drafter together with the metadata omlx needs.
 
