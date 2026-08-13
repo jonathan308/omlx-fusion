@@ -82,6 +82,34 @@ def test_launcher_rejects_overlapping_api_and_collective_ports(tmp_path):
         )
 
 
+def test_launcher_passes_the_kv_tier_flag_only_when_the_plan_enables_it(tmp_path):
+    from dataclasses import replace
+
+    from omlx.cluster.inference_worker import build_parser
+
+    def worker_namespace(deployment):
+        argv = build_mlx_launch_argv(
+            deployment,
+            hostfile=(tmp_path / "hosts.json").resolve(),
+            api_port=32100,
+            collective_port=32120,
+        )
+        tail = argv[argv.index("--") + 1 :]
+        return argv, build_parser().parse_args(tail[3:])
+
+    plain_argv, plain_args = worker_namespace(_deployment())
+    assert "--kv-tier" not in plain_argv
+    assert plain_args.kv_tier is False
+
+    enabled = replace(
+        _deployment(),
+        execution=replace(_deployment().execution, kv_tier=True),
+    )
+    enabled_argv, enabled_args = worker_namespace(enabled)
+    assert "--kv-tier" in enabled_argv
+    assert enabled_args.kv_tier is True
+
+
 def test_ring_launch_reserves_full_collective_port_span():
     deployment = _deployment()
 
@@ -685,7 +713,9 @@ def _parsed_plan(deployment: ClusterDeployment, tmp_path):
     worker_argv = _worker_argv(deployment, tmp_path)
     # argv[0..2] are the interpreter, -m and the module; argparse sees the rest.
     args = build_parser().parse_args(worker_argv[3:])
-    plan_hash, assignments, _profiles, _tp = decode_worker_contract(args.plan)
+    plan_hash, assignments, _profiles, _tp, _cache_contract = decode_worker_contract(
+        args.plan
+    )
     return args, plan_hash, assignments
 
 

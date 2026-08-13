@@ -21,7 +21,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from .deployment import decode_worker_contract
+from .deployment import decode_worker_contract, validate_worker_cache_contract
 from .forensics import capture_wedge_forensics
 from .liveness import PeerWatchdog, check_peers
 from .memory_guard import (
@@ -312,6 +312,7 @@ def _execution_settings(args: argparse.Namespace) -> ExecutionSettings:
         sampling_rank_only=args.sampling_rank_only,
         async_overlap=args.async_overlap,
         ring_connections_per_ip=args.ring_connections_per_ip,
+        kv_tier=args.kv_tier,
         tuning_reason=args.tuning_reason,
     )
 
@@ -1209,10 +1210,21 @@ def run_worker(args: argparse.Namespace) -> int:
     # MLX-LM's later generation thread on a single cross-thread stream.
     generation_stream = _cross_thread_generation_stream(mx)
 
-    plan_hash, assignments, performance_profiles, tensor_parallel_size = (
+    plan_hash, assignments, performance_profiles, tensor_parallel_size, cache_contract = (
         decode_worker_contract(args.plan)
     )
     execution = _execution_settings(args)
+    # The signed plan carries the rank-agreed cache capacity; a worker
+    # launched with flags that disagree must refuse, same as a plan-hash
+    # mismatch — drifting cache geometry is how pipelines hang.
+    try:
+        validate_worker_cache_contract(
+            cache_contract,
+            prompt_cache_size=args.prompt_cache_size,
+            kv_tier=bool(args.kv_tier),
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
     init_backend = "jaccl" if args.backend.startswith("jaccl") else "ring"
     group = mx.distributed.init(backend=init_backend, strict=True)
     rank = group.rank()
@@ -1609,6 +1621,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pipeline-microbatch-size", type=int, default=4)
     parser.add_argument("--auto-tune", action="store_true")
     parser.add_argument("--cache-affinity", action="store_true")
+    parser.add_argument(
+        "--kv-tier",
+        action="store_true",
+        help=(
+            "Enable the durable rank-local SSD tier for the prompt cache. "
+            "Carried by the signed plan; the per-rank disk budget and "
+            "directory stay rank-local environment (OMLX_CLUSTER_KV_TIER_*)."
+        ),
+    )
     parser.add_argument("--sampling-rank-only", action="store_true")
     parser.add_argument("--async-overlap", action="store_true")
     parser.add_argument("--ring-connections-per-ip", type=int, default=1)

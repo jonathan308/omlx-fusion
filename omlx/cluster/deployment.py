@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from .performance import (
+    MAX_PLAN_PROMPT_CACHE_SIZE,
     ExecutionSettings,
     NodePerformanceProfile,
     execution_profile,
@@ -424,6 +425,14 @@ class ClusterDeployment:
                     profile.to_dict() for profile in self.performance_profiles
                 ],
                 "tensor_parallel_size": self.tensor_parallel_size,
+                # The rank-agreed prompt-cache capacity, carried by the signed
+                # plan rather than argv alone: every rank configures the same
+                # bounded count, and a worker whose flags disagree with the
+                # plan refuses to launch instead of drifting a cache tier.
+                "execution_cache": {
+                    "prompt_cache_size": self.execution.prompt_cache_size,
+                    "kv_tier": self.execution.kv_tier,
+                },
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -440,8 +449,15 @@ def decode_worker_contract(
     tuple[PipelineAssignment, ...],
     tuple[NodePerformanceProfile, ...],
     int,
+    dict[str, Any] | None,
 ]:
-    """Decode and validate the full worker contract without accepting code."""
+    """Decode and validate the full worker contract without accepting code.
+
+    Returns the plan hash, assignments, performance profiles, tensor-parallel
+    size, and the rank-agreed cache contract (``prompt_cache_size`` /
+    ``kv_tier``) — None for a plan written before the contract carried one,
+    in which case the launch flags stay authoritative.
+    """
 
     if not isinstance(encoded, str) or len(encoded) > _MAX_PLAN_BYTES * 2:
         raise ValueError("encoded pipeline plan is too large")
@@ -496,11 +512,51 @@ def decode_worker_contract(
     tensor_parallel_size = int(payload.get("tensor_parallel_size", 1))
     if not 1 <= tensor_parallel_size <= len(parsed):
         raise ValueError("tensor_parallel_size must be between 1 and the assignment count")
-    return plan_hash, parsed, profiles, tensor_parallel_size
+    cache_contract = payload.get("execution_cache")
+    if cache_contract is not None:
+        if not isinstance(cache_contract, dict):
+            raise ValueError("pipeline plan cache contract is invalid")
+        agreed_size = cache_contract.get("prompt_cache_size")
+        agreed_kv_tier = cache_contract.get("kv_tier")
+        if (
+            not isinstance(agreed_size, int)
+            or isinstance(agreed_size, bool)
+            or not 1 <= agreed_size <= MAX_PLAN_PROMPT_CACHE_SIZE
+            or not isinstance(agreed_kv_tier, bool)
+        ):
+            raise ValueError("pipeline plan cache contract is invalid")
+        cache_contract = {
+            "prompt_cache_size": agreed_size,
+            "kv_tier": agreed_kv_tier,
+        }
+    return plan_hash, parsed, profiles, tensor_parallel_size, cache_contract
+
+
+def validate_worker_cache_contract(
+    cache_contract: dict[str, Any] | None,
+    *,
+    prompt_cache_size: int,
+    kv_tier: bool,
+) -> None:
+    """Refuse a worker whose launch flags drifted from the signed plan.
+
+    The prompt-cache capacity is rank-agreed: every rank must configure the
+    same bounded count and the same tier flag, or cache reuse diverges and
+    the pipeline hangs at the next unmatched collective. A plan written
+    before the contract carried cache fields (None) leaves the flags
+    authoritative.
+    """
+
+    if cache_contract is None:
+        return
+    if cache_contract["prompt_cache_size"] != prompt_cache_size:
+        raise ValueError("worker prompt cache size does not match the signed plan")
+    if cache_contract["kv_tier"] != bool(kv_tier):
+        raise ValueError("worker KV tier flag does not match the signed plan")
 
 
 def decode_worker_plan(encoded: str) -> tuple[str, tuple[PipelineAssignment, ...]]:
     """Backward-compatible assignment-only worker plan decoder."""
 
-    plan_hash, assignments, _, _ = decode_worker_contract(encoded)
+    plan_hash, assignments, _, _, _ = decode_worker_contract(encoded)
     return plan_hash, assignments

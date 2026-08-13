@@ -172,8 +172,8 @@ def test_worker_contract_round_trips_with_tensor_parallelism():
         tensor_parallel_size=plan.tensor_parallel_size,
     )
 
-    plan_hash, assignments, _profiles, tp_size = decode_worker_contract(
-        deployment.encode_worker_plan()
+    plan_hash, assignments, _profiles, tp_size, _cache_contract = (
+        decode_worker_contract(deployment.encode_worker_plan())
     )
 
     assert plan_hash == plan.plan_hash
