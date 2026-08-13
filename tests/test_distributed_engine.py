@@ -725,3 +725,52 @@ async def test_stop_quiesce_is_bounded_so_a_wedged_rank_still_dies(monkeypatch):
     # The wedged request was not faked away — the stop outlasted it.
     assert engine.has_active_requests()
     assert engine._client is None
+
+
+# ---------------------------------------------------------------------------
+# Supervision wiring
+#
+# The restart supervisor owns boot attempts; the engine keeps pointing its
+# client and status at the current one. These pin the visible behavior of
+# that handoff: fast, accurate errors while a restart is in flight or the
+# breaker has halted the loop.
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_available_reports_a_restart_in_progress():
+    engine = _ready_engine(lambda request: httpx.Response(200, json={}))
+    engine._client = None  # what a mid-restart window looks like
+
+    with pytest.raises(
+        DistributedInferenceError, match="restarting a failed rank"
+    ):
+        engine._ensure_available()
+
+
+def test_ensure_available_reports_halted_supervision():
+    engine = _ready_engine(lambda request: httpx.Response(200, json={}))
+    engine._broken_reason = "3 quick startup failures"
+
+    with pytest.raises(DistributedInferenceError, match="supervision halted"):
+        engine._ensure_available()
+
+
+def test_cluster_status_includes_supervision_state():
+    engine = DistributedBatchedEngine(_deployment())
+
+    status = engine.cluster_status()
+
+    assert status["supervision"]["quick_failures"] == 0
+    assert status["supervision"]["guard_teardowns"] == 0
+    assert status["supervision"]["broken_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_stop_halts_the_supervision_loop_before_teardown():
+    engine = _ready_engine(lambda request: httpx.Response(200, json={}))
+
+    await engine.stop()
+
+    # Without this the rank-group teardown would be read as a death and the
+    # supervision thread would immediately relaunch it.
+    assert engine._supervision._stop.is_set()

@@ -593,9 +593,15 @@ def _finite_metrics(value: Any) -> bool:
 class _TelemetryQueue:
     """Observe MLX-LM's rank-local response queue without changing its API."""
 
-    def __init__(self, queue: Any, telemetry: RuntimeTelemetry) -> None:
+    def __init__(
+        self,
+        queue: Any,
+        telemetry: RuntimeTelemetry,
+        stall_watchdog: Any | None = None,
+    ) -> None:
         self._queue = queue
         self._telemetry = telemetry
+        self._stall_watchdog = stall_watchdog
         self._request_id = telemetry.begin_request()
         self._finished = False
 
@@ -604,9 +610,13 @@ class _TelemetryQueue:
             if item is None:
                 self._finished = True
                 self._telemetry.finish_request(self._request_id)
+                if self._stall_watchdog is not None:
+                    self._stall_watchdog.note_request_finished()
             elif isinstance(item, BaseException):
                 self._finished = True
                 self._telemetry.finish_request(self._request_id, failed=True)
+                if self._stall_watchdog is not None:
+                    self._stall_watchdog.note_request_finished()
             elif hasattr(item, "prompt") and hasattr(item, "prompt_cache_count"):
                 prompt = getattr(item, "prompt", ())
                 cache_count = getattr(item, "prompt_cache_count", 0)
@@ -615,9 +625,18 @@ class _TelemetryQueue:
                     prompt_tokens=len(prompt),
                     cached_tokens=max(0, int(cache_count)),
                 )
+                if self._stall_watchdog is not None:
+                    # Arm the watchdog as the request enters prefill and size
+                    # its chunk-silence window to the uncached prompt work.
+                    self._stall_watchdog.note_request_started()
+                    self._stall_watchdog.note_prefill_budget(
+                        max(0, len(prompt) - int(cache_count))
+                    )
                 self._telemetry.mark_pending_uid(self._request_id)
             elif hasattr(item, "token") and hasattr(item, "finish_reason"):
                 self._telemetry.observe_token(self._request_id)
+                if self._stall_watchdog is not None:
+                    self._stall_watchdog.note_token()
         return self._queue.put(item, *args, **kwargs)
 
 
@@ -628,6 +647,7 @@ def install_server_telemetry(
     execution: ExecutionSettings | None = None,
     assignment: PipelineAssignment | None = None,
     prefill_guard: Any | None = None,
+    stall_watchdog: Any | None = None,
     heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
 ) -> Iterator[RuntimeTelemetry]:
     """Patch the pinned worker's generator at its rank-local queue boundary.
@@ -635,6 +655,12 @@ def install_server_telemetry(
     Also starts the idle heartbeat for as long as the rank is serving, so a
     marker that has stopped ageing means the rank has stopped, not that nobody
     has asked it anything.
+
+    ``stall_watchdog`` receives the liveness signals this boundary already
+    sees: request start/finish from the response queue, the prefill budget
+    from each request's prompt, one activity tick per batch step, and one
+    channel-share observation per request broadcast (which the watchdog's
+    rank-0 idle heartbeat counts).
     """
 
     import mlx.core as mx
@@ -702,6 +728,11 @@ def install_server_telemetry(
                 generation_responses=len(generation_responses),
                 elapsed_seconds=elapsed,
             )
+            if stall_watchdog is not None:
+                # A completed batch step — prefill chunk or decode drain — is
+                # the strongest liveness proof this rank has: the Metal/JACCL
+                # loop just did work.
+                stall_watchdog.note_activity()
             return prompt_responses, generation_responses
 
     class TelemetryPromptCache(original_prompt_cache):
@@ -763,10 +794,20 @@ def install_server_telemetry(
     class TelemetryResponseGenerator(original):
         def _share_request(self, request: Any) -> Any:
             shared = super()._share_request(request)
+            if stall_watchdog is not None:
+                # Every pass through here — request or idle None-share — is one
+                # traversal of the token-broadcast channel. The watchdog counts
+                # them; on rank 0, while idle, that count is the heartbeat that
+                # proves the channel (and with it the JACCL progress guard's
+                # keepalive) is alive.
+                stall_watchdog.note_channel_share()
             if shared is None:
                 return None
             response_queue, *rest = shared
-            return _TelemetryQueue(response_queue, telemetry), *rest
+            return (
+                _TelemetryQueue(response_queue, telemetry, stall_watchdog),
+                *rest,
+            )
 
         def _tokenize(self, tokenizer: Any, request: Any, args: Any) -> Any:
             tokenized = super()._tokenize(tokenizer, request, args)

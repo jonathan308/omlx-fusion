@@ -17,6 +17,7 @@ import httpx
 
 from ..cluster.deployment import ClusterDeployment
 from ..cluster.launch import DistributedJobSupervisor, DistributedLaunchError
+from ..cluster.supervision import ClusterRestartSupervisor
 from .base import GenerationOutput
 from .batched import BatchedEngine
 
@@ -85,10 +86,28 @@ class DistributedBatchedEngine(BatchedEngine):
             launch_kwargs["python_executable"] = python_executable
         self.deployment = deployment
         self._request_read_timeout = request_read_timeout
+        self._launch_kwargs = launch_kwargs
         self._supervisor = DistributedJobSupervisor(
             deployment,
             **launch_kwargs,
         )
+        # The self-heal layer: when a rank dies, this relaunches the
+        # deployment under a guard-teardown budget and a quick-failure
+        # breaker, runs the sacrificial warmup generation on every boot, and
+        # watches the rank-0 API for liveness. It is in-process and dies with
+        # this server; its budgets persist in the cluster registry dir so a
+        # supervisor restart cannot reset them. ``self._supervisor`` always
+        # points at the *current* boot attempt, so existing status/stop
+        # call-sites — and their tests — keep working unchanged.
+        self._supervision = ClusterRestartSupervisor(
+            deployment,
+            supervisor_factory=self._spawn_supervisor,
+            on_ready=self._on_supervision_ready,
+            on_down=self._on_supervision_down,
+            on_broken=self._on_supervision_broken,
+        )
+        self._broken_reason: str | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._client: httpx.AsyncClient | None = None
         self._model_type: str | None = None
         self._active_requests = 0
@@ -98,6 +117,47 @@ class DistributedBatchedEngine(BatchedEngine):
         # for it to drain.
         self._stopping = False
         self._quiesce_timeout_s = _quiesce_timeout_s()
+
+    def _spawn_supervisor(self) -> DistributedJobSupervisor:
+        """Create one boot attempt's job supervisor and adopt it immediately.
+
+        Adoption at attempt start — not at readiness — is what lets stop()
+        SIGTERM a boot that is still loading, and what makes a mid-boot death
+        report itself through the familiar status channel.
+        """
+
+        self._supervisor = DistributedJobSupervisor(
+            self.deployment,
+            **self._launch_kwargs,
+        )
+        return self._supervisor
+
+    def _on_supervision_ready(self, supervisor: Any, endpoint: str) -> None:
+        """Swap the private client onto a freshly (re)booted rank group.
+
+        Called from the supervision thread on every successful boot. Constructing
+        the httpx client off the event loop is safe; closing the old one is not,
+        so that is handed back to the loop the engine was started on.
+        """
+
+        old = self._client
+        self._supervisor = supervisor
+        self._client = self._new_client(endpoint)
+        loop = self._loop
+        if old is not None and loop is not None and loop.is_running():
+            asyncio.run_coroutine_threadsafe(old.aclose(), loop)
+
+    def _on_supervision_down(self, supervisor: Any) -> None:
+        # The old endpoint is dead; requests must fail fast against the
+        # restart rather than hang on a closed socket.
+        old = self._client
+        self._client = None
+        loop = self._loop
+        if old is not None and loop is not None and loop.is_running():
+            asyncio.run_coroutine_threadsafe(old.aclose(), loop)
+
+    def _on_supervision_broken(self, reason: str) -> None:
+        self._broken_reason = reason
 
     def _new_client(self, endpoint: str) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -131,7 +191,9 @@ class DistributedBatchedEngine(BatchedEngine):
     def cluster_status(self) -> dict[str, Any]:
         """Return the bounded launcher/rank state used by the admin UI."""
 
-        return self._supervisor.status().to_dict()
+        status = self._supervisor.status().to_dict()
+        status["supervision"] = self._supervision.status()
+        return status
 
     async def start(self) -> None:
         if self._loaded:
@@ -144,6 +206,10 @@ class DistributedBatchedEngine(BatchedEngine):
                 "distributed engine is stopping and cannot accept new work"
             )
         self._validate_model_settings()
+        # An explicit start is the operator's answer to a halted supervision
+        # loop; clear the verdict before the first boot attempt.
+        self._broken_reason = None
+        self._loop = asyncio.get_running_loop()
 
         # Tokenizer/config metadata stays in the oMLX process. No model weights
         # are loaded here.
@@ -173,16 +239,22 @@ class DistributedBatchedEngine(BatchedEngine):
         )
 
         try:
-            await asyncio.to_thread(self._supervisor.start)
+            # Blocks through boot retries: warmup failures and launch failures
+            # alike are routed through the restart budget before this returns
+            # or raises.
+            await asyncio.to_thread(self._supervision.start)
         except Exception:
             self._tokenizer = None
             self._model_type = None
             raise
-        endpoint = self._supervisor.endpoint
+        endpoint = self._supervision.endpoint
         if endpoint is None:
             await asyncio.to_thread(self._supervisor.stop)
             raise DistributedLaunchError("distributed endpoint was not created")
-        self._client = self._new_client(endpoint)
+        if self._client is None:
+            # Normally already set by the readiness callback; this only covers
+            # a supervision path that skipped it.
+            self._client = self._new_client(endpoint)
         self._loaded = True
         logger.info(
             "Distributed engine ready: model=%s ranks=%d backend=%s plan=%s",
@@ -221,6 +293,9 @@ class DistributedBatchedEngine(BatchedEngine):
         # how wired unified memory ends up orphaned in the kernel.
         self._stopping = True
         self._loaded = False
+        # Halt the self-heal loop first, or tearing the rank group down below
+        # would be read as a death and immediately relaunched.
+        self._supervision.stop()
         await self._quiesce_in_flight(self._quiesce_timeout_s)
         client, self._client = self._client, None
         try:
@@ -264,7 +339,17 @@ class DistributedBatchedEngine(BatchedEngine):
     def _ensure_available(self) -> httpx.AsyncClient:
         client = self._client
         status = self._supervisor.status()
+        if self._broken_reason is not None:
+            raise DistributedInferenceError(
+                "distributed supervision halted restarts: "
+                f"{self._broken_reason}"
+            )
         if not self._loaded or client is None:
+            if self._loaded and client is None:
+                raise DistributedInferenceError(
+                    "distributed engine is restarting a failed rank; "
+                    "retry shortly"
+                )
             raise DistributedInferenceError("distributed engine is not loaded")
         if status.returncode is not None:
             detail = status.failure_reason or ""

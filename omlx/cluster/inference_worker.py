@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from .deployment import decode_worker_contract
+from .forensics import capture_wedge_forensics
 from .liveness import PeerWatchdog, check_peers
 from .memory_guard import (
     admission_budget,
@@ -39,6 +40,7 @@ from .planner import PipelineAssignment
 from .prefill_guard import build_guard
 from .progressive_loading import install_progressive_loader
 from .runtime_optimizations import install_runtime_optimizations
+from .stall_watchdog import StallWatchdog
 from .telemetry import install_server_telemetry
 
 _EVENT_PREFIX = "OMLX_CLUSTER_EVENT:"
@@ -1119,6 +1121,21 @@ def run_worker(args: argparse.Namespace) -> int:
         args.state_dir,
         rank=rank,
     )
+    # The stall watchdog only ever acts while a generation is active, so it is
+    # armed before the first request can possibly arrive: a wedge during the
+    # very first generation is exactly the cold-start hazard it exists for.
+    # Its fatal path is the graceful rank exit — release Metal, then unwind —
+    # and its forensics capture fires long before that, while the evidence is
+    # still alive.
+    stall_watchdog = StallWatchdog(
+        rank=rank,
+        marker=marker,
+        emit_event=_emit_event,
+        on_fatal=_begin_graceful_rank_exit,
+        capture=capture_wedge_forensics,
+        state_dir=args.state_dir,
+    )
+    stall_watchdog.start()
 
     preserve_failure_marker = False
     try:
@@ -1335,6 +1352,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         marker,
                         execution=execution,
                         assignment=assignment,
+                        stall_watchdog=stall_watchdog,
                         prefill_guard=build_guard(
                             provider.model,
                             rank=rank,
@@ -1374,6 +1392,7 @@ def run_worker(args: argparse.Namespace) -> int:
             )
         raise
     finally:
+        stall_watchdog.stop()
         marker.stop_heartbeat()
         if not preserve_failure_marker:
             marker.remove()

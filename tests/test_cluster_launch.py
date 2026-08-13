@@ -167,6 +167,60 @@ def test_supervisor_collects_every_rank_ready_event():
     assert status["ranks"][1]["measured_weight_bytes"] == 11
 
 
+def test_rank_failure_phases_surface_structured_stall_evidence(monkeypatch):
+    """The restart supervisor classifies deaths from these phases."""
+
+    supervisor = launch.DistributedJobSupervisor(_deployment(), preflight=False)
+    markers = {
+        0: {
+            "deployment_id": "cluster-test",
+            "plan_hash": "c" * 64,
+            "rank": 0,
+            "phase": "stall",
+            "error": "generation stalled 241s",
+        },
+        1: {
+            "deployment_id": "cluster-test",
+            "plan_hash": "c" * 64,
+            "rank": 1,
+            "phase": "peer_lost",
+            "error": "rank 0 stopped reporting",
+        },
+    }
+    monkeypatch.setattr(
+        launch, "read_marker", lambda _path: markers[0]
+    )
+    monkeypatch.setattr(
+        launch,
+        "read_remote_marker",
+        lambda *_a, **_k: (markers[1], None, None, ""),
+    )
+
+    assert supervisor.rank_failure_phases() == {0: "stall", 1: "peer_lost"}
+
+
+def test_rank_failure_phases_ignore_markers_from_another_plan(monkeypatch):
+    supervisor = launch.DistributedJobSupervisor(_deployment(), preflight=False)
+    monkeypatch.setattr(
+        launch,
+        "read_marker",
+        lambda _path: {
+            "deployment_id": "cluster-test",
+            "plan_hash": "0" * 64,
+            "rank": 0,
+            "phase": "stall",
+            "error": "stale evidence from a previous plan",
+        },
+    )
+    monkeypatch.setattr(
+        launch,
+        "read_remote_marker",
+        lambda *_a, **_k: (None, None, None, ""),
+    )
+
+    assert supervisor.rank_failure_phases() == {}
+
+
 def test_supervisor_stop_kills_rank_left_after_launcher_exits(monkeypatch):
     class Launcher:
         pid = 43210

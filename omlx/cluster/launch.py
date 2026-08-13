@@ -1363,17 +1363,18 @@ class DistributedJobSupervisor:
         suffix = f": {detail}" if detail else ""
         return f"distributed launcher exited with code {returncode}{suffix}"
 
-    def _runtime_failure_reason(self) -> str | None:
-        """Recover the rank exception MLX's SSH cleanup can otherwise hide.
+    def _rank_failure_markers(self) -> dict[int, dict[str, Any]]:
+        """Persisted failure marker per rank, for this exact deployment+plan.
 
-        ``mlx.launch`` may exit successfully after a worker failure and then
-        print a ``CalledProcessError`` from its cleanup thread because the
-        remote PID has already disappeared. Every rank has already persisted
-        the useful exception in its own bounded marker, so prefer that evidence
-        when it belongs to this exact deployment and plan.
+        Every rank records its own exception in its bounded marker before it
+        dies, so the marker is better evidence than anything the launcher's
+        SSH cleanup prints afterwards. Only markers that belong to this
+        deployment, this plan, and this rank count. The ``stall`` phase is the
+        stall watchdog's structured wedge evidence; the other three predate
+        it.
         """
 
-        failures: list[str] = []
+        markers: dict[int, dict[str, Any]] = {}
         for rank, host in enumerate(self.deployment.hosts):
             filename = f"{self.deployment.deployment_id}-rank-{rank}.json"
             if host.ssh in {"127.0.0.1", "localhost", "::1"}:
@@ -1392,13 +1393,45 @@ class DistributedJobSupervisor:
                 marker.get("deployment_id") != self.deployment.deployment_id
                 or marker.get("plan_hash") != self.deployment.plan_hash
                 or marker.get("rank") != rank
-                or marker.get("phase") not in {
+                or marker.get("phase")
+                not in {
                     "failed",
                     "peer_lost",
                     "launcher_lost",
+                    "stall",
                 }
             ):
                 continue
+            markers[rank] = marker
+        return markers
+
+    def rank_failure_phases(self) -> dict[int, str]:
+        """``{rank: phase}`` for each rank that recorded a structured failure.
+
+        The restart supervisor classifies deaths from this: ``peer_lost``,
+        ``launcher_lost`` and ``stall`` are memory-safe self-heals (the rank
+        released its Metal state on the way out) and earn the guard-teardown
+        restart budget rather than the quick-failure one.
+        """
+
+        return {
+            rank: str(marker.get("phase"))
+            for rank, marker in self._rank_failure_markers().items()
+        }
+
+    def _runtime_failure_reason(self) -> str | None:
+        """Recover the rank exception MLX's SSH cleanup can otherwise hide.
+
+        ``mlx.launch`` may exit successfully after a worker failure and then
+        print a ``CalledProcessError`` from its cleanup thread because the
+        remote PID has already disappeared. Every rank has already persisted
+        the useful exception in its own bounded marker, so prefer that evidence
+        when it belongs to this exact deployment and plan.
+        """
+
+        failures: list[str] = []
+        for rank, marker in self._rank_failure_markers().items():
+            host = self.deployment.hosts[rank]
             error = marker.get("error")
             if isinstance(error, str) and error.strip():
                 failures.append(
