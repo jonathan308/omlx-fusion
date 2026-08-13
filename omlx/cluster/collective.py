@@ -477,3 +477,110 @@ def run_local_deepseek_tp_smoke(
         "elapsed_seconds": time.monotonic() - started_at,
         "ranks": [by_rank[rank] for rank in (0, 1)],
     }
+
+
+def _run_local_lockstep_cancel_smoke(
+    *,
+    timeout: float = 45.0,
+    runner: LauncherRunner = _run_launcher,
+    starting_port: int | None = None,
+) -> dict[str, Any]:
+    """Prove two ranks break at the same step/chunk when a cancel lands.
+
+    Maintainer-only real-collective gate, same shape as the MiniMax decode
+    smoke: two loopback ranks decode a tiny model, rank zero arms the cancel
+    latch mid-decode, and the run fails unless both ranks surface the swapped
+    stop id at the same step and abandon the armed prefill after exactly one
+    computed chunk.
+    """
+
+    if timeout <= 0:
+        raise ValueError("timeout must be greater than zero")
+    if starting_port is None:
+        starting_port = _find_loopback_port_span(2)
+    if not 1 <= starting_port <= 65534:
+        raise ValueError("starting_port must leave room for two ranks")
+
+    launcher = (
+        "from mlx._distributed_utils.launch import main; raise SystemExit(main() or 0)"
+    )
+    argv = [
+        sys.executable,
+        "-c",
+        launcher,
+        "--backend",
+        "ring",
+        "--hosts",
+        "127.0.0.1",
+        "--repeat-hosts",
+        "2",
+        "--starting-port",
+        str(starting_port),
+        "--",
+        sys.executable,
+        "-m",
+        "omlx.cluster.lockstep_cancel_smoke_worker",
+    ]
+    started_at = time.monotonic()
+    try:
+        completed = runner(argv, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CollectiveSmokeError(
+            f"could not launch MLX lockstep cancel smoke: {exc}"
+        ) from exc
+
+    records: list[dict[str, Any]] = []
+    for line in completed.stdout.splitlines():
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and payload.get("type") == (
+            "lockstep_cancel_result"
+        ):
+            records.append(payload)
+    detail = completed.stderr.strip()
+    if completed.returncode != 0:
+        suffix = f": {detail}" if detail else ""
+        raise CollectiveSmokeError(
+            f"MLX lockstep cancel smoke exited with code "
+            f"{completed.returncode}{suffix}"
+        )
+    by_rank = {
+        record["rank"]: record
+        for record in records
+        if isinstance(record.get("rank"), int)
+    }
+    if len(records) != 2 or set(by_rank) != {0, 1}:
+        suffix = f": {detail}" if detail else ""
+        raise CollectiveSmokeError(
+            "lockstep cancel smoke did not return one result from each rank"
+            + suffix
+        )
+    for rank, record in by_rank.items():
+        if (
+            record.get("size") != 2
+            or record.get("model_type") != "minimax_m3_vl"
+            or record.get("decode_steps") != 4
+            # The latch armed after two steps; the stop id enters the
+            # consumed stream at step two on every rank, or it is not
+            # lockstep.
+            or record.get("cancel_step") != 2
+            or record.get("prefill_cancelled") is not True
+            or record.get("prefill_chunks") != 1
+        ):
+            raise CollectiveSmokeError(
+                f"rank {rank} returned an invalid lockstep cancel result: {record}"
+            )
+    return {
+        "ok": True,
+        "backend": "ring",
+        "loopback_only": True,
+        "model_type": "minimax_m3_vl",
+        "rank_count": 2,
+        "cancel_step": 2,
+        "prefill_chunks": 1,
+        "starting_port": starting_port,
+        "elapsed_seconds": time.monotonic() - started_at,
+        "ranks": [by_rank[rank] for rank in (0, 1)],
+    }

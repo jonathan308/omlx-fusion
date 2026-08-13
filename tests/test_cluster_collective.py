@@ -8,6 +8,7 @@ import pytest
 
 from omlx.cluster.collective import (
     CollectiveSmokeError,
+    _run_local_lockstep_cancel_smoke,
     _run_local_minimax_decode_smoke,
     run_local_collective_smoke,
     run_local_deepseek_tp_smoke,
@@ -250,3 +251,76 @@ def test_local_deepseek_tp_smoke_rejects_a_reference_mismatch():
 
     with pytest.raises(CollectiveSmokeError, match="invalid DeepSeek TP result"):
         run_local_deepseek_tp_smoke(runner=runner, starting_port=43000)
+
+
+def _lockstep_cancel_records(cancel_step_rank1=2, prefill_chunks_rank1=1):
+    return [
+        {
+            "type": "lockstep_cancel_result",
+            "model_type": "minimax_m3_vl",
+            "rank": rank,
+            "size": 2,
+            "decode_steps": 4,
+            "cancel_step": 2 if rank == 0 else cancel_step_rank1,
+            "prefill_cancelled": True,
+            "prefill_chunks": 1 if rank == 0 else prefill_chunks_rank1,
+        }
+        for rank in (0, 1)
+    ]
+
+
+def test_local_lockstep_cancel_smoke_validates_identical_break_points():
+    def runner(argv, *, timeout):
+        assert "omlx.cluster.lockstep_cancel_smoke_worker" in argv
+        assert timeout == 9.0
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout="\n".join(
+                json.dumps(record) for record in _lockstep_cancel_records()
+            ),
+            stderr="",
+        )
+
+    result = _run_local_lockstep_cancel_smoke(
+        timeout=9.0,
+        runner=runner,
+        starting_port=43000,
+    )
+
+    assert result["ok"] is True
+    assert result["loopback_only"] is True
+    assert result["cancel_step"] == 2
+    assert [record["rank"] for record in result["ranks"]] == [0, 1]
+
+
+def test_local_lockstep_cancel_smoke_rejects_divergent_cancel_steps():
+    def runner(argv, *, timeout):
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout="\n".join(
+                json.dumps(record)
+                for record in _lockstep_cancel_records(cancel_step_rank1=3)
+            ),
+            stderr="",
+        )
+
+    with pytest.raises(CollectiveSmokeError, match="invalid lockstep cancel"):
+        _run_local_lockstep_cancel_smoke(runner=runner, starting_port=43000)
+
+
+def test_local_lockstep_cancel_smoke_rejects_a_late_prefill_break():
+    def runner(argv, *, timeout):
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout="\n".join(
+                json.dumps(record)
+                for record in _lockstep_cancel_records(prefill_chunks_rank1=2)
+            ),
+            stderr="",
+        )
+
+    with pytest.raises(CollectiveSmokeError, match="invalid lockstep cancel"):
+        _run_local_lockstep_cancel_smoke(runner=runner, starting_port=43000)

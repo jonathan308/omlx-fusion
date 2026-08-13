@@ -725,3 +725,146 @@ async def test_stop_quiesce_is_bounded_so_a_wedged_rank_still_dies(monkeypatch):
     # The wedged request was not faked away — the stop outlasted it.
     assert engine.has_active_requests()
     assert engine._client is None
+
+
+# ---------------------------------------------------------------------------
+# Lockstep cancel + coordinated shutdown wiring
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_abort_all_requests_arms_the_lockstep_cancel_first():
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        return httpx.Response(200, json={"status": "armed"})
+
+    engine = _ready_engine(handler)
+    engine._worker_lockstep_cancel = True
+    await engine._enter_request()
+
+    active = await engine.abort_all_requests()
+
+    assert active == 1
+    assert ("POST", "/admin/cancel") in calls
+    # The supervisor was never started, so there is no endpoint to rebuild
+    # the private client against: it stays closed, as before.
+    assert engine._client is None
+
+
+@pytest.mark.asyncio
+async def test_abort_all_requests_falls_back_without_the_capability():
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json={})
+
+    engine = _ready_engine(handler)
+    await engine._enter_request()
+
+    await engine.abort_all_requests()
+
+    assert "/admin/cancel" not in calls
+
+
+@pytest.mark.asyncio
+async def test_abort_all_requests_tolerates_a_dead_worker():
+    def handler(request):
+        raise httpx.ConnectError("worker gone", request=request)
+
+    engine = _ready_engine(handler)
+    engine._worker_lockstep_cancel = True
+    await engine._enter_request()
+
+    assert await engine.abort_all_requests() == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_prefers_the_cooperative_shutdown_before_term(monkeypatch):
+    events = []
+
+    def handler(request):
+        events.append(("POST", request.url.path))
+        return httpx.Response(200, json={"status": "broadcast"})
+
+    engine = _ready_engine(handler)
+    engine._worker_coordinated_shutdown = True
+    # The ranks exit themselves once the sentinel crosses.
+    monkeypatch.setattr(
+        engine._supervisor,
+        "status",
+        lambda: SimpleNamespace(returncode=0),
+    )
+    monkeypatch.setattr(
+        engine._supervisor,
+        "stop",
+        lambda: events.append(("TERM", "supervisor")),
+    )
+
+    await engine.stop()
+
+    assert ("POST", "/admin/shutdown") in events
+    # The supervisor TERM remains the backstop and still runs afterwards.
+    assert ("TERM", "supervisor") in events
+    assert events.index(("POST", "/admin/shutdown")) < events.index(
+        ("TERM", "supervisor")
+    )
+
+
+@pytest.mark.asyncio
+async def test_cooperative_shutdown_wait_is_bounded_before_term(monkeypatch):
+    def handler(request):
+        return httpx.Response(200, json={"status": "pending"})
+
+    engine = _ready_engine(handler)
+    engine._worker_coordinated_shutdown = True
+    engine._cooperative_stop_timeout_s = 0.3
+    # A sentinel that never lands must not make the deployment unstoppable.
+    monkeypatch.setattr(
+        engine._supervisor,
+        "status",
+        lambda: SimpleNamespace(returncode=None),
+    )
+    stopped = []
+    monkeypatch.setattr(engine._supervisor, "stop", lambda: stopped.append(True))
+
+    started = time.monotonic()
+    await asyncio.wait_for(engine.stop(), timeout=5)
+
+    assert stopped == [True]
+    assert time.monotonic() - started < 3
+
+
+@pytest.mark.asyncio
+async def test_stop_skips_the_cooperative_shutdown_without_the_capability(
+    monkeypatch,
+):
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json={})
+
+    engine = _ready_engine(handler)
+    stopped = []
+    monkeypatch.setattr(engine._supervisor, "stop", lambda: stopped.append(True))
+
+    await engine.stop()
+
+    assert "/admin/shutdown" not in calls
+    assert stopped == [True]
+
+
+def test_worker_capabilities_come_from_the_ready_event():
+    assert distributed._ready_capability(None, "lockstep_cancel") is False
+    assert distributed._ready_capability({}, "lockstep_cancel") is False
+    event = {
+        "optimizations": {
+            "lockstep_cancel": {"active": True, "enabled": True, "reason": "ok"},
+            "coordinated_shutdown": {"active": False, "reason": "drifted"},
+        }
+    }
+    assert distributed._ready_capability(event, "lockstep_cancel") is True
+    assert distributed._ready_capability(event, "coordinated_shutdown") is False

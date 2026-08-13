@@ -217,6 +217,8 @@ def test_no_unreachable_functions_in_the_cluster_package():
         # Maintainer-only real-collective regression gate. It deliberately is
         # not exposed in the GUI or production route surface.
         ("collective.py", "_run_local_minimax_decode_smoke"),
+        # Same maintainer-only gate, for the lockstep cancel/sentinel paths.
+        ("collective.py", "_run_local_lockstep_cancel_smoke"),
         # known_hosts helpers, not yet wired into the pairing flow.
         ("ssh_keys.py", "add_host_key"),
         ("ssh_keys.py", "_ssh_executable"),

@@ -36,6 +36,19 @@ _QUIESCE_TIMEOUT_ENV = "OMLX_CLUSTER_QUIESCE_TIMEOUT_S"
 _DEFAULT_QUIESCE_TIMEOUT_S = 30.0
 _QUIESCE_POLL_S = 0.1
 
+# How long engine stop waits for the coordinated shutdown sentinel to exit
+# every rank itself before the supervisor's TERM escalation. The sentinel
+# path releases Metal on each rank through the graceful exit; TERM remains
+# the bound for a worker that never got it (older workers 404 the POST).
+_COOPERATIVE_STOP_TIMEOUT_ENV = "OMLX_CLUSTER_COOPERATIVE_STOP_TIMEOUT_S"
+_DEFAULT_COOPERATIVE_STOP_TIMEOUT_S = 15.0
+_COOPERATIVE_STOP_POLL_S = 0.1
+
+# Short deadline for the localhost admin POSTs themselves: they are in-memory
+# latch operations on a healthy worker, and a wedged worker must not stall an
+# abort or a stop behind the long streaming read timeout.
+_ADMIN_POST_TIMEOUT_S = 5.0
+
 
 def _quiesce_timeout_s() -> float:
     raw = os.environ.get(_QUIESCE_TIMEOUT_ENV, "").strip()
@@ -45,6 +58,30 @@ def _quiesce_timeout_s() -> float:
             if value > 0:
                 return value
     return _DEFAULT_QUIESCE_TIMEOUT_S
+
+
+def _cooperative_stop_timeout_s() -> float:
+    raw = os.environ.get(_COOPERATIVE_STOP_TIMEOUT_ENV, "").strip()
+    if raw:
+        with suppress(ValueError):
+            value = float(raw)
+            if value > 0:
+                return value
+    return _DEFAULT_COOPERATIVE_STOP_TIMEOUT_S
+
+
+def _ready_capability(event: Any, name: str) -> bool:
+    """Read one worker-reported capability out of the ready event."""
+
+    if not isinstance(event, dict):
+        return False
+    optimizations = event.get("optimizations")
+    if not isinstance(optimizations, dict):
+        return False
+    capability = optimizations.get(name)
+    if not isinstance(capability, dict):
+        return False
+    return bool(capability.get("active"))
 
 
 class DistributedBatchedEngine(BatchedEngine):
@@ -98,6 +135,12 @@ class DistributedBatchedEngine(BatchedEngine):
         # for it to drain.
         self._stopping = False
         self._quiesce_timeout_s = _quiesce_timeout_s()
+        self._cooperative_stop_timeout_s = _cooperative_stop_timeout_s()
+        # Worker capabilities read off the ready event. False means "do not
+        # ask": an older worker 404s the admin routes, and every caller falls
+        # back to exactly today's disconnect/TERM behavior.
+        self._worker_lockstep_cancel = False
+        self._worker_coordinated_shutdown = False
 
     def _new_client(self, endpoint: str) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -173,11 +216,19 @@ class DistributedBatchedEngine(BatchedEngine):
         )
 
         try:
-            await asyncio.to_thread(self._supervisor.start)
+            ready_event = await asyncio.to_thread(self._supervisor.start)
         except Exception:
             self._tokenizer = None
             self._model_type = None
             raise
+        self._worker_lockstep_cancel = _ready_capability(
+            ready_event,
+            "lockstep_cancel",
+        )
+        self._worker_coordinated_shutdown = _ready_capability(
+            ready_event,
+            "coordinated_shutdown",
+        )
         endpoint = self._supervisor.endpoint
         if endpoint is None:
             await asyncio.to_thread(self._supervisor.stop)
@@ -225,6 +276,13 @@ class DistributedBatchedEngine(BatchedEngine):
         client, self._client = self._client, None
         try:
             if client is not None:
+                if self._worker_coordinated_shutdown:
+                    # Prefer the cooperative stop: the sentinel crosses the
+                    # share channel at a request boundary, every rank releases
+                    # Metal through the graceful exit path, and they leave
+                    # together — including remote ranks, which a killpg TERM
+                    # otherwise reaches only through watchdog timeouts.
+                    await self._request_worker_shutdown(client)
                 await client.aclose()
         finally:
             try:
@@ -234,6 +292,35 @@ class DistributedBatchedEngine(BatchedEngine):
                 self._model_type = None
                 self._loaded = False
         logger.info("Distributed engine stopped: %s", self.deployment.deployment_id)
+
+    async def _request_worker_shutdown(self, client: httpx.AsyncClient) -> None:
+        """Ask rank zero for the coordinated shutdown, then give it a window.
+
+        Any failure — a 404 from an older worker, a connection that dies with
+        the ranks — simply hands stop() back to the supervisor's TERM->KILL
+        escalation, which is already sized for a graceful per-rank teardown.
+        """
+
+        with suppress(httpx.HTTPError):
+            await client.post(
+                "/admin/shutdown",
+                json={},
+                timeout=_ADMIN_POST_TIMEOUT_S,
+            )
+        deadline = time.monotonic() + self._cooperative_stop_timeout_s
+        while True:
+            status = self._supervisor.status()
+            if status.returncode is not None:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.info(
+                    "Coordinated cluster shutdown did not exit the ranks "
+                    "within %.1fs; escalating to the supervisor's TERM",
+                    self._cooperative_stop_timeout_s,
+                )
+                return
+            await asyncio.sleep(min(_COOPERATIVE_STOP_POLL_S, remaining))
 
     async def _quiesce_in_flight(self, timeout_s: float) -> bool:
         """Wait for in-flight requests to drain, up to ``timeout_s``.
@@ -1205,11 +1292,25 @@ class DistributedBatchedEngine(BatchedEngine):
         return None
 
     async def abort_all_requests(self) -> int:
-        # Closing the private client disconnects all rank-zero handlers. The
-        # MLX-LM handler cancels their generation contexts in ``finally``.
+        # Arm the lockstep cancel first: rank zero swaps the next sampled
+        # token for a stop id ahead of the token all-sum and the prefill loop
+        # reads its cancel all-sum at the next chunk boundary, so every rank
+        # stops at the same boundary instead of learning from a dead socket a
+        # request later. Best-effort — a worker without the capability is
+        # handled by the client close below, exactly as before.
         active = self._active_requests
         client, self._client = self._client, None
         if client is not None:
+            if active > 0 and self._worker_lockstep_cancel:
+                with suppress(httpx.HTTPError):
+                    await client.post(
+                        "/admin/cancel",
+                        json={},
+                        timeout=_ADMIN_POST_TIMEOUT_S,
+                    )
+            # Closing the private client disconnects all rank-zero handlers.
+            # The MLX-LM handler cancels their generation contexts in
+            # ``finally``.
             await client.aclose()
             endpoint = self._supervisor.endpoint
             if endpoint is not None and self._loaded:
