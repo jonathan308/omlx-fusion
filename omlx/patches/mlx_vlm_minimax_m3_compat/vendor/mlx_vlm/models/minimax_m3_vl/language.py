@@ -1,6 +1,8 @@
 from functools import partial
 from typing import Any, List, Optional
 
+import os
+
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
@@ -24,6 +26,35 @@ from .msa import (
 _MSA_SPARSE_DECODE_DEFAULT_MAX_DENSITY = 0.5
 _MSA_PREFILL_BLOCKWISE_TOPK_MIN_KV_LEN = 32768
 _MSA_PREFILL_BLOCKWISE_TOPK_BLOCK_CHUNK = 2
+
+
+def _msa_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        return default
+
+
+# Tiny multi-token steps (EAGLE3 verify blocks, micro-suffixes) must NOT take
+# the custom MSA prefill path: the blockwise top-k builder's cost is dominated
+# by scoring the FULL kv history, so at L=4 over 19k context it turns each
+# speculative round into an O(ctx) prefill (ThunderMLX measured decode
+# collapsing 22 -> 6 t/s, scaling with ctx). Below this L the native MiniMax
+# attention path handles the step at decode-like cost.
+_MSA_PREFILL_MIN_L = max(2, _msa_env_int("MLX_MINIMAX_MSA_PREFILL_MIN_L", 16))
+
+# Incremental suffixes over a long resident KV hit a shape-specific Metal
+# stall in the custom blockwise sparse prefill kernel (captured at L=194 and
+# L=483; cold/large chunks are unaffected — ThunderMLX prefill-cache capacity
+# lab, 2026-07-12). Route exactly that narrow shape back through the native
+# MiniMax attention path; full prefill chunks stay on the accelerated MSA
+# path. MAX_L defaults to the production-proven 512; 0 disables the guard.
+_MSA_PREFILL_LONG_K_SMALL_L_MAX_L = max(
+    0, _msa_env_int("MLX_MINIMAX_MSA_PREFILL_LONG_K_SMALL_L_MAX_L", 512)
+)
+_MSA_PREFILL_LONG_K_SMALL_L_MIN_KV = max(
+    0, _msa_env_int("MLX_MINIMAX_MSA_PREFILL_LONG_K_SMALL_L_MIN_KV", 32768)
+)
 
 
 def _is_bool_mask(mask: mx.array) -> bool:
@@ -1056,11 +1087,21 @@ class MiniMaxAttention(nn.Module):
         num_blocks = (total_len + self.sparse_block_size - 1) // self.sparse_block_size
         selected_len = min(self.sparse_topk_blocks, num_blocks) * self.sparse_block_size
         sparse_density = selected_len / total_len if total_len else 1.0
+        # long-K-small-L guard: a small incremental suffix over a long resident
+        # KV stalls the custom sparse prefill kernel; tiny multi-token chunks
+        # turn it into an O(ctx)-per-step prefill. Both shapes fall through to
+        # the native MiniMax attention path (see the constant block above).
+        long_k_small_l = (
+            _MSA_PREFILL_LONG_K_SMALL_L_MAX_L > 0
+            and L <= _MSA_PREFILL_LONG_K_SMALL_L_MAX_L
+            and total_len >= _MSA_PREFILL_LONG_K_SMALL_L_MIN_KV
+        )
         return (
             mx.metal.is_available()
             and self.sparse_score_type == "max"
             and B == 1
-            and L > 1
+            and L >= _MSA_PREFILL_MIN_L
+            and not long_k_small_l
             and q_positions is None
             and (mask is None or isinstance(mask, str))
             and self.index_heads == K
