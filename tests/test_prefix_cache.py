@@ -24,6 +24,24 @@ from omlx.cache.prefix_cache import BlockAwarePrefixCache, BlockCacheEntry
 from omlx.cache.stats import PrefixCacheStats
 
 
+def _wait_for_ssd_persistence(ssd_manager, minimum=1, timeout_s=10.0):
+    """Wait until the background writer has persisted blocks to disk.
+
+    Restores served from the not-yet-flushed pending write buffer skip
+    hot-tier promotion, so hot-tier assertions race the single writer
+    thread under load. Poll the persisted-save counter instead of sleeping
+    a fixed interval.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if ssd_manager.get_stats().saves_persisted >= minimum:
+            return
+        time.sleep(0.02)
+    raise AssertionError(
+        f"timed out waiting for SSD persistence: {ssd_manager.get_stats()}"
+    )
+
+
 class MockModel:
     """Mock model for testing."""
 
@@ -406,6 +424,7 @@ class TestBlockAwarePrefixCache:
                 is not None
             )
             assert ssd_manager.get_stats().hot_cache_entries == 0
+            _wait_for_ssd_persistence(ssd_manager)
 
             assert (
                 prefix_cache.restore_exact_prefix(
