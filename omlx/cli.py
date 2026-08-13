@@ -78,6 +78,78 @@ def _has_cli_overrides(args) -> bool:
     return bool(getattr(args, "no_cache", False))
 
 
+def _reclaim_stale_serve_port(port: int, *, term_grace_seconds: float = 5.0) -> None:
+    """Reclaim the serve port from a stale oMLX process (opt-in).
+
+    Port of ThunderMLX start_gateway.sh's stale-process reclamation
+    (start_gateway.sh:27-75): the port owner is only ever signalled when it
+    is identity-verified as another ``omlx serve`` process; a foreign
+    listener is never touched and aborts the start with exit code 2. No-op
+    when the port is free or the owner cannot be determined — the subsequent
+    bind then reports the conflict as usual.
+    """
+    import os
+    import signal
+    import subprocess
+    import time
+
+    def _listener_pid() -> int | None:
+        try:
+            result = subprocess.run(
+                ["lsof", "-nP", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        for line in result.stdout.splitlines():
+            try:
+                return int(line.strip())
+            except ValueError:
+                continue
+        return None
+
+    pid = _listener_pid()
+    if pid is None:
+        return
+    try:
+        owner = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        owner = ""
+    if "omlx" not in owner or "serve" not in owner:
+        print(f"Port {port} is owned by a non-oMLX process (pid {pid}): {owner}")
+        print("Refusing to stop it. Stop the process yourself, choose another")
+        print("port, or unset OMLX_SERVE_REPLACE_STALE.")
+        sys.exit(2)
+
+    print(f"Port {port} is owned by stale oMLX process {pid}; replacing it...")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    deadline = time.monotonic() + term_grace_seconds
+    while time.monotonic() < deadline:
+        if _listener_pid() is None:
+            return
+        time.sleep(0.25)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        return
+    # Wait for the listener to disappear so the bind below succeeds.
+    deadline = time.monotonic() + term_grace_seconds
+    while time.monotonic() < deadline:
+        if _listener_pid() is None:
+            return
+        time.sleep(0.25)
+
+
 def serve_command(args):
     """Start the OpenAI-compatible multi-model server."""
     import logging
@@ -210,6 +282,8 @@ def serve_command(args):
     # normal startup runs ASGI lifespan before binding host/port, which means
     # pinned models can be preloaded before a port conflict is detected.
     bind_hosts = [h.strip() for h in settings.server.host.split(",") if h.strip()]
+    if os.environ.get("OMLX_SERVE_REPLACE_STALE", "0") == "1":
+        _reclaim_stale_serve_port(settings.server.port)
     for h in bind_hosts:
         print(f"Binding server at http://{h}:{settings.server.port}")
     # uvicorn does not support "trace" — map to "debug" for its internal logging
