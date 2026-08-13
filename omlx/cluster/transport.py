@@ -1196,6 +1196,31 @@ def parse_thunderbolt_interfaces(output: str) -> frozenset[str]:
     return frozenset(interfaces)
 
 
+def parse_linux_ip_addresses(output: str) -> tuple[InterfaceAddress, ...]:
+    """Parse ``ip -o -4 address show up`` when Linux has no ifconfig."""
+
+    addresses: list[InterfaceAddress] = []
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) < 4 or fields[2] != "inet":
+            continue
+        interface = fields[1].split("@", 1)[0]
+        try:
+            network = ipaddress.ip_interface(fields[3])
+        except ValueError:
+            continue
+        if network.ip.is_loopback or not isinstance(network, ipaddress.IPv4Interface):
+            continue
+        addresses.append(
+            InterfaceAddress(
+                interface=interface,
+                address=str(network.ip),
+                prefix_length=network.network.prefixlen,
+            )
+        )
+    return tuple(addresses)
+
+
 def _read(ssh_hostname: str, command: list[str]) -> str:
     """Run one read-only command on a host, returning "" when it cannot run."""
 
@@ -1223,9 +1248,14 @@ def probe_host_interfaces(ssh_hostname: str) -> HostInterfaces:
     already know the name of.
     """
 
+    addresses = parse_interface_addresses(_read(ssh_hostname, ["ifconfig", "-a"]))
+    if not addresses:
+        addresses = parse_linux_ip_addresses(
+            _read(ssh_hostname, ["ip", "-o", "-4", "address", "show", "up"])
+        )
     return HostInterfaces(
         host=ssh_hostname,
-        addresses=parse_interface_addresses(_read(ssh_hostname, ["ifconfig", "-a"])),
+        addresses=addresses,
         rdma_interfaces=frozenset(
             device.removeprefix("rdma_") for device in _rdma_devices(ssh_hostname)
         ),
@@ -1472,10 +1502,27 @@ def verify_link_reachability(
         route = run(local.host, ("/sbin/route", "-n", "get", remote.address))
         selected = _route_interface(route.stdout) if route.returncode == 0 else ""
         if selected != local.interface:
+            # Linux does not implement macOS's ``route -n get`` form. Binding
+            # a TCP connection to the candidate source address proves both the
+            # route and that the peer's SSH service answers on that exact path,
+            # without needing a platform-specific interface command.
+            script = (
+                "import socket,sys\n"
+                "s=socket.create_connection((sys.argv[2],22),timeout=3,"
+                "source_address=(sys.argv[1],0))\n"
+                "s.close()"
+            )
+            if route.returncode != 0:
+                bound = run(
+                    local.host,
+                    ("python3", "-c", script, local.address, remote.address),
+                )
+                if bound.returncode == 0:
+                    continue
             detail = (
                 f"route uses {selected}"
                 if selected
-                else "macOS reported no usable route"
+                else "the host reported no usable route"
             )
             return False, (
                 f"{local.host} cannot use {local.interface} to reach "

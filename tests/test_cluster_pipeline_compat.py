@@ -39,6 +39,14 @@ def test_standard_pipeline_mixin_has_an_explicit_assignment_contract(tmp_path):
         assert pipeline_assignment_is_honored(model)
 
 
+def test_thin_qwen_moe_wrapper_inherits_the_pipeline_contract(tmp_path):
+    model = _model_config(tmp_path, "qwen3_5_moe")
+
+    assert not pipeline_assignment_is_honored(model)
+    with install_pipeline_compatibility(_assignment()):
+        assert pipeline_assignment_is_honored(model)
+
+
 def test_nemotron_compatibility_has_an_explicit_assignment_contract(tmp_path):
     model = _model_config(tmp_path, "nemotron_h")
 

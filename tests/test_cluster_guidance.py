@@ -6,6 +6,15 @@ import pytest
 from omlx.cluster.guidance import explain
 
 
+def test_missing_worker_runtime_is_explained_as_online_setup():
+    guidance = explain(
+        "cuda-worker-1 is online, but its oMLX worker runtime is not installed yet."
+    )
+
+    assert guidance.title == "The device is online but its worker runtime is missing"
+    assert "SSH and hardware discovery succeeded" in guidance.explanation
+
+
 @pytest.mark.parametrize(
     ("message", "expected_in_title"),
     [

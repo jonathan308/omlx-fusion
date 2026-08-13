@@ -189,6 +189,7 @@ def merge_model_inventories(
                         "ssh": ssh_target,
                         "model_path": model.get("model_path"),
                         "estimated_size": int(model.get("estimated_size") or 0),
+                        "python_executable": model.get("python_executable"),
                     }
                     for node_id, ssh_target, model in locations
                 ],

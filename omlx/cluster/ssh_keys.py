@@ -85,11 +85,22 @@ def _key_fingerprint(public_key: str) -> str:
 
     # Extract the base64-encoded key data
     parts = public_key.strip().split()
-    if len(parts) < 2:
+    if len(parts) < 2 or parts[0] not in {"ssh-ed25519", "ssh-rsa"}:
         raise ValueError("invalid SSH public key format")
-    key_data = base64.b64decode(parts[1])
+    try:
+        key_data = base64.b64decode(parts[1], validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("invalid SSH public key format") from exc
+    if not key_data:
+        raise ValueError("invalid SSH public key format")
     digest = hashlib.sha256(key_data).digest()
     return "SHA256:" + base64.b64encode(digest).decode().rstrip("=")
+
+
+def ssh_public_key_fingerprint(public_key: str) -> str:
+    """Return the OpenSSH SHA-256 fingerprint for a public key."""
+
+    return _key_fingerprint(public_key)
 
 
 def generate_ssh_key_pair(
@@ -364,6 +375,58 @@ def add_host_key(
     if known_hosts_path.exists():
         os.chmod(known_hosts_path, 0o600)
 
+    return True
+
+
+def pin_enrolled_host_key(
+    *,
+    hostname: str,
+    public_key: str,
+    known_hosts_path: Path | None = None,
+) -> bool:
+    """Install the host key reported by a one-time enrolled worker.
+
+    Existing identities are compared rather than overwritten.  This preserves
+    the same changed-host fail-closed rule used by normal cluster SSH.
+    """
+
+    hostname = validate_ssh_target(hostname)
+    if "@" in hostname:
+        hostname = hostname.rsplit("@", 1)[1]
+    parts = public_key.strip().split()
+    if len(parts) < 2 or parts[0] not in {"ssh-ed25519", "ssh-rsa"}:
+        raise ValueError("invalid SSH host public key")
+    normalized_key = " ".join(parts[:2])
+    if known_hosts_path is None:
+        known_hosts_path = get_known_hosts_path()
+
+    existing_lines = (
+        known_hosts_path.read_text(encoding="utf-8").splitlines()
+        if known_hosts_path.exists()
+        else []
+    )
+    matching_hosts = [
+        line.strip()
+        for line in existing_lines
+        if line.strip() and not line.lstrip().startswith("#")
+        and line.split(maxsplit=1)[0] == hostname
+    ]
+    if matching_hosts:
+        if any(
+            len(line.split()) >= 3
+            and " ".join(line.split()[1:3]) == normalized_key
+            for line in matching_hosts
+        ):
+            return False
+        raise RuntimeError(
+            f"refusing changed SSH host key for enrolled worker {hostname}"
+        )
+
+    known_hosts_path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(known_hosts_path.parent, 0o700)
+    with known_hosts_path.open("a", encoding="utf-8") as stream:
+        stream.write(f"{hostname} {normalized_key}\n")
+    os.chmod(known_hosts_path, 0o600)
     return True
 
 

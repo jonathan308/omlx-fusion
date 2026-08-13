@@ -78,6 +78,8 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
+from omlx.prefill_progress import get_prefill_tracker
+
 from . import cache_rollback as _rollback_mod
 from . import prompt_priming as _prompt_priming
 
@@ -1535,18 +1537,43 @@ _STD_TAX_SKIP = 2  # first post-hand-off steps still carry transition costs
 _STD_TAX_SAMPLES = 8
 _STD_TAX_EMA = 0.5
 _STD_TAX_MAX = 1.5
+# Cycle timings sampled while another request is prefilling (any engine on
+# the shared GPU) are contention-shaped, not loop-shaped. A park probe armed
+# or finalized in that window latches a poisoned t0/t_std ratio on the model
+# and depresses MTP for every later sequence (#2622).
+_STD_TAX_CONTENTION_WINDOW_S = 3.0
+_STD_TAX_WARN = 1.3  # a stored tax at/above this is worth an INFO line
+_STD_TAX_DECAY_S = 600.0  # stale latch decays toward the default margin
+
+
+def _prefill_activity_recent() -> bool:
+    try:
+        return get_prefill_tracker().recently_active(
+            _STD_TAX_CONTENTION_WINDOW_S
+        )
+    except Exception:
+        return False
 
 
 def _arm_std_tax_probe(
     gen_batch: Any, t0_ms: Optional[float], uid: Any = None
 ) -> None:
-    if t0_ms and t0_ms > 0.0:
-        gen_batch._omlx_mtp_tax_probe = {
-            "t0": float(t0_ms),
-            "skip": _STD_TAX_SKIP,
-            "samples": [],
-            "uid": uid,
-        }
+    if not (t0_ms and t0_ms > 0.0):
+        return
+    if _prefill_activity_recent():
+        logger.debug(
+            "MTP loop-tax probe skipped: prefill activity within %.1fs, "
+            "t0=%.1fms is contention-contaminated",
+            _STD_TAX_CONTENTION_WINDOW_S,
+            t0_ms,
+        )
+        return
+    gen_batch._omlx_mtp_tax_probe = {
+        "t0": float(t0_ms),
+        "skip": _STD_TAX_SKIP,
+        "samples": [],
+        "uid": uid,
+    }
 
 
 def _record_std_tax_sample(gen_batch: Any, duration_ms: float) -> None:
@@ -1576,6 +1603,12 @@ def _record_std_tax_sample(gen_batch: Any, duration_ms: float) -> None:
     t_std = samples[len(samples) // 2]
     if t_std <= 0.0:
         return
+    if _prefill_activity_recent():
+        logger.debug(
+            "MTP loop-tax probe discarded: prefill activity during the "
+            "std sampling window"
+        )
+        return
     tax = min(_STD_TAX_MAX, max(1.0, probe["t0"] / t_std))
     model = getattr(gen_batch, "model", None)
     if model is None:
@@ -1585,14 +1618,36 @@ def _record_std_tax_sample(gen_batch: Any, duration_ms: float) -> None:
         tax = (1.0 - _STD_TAX_EMA) * float(prev) + _STD_TAX_EMA * tax
     try:
         model._omlx_mtp_loop_tax = tax
+        model._omlx_mtp_loop_tax_ts = time.monotonic()
     except Exception:
         return
-    logger.debug(
+    log = logger.info if tax >= _STD_TAX_WARN else logger.debug
+    log(
         "MTP loop tax measured: %.3f (parked t0=%.1fms, std step=%.1fms)",
         tax,
         probe["t0"],
         t_std,
     )
+
+
+def _effective_loop_tax(model: Any) -> Optional[float]:
+    """Measured loop tax, decayed toward the default exit margin with age.
+
+    A genuine loop tax is stable and re-latches through fresh park probes,
+    so decay costs nothing in the steady state. A high value that stopped
+    being reproduced — the signature of a probe that sampled around a
+    contention episode despite the arm/finalize guards — must not depress
+    MTP until the next restart (#2622).
+    """
+    tax = getattr(model, "_omlx_mtp_loop_tax", None)
+    if tax is None:
+        return None
+    ts = getattr(model, "_omlx_mtp_loop_tax_ts", None)
+    if ts is None:
+        return float(tax)
+    age = max(0.0, time.monotonic() - float(ts))
+    prior = float(_DepthController.EXIT_MARGIN)
+    return prior + (float(tax) - prior) * math.exp(-age / _STD_TAX_DECAY_S)
 
 
 class _DepthController:
@@ -2268,9 +2323,7 @@ def _post_init_mtp(gen_batch: Any) -> None:
                 marginal_ms=getattr(
                     gen_batch.model, "_omlx_mtp_marginal_ms", None
                 ),
-                exit_margin=getattr(
-                    gen_batch.model, "_omlx_mtp_loop_tax", None
-                ),
+                exit_margin=_effective_loop_tax(gen_batch.model),
             )
         primed = _prompt_priming.take_primed(
             gen_batch.model, gen_batch.prompt_cache, main_tok

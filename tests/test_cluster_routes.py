@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for authenticated cluster admin route handlers."""
 
+import base64
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from omlx.cluster import routes
+from omlx.cluster.enrollment import ClusterEnrollmentStore
 from omlx.cluster.models import (
     ClusterStatus,
     RDMACapability,
@@ -45,6 +47,25 @@ def _client() -> TestClient:
     app = FastAPI()
     app.include_router(routes.router)
     return TestClient(app)
+
+
+def _enrollment_client() -> TestClient:
+    app = FastAPI()
+    app.include_router(routes.router)
+    app.include_router(routes.join_router)
+    return TestClient(app)
+
+
+def _worker_claim() -> dict:
+    return {
+        "node_id": "cuda-worker-1-machine",
+        "hostname": "cuda-worker-1",
+        "ssh_user": "omlxworker",
+        "ssh_port": 22,
+        "addresses": ["10.42.0.21"],
+        "accelerator": "cuda",
+        "platform": "Linux-aarch64",
+    }
 
 
 def _approval_for(payload: dict) -> str:
@@ -295,6 +316,7 @@ def test_cluster_diagnostics_bundles_and_redacts_local_evidence(monkeypatch):
                     "phase": "failed",
                     "model": f"{Path.home()}/.omlx/models/example",
                     "detail": "user@Studio.local stopped",
+                    "join_key": "must-not-leak-either",
                     "pairing_token": "must-not-leak",
                 }
             ],
@@ -321,6 +343,7 @@ def test_cluster_diagnostics_bundles_and_redacts_local_evidence(monkeypatch):
     marker = payload["runtime"]["jobs"][0]
     assert marker["model"].startswith("~/.omlx/")
     assert marker["detail"] == "<user>@Studio.local stopped"
+    assert marker["join_key"] == "<redacted>"
     assert marker["pairing_token"] == "<redacted>"
 
 
@@ -432,6 +455,7 @@ def test_cluster_peer_probe_route(monkeypatch):
 
 def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch):
     gib = 1024**3
+    asked = {}
     monkeypatch.setattr(
         "omlx.cluster.node_role._enforcer_ceiling_bytes",
         lambda: 100 * gib,
@@ -439,7 +463,9 @@ def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch)
     monkeypatch.setattr(
         routes,
         "probe_remote_admission_ceiling",
-        lambda ssh: 213 * gib + 123,
+        lambda ssh, *, python_executable: (
+            asked.update(ssh=ssh, python=python_executable) or 213 * gib + 123
+        ),
     )
 
     response = _client().post(
@@ -453,11 +479,16 @@ def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch)
                 {
                     "node_id": "studio",
                     "ssh": "studio.local",
+                    "python_executable": "/opt/omlx/bin/python",
                 },
             ],
             "roles": {"local": "workstation", "studio": "headless"},
         },
     )
+    assert asked == {
+        "ssh": "studio.local",
+        "python": "/opt/omlx/bin/python",
+    }
 
     assert response.status_code == 200
     local, studio = response.json()["nodes"]
@@ -1108,6 +1139,185 @@ def test_pairing_token_route_authenticates_with_the_shared_secret():
     assert rejected.json() == {"valid": False}
 
 
+def test_cuda_join_command_is_single_use_pinned_and_not_cached(
+    monkeypatch, tmp_path
+):
+    from omlx.cluster import ssh_keys
+
+    store = ClusterEnrollmentStore(tmp_path)
+    public_key = "ssh-ed25519 " + base64.b64encode(b"controller-key-material").decode()
+    fingerprint = ssh_keys.ssh_public_key_fingerprint(public_key)
+    monkeypatch.setattr(routes, "get_cluster_enrollment", lambda: store)
+    monkeypatch.setattr(routes, "worker_source_digest", lambda: "b" * 64)
+    monkeypatch.setattr(
+        ssh_keys,
+        "get_or_create_ssh_key",
+        lambda: SimpleNamespace(public_key=public_key, fingerprint=fingerprint),
+    )
+
+    response = _enrollment_client().post(
+        "/admin/api/cluster/join-keys",
+        json={
+            "controller_ip": "10.42.0.10",
+            "controller_port": 8000,
+            "scheme": "http",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert response.headers["cache-control"] == "no-store"
+    assert "join_key" not in payload
+    assert "--source-digest " + "b" * 64 in payload["command"]
+    assert "/cluster/join/bootstrap.py" in payload["command"]
+    assert payload["controller_key_fingerprint"] == fingerprint
+    assert payload["single_use"] is True
+    assert '"join_key":' not in _enrollment_client().get(
+        "/admin/api/cluster/join-status"
+    ).text
+
+
+def test_cuda_join_command_only_accepts_a_private_ipv4_controller():
+    client = _enrollment_client()
+    for controller_ip in ("127.0.0.1", "8.8.8.8", "fd00::10"):
+        response = client.post(
+            "/admin/api/cluster/join-keys",
+            json={"controller_ip": controller_ip, "controller_port": 8000},
+        )
+        assert response.status_code == 400
+        assert "controller" in response.json()["detail"]
+
+
+def test_cuda_worker_claim_replay_and_completion_fail_closed(
+    monkeypatch, tmp_path
+):
+    from omlx.cluster import ssh_keys
+
+    store = ClusterEnrollmentStore(tmp_path)
+    public_key = "ssh-ed25519 " + base64.b64encode(b"controller-key-material").decode()
+    fingerprint = ssh_keys.ssh_public_key_fingerprint(public_key)
+    worker_key = "ssh-ed25519 " + base64.b64encode(b"worker-key-material").decode()
+    worker_fingerprint = ssh_keys.ssh_public_key_fingerprint(worker_key)
+    monkeypatch.setattr(routes, "get_cluster_enrollment", lambda: store)
+    monkeypatch.setattr(routes, "worker_source_bundle", lambda: b"source-bundle")
+    monkeypatch.setattr(
+        ssh_keys,
+        "get_or_create_ssh_key",
+        lambda: SimpleNamespace(public_key=public_key, fingerprint=fingerprint),
+    )
+    pinned = []
+    monkeypatch.setattr(
+        ssh_keys,
+        "pin_enrolled_host_key",
+        lambda **kwargs: pinned.append(kwargs),
+    )
+    raw_key, _ = store.issue_join_key(
+        controller_url="http://10.42.0.10:8000",
+        source_digest="b" * 64,
+    )
+    client = _enrollment_client()
+
+    missing = client.post("/cluster/join/claim", json=_worker_claim())
+    claimed = client.post(
+        "/cluster/join/claim",
+        json=_worker_claim(),
+        headers={"Authorization": f"Bearer {raw_key}"},
+    )
+    replayed = client.post(
+        "/cluster/join/claim",
+        json=_worker_claim(),
+        headers={"Authorization": f"Bearer {raw_key}"},
+    )
+
+    assert missing.status_code == 401
+    assert claimed.status_code == 200
+    assert claimed.headers["cache-control"] == "no-store"
+    assert replayed.status_code == 401
+    assert replayed.json() == {"detail": "invalid enrollment credential"}
+    session = claimed.json()["session_token"]
+    source = client.get(
+        "/cluster/join/source",
+        headers={"Authorization": f"Bearer {session}"},
+    )
+    assert source.content == b"source-bundle"
+    assert source.headers["cache-control"] == "no-store"
+
+    completion = _worker_claim() | {
+        "python_executable": "/opt/omlx-cluster-worker/venv/bin/python",
+        "source_digest": "b" * 64,
+        "ssh_host_public_key": worker_key,
+        "ssh_host_fingerprint": worker_fingerprint,
+        "runtime": {"mlx": "0.32.0"},
+    }
+    changed = client.post(
+        "/cluster/join/complete",
+        json=completion | {"addresses": ["10.42.0.22"]},
+        headers={"Authorization": f"Bearer {session}"},
+    )
+    assert changed.status_code == 400
+    assert "identity changed" in changed.json()["detail"]
+    assert pinned == []
+
+    completed = client.post(
+        "/cluster/join/complete",
+        json=completion,
+        headers={"Authorization": f"Bearer {session}"},
+    )
+    assert completed.status_code == 200
+    assert completed.json()["ssh"] == "omlxworker@10.42.0.21"
+    assert pinned == [{"hostname": "10.42.0.21", "public_key": worker_key}]
+    status = client.get("/admin/api/cluster/join-status")
+    assert status.json()["nodes"][0]["node_id"] == "cuda-worker-1-machine"
+    assert raw_key not in status.text
+    assert session not in status.text
+
+
+def test_cuda_worker_completion_refuses_a_forged_host_fingerprint(
+    monkeypatch, tmp_path
+):
+    from omlx.cluster import ssh_keys
+
+    store = ClusterEnrollmentStore(tmp_path)
+    controller_key = "ssh-ed25519 " + base64.b64encode(b"controller").decode()
+    monkeypatch.setattr(routes, "get_cluster_enrollment", lambda: store)
+    monkeypatch.setattr(
+        ssh_keys,
+        "get_or_create_ssh_key",
+        lambda: SimpleNamespace(
+            public_key=controller_key,
+            fingerprint=ssh_keys.ssh_public_key_fingerprint(controller_key),
+        ),
+    )
+    worker_key = "ssh-ed25519 " + base64.b64encode(
+        b"worker-host-key-material-long-enough"
+    ).decode()
+    raw_key, _ = store.issue_join_key(
+        controller_url="http://10.42.0.10:8000",
+        source_digest="b" * 64,
+    )
+    client = _enrollment_client()
+    claimed = client.post(
+        "/cluster/join/claim",
+        json=_worker_claim(),
+        headers={"Authorization": f"Bearer {raw_key}"},
+    )
+    session = claimed.json()["session_token"]
+    response = client.post(
+        "/cluster/join/complete",
+        json=_worker_claim()
+        | {
+            "python_executable": "/opt/omlx-cluster-worker/venv/bin/python",
+            "source_digest": "b" * 64,
+            "ssh_host_public_key": worker_key,
+            "ssh_host_fingerprint": "SHA256:" + "A" * 43,
+        },
+        headers={"Authorization": f"Bearer {session}"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "worker SSH fingerprint mismatch"
+
+
 def test_key_exchange_routes_keep_the_shared_secret_out_of_the_url(monkeypatch):
     from omlx.cluster import ssh_keys
 
@@ -1712,3 +1922,138 @@ def test_a_peer_that_cannot_import_blocks_activation_with_its_fix(
     # The command has to survive to the page verbatim: a summary that names the
     # problem and hides the one-line fix sends the user back to the logs.
     assert issue["remediation"] == 'ssh studio.local "uv pip install mlx-vlm"'
+
+
+def test_cuda_fabric_verification_is_a_gui_api_and_uses_live_peer_facts(monkeypatch):
+    def peer(ssh, **_kwargs):
+        suffix = "1" if ssh == "spark-a.local" else "2"
+        return {
+            "runtime_compatible": True,
+            "status": {
+                "node": {
+                    "accelerator": "cuda",
+                    "distributed_backends": ["ring", "nccl"],
+                    "fabric_kind": "connectx-7",
+                },
+                "transport": {
+                    "rdma": {
+                        "devices": ["mlx5_0", "mlx5_1"],
+                        "addresses": {
+                            "mlx5_0": f"192.168.100.{suffix}",
+                            "mlx5_1": f"192.168.101.{suffix}",
+                        },
+                        "network_interfaces": {
+                            "mlx5_0": "enp1s0f0np0",
+                            "mlx5_1": "enp2s0f0np0",
+                        },
+                    }
+                },
+            },
+        }
+
+    captured = {}
+
+    def verify(hosts):
+        captured["hosts"] = hosts
+        return {
+            "ok": True,
+            "verified": True,
+            "group_id": "connectx-verified",
+            "transport": "nccl",
+            "payload_bytes_per_second": 3 * 1024**3,
+        }
+
+    monkeypatch.setattr(routes, "probe_remote_host", peer)
+    monkeypatch.setattr(routes, "run_cuda_fabric_probe", verify)
+
+    response = _client().post(
+        "/admin/api/cluster/cuda-fabric/verify",
+        json={
+            "hosts": [
+                {"node_id": "spark-a", "ssh": "spark-a.local"},
+                {"node_id": "spark-b", "ssh": "spark-b.local"},
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["verified"] is True
+    assert [host.ips for host in captured["hosts"]] == [
+        ("192.168.100.1", "192.168.101.1"),
+        ("192.168.100.2", "192.168.101.2"),
+    ]
+    assert all(
+        host.interfaces == ("enp1s0f0np0", "enp2s0f0np0")
+        for host in captured["hosts"]
+    )
+
+
+def test_cuda_fabric_verification_refuses_unmeasured_connectx(monkeypatch):
+    monkeypatch.setattr(
+        routes,
+        "probe_remote_host",
+        lambda *_args, **_kwargs: {
+            "status": {
+                "node": {
+                    "accelerator": "cuda",
+                    "distributed_backends": ["nccl"],
+                    "fabric_kind": "connectx-7",
+                },
+                "transport": {
+                    "rdma": {
+                        "devices": ["mlx5_0"],
+                        "addresses": {},
+                        "network_interfaces": {"mlx5_0": "enp1s0f0np0"},
+                    }
+                },
+            }
+        },
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/cuda-fabric/verify",
+        json={
+            "hosts": [
+                {"node_id": "spark-a", "ssh": "spark-a.local"},
+                {"node_id": "spark-b", "ssh": "spark-b.local"},
+            ]
+        },
+    )
+
+    assert response.status_code == 409
+    assert "no direct-link IP" in response.json()["detail"]
+
+
+def test_verified_cuda_pair_is_kept_adjacent_in_outer_ring():
+    hosts = [
+        routes.ClusterHostRequest(node_id="mac", ssh="127.0.0.1", ips=["10.0.0.1"]),
+        routes.ClusterHostRequest(node_id="spark-a", ssh="spark-a", ips=["10.0.0.2"]),
+        routes.ClusterHostRequest(node_id="other", ssh="other", ips=["10.0.0.3"]),
+        routes.ClusterHostRequest(node_id="spark-b", ssh="spark-b", ips=["10.0.0.4"]),
+    ]
+    nodes = [
+        routes.ClusterPlanNodeRequest(node_id="mac", capacity_bytes=64 * 1024**3),
+        routes.ClusterPlanNodeRequest(
+            node_id="spark-a",
+            capacity_bytes=115 * 1024**3,
+            accelerator="cuda",
+            fabric_group_id="connectx-proof",
+            fabric_verified=True,
+        ),
+        routes.ClusterPlanNodeRequest(node_id="other", capacity_bytes=64 * 1024**3),
+        routes.ClusterPlanNodeRequest(
+            node_id="spark-b",
+            capacity_bytes=115 * 1024**3,
+            accelerator="cuda",
+            fabric_group_id="connectx-proof",
+            fabric_verified=True,
+        ),
+    ]
+
+    ordered = routes._coalesce_verified_cuda_groups(
+        ["127.0.0.1", "spark-a", "other", "spark-b"],
+        hosts,
+        nodes,
+    )
+
+    assert ordered == ["127.0.0.1", "spark-a", "spark-b", "other"]

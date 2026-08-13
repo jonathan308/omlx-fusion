@@ -2,10 +2,10 @@
     <div class="animate-fade-in-up">
         <!-- The normal path describes the outcome, not the distributed system. -->
         <div class="mb-6">
-            <h2 class="text-2xl font-bold tracking-tight text-neutral-900">Use your Macs together</h2>
+            <h2 class="text-2xl font-bold tracking-tight text-neutral-900">Use your accelerator pool together</h2>
             <p class="text-sm text-neutral-500 mt-2 max-w-2xl">
-                oMLX finds nearby Macs, checks their connections and memory,
-                and chooses the best way to run each model.
+                oMLX finds Metal and CUDA workers, checks their connections and
+                usable memory, and chooses how to shard each model.
             </p>
         </div>
 
@@ -17,7 +17,7 @@
                 <i data-lucide="circle-alert" class="w-4 h-4 mt-0.5 flex-shrink-0"></i>
                 <div class="min-w-0 flex-1">
                     <div class="font-semibold"
-                         x-text="clusterGuidance ? clusterGuidance.title : 'Something went wrong'"></div>
+                         x-text="clusterGuidance ? clusterGuidance.title : clusterDisplayedError()"></div>
                     <div class="text-xs text-red-700 mt-1"
                          x-show="clusterGuidance"
                          x-text="clusterGuidance ? clusterGuidance.explanation : ''"></div>
@@ -162,7 +162,7 @@
                     <div class="p-5 sm:p-6">
                         <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
                             <div>
-                                <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">Your Macs</div>
+                                <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">Your compute pool</div>
                                 <h4 class="text-lg font-semibold text-neutral-900 mt-1"
                                     x-text="clusterPairTitle()"></h4>
                                 <p class="text-xs text-neutral-500 mt-1"
@@ -195,8 +195,7 @@
                                         <i data-lucide="cable" class="w-3.5 h-3.5"></i>
                                         <span x-text="clusterFriendlyConnectionLabel()"></span>
                                         <span class="cluster-fabric__connection-separator">·</span>
-                                        <span x-text="clusterQuickNodes().length + ' Mac' +
-                                            (clusterQuickNodes().length === 1 ? '' : 's')"></span>
+                                        <span x-text="clusterDeviceCountLabel()"></span>
                                     </div>
                                 </div>
 
@@ -310,32 +309,67 @@
                                     <template x-for="node in clusterNeuralFabricNodes()"
                                               :key="'fabric-' + node.rank">
                                         <div class="cluster-fabric-node"
-                                             :class="{
+                                            :class="{
                                                 'cluster-fabric-node--local': node.local,
                                                 'cluster-fabric-node--online': node.online,
-                                                'cluster-fabric-node--working': node.working
+                                                'cluster-fabric-node--working': node.working,
+                                                'cluster-fabric-node--cuda': node.accelerator === 'cuda',
+                                                'cluster-fabric-node--supernode': node.memberCount > 1
                                             }"
                                              :style="'left:' + node.x + '%;top:' + node.y + '%'">
                                             <div class="cluster-fabric-node__topline">
-                                                <span x-text="node.local
-                                                    ? 'Coordinator · R0'
-                                                    : 'Worker · R' + node.rank"></span>
+                                                <span x-text="clusterNodeRankLabel(node)"></span>
                                                 <span class="cluster-fabric-node__state"
                                                       x-text="node.state"></span>
                                             </div>
                                             <div class="cluster-fabric-node__identity">
                                                 <span class="cluster-fabric-node__orb">
-                                                    <i :data-lucide="node.local ? 'laptop' : 'monitor'"
-                                                       class="w-3.5 h-3.5"></i>
+                                                    <template x-if="node.accelerator === 'cuda'">
+                                                        <svg role="img" viewBox="0 0 24 24"
+                                                             aria-label="NVIDIA CUDA">
+                                                            <title>NVIDIA CUDA</title>
+                                                            <path fill="currentColor" d="M8.948 8.798v-1.43a6.7 6.7 0 0 1 .424-.018c3.922-.124 6.493 3.374 6.493 3.374s-2.774 3.851-5.75 3.851c-.398 0-.787-.062-1.158-.185v-4.346c1.528.185 1.837.857 2.747 2.385l2.04-1.714s-1.492-1.952-4-1.952a6.016 6.016 0 0 0-.796.035m0-4.735v2.138l.424-.027c5.45-.185 9.01 4.47 9.01 4.47s-4.08 4.964-8.33 4.964c-.37 0-.733-.035-1.095-.097v1.325c.3.035.61.062.91.062 3.957 0 6.82-2.023 9.593-4.408.459.371 2.34 1.263 2.73 1.652-2.633 2.208-8.772 3.984-12.253 3.984-.335 0-.653-.018-.971-.053v1.864H24V4.063zm0 10.326v1.131c-3.657-.654-4.673-4.46-4.673-4.46s1.758-1.944 4.673-2.262v1.237H8.94c-1.528-.186-2.73 1.245-2.73 1.245s.68 2.412 2.739 3.11M2.456 10.9s2.164-3.197 6.5-3.533V6.201C4.153 6.59 0 10.653 0 10.653s2.35 6.802 8.948 7.42v-1.237c-4.84-.6-6.492-5.936-6.492-5.936z"/>
+                                                        </svg>
+                                                    </template>
+                                                    <template x-if="node.accelerator !== 'cuda'">
+                                                        <i :data-lucide="node.local ? 'laptop' : 'monitor'"
+                                                           class="w-3.5 h-3.5"></i>
+                                                    </template>
                                                 </span>
                                                 <span class="cluster-fabric-node__name"
-                                                      x-text="clusterMacHardwareLabel(node)"></span>
+                                                      x-text="clusterNodeHardwareLabel(node)"></span>
                                             </div>
+                                            <div x-show="node.memberCount > 1"
+                                                 class="cluster-fabric-node__fabric"
+                                                 x-text="node.fabricVerified
+                                                    ? `${node.memberCount} physical CUDA workers · ConnectX-7 verified`
+                                                    : `${node.memberCount} CUDA workers · direct link not verified`"></div>
+                                            <button type="button"
+                                                    x-show="node.memberCount > 1 && !node.fabricVerified"
+                                                    x-cloak
+                                                    @click.stop="verifyCudaSupernode(node)"
+                                                    :disabled="!clusterCanVerifyCudaSupernode(node)
+                                                        || Boolean(clusterCudaFabricVerificationLoading)"
+                                                    class="cluster-fabric-node__verify">
+                                                <span x-text="clusterCudaFabricVerificationLoading
+                                                    === clusterCudaFabricVerificationKey(node)
+                                                    ? 'Testing NCCL…'
+                                                    : 'Verify ConnectX'"></span>
+                                            </button>
+                                            <div x-show="node.fabricVerified && clusterCudaFabricRateLabel(node)"
+                                                 x-cloak
+                                                 class="cluster-fabric-node__verified-rate"
+                                                 x-text="clusterCudaFabricRateLabel(node)"></div>
                                             <div class="cluster-fabric-node__memory"
                                                  x-text="node.memoryLabel"></div>
                                         </div>
                                     </template>
                                 </div>
+
+                                <div x-show="clusterCudaFabricVerificationError"
+                                     x-cloak
+                                     class="cluster-fabric__verification-error"
+                                     x-text="clusterCudaFabricVerificationError"></div>
 
                                 <div x-show="!clusterNeuralFabricJob()?.live"
                                      x-cloak
@@ -343,9 +377,9 @@
                                      data-cluster-memory-allowances>
                                     <div class="cluster-fabric__memory-header">
                                         <div>
-                                            <span>Memory allowed</span>
+                                            <span>Pooled accelerator memory</span>
                                             <strong x-text="clusterCombinedMemoryLabel()"></strong>
-                                            <small>Set the most oMLX may use. Model splitting stays automatic.</small>
+                                            <small>Installed memory is shown separately from the safe model budget. Splitting stays automatic unless you override shard balance.</small>
                                         </div>
                                         <button type="button"
                                                 x-show="clusterMemoryAllowanceCustomized()"
@@ -359,7 +393,7 @@
                                                   :key="'memory-allowance-' + node.nodeId">
                                             <label class="cluster-fabric__memory-node">
                                                 <span>
-                                                    <strong x-text="clusterMacHardwareLabel(node)"></strong>
+                                                    <strong x-text="clusterNodeHardwareLabel(node)"></strong>
                                                     <code x-text="clusterMemoryGiBLabel(node.usableGiB)"></code>
                                                 </span>
                                                 <input type="range"
@@ -598,13 +632,13 @@
                                        class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-neutral-400"></i>
                                     <input type="search"
                                            x-model="clusterModelSearch"
-                                           placeholder="Search models on every Mac"
+                                           placeholder="Search models across the pool"
                                            class="w-full pl-9 pr-3 py-2.5 text-sm border border-neutral-200 rounded-xl focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                                 </div>
                                 <span class="text-xs text-neutral-400"
                                       x-show="clusterModelInventoryLoading || clusterCatalogueLoading"
                                       x-text="clusterModelInventoryLoading
-                                        ? 'Reading models from every Mac…'
+                                        ? 'Reading models from every worker…'
                                         : 'Checking what fits…'"></span>
                             </div>
 
@@ -683,6 +717,120 @@
                             Connection checks, model splitting, and retries are automatic.
                             macOS only asks when it needs permission.
                         </p>
+                    </div>
+                </section>
+
+                <section class="mb-6 overflow-hidden rounded-2xl border border-green-200 bg-white"
+                         data-cluster-cuda-enrollment>
+                    <div class="flex flex-col gap-4 border-b border-green-100 bg-green-50/70 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+                        <div class="flex items-start gap-3">
+                            <span class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-green-600 text-white">
+                                <svg role="img" viewBox="0 0 24 24" class="h-5 w-5"
+                                     aria-label="NVIDIA CUDA">
+                                    <title>NVIDIA CUDA</title>
+                                    <path fill="currentColor" d="M8.948 8.798v-1.43a6.7 6.7 0 0 1 .424-.018c3.922-.124 6.493 3.374 6.493 3.374s-2.774 3.851-5.75 3.851c-.398 0-.787-.062-1.158-.185v-4.346c1.528.185 1.837.857 2.747 2.385l2.04-1.714s-1.492-1.952-4-1.952a6.016 6.016 0 0 0-.796.035m0-4.735v2.138l.424-.027c5.45-.185 9.01 4.47 9.01 4.47s-4.08 4.964-8.33 4.964c-.37 0-.733-.035-1.095-.097v1.325c.3.035.61.062.91.062 3.957 0 6.82-2.023 9.593-4.408.459.371 2.34 1.263 2.73 1.652-2.633 2.208-8.772 3.984-12.253 3.984-.335 0-.653-.018-.971-.053v1.864H24V4.063zm0 10.326v1.131c-3.657-.654-4.673-4.46-4.673-4.46s1.758-1.944 4.673-2.262v1.237H8.94c-1.528-.186-2.73 1.245-2.73 1.245s.68 2.412 2.739 3.11M2.456 10.9s2.164-3.197 6.5-3.533V6.201C4.153 6.59 0 10.653 0 10.653s2.35 6.802 8.948 7.42v-1.237c-4.84-.6-6.492-5.936-6.492-5.936z"/>
+                                </svg>
+                            </span>
+                            <div>
+                                <h3 class="text-sm font-semibold text-neutral-900">Add a CUDA worker</h3>
+                                <p class="mt-1 max-w-2xl text-xs leading-relaxed text-neutral-600">
+                                    Generate one secure command per CUDA box. It installs the minimal
+                                    worker runtime, exchanges pinned SSH identities, and adds the box
+                                    to this pool automatically.
+                                </p>
+                            </div>
+                        </div>
+                        <span x-show="clusterJoinedNodes.length" x-cloak
+                              class="inline-flex shrink-0 items-center gap-2 rounded-full border border-green-200 bg-white px-3 py-1.5 text-xs font-semibold text-green-700">
+                            <span class="h-2 w-2 rounded-full bg-green-500"></span>
+                            <span x-text="clusterJoinedNodes.length + ' CUDA worker' + (clusterJoinedNodes.length === 1 ? '' : 's') + ' joined'"></span>
+                        </span>
+                    </div>
+
+                    <div class="p-5">
+                        <div x-show="clusterJoinedNodes.length" x-cloak
+                             class="mb-5 grid grid-cols-1 gap-2 lg:grid-cols-2"
+                             data-cluster-joined-cuda-nodes>
+                            <template x-for="node in clusterJoinedNodes" :key="node.node_id">
+                                <div class="flex items-center justify-between gap-4 rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3">
+                                    <div class="min-w-0">
+                                        <div class="truncate text-sm font-semibold text-neutral-800"
+                                             x-text="node.hostname"></div>
+                                        <div class="mt-0.5 truncate font-mono text-[11px] text-neutral-500"
+                                             x-text="node.ssh"></div>
+                                    </div>
+                                    <div class="shrink-0 text-right">
+                                        <div class="text-[10px] font-bold uppercase tracking-wider text-green-700">CUDA · joined</div>
+                                        <div class="mt-0.5 text-[10px] text-neutral-400"
+                                             x-text="clusterJoinedAtLabel(node)"></div>
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+
+                        <div class="grid grid-cols-1 items-end gap-3 lg:grid-cols-[minmax(0,1fr)_auto]">
+                            <label>
+                                <span class="mb-1.5 block text-xs font-medium text-neutral-700">Studio LAN IPv4 address</span>
+                                <input type="text"
+                                       inputmode="decimal"
+                                       autocomplete="off"
+                                       spellcheck="false"
+                                       x-model.trim="clusterJoinControllerIp"
+                                       :placeholder="clusterJoinSuggestedIp() || '192.168.1.20'"
+                                       @keydown.enter.prevent="generateClusterCudaJoinCommand()"
+                                       class="w-full rounded-xl border border-neutral-200 px-3 py-2.5 font-mono text-sm focus:border-transparent focus:ring-2 focus:ring-green-600">
+                            </label>
+                            <button type="button"
+                                    @click="generateClusterCudaJoinCommand()"
+                                    :disabled="clusterJoinLoading"
+                                    class="inline-flex items-center justify-center gap-2 rounded-xl bg-neutral-900 px-5 py-2.5 text-sm font-semibold text-white hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-50"
+                                    data-cluster-generate-cuda-join>
+                                <i data-lucide="key-round" class="h-4 w-4"></i>
+                                <span x-text="clusterJoinLoading ? 'Generating…' : (clusterJoinCommand ? 'Generate another' : 'Generate join command')"></span>
+                            </button>
+                        </div>
+
+                        <p x-show="clusterJoinLanWarning()" x-cloak
+                           class="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-800"
+                           x-text="clusterJoinLanWarning()"></p>
+
+                        <div x-show="clusterJoinCommand" x-cloak
+                             class="mt-4 overflow-hidden rounded-xl border border-neutral-700 bg-neutral-950"
+                             data-cluster-cuda-join-command>
+                            <div class="flex flex-col gap-2 border-b border-neutral-800 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+                                <div>
+                                    <div class="text-xs font-semibold text-white">Paste into one Ubuntu/Debian CUDA box</div>
+                                    <div class="mt-0.5 text-[10px] text-neutral-400"
+                                         x-text="clusterJoinCommandStatusLabel()"></div>
+                                </div>
+                                <div class="flex items-center gap-2">
+                                    <button type="button"
+                                            @click="copyClusterCommands('cudaJoin', [clusterJoinCommand])"
+                                            :disabled="!clusterJoinCommandUsable()"
+                                            class="rounded-lg bg-white px-3 py-1.5 text-xs font-semibold text-neutral-900 disabled:cursor-not-allowed disabled:opacity-40">
+                                        <span x-text="clusterCommandsCopied.cudaJoin ? 'Copied!' : 'Copy command'"></span>
+                                    </button>
+                                    <button type="button"
+                                            @click="revokeClusterJoinCommand()"
+                                            x-show="clusterJoinCommandUsable()"
+                                            class="rounded-lg border border-neutral-700 px-3 py-1.5 text-xs font-medium text-neutral-300 hover:bg-neutral-900">
+                                        Revoke
+                                    </button>
+                                </div>
+                            </div>
+                            <pre class="max-h-44 overflow-auto whitespace-pre-wrap break-all p-4 font-mono text-[11px] leading-relaxed text-green-300"
+                                 x-text="clusterJoinCommand"></pre>
+                        </div>
+
+                        <p class="mt-3 text-[11px] leading-relaxed text-neutral-500">
+                            The command is single-use and expires after 10 minutes. It may ask for
+                            sudo on the CUDA box; after that, discovery, SSH setup, environment
+                            creation, compatibility checks, and pool selection are automatic.
+                            Generate a fresh command for the second CUDA worker.
+                        </p>
+                        <p x-show="clusterJoinError" x-cloak
+                           class="mt-3 text-xs font-medium text-red-600"
+                           x-text="clusterJoinError"></p>
                     </div>
                 </section>
 
@@ -805,7 +953,7 @@
                                     </div>
                                     <div class="text-lg font-semibold mt-2 truncate" x-text="job.deployment_id"></div>
                                     <div class="text-xs text-neutral-400 mt-1 truncate"
-                                         x-text="job.backend.toUpperCase() + ' · ' + job.world_size + ' Macs · rank-local KV'"></div>
+                                         x-text="job.backend.toUpperCase() + ' · ' + job.world_size + ' devices · rank-local KV'"></div>
                                     <p x-show="!job.live && job.error"
                                        x-cloak
                                        class="text-xs text-red-300 mt-2 max-w-3xl"
@@ -1181,7 +1329,7 @@
                                                 <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-400"
                                                      x-text="'Worker · rank ' + node.rank"></div>
                                                 <div class="font-semibold text-neutral-900 truncate"
-                                                     x-text="clusterMacHardwareLabel(node)"></div>
+                                                     x-text="clusterNodeHardwareLabel(node)"></div>
                                             </div>
                                         </div>
                                         <span class="inline-flex items-center gap-1.5 text-xs font-medium"
@@ -1192,7 +1340,7 @@
                                     </div>
 
                                     <p class="text-xs text-neutral-500 mt-4 leading-relaxed">
-                                        oMLX validates this Mac, its memory, and every required link before launch.
+                                        oMLX validates this coordinator, every worker, their memory, and every required link before launch.
                                     </p>
 
                                     <div class="mt-4 pt-4 border-t border-neutral-200 space-y-2 text-xs">
@@ -1253,7 +1401,7 @@
                                 <div class="w-11 h-11 rounded-2xl bg-neutral-100 text-neutral-400 flex items-center justify-center">
                                     <i data-lucide="monitor-up" class="w-5 h-5"></i>
                                 </div>
-                                <div class="font-semibold text-neutral-900 mt-4">Waiting for another Mac</div>
+                                <div class="font-semibold text-neutral-900 mt-4">Waiting for another worker</div>
                                 <p class="text-xs text-neutral-500 mt-2 leading-relaxed">
                                     Connect it and open oMLX. Bonjour discovery updates this view automatically.
                                 </p>
@@ -1583,7 +1731,7 @@
                     <div class="px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                         <div class="flex items-center gap-2">
                             <i data-lucide="shield-check" class="w-4 h-4 text-neutral-500"></i>
-                            <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">1 · Verify the peer Mac</span>
+                            <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">1 · Verify the worker</span>
                         </div>
                         <p class="text-xs text-neutral-400 mt-1">Known-host SSH establishes identity; the probe checks oMLX, MLX, memory, RDMA, and the return route.</p>
                     </div>
@@ -1613,7 +1761,7 @@
                              x-cloak>
                         <div class="mb-5 flex flex-wrap items-center gap-2">
                             <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Detected nearby</span>
-                            <span x-show="clusterDiscoveryLoading" class="text-xs text-neutral-400 animate-pulse">Looking for Macs…</span>
+                            <span x-show="clusterDiscoveryLoading" class="text-xs text-neutral-400 animate-pulse">Looking for workers…</span>
                             <template x-for="peer in (clusterDiscoveredPeers || [])" :key="peer.ssh">
                                 <button @click="selectClusterDiscoveredPeer(peer)"
                                         :disabled="clusterPeerProbeLoading"
@@ -1953,7 +2101,7 @@
                                 <div class="min-w-0">
                                     <div class="text-sm font-semibold text-neutral-900">Start automatically</div>
                                     <div class="text-xs text-neutral-500 mt-1">
-                                        Checks every Mac, chooses the links and model split, then starts the cluster.
+                                        Checks every worker, chooses the links and model split, then starts the cluster.
                                     </div>
                                 </div>
                                 <button @click="startCluster()"
@@ -1964,7 +2112,7 @@
                                         ? (clusterActivationProgress || 'Configuring Thunderbolt…')
                                         : (clusterActivationLoading
                                             ? (clusterActivationProgress || 'Starting cluster…')
-                                            : (clusterAutoconfigureLoading ? 'Checking every Mac…' : 'Start Cluster'))"></span>
+                                            : (clusterAutoconfigureLoading ? 'Checking every worker…' : 'Start Cluster'))"></span>
                                 </button>
                             </div>
 
@@ -2013,7 +2161,7 @@
                                     <div>
                                         <div class="text-xs font-medium text-neutral-800">Choose a downloaded model</div>
                                         <div class="text-[10px] text-neutral-500 mt-0.5">
-                                            The selected model will run across the Macs above.
+                                            The selected model will run across the accelerator pool above.
                                         </div>
                                     </div>
                                     <button @click="loadClusterCatalogue()"
@@ -2030,7 +2178,7 @@
                                        class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-neutral-400"></i>
                                     <input type="search"
                                            x-model="clusterModelSearch"
-                                           placeholder="Search models on every Mac"
+                                           placeholder="Search models across the pool"
                                            class="w-full pl-9 pr-3 py-2 text-xs border border-neutral-200 rounded-xl focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                                 </div>
 
@@ -2297,7 +2445,7 @@
                                         <div class="mt-2 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-[10px] text-amber-800" x-text="warning"></div>
                                     </template>
                                     <p class="text-[10px] text-neutral-400 mt-3">
-                                        Review the plan below, then activate. Activation starts processes on the peer Mac.
+                                        Review the plan below, then activate. Activation starts processes on every selected worker.
                                     </p>
                                 </div>
                             </template>
@@ -2347,7 +2495,7 @@
                                     <label class="flex items-start gap-2 text-xs text-neutral-700">
                                         <input type="checkbox" x-model="clusterAutoTune"
                                                class="mt-0.5 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                        <span><span class="font-medium">Auto tune</span><span class="block text-[10px] text-neutral-500 mt-0.5">Benchmark the Macs and link before launch.</span></span>
+                                        <span><span class="font-medium">Auto tune</span><span class="block text-[10px] text-neutral-500 mt-0.5">Benchmark the accelerators and links before launch.</span></span>
                                     </label>
                                     <label class="flex items-start gap-2 text-xs text-neutral-700">
                                         <input type="checkbox" x-model="clusterAsyncOverlap"
@@ -2381,10 +2529,10 @@
                              whole model resident; under TP each holds a share. -->
                         <template x-if="clusterAutoconfigure && clusterAutoconfigure.plan">
                             <div class="mb-4 rounded-xl border border-neutral-200 bg-white p-3">
-                                <div class="text-[9px] uppercase tracking-wider text-neutral-500">Memory per Mac</div>
+                                <div class="text-[9px] uppercase tracking-wider text-neutral-500">Memory per accelerator</div>
                                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-2">
                                     <div>
-                                        <div class="text-[10px] text-neutral-500">On one Mac alone</div>
+                                        <div class="text-[10px] text-neutral-500">On one accelerator alone</div>
                                         <div class="text-xs font-medium text-neutral-700 mt-1"
                                              x-text="formatClusterGiB(clusterAutoconfigure.plan.model.total_weight_bytes)"></div>
                                     </div>
@@ -2394,7 +2542,7 @@
                                              x-text="formatClusterGiB(Math.max(...clusterAutoconfigure.plan.assignments.map(a => a.planned_weight_bytes)))"></div>
                                     </div>
                                     <div>
-                                        <div class="text-[10px] text-neutral-500">Saved per Mac</div>
+                                        <div class="text-[10px] text-neutral-500">Saved per accelerator</div>
                                         <div class="text-xs font-medium text-green-600 mt-1"
                                              x-text="formatClusterGiB(
                                                 clusterAutoconfigure.plan.model.total_weight_bytes
@@ -2419,15 +2567,15 @@
                                 </template>
                             </div>
                             <span class="text-xs text-neutral-400" x-text="clusterPlanTensorParallelSize > 1
-                                ? 'Every detected Mac works on every token'
-                                : `Each of the ${clusterPlanNodes.length} detected Macs holds different layers`"></span>
+                                ? 'Every detected accelerator works on every token'
+                                : `Each of the ${clusterPlanNodes.length} detected accelerators holds different layers`"></span>
                         </div>
                         <div x-show="clusterPlanError" x-cloak
                              class="mt-4 px-4 py-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-700"
                              x-text="clusterPlanError"></div>
                         <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mt-5">
                             <p class="text-xs text-neutral-400">
-                                Auto optimisation benchmarks every Mac and the selected links during activation.
+                                Auto optimisation benchmarks every accelerator and selected link during activation.
                             </p>
                             <button @click="runClusterPlan()"
                                     :disabled="clusterPlanLoading"
@@ -2439,7 +2587,7 @@
                     </div>
                 </div>
 
-                <!-- What each Mac may give. Installed RAM overstates a
+                <!-- What each device may give. Installed memory overstates a
                      MacBook by ~20 GiB (the GPU cannot address it all), and a
                      Mac someone is working on must not be planned like a shelf
                      appliance. Both are set here rather than assumed. -->
@@ -2448,16 +2596,16 @@
                      x-init="loadClusterNodeRoles()">
                     <div class="px-6 py-4 border-b border-neutral-200 flex items-center justify-between gap-3">
                         <div>
-                            <div class="text-xs font-bold uppercase tracking-wider text-neutral-900">Memory each Mac gives</div>
+                            <div class="text-xs font-bold uppercase tracking-wider text-neutral-900">Memory each accelerator gives</div>
                             <p class="text-xs text-neutral-500 mt-1">
-                                Measured from the GPU allocation cap, not installed RAM.
+                                Measured from the safe allocation cap, not installed memory.
                             </p>
                         </div>
                         <button @click="measureClusterBudgets()"
                                 :disabled="clusterBudgetsLoading"
                                 class="px-3 py-1.5 text-xs font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 disabled:opacity-50 shrink-0">
                             <i data-lucide="gauge" class="w-3.5 h-3.5"></i>
-                            <span x-text="clusterBudgetsLoading ? 'Measuring…' : 'Measure Macs'"></span>
+                            <span x-text="clusterBudgetsLoading ? 'Measuring…' : 'Measure devices'"></span>
                         </button>
                     </div>
 
@@ -2515,8 +2663,8 @@
                     </div>
                 </div>
 
-                <!-- Pipeline split. Weights are only half the memory story:
-                     the layers a Mac holds set how much KV cache fits beside
+                <!-- Model shard balance. Weights are only half the memory story:
+                     the layers a device holds set how much KV cache fits beside
                      them, so moving the split moves the usable context. Shown
                      live, because the trade is not obvious from the numbers
                      going in. -->
@@ -2525,10 +2673,10 @@
                         <div class="px-6 py-4 border-b border-neutral-200">
                             <div class="flex items-center justify-between gap-3">
                                 <div>
-                                    <div class="text-xs font-bold uppercase tracking-wider text-neutral-900">Pipeline split</div>
+                                    <div class="text-xs font-bold uppercase tracking-wider text-neutral-900">Model shard balance</div>
                                     <p class="text-xs text-neutral-500 mt-1">
-                                        Move the split to put more of the model on one Mac. Fewer layers on a
-                                        Mac means more room for KV cache beside them.
+                                        Automatic uses measured memory and speed. Move a device's target to put
+                                        more layers there; every override is re-checked before launch.
                                     </p>
                                 </div>
                                 <button @click="clusterResetSplit()"
@@ -2572,7 +2720,7 @@
                                                @change="clusterSplitChanged()">
                                         <span class="text-[9px] text-neutral-400"
                                               x-text="'Planner placed ' + node.actualGiB.toFixed(1)
-                                                + ' GiB on this Mac'"></span>
+                                                + ' GiB on this accelerator'"></span>
                                     </label>
                                 </template>
                             </div>

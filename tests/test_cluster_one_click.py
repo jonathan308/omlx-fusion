@@ -764,6 +764,7 @@ def test_stale_catalogue_result_is_discarded_and_retried_with_measured_budgets()
     result = _run_dashboard_helpers(
         (
             "clusterCatalogueModels",
+            "clusterPythonExecutableForSsh",
             "clusterCatalogueInputsReady",
             "clusterCatalogueRequestKey",
             "loadClusterCatalogue",
@@ -1019,6 +1020,48 @@ component.previewClusterWeightBalance = async () => {};
     assert result["target"] == 262144
     assert result["mode"] == "auto"
     assert result["saved"]["context_mode"] == "auto"
+
+
+def test_remote_model_selection_carries_its_linux_python_path():
+    result = _run_dashboard_helpers(
+        ("clusterPythonExecutableForSsh", "selectClusterModel"),
+        """
+let saved = null;
+global.window = {
+  localStorage: {
+    setItem: (_key, value) => { saved = JSON.parse(value); },
+  },
+};
+Object.assign(component, {
+  clusterPlanNodes: [{
+    ssh: 'cuda-worker-1',
+    python_executable: '/opt/omlx/bin/python',
+  }],
+  clusterPeerProbes: {},
+  clusterCatalogueFit: () => null,
+  clusterTensorParallelOptions: () => [1],
+  clusterModelTargetContext: (_model, value) => value,
+  clusterShowModelPicker: true,
+  clusterWeightTargetsGiB: {},
+  invalidateClusterPlan: () => {},
+  previewClusterWeightBalance: () => {},
+});
+component.selectClusterModel({
+  model_path: '/models/glm',
+  model_source: 'cuda-worker-1',
+  model_context_length: 131072,
+});
+process.stdout.write(JSON.stringify({
+  sourcePython: component.clusterPlanModelSourcePython,
+  savedPython: saved.model_source_python,
+}));
+""",
+    )
+
+    assert result == {
+        "sourcePython": "/opt/omlx/bin/python",
+        "savedPython": "/opt/omlx/bin/python",
+    }
 
 
 def test_automatic_context_does_not_flash_an_unverified_native_ceiling():
@@ -1280,6 +1323,152 @@ process.stdout.write(JSON.stringify({
     }
 
 
+def test_connectx_cuda_pair_is_one_logical_unit_with_two_physical_members():
+    result = _run_dashboard_helpers(
+        (
+            "clusterFriendlyMacName",
+            "clusterWorkerPeers",
+            "clusterQuickNodes",
+            "clusterLogicalNodes",
+            "clusterCudaFabricVerificationKey",
+            "clusterNodeHardwareLabel",
+            "clusterDeviceCountLabel",
+            "clusterMemoryNodes",
+            "clusterCombinedUsableMemoryGiB",
+            "clusterCombinedPhysicalMemoryGiB",
+            "clusterMemoryGiBLabel",
+            "clusterCombinedMemoryLabel",
+        ),
+        """
+const gib = 1024 ** 3;
+component.clusterStatus = { node: {
+  hostname: 'Mac Studio', accelerator: 'metal', accelerator_vendor: 'apple',
+  chip_name: 'Apple M3 Ultra', physical_memory_bytes: 256 * gib,
+  recommended_working_set_bytes: 220 * gib,
+} };
+component.clusterSelectedPeers = [
+  { ssh: 'spark-a', name: 'Spark A' },
+  { ssh: 'spark-b', name: 'Spark B' },
+];
+component.clusterPeerProbes = {
+  'spark-a': { runtime_compatible: true, status: { node: {
+    hostname: 'spark-a', chip_name: 'NVIDIA GB10', accelerator: 'cuda',
+    accelerator_vendor: 'nvidia', fabric_kind: 'connectx-7',
+    physical_memory_bytes: 128 * gib, recommended_working_set_bytes: 115 * gib,
+  } } },
+  'spark-b': { runtime_compatible: true, status: { node: {
+    hostname: 'spark-b', chip_name: 'NVIDIA GB10', accelerator: 'cuda',
+    accelerator_vendor: 'nvidia', fabric_kind: 'connectx-7',
+    physical_memory_bytes: 128 * gib, recommended_working_set_bytes: 115 * gib,
+  } } },
+};
+component.clusterPlanNodes = [
+  { node_id: 'Mac Studio', capacity_gib: 220, reserve_gib: 0 },
+  { node_id: 'spark-a', capacity_gib: 115, reserve_gib: 0 },
+  { node_id: 'spark-b', capacity_gib: 115, reserve_gib: 0 },
+];
+const physical = component.clusterQuickNodes();
+const logical = component.clusterLogicalNodes();
+const supernode = logical.find(node => node.memberCount === 2);
+process.stdout.write(JSON.stringify({
+  physicalCount: physical.length,
+  logicalCount: logical.length,
+  memberCount: supernode.memberCount,
+  ranks: supernode.ranks,
+  label: component.clusterNodeHardwareLabel(supernode),
+  countLabel: component.clusterDeviceCountLabel(),
+  memoryLabel: component.clusterCombinedMemoryLabel(),
+}));
+""",
+    )
+
+    assert result == {
+        "physicalCount": 3,
+        "logicalCount": 2,
+        "memberCount": 2,
+        "ranks": [1, 2],
+        "label": "2× NVIDIA CUDA pair · GB10 · 256 GB pooled",
+        "countLabel": "2 visual groups · 3 execution ranks",
+        "memoryLabel": "450 GiB model-usable of 512 GiB installed",
+    }
+
+
+def test_dashboard_verifies_connectx_and_persists_group_in_plan_payload():
+    result = _run_dashboard_helpers(
+        (
+            "clusterCudaFabricVerificationKey",
+            "clusterNeuralFabricJob",
+            "clusterCanVerifyCudaSupernode",
+            "verifyCudaSupernode",
+        ),
+        """
+const calls = [];
+global.window = { location: { href: '' } };
+global.fetch = async (url, options) => {
+  calls.push({ url, body: JSON.parse(options.body) });
+  return {
+    status: 200,
+    ok: true,
+    json: async () => ({
+      ok: true,
+      verified: true,
+      group_id: 'connectx-live-proof',
+      payload_bytes_per_second: 3 * (1024 ** 3),
+    }),
+  };
+};
+component.clusterResponseError = async (_response, fallback) => fallback;
+component.invalidateClusterPlan = () => { component.invalidated = true; };
+component.clusterActivationLoading = false;
+component.clusterStatus = { runtime_jobs: { jobs: [] } };
+component.clusterCudaFabricVerificationLoading = '';
+component.clusterCudaFabricVerificationError = '';
+component.clusterCudaFabricVerifications = {};
+component.clusterPlanNodes = [
+  { node_id: 'spark-a', ssh: 'spark-a', accelerator: 'cuda' },
+  { node_id: 'spark-b', ssh: 'spark-b', accelerator: 'cuda' },
+];
+const node = {
+  memberCount: 2,
+  accelerator: 'cuda',
+  members: [
+    { name: 'Spark A', ssh: 'spark-a', online: true },
+    { name: 'Spark B', ssh: 'spark-b', online: true },
+  ],
+};
+(async () => {
+  const verified = await component.verifyCudaSupernode(node);
+  process.stdout.write(JSON.stringify({
+    verified,
+    calls,
+    planNodes: component.clusterPlanNodes,
+    invalidated: component.invalidated,
+    error: component.clusterCudaFabricVerificationError,
+  }));
+})().catch(error => { console.error(error); process.exit(1); });
+""",
+    )
+
+    assert result["verified"] is True
+    assert result["calls"] == [
+        {
+            "url": "/admin/api/cluster/cuda-fabric/verify",
+            "body": {
+                "hosts": [
+                    {"node_id": "Spark A", "ssh": "spark-a"},
+                    {"node_id": "Spark B", "ssh": "spark-b"},
+                ]
+            },
+        }
+    ]
+    assert all(node["fabric_verified"] for node in result["planNodes"])
+    assert {
+        node["fabric_group_id"] for node in result["planNodes"]
+    } == {"connectx-live-proof"}
+    assert result["invalidated"] is True
+    assert result["error"] == ""
+
+
 def test_model_picker_ranks_real_fit_and_uses_friendly_names():
     result = _run_dashboard_helpers(
         (
@@ -1326,9 +1515,9 @@ process.stdout.write(JSON.stringify({
     assert result == {
         "order": ["/big", "/small", "/huge"],
         "recommended": ["/big", "/small"],
-        "firstGroup": "Recommended for these Macs",
+        "firstGroup": "Recommended for this pool",
         "allGroup": "All other models",
-        "bestBadge": "Best for these Macs",
+        "bestBadge": "Best for this pool",
         "tooLargeBadge": "Does not fit",
         "displayName": "big",
         "owner": "lab",
@@ -1389,12 +1578,12 @@ process.stdout.write(JSON.stringify({ start, rejected, rejectedDisabled, retry, 
     )
 
     assert result == {
-        "start": "Start Qwen3.6-27B-q3 on 2 Macs",
+        "start": "Start Qwen3.6-27B-q3 on 2 devices",
         "rejected": "Choose a cluster-compatible model",
         "rejectedDisabled": True,
         "retry": "Retry Qwen3.6-27B-q3 setup",
         "stop": "Stop",
-        "find": "Find my Macs",
+        "find": "Find workers",
     }
 
 
@@ -1525,6 +1714,68 @@ def test_first_run_adopts_omlx_peers_before_transport_has_been_measured():
     assert "if (this.clusterWorkerPeers().length" in source
     assert source.count("await this.measureClusterBudgets()") == 1
     assert "await this.previewClusterWeightBalance()" in source
+
+
+def test_initialization_resyncs_live_capabilities_before_measuring_budgets():
+    source = _method_source("initializeClusterSetup")
+
+    hardware = source.index("await this.loadClusterPeerHardware()")
+    resync = source.index("this.syncClusterNodesFromPeers()", hardware)
+    budgets = source.index("await this.measureClusterBudgets()", resync)
+
+    assert hardware < resync < budgets
+
+
+def test_cached_worker_hardware_is_reprobed_for_runtime_paths():
+    result = _run_dashboard_helpers(
+        ("loadClusterPeerHardware",),
+        """
+const calls = [];
+global.fetch = async (_url, options) => {
+  const request = JSON.parse(options.body);
+  calls.push(request.ssh);
+  return {
+    ok: true,
+    json: async () => ({
+      status: {
+        node: { hostname: request.ssh, accelerator: 'cuda' },
+        runtime: { python_executable: '/opt/omlx/bin/python' },
+      },
+    }),
+  };
+};
+Object.assign(component, {
+  clusterPeerProbe: null,
+  clusterPeerSsh: '',
+  clusterLocalIp: '',
+  clusterWorkerPeers: () => [
+    { ssh: 'spark-a.local' },
+    { ssh: 'spark-b.local' },
+  ],
+  clusterPeerProbes: {
+    'spark-a.local': { cached: true, status: { node: { hostname: 'old-a' } } },
+    'spark-b.local': { cached: true, status: { node: { hostname: 'old-b' } } },
+  },
+  saveClusterKnownNodes: () => {},
+});
+(async () => {
+  await component.loadClusterPeerHardware();
+  process.stdout.write(JSON.stringify({
+    calls,
+    python: component.clusterPeerProbes['spark-b.local']
+      .status.runtime.python_executable,
+  }));
+})().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
+""",
+    )
+
+    assert result == {
+        "calls": ["spark-a.local", "spark-b.local"],
+        "python": "/opt/omlx/bin/python",
+    }
 
 
 def test_automatic_weight_preview_cannot_start_rank_processes():

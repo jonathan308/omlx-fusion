@@ -100,6 +100,35 @@ def test_cluster_model_path_resolves_to_public_model_id(tmp_path):
     assert pool.resolve_cluster_model_id(str(model_path)) == "friendly-name"
 
 
+def test_cluster_model_path_collapses_equivalent_public_aliases(tmp_path):
+    model_path = tmp_path / "snapshot"
+    model_path.mkdir()
+    pool = EnginePool()
+    hashed = _entry(str(model_path))
+    repo = _entry(str(model_path))
+    repo.source_type = "huggingface"
+    repo.source_repo_id = "owner/model"
+    pool._entries["87e768fb"] = hashed
+    pool._entries["owner--model"] = repo
+
+    assert pool.resolve_cluster_model_id(str(model_path)) == "owner--model"
+
+
+def test_cluster_model_path_rejects_incompatible_public_aliases(tmp_path):
+    model_path = tmp_path / "snapshot"
+    model_path.mkdir()
+    pool = EnginePool()
+    text = _entry(str(model_path))
+    vision = _entry(str(model_path))
+    vision.model_type = "vlm"
+    vision.engine_type = "vlm"
+    pool._entries["text"] = text
+    pool._entries["vision"] = vision
+
+    with pytest.raises(ValueError, match="incompatible public model IDs"):
+        pool.resolve_cluster_model_id(str(model_path))
+
+
 def test_active_cluster_deployment_id_resolves_to_public_model_id(tmp_path):
     model_path = tmp_path / "nemotron"
     model_path.mkdir()

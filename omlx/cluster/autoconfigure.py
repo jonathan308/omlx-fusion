@@ -659,8 +659,19 @@ def preflight_issues(
             )
             continue
 
-        runtime = status.get("runtime") or {}
-        if local_versions:
+        payload = status.get("status") if isinstance(status.get("status"), dict) else status
+        runtime = payload.get("runtime") or {}
+        reported_runtime_mismatch = status.get("runtime_compatible") is False
+        if reported_runtime_mismatch:
+            issues.append(
+                PreflightIssue(
+                    node_id,
+                    "runtime_mismatch",
+                    "; ".join(status.get("runtime_mismatches") or ())
+                    or "worker runtime differs from the coordinator",
+                )
+            )
+        if local_versions and not reported_runtime_mismatch:
             for package, expected in local_versions.items():
                 actual = runtime.get(package)
                 if actual and expected and actual != expected:
@@ -672,7 +683,17 @@ def preflight_issues(
                         )
                     )
 
-        models = status.get("models")
+        node = payload.get("node") or {}
+        if node.get("accelerator") == "cuda" and node.get("memory_kind") == "vram":
+            issues.append(
+                PreflightIssue(
+                    node_id,
+                    "cuda_memory_guard_unavailable",
+                    "discrete CUDA VRAM cannot yet be monitored during model loading",
+                )
+            )
+
+        models = payload.get("models")
         if model_path and isinstance(models, (list, tuple)) and model_path not in models:
             issues.append(
                 PreflightIssue(
@@ -703,6 +724,7 @@ def describe_preflight(issues: Sequence[PreflightIssue]) -> str:
         "model_missing": "missing the model",
         "runtime_mismatch": "running a different MLX version",
         "import_missing": "missing a Python package this model needs",
+        "cuda_memory_guard_unavailable": "using unsupported discrete CUDA memory",
     }
     for kind, nodes in by_kind.items():
         parts.append(f"{', '.join(sorted(set(nodes)))} {labels.get(kind, kind)}")
@@ -1178,6 +1200,7 @@ def peer_import_issues(
     *,
     model_path: str | Path,
     python_executable: str = sys.executable,
+    python_by_node: Mapping[str, str] | None = None,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     timeout: float = 30.0,
 ) -> tuple[PreflightIssue, ...]:
@@ -1198,14 +1221,14 @@ def peer_import_issues(
     if not requirements:
         return ()
     by_module = {requirement.module: requirement for requirement in requirements}
-    command = shlex.join(
-        [python_executable, "-c", _IMPORT_PROBE, ",".join(sorted(by_module))]
-    )
-
     issues: list[PreflightIssue] = []
     for node_id, ssh_target in hosts.items():
         if ssh_target in _LOCAL_SSH_TARGETS:
             continue
+        peer_python = (python_by_node or {}).get(node_id) or python_executable
+        command = shlex.join(
+            [peer_python, "-c", _IMPORT_PROBE, ",".join(sorted(by_module))]
+        )
         try:
             completed = _run_cluster_ssh(
                 ssh_target, command, timeout=timeout, runner=runner
@@ -1226,8 +1249,8 @@ def peer_import_issues(
                 PreflightIssue(
                     node_id,
                     "unreachable",
-                    f"{python_executable} could not run on this peer: {detail}",
-                    remediation=f'ssh {ssh_target} "{python_executable} -V"',
+                    f"{peer_python} could not run on this peer: {detail}",
+                    remediation=f'ssh {ssh_target} "{peer_python} -V"',
                 )
             )
             continue
@@ -1256,7 +1279,7 @@ def peer_import_issues(
             continue
         # The peer reports the interpreter it actually ran under, so the fix
         # names that one rather than the path we hoped it would be.
-        peer_python = report.get("python") or python_executable
+        peer_python = report.get("python") or peer_python
         issues.append(
             PreflightIssue(
                 node_id,

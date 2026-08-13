@@ -970,6 +970,48 @@ def test_preflight_does_not_invent_problems_from_missing_data():
     assert preflight_issues(statuses, model_path="/models/llama") == ()
 
 
+def test_preflight_unwraps_the_live_peer_probe_response():
+    from omlx.cluster.autoconfigure import preflight_issues
+
+    issues = preflight_issues(
+        {
+            "spark-a": {
+                "runtime_compatible": False,
+                "runtime_mismatches": ["mlx local=0.32.0 remote=0.31.0"],
+                "status": {
+                    "runtime": {"mlx_version": "0.31.0"},
+                    "node": {"accelerator": "cuda", "memory_kind": "unified"},
+                },
+            }
+        },
+        model_path="/models/llama",
+        local_versions={"mlx_version": "0.32.0"},
+    )
+
+    assert [(issue.kind, issue.detail) for issue in issues] == [
+        ("runtime_mismatch", "mlx local=0.32.0 remote=0.31.0")
+    ]
+
+
+def test_preflight_refuses_discrete_cuda_without_a_live_vram_guard():
+    from omlx.cluster.autoconfigure import preflight_issues
+
+    issues = preflight_issues(
+        {
+            "cuda-box": {
+                "runtime_compatible": True,
+                "status": {
+                    "runtime": {"mlx_version": "0.32.0"},
+                    "node": {"accelerator": "cuda", "memory_kind": "vram"},
+                },
+            }
+        },
+        model_path=None,
+    )
+
+    assert [issue.kind for issue in issues] == ["cuda_memory_guard_unavailable"]
+
+
 def test_rdma_detection_does_not_ssh_to_itself(monkeypatch):
     """MLX's check_rdma shells out to `ssh 127.0.0.1 ibv_devices`.
 

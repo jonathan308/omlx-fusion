@@ -48,6 +48,28 @@ def pipeline_assignment_is_honored(model_path: str | Path) -> bool:
     except (ImportError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
         return False
 
+    return _module_honors_pipeline_assignment(module, seen=frozenset())
+
+
+def _module_honors_pipeline_assignment(
+    module: Any,
+    *,
+    seen: frozenset[str],
+) -> bool:
+    """Follow thin MLX-LM architecture wrappers to their pipeline model.
+
+    Modules such as ``qwen3_5_moe`` subclass the outer model from
+    ``qwen3_5``. The wrapper does not re-export ``PipelineMixin``, but the
+    loaded inner text model still uses that exact pipeline contract. Follow
+    only class bases inside ``mlx_lm.models``; unrelated framework bases do
+    not become evidence.
+    """
+
+    module_name = str(getattr(module, "__name__", ""))
+    if not module_name or module_name in seen:
+        return False
+    seen = seen | {module_name}
+
     declared = getattr(module, "HONORS_PIPELINE_ASSIGNMENT", None)
     if declared is not None:
         return declared is True
@@ -55,11 +77,32 @@ def pipeline_assignment_is_honored(model_path: str | Path) -> bool:
     # Only a method carrying the explicit contract is evidence. Inherited
     # methods count: install_unequal_pipeline_plan replaces PipelineMixin's
     # method, and subclasses inherit that exact marked callable.
-    for candidate in vars(module).values():
-        if not isinstance(candidate, type):
-            continue
+    candidates = [
+        candidate
+        for candidate in vars(module).values()
+        if isinstance(candidate, type)
+    ]
+    for candidate in candidates:
         method = getattr(candidate, "pipeline", None)
         if getattr(method, _ASSIGNMENT_CONTRACT, False):
+            return True
+
+    base_modules = {
+        str(getattr(base, "__module__", ""))
+        for candidate in candidates
+        for base in getattr(candidate, "__bases__", ())
+    }
+    for base_module in sorted(base_modules):
+        if (
+            not base_module.startswith("mlx_lm.models.")
+            or base_module in seen
+        ):
+            continue
+        try:
+            inherited = importlib.import_module(base_module)
+        except ImportError:
+            continue
+        if _module_honors_pipeline_assignment(inherited, seen=seen):
             return True
     return False
 

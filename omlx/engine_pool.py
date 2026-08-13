@@ -695,6 +695,38 @@ class EnginePool:
         """Get entry for a specific model, or None if not found."""
         return self._entries.get(model_id)
 
+    @staticmethod
+    def _select_cluster_path_match(
+        matches: list[tuple[str, EngineEntry]],
+    ) -> tuple[str, EngineEntry]:
+        """Choose one public alias when discovery names one path twice.
+
+        Hugging Face snapshots can be discovered once from an explicit model
+        directory (the snapshot hash) and once from the HF cache (the repo
+        ID). Those are aliases, not ambiguous model contents. Preserve the
+        fail-closed behavior only when the aliases disagree about how the
+        model must be served.
+        """
+
+        signatures = {
+            (entry.model_type, entry.engine_type, entry.config_model_type)
+            for _, entry in matches
+        }
+        if len(signatures) > 1:
+            raise ValueError(
+                "cluster model path is ambiguous across incompatible public "
+                "model IDs: "
+                + ", ".join(sorted(model_id for model_id, _ in matches))
+            )
+        return min(
+            matches,
+            key=lambda item: (
+                item[1].engine is None,
+                item[1].source_repo_id is None,
+                item[0],
+            ),
+        )
+
     def resolve_cluster_model_id(self, model_path: str) -> str:
         """Resolve one downloaded LLM path to its public oMLX model ID.
 
@@ -719,12 +751,7 @@ class EnginePool:
                 matches.append((model_id, entry))
         if not matches:
             raise ModelNotFoundError(model_path, list(self._entries.keys()))
-        if len(matches) > 1:
-            raise ValueError(
-                "cluster model path is ambiguous across public model IDs: "
-                + ", ".join(sorted(model_id for model_id, _ in matches))
-            )
-        model_id, entry = matches[0]
+        model_id, entry = self._select_cluster_path_match(matches)
         if entry.engine_type != "batched":
             raise ValueError(
                 f"Model '{model_id}' is a {entry.model_type} model. "
@@ -761,13 +788,8 @@ class EnginePool:
             for model_id, entry in self._entries.items()
             if str(Path(entry.model_path).expanduser().resolve()) == candidate_key
         ]
-        if len(exact) > 1:
-            raise ValueError(
-                "cluster model path is ambiguous across public model IDs: "
-                + ", ".join(sorted(model_id for model_id, _ in exact))
-            )
         if exact:
-            model_id, entry = exact[0]
+            model_id, entry = self._select_cluster_path_match(exact)
             if entry.engine_type != "batched":
                 raise ValueError(
                     f"Model '{model_id}' is already registered as "

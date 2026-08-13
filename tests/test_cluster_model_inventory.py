@@ -143,7 +143,9 @@ def test_cluster_inventory_endpoint_unions_local_and_peer_models(monkeypatch):
     monkeypatch.setattr(
         routes,
         "remote_model_inventory",
-        lambda host: [_model(size=236, path="/models/m3")],
+        lambda host, *, python_executable: [
+            _model(size=236, path="/models/m3")
+        ],
     )
 
     response = _client().post(
@@ -151,7 +153,11 @@ def test_cluster_inventory_endpoint_unions_local_and_peer_models(monkeypatch):
         json={
             "hosts": [
                 {"node_id": "MacBook", "ssh": "127.0.0.1"},
-                {"node_id": "Mac Studio", "ssh": "studio"},
+                {
+                    "node_id": "Mac Studio",
+                    "ssh": "studio",
+                    "python_executable": "/opt/omlx/bin/python",
+                },
             ]
         },
     )
@@ -159,6 +165,7 @@ def test_cluster_inventory_endpoint_unions_local_and_peer_models(monkeypatch):
     assert response.status_code == 200
     [model] = response.json()["models"]
     assert model["model_source"] == "studio"
+    assert model["python_executable"] == "/opt/omlx/bin/python"
     assert model["location_count"] == 2
 
 
@@ -167,8 +174,8 @@ def test_catalogue_measures_a_peer_owned_model_on_the_peer(monkeypatch):
 
     asked = {}
 
-    def fake_layout(host, path):
-        asked.update(host=host, path=path)
+    def fake_layout(host, path, *, python_executable):
+        asked.update(host=host, path=path, python=python_executable)
         return ModelLayout(
             source=path,
             fixed_weight_bytes=0,
@@ -198,6 +205,7 @@ def test_catalogue_measures_a_peer_owned_model_on_the_peer(monkeypatch):
                     "id": "m3",
                     "model_path": "/models/m3",
                     "model_source": "studio",
+                    "model_source_python": "/opt/omlx/bin/python",
                     "source_node_id": "Studio",
                     "model_context_length": 262144,
                 }
@@ -206,7 +214,11 @@ def test_catalogue_measures_a_peer_owned_model_on_the_peer(monkeypatch):
     )
 
     assert response.status_code == 200
-    assert asked == {"host": "studio", "path": "/models/m3"}
+    assert asked == {
+        "host": "studio",
+        "path": "/models/m3",
+        "python": "/opt/omlx/bin/python",
+    }
     assert response.json()["models"][0]["model_source"] == "studio"
     assert response.json()["models"][0]["fits"] is True
 
@@ -216,8 +228,8 @@ def test_plan_carries_the_selected_model_holder_to_remote_measurement(monkeypatc
 
     asked = {}
 
-    def fake_layout(host, path):
-        asked.update(host=host, path=path)
+    def fake_layout(host, path, *, python_executable):
+        asked.update(host=host, path=path, python=python_executable)
         return ModelLayout(
             source=path,
             fixed_weight_bytes=0,
@@ -231,6 +243,7 @@ def test_plan_carries_the_selected_model_holder_to_remote_measurement(monkeypatc
         json={
             "model_path": "/models/m3",
             "model_source": "studio",
+            "model_source_python": "/opt/omlx/bin/python",
             "nodes": [
                 {"node_id": "MacBook", "capacity_bytes": 1 << 30},
                 {"node_id": "Studio", "capacity_bytes": 1 << 30},
@@ -239,4 +252,8 @@ def test_plan_carries_the_selected_model_holder_to_remote_measurement(monkeypatc
     )
 
     assert response.status_code == 200
-    assert asked == {"host": "studio", "path": "/models/m3"}
+    assert asked == {
+        "host": "studio",
+        "path": "/models/m3",
+        "python": "/opt/omlx/bin/python",
+    }

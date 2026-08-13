@@ -419,7 +419,8 @@ async def lifespan(app: FastAPI):
     # and API port without asking the user to type an SSH target. Publication
     # is best-effort: inference remains available if Bonjour is disabled.
     if (
-        distributed_inference_enabled()
+        _server_state.global_settings is not None
+        and distributed_inference_enabled()
         and os.environ.get("OMLX_BONJOUR", "1").strip().lower()
         not in {"0", "false", "no", "off"}
     ):
@@ -634,6 +635,7 @@ def _register_cluster_routes() -> None:
     global _cluster_routes_registered
     if _cluster_routes_registered:
         return
+    from .cluster.routes import join_router as cluster_join_router
     from .cluster.routes import peer_router as cluster_peer_router
     from .cluster.routes import router as cluster_router
     from .cluster.routes import set_cluster_getters
@@ -654,6 +656,13 @@ def _register_cluster_routes() -> None:
         dependencies=[
             Depends(require_distributed_inference_enabled),
         ],
+    )
+    # The bootstrap bytes are public but pinned by SHA-256 in an admin-created
+    # command. Claim/source/complete authenticate with one-time enrollment
+    # credentials, not the browser's admin cookie.
+    app.include_router(
+        cluster_join_router,
+        dependencies=[Depends(require_distributed_inference_enabled)],
     )
     _cluster_routes_registered = True
 
@@ -1926,10 +1935,12 @@ def init_server(
     _server_state.engine_pool = EnginePool(
         scheduler_config=scheduler_config,
     )
+    from .cluster.enrollment import configure_cluster_enrollment
     from .cluster.registry import configure_cluster_registry
     from .cluster.strategy_benchmarks import configure_strategy_benchmark_store
 
     _server_state.engine_pool._cluster_registry = configure_cluster_registry(base_path)
+    configure_cluster_enrollment(base_path)
     configure_strategy_benchmark_store(base_path)
 
     # Discover models (use pinned models from settings file)

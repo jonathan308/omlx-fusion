@@ -81,6 +81,21 @@ def _first_seen_host_guidance(message: str) -> Guidance | None:
 # Ordered: the first pattern that matches wins, so put specific before general.
 _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
     (
+        re.compile(r"oMLX worker runtime is not installed", re.I),
+        Guidance(
+            "The device is online but its worker runtime is missing",
+            "SSH and hardware discovery succeeded, but this device cannot join "
+            "an MLX collective until the matching oMLX worker build is installed.",
+            (
+                "Install or update oMLX on the named device to the same build as "
+                "the coordinator.",
+                "Return here and press Start again; oMLX will re-check the "
+                "runtime, memory, and links automatically.",
+            ),
+            "worker-runtime",
+        ),
+    ),
+    (
         re.compile(
             r"weight file is missing|model stage is incomplete|missing .*\.safetensors",
             re.I,

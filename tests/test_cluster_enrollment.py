@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for guided cluster enrollment: join tokens, redeem, and the CLI."""
+"""Tests for guided cluster enrollment and headless-worker join state."""
 
 from __future__ import annotations
 
 import base64
 import json
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +16,9 @@ from fastapi.testclient import TestClient
 from omlx import cli
 from omlx.cluster import enrollment, routes
 from omlx.cluster.enrollment import (
+    ClusterEnrollmentStore,
+    EnrolledNode,
+    EnrollmentError,
     JoinConnectionError,
     JoinTokenStore,
     decode_join_token,
@@ -28,6 +32,10 @@ from omlx.cluster.enrollment import (
 )
 from omlx.cluster.ssh_keys import SSHKeyPair, create_key_exchange_token
 from omlx.cluster.token_auth import sign_pairing_payload
+
+#----------------------------------------------------------------------
+# Guided peer enrollment ("Add a Mac")
+#----------------------------------------------------------------------
 
 EXPECTED = {"omlx": "0.5.3", "mlx": "0.32.0", "mlx-lm": "0.31.3"}
 
@@ -628,7 +636,7 @@ class TestJoinRoutes:
         assert minted["expires_in_seconds"] == enrollment.JOIN_TOKEN_TTL
 
         pending = client.get(
-            "/admin/api/cluster/join-status",
+            "/admin/api/cluster/join-token-status",
             params={"token_id": minted["token_id"]},
         ).json()
         assert pending["token"]["status"] == "pending"
@@ -651,7 +659,7 @@ class TestJoinRoutes:
         assert body["runtime_compatible"] is True
 
         done = client.get(
-            "/admin/api/cluster/join-status",
+            "/admin/api/cluster/join-token-status",
             params={"token_id": minted["token_id"]},
         ).json()
         assert done["token"]["status"] == "redeemed"
@@ -720,7 +728,7 @@ class TestJoinRoutes:
 
     def test_join_status_unknown_token(self, client):
         payload = client.get(
-            "/admin/api/cluster/join-status", params={"token_id": "nope"}
+            "/admin/api/cluster/join-token-status", params={"token_id": "nope"}
         ).json()
         assert payload["token"] is None
         assert payload["enrolled"] == []
@@ -734,3 +742,200 @@ def test_peer_router_registered_with_404_hiding_only():
     block = source.split(marker, 1)[1].split("]")[0]
     assert "Depends(require_distributed_inference_enabled)" in block
     assert "Depends(require_admin)" not in block
+
+
+#----------------------------------------------------------------------
+# One-time headless-worker enrollment state
+#----------------------------------------------------------------------
+
+class _Clock:
+    def __init__(self, now: float = 1000.0):
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _node(
+    *, digest: str = "a" * 64, node_id: str = "cuda-worker-1-machine"
+) -> EnrolledNode:
+    return EnrolledNode(
+        node_id=node_id,
+        hostname="cuda-worker-1",
+        ssh="omlxworker@10.42.0.21",
+        ssh_user="omlxworker",
+        ssh_port=22,
+        addresses=("10.42.0.21",),
+        accelerator="cuda",
+        platform="Linux-aarch64",
+        python_executable="/opt/omlx-cluster-worker/venv/bin/python",
+        source_digest=digest,
+        ssh_host_fingerprint="SHA256:" + "A" * 43,
+        joined_at=1001.0,
+        last_seen_at=1001.0,
+    )
+
+
+def test_join_key_is_single_use_and_status_never_returns_the_secret(tmp_path):
+    store = ClusterEnrollmentStore(tmp_path)
+    raw_key, issued = store.issue_join_key(
+        controller_url="http://10.42.0.10:8000",
+        source_digest="a" * 64,
+    )
+
+    raw_session, session = store.claim(
+        raw_key,
+        node_id="cuda-worker-1-machine",
+        hostname="cuda-worker-1",
+        ssh_user="omlxworker",
+        ssh_port=22,
+        addresses=("10.42.0.21",),
+    )
+
+    assert issued["status"] == "pending"
+    assert session.source_digest == "a" * 64
+    assert raw_key not in json.dumps(store.to_dict())
+    assert raw_session not in json.dumps(store.to_dict())
+    with pytest.raises(EnrollmentError, match="already been used"):
+        store.claim(
+            raw_key,
+            node_id="cuda-worker-1-machine",
+            hostname="cuda-worker-1",
+            ssh_user="omlxworker",
+            ssh_port=22,
+            addresses=("10.42.0.21",),
+        )
+
+
+def test_expired_join_key_and_session_fail_closed(tmp_path):
+    clock = _Clock()
+    store = ClusterEnrollmentStore(tmp_path, clock=clock)
+    raw_key, _ = store.issue_join_key(
+        controller_url="http://10.42.0.10:8000",
+        source_digest="a" * 64,
+        ttl=30,
+    )
+    clock.now += 31
+    with pytest.raises(EnrollmentError, match="invalid or expired"):
+        store.claim(
+            raw_key,
+            node_id="cuda-worker-1-machine",
+            hostname="cuda-worker-1",
+            ssh_user="omlxworker",
+            ssh_port=22,
+            addresses=("10.42.0.21",),
+        )
+
+    clock.now = 2000.0
+    raw_key, _ = store.issue_join_key(
+        controller_url="http://10.42.0.10:8000",
+        source_digest="a" * 64,
+        ttl=30,
+    )
+    raw_session, _ = store.claim(
+        raw_key,
+        node_id="cuda-worker-1-machine",
+        hostname="cuda-worker-1",
+        ssh_user="omlxworker",
+        ssh_port=22,
+        addresses=("10.42.0.21",),
+    )
+    clock.now += 1201
+    with pytest.raises(EnrollmentError, match="invalid or expired"):
+        store.authorize_session(raw_session)
+
+
+def test_completion_is_bound_to_claimed_worker_identity(tmp_path):
+    store = ClusterEnrollmentStore(tmp_path)
+    raw_key, _ = store.issue_join_key(
+        controller_url="http://10.42.0.10:8000",
+        source_digest="a" * 64,
+    )
+    raw_session, _ = store.claim(
+        raw_key,
+        node_id="cuda-worker-1-machine",
+        hostname="cuda-worker-1",
+        ssh_user="omlxworker",
+        ssh_port=22,
+        addresses=("10.42.0.21",),
+    )
+
+    with pytest.raises(EnrollmentError, match="identity changed"):
+        store.complete(raw_session, _node(node_id="cuda-worker-2-machine"))
+
+    completed = store.complete(raw_session, _node())
+    assert completed.node_id == "cuda-worker-1-machine"
+    assert store.list_nodes()[0].node_id == "cuda-worker-1-machine"
+    with pytest.raises(EnrollmentError, match="invalid or expired"):
+        store.authorize_session(raw_session)
+
+
+def test_completed_nodes_persist_without_credentials(tmp_path):
+    store = ClusterEnrollmentStore(tmp_path)
+    raw_key, _ = store.issue_join_key(
+        controller_url="http://10.42.0.10:8000",
+        source_digest="a" * 64,
+    )
+    raw_session, _ = store.claim(
+        raw_key,
+        node_id="cuda-worker-1-machine",
+        hostname="cuda-worker-1",
+        ssh_user="omlxworker",
+        ssh_port=22,
+        addresses=("10.42.0.21",),
+    )
+    store.complete(raw_session, _node())
+
+    restored = ClusterEnrollmentStore(tmp_path)
+    serialized = store.path.read_text(encoding="utf-8")
+
+    assert restored.list_nodes() == (_node(),)
+    assert raw_key not in serialized
+    assert raw_session not in serialized
+    assert "join_key" not in serialized
+    assert "session_token" not in serialized
+    assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+
+
+def test_revocation_invalidates_a_claim_session(tmp_path):
+    store = ClusterEnrollmentStore(tmp_path)
+    raw_key, issued = store.issue_join_key(
+        controller_url="http://10.42.0.10:8000",
+        source_digest="a" * 64,
+    )
+    raw_session, _ = store.claim(
+        raw_key,
+        node_id="cuda-worker-1-machine",
+        hostname="cuda-worker-1",
+        ssh_user="omlxworker",
+        ssh_port=22,
+        addresses=("10.42.0.21",),
+    )
+
+    assert store.revoke_join_key(issued["join_id"]) is True
+    with pytest.raises(EnrollmentError, match="invalid or expired"):
+        store.authorize_session(raw_session)
+
+
+def test_claim_session_can_still_be_revoked_after_join_key_expiry(tmp_path):
+    clock = _Clock()
+    store = ClusterEnrollmentStore(tmp_path, clock=clock)
+    raw_key, issued = store.issue_join_key(
+        controller_url="http://10.42.0.10:8000",
+        source_digest="a" * 64,
+        ttl=30,
+    )
+    raw_session, _ = store.claim(
+        raw_key,
+        node_id="cuda-worker-1-machine",
+        hostname="cuda-worker-1",
+        ssh_user="omlxworker",
+        ssh_port=22,
+        addresses=("10.42.0.21",),
+    )
+    clock.now += 31
+
+    assert store.to_dict()["join_keys"][0]["status"] == "used"
+    assert store.revoke_join_key(issued["join_id"]) is True
+    with pytest.raises(EnrollmentError, match="invalid or expired"):
+        store.authorize_session(raw_session)

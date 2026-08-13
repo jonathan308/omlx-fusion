@@ -21,6 +21,7 @@ from omlx.cluster.transport import (
     configure_link,
     detect_transports,
     parse_interface_addresses,
+    parse_linux_ip_addresses,
     parse_thunderbolt_interfaces,
     resolve_link_addresses,
     select_backend,
@@ -52,6 +53,17 @@ def test_everything_working_says_so_plainly():
     assert status.backend == "jaccl"
     assert status.commands == (), "nothing to fix, so offer no commands"
     assert status.link_label == "TB5 at 120 Gb/s"
+
+
+def test_linux_ip_fallback_reads_active_ipv4_interfaces():
+    addresses = parse_linux_ip_addresses(
+        "2: enp1s0f0np0    inet 192.168.100.1/30 brd 192.168.100.3 scope global\n"
+        "1: lo    inet 127.0.0.1/8 scope host\n"
+    )
+
+    assert addresses == (
+        InterfaceAddress("enp1s0f0np0", "192.168.100.1", 30),
+    )
 
 
 def test_ports_without_an_ip_are_prepared_by_start_cluster():

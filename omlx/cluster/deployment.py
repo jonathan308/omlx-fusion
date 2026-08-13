@@ -11,6 +11,7 @@ import math
 import re
 import zlib
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 from .performance import (
@@ -87,6 +88,7 @@ class ClusterHost:
     ssh: str
     ips: tuple[str, ...]
     rdma: tuple[RDMAPath, ...] = ()
+    python_executable: str | None = None
 
     def __post_init__(self) -> None:
         if _NODE_ID.fullmatch(self.node_id) is None:
@@ -98,9 +100,15 @@ class ClusterHost:
             "rdma",
             tuple(_validate_rdma_path(path) for path in self.rdma),
         )
+        if self.python_executable is not None:
+            executable = self.python_executable.strip()
+            path = Path(executable)
+            if not path.is_absolute() or "\x00" in executable or len(executable) > 4096:
+                raise ValueError("cluster host Python executable must be absolute")
+            object.__setattr__(self, "python_executable", executable)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "node_id": self.node_id,
             "ssh": self.ssh,
             "ips": list(self.ips),
@@ -108,6 +116,9 @@ class ClusterHost:
                 list(path) if isinstance(path, tuple) else path for path in self.rdma
             ],
         }
+        if self.python_executable:
+            payload["python_executable"] = self.python_executable
+        return payload
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> ClusterHost:
@@ -121,7 +132,16 @@ class ClusterHost:
             raise ValueError("cluster host requires string node_id and ssh fields")
         if not isinstance(ips, list) or not isinstance(rdma, list):
             raise ValueError("cluster host ips and rdma fields must be arrays")
-        return cls(node_id=node_id, ssh=ssh, ips=tuple(ips), rdma=tuple(rdma))
+        python_executable = payload.get("python_executable")
+        if python_executable is not None and not isinstance(python_executable, str):
+            raise ValueError("cluster host Python executable must be a string")
+        return cls(
+            node_id=node_id,
+            ssh=ssh,
+            ips=tuple(ips),
+            rdma=tuple(rdma),
+            python_executable=python_executable,
+        )
 
 
 def _assignment_from_dict(payload: dict[str, Any]) -> PipelineAssignment:

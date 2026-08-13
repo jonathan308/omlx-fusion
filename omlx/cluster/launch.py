@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.metadata
+import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -35,12 +38,60 @@ _EVENT_PREFIX = "OMLX_CLUSTER_EVENT:"
 _LOG_LINE_LIMIT = 8192
 _LOG_HISTORY = 200
 _REMOTE_OUTPUT_LIMIT = 64 * 1024
+_FABRIC_INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
+_DEFAULT_CONNECTX_MIN_BYTES_PER_SECOND = 2 * 1024**3
 
 logger = logging.getLogger(__name__)
 
 
 class DistributedLaunchError(RuntimeError):
     """Raised when a distributed job cannot become or remain ready."""
+
+
+@dataclass(frozen=True)
+class CudaFabricProbeHost:
+    """One CUDA worker and its direct-link NCCL endpoint."""
+
+    node_id: str
+    ssh: str
+    ips: tuple[str, ...]
+    interfaces: tuple[str, ...]
+    rdma_devices: tuple[str, ...]
+    python_executable: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.node_id.strip() or len(self.node_id) > 128:
+            raise ValueError("CUDA fabric member requires a node ID")
+        object.__setattr__(self, "ssh", validate_ssh_target(self.ssh.strip()))
+        if not self.ips or not (
+            len(self.ips) == len(self.interfaces) == len(self.rdma_devices)
+        ):
+            raise ValueError(
+                "CUDA fabric member requires matching IP, interface, and RDMA lists"
+            )
+        normalized_ips: list[str] = []
+        for raw_ip in self.ips:
+            try:
+                normalized_ips.append(str(ipaddress.ip_address(raw_ip.strip())))
+            except ValueError as exc:
+                raise ValueError(
+                    "CUDA fabric member requires valid IP addresses"
+                ) from exc
+        object.__setattr__(self, "ips", tuple(normalized_ips))
+        interfaces = tuple(interface.strip() for interface in self.interfaces)
+        if any(not _FABRIC_INTERFACE_RE.fullmatch(item) for item in interfaces):
+            raise ValueError("CUDA fabric member has an invalid interface name")
+        object.__setattr__(self, "interfaces", interfaces)
+        rdma_devices = tuple(device.strip() for device in self.rdma_devices)
+        if any(not _FABRIC_INTERFACE_RE.fullmatch(item) for item in rdma_devices):
+            raise ValueError("CUDA fabric member has an invalid RDMA device name")
+        object.__setattr__(self, "rdma_devices", rdma_devices)
+        if self.python_executable is not None:
+            object.__setattr__(
+                self,
+                "python_executable",
+                _validate_python_executable(self.python_executable.strip()),
+            )
 
 
 def _process_group_alive(process_group: int) -> bool:
@@ -118,6 +169,10 @@ def _package_version(name: str) -> str:
     try:
         return importlib.metadata.version(name)
     except importlib.metadata.PackageNotFoundError:
+        if name == "omlx":
+            from omlx._version import __version__
+
+            return __version__
         return "unknown"
 
 
@@ -134,6 +189,32 @@ def _validate_python_executable(value: str) -> str:
     if not path.is_absolute() or "\x00" in value or len(value.encode()) > 4096:
         raise ValueError("distributed Python executable must be an absolute path")
     return str(path)
+
+
+def _rank_python_module_argv(
+    python_by_rank: list[str | None],
+    *,
+    fallback: str,
+    module: str,
+) -> list[str]:
+    """Build one command that selects each host's probed interpreter by rank."""
+
+    default = _validate_python_executable(fallback)
+    executables = [
+        _validate_python_executable(value) if value else default
+        for value in python_by_rank
+    ]
+    if len(set(executables)) == 1:
+        return [executables[0], "-m", module]
+    cases = " ".join(
+        f"{rank}) omlx_python={shlex.quote(executable)};;"
+        for rank, executable in enumerate(executables)
+    )
+    script = (
+        f'case "${{MLX_RANK:-}}" in {cases} *) exit 64;; esac; '
+        'exec "$omlx_python" "$@"'
+    )
+    return ["/bin/sh", "-c", script, "omlx-rank-python", "-m", module]
 
 
 def build_mlx_launch_argv(
@@ -202,9 +283,11 @@ def build_mlx_launch_argv(
     argv.extend(
         [
             "--",
-            python_executable,
-            "-m",
-            "omlx.cluster.inference_worker",
+            *_rank_python_module_argv(
+                [host.python_executable for host in deployment.hosts],
+                fallback=python_executable,
+                module="omlx.cluster.inference_worker",
+            ),
             "--model",
             deployment.model,
             "--backend",
@@ -252,6 +335,8 @@ def build_mlx_launch_argv(
         argv.append("--cache-affinity")
     if deployment.execution.kv_tier:
         argv.append("--kv-tier")
+    if deployment.execution.prompt_cache_ssd:
+        argv.append("--prompt-cache-ssd")
     if deployment.execution.auto_tune:
         argv.append("--auto-tune")
     if deployment.execution.sampling_rank_only:
@@ -367,9 +452,11 @@ def run_cluster_performance_probe(
         argv.extend(
             [
                 "--",
-                python_executable,
-                "-m",
-                "omlx.cluster.performance_worker",
+                *_rank_python_module_argv(
+                    [host.python_executable for host in deployment.hosts],
+                    fallback=python_executable,
+                    module="omlx.cluster.performance_worker",
+                ),
             ]
         )
         environment = os.environ.copy()
@@ -415,6 +502,166 @@ def run_cluster_performance_probe(
             else 1
         ),
         "profiles": [profile.to_dict() for profile in profiles],
+    }
+
+
+def run_cuda_fabric_probe(
+    hosts: tuple[CudaFabricProbeHost, CudaFabricProbeHost],
+    *,
+    timeout: float = 90.0,
+    payload_mib: int = 64,
+    repeats: int = 3,
+    minimum_bytes_per_second: float = _DEFAULT_CONNECTX_MIN_BYTES_PER_SECOND,
+    python_executable: str = sys.executable,
+    cwd: Path | None = None,
+    runner: PerformanceProbeRunner = _run_performance_launcher,
+) -> dict[str, Any]:
+    """Launch an isolated two-worker NCCL test over explicit ConnectX IPs.
+
+    This is intentionally separate from the heterogeneous outer Ring. A Ring
+    subgroup still uses Ring and therefore cannot prove that NCCL or the direct
+    ConnectX path is active. The dashboard calls this before it marks a CUDA
+    pair verified.
+    """
+
+    if len(hosts) != 2:
+        raise ValueError("CUDA fabric verification requires exactly two workers")
+    if len({host.ssh for host in hosts}) != 2:
+        raise ValueError("CUDA fabric workers must use distinct SSH targets")
+    if set(hosts[0].ips) & set(hosts[1].ips):
+        raise ValueError("CUDA fabric workers must use distinct direct-link IPs")
+    if timeout <= 0:
+        raise ValueError("CUDA fabric probe timeout must be positive")
+    if not 1 <= payload_mib <= 1024:
+        raise ValueError("CUDA fabric payload must be between 1 and 1024 MiB")
+    if not 1 <= repeats <= 20:
+        raise ValueError("CUDA fabric repeats must be between 1 and 20")
+    if not math.isfinite(minimum_bytes_per_second) or minimum_bytes_per_second <= 0:
+        raise ValueError("CUDA fabric throughput floor must be finite and positive")
+    python_executable = _validate_python_executable(python_executable)
+    if cwd is not None and not cwd.is_absolute():
+        raise ValueError("distributed working directory must be absolute")
+
+    with tempfile.TemporaryDirectory(prefix="omlx-cuda-fabric-") as temporary_name:
+        temporary = Path(temporary_name)
+        _install_cluster_ssh_wrapper(temporary)
+        hostfile = temporary / "hostfile.json"
+        hostfile.write_text(
+            json.dumps(
+                {
+                    "backend": "nccl",
+                    "envs": [],
+                    "hosts": [
+                        {"ssh": host.ssh, "ips": list(host.ips), "rdma": []}
+                        for host in hosts
+                    ],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            nccl_port = int(listener.getsockname()[1])
+        launcher = (
+            "from mlx._distributed_utils.launch import main; "
+            "raise SystemExit(main() or 0)"
+        )
+        argv = [
+            python_executable,
+            "-c",
+            launcher,
+            "--backend",
+            "nccl",
+            "--hostfile",
+            str(hostfile),
+            "--nccl-port",
+            str(nccl_port),
+        ]
+        if cwd is not None:
+            argv.extend(["--cwd", str(cwd)])
+        argv.extend(
+            [
+                "--",
+                *_rank_python_module_argv(
+                    [host.python_executable for host in hosts],
+                    fallback=python_executable,
+                    module="omlx.cluster.nccl_fabric_worker",
+                ),
+                "--interfaces",
+                json.dumps([list(host.interfaces) for host in hosts]),
+                "--rdma-devices",
+                json.dumps([list(host.rdma_devices) for host in hosts]),
+                "--payload-mib",
+                str(payload_mib),
+                "--repeats",
+                str(repeats),
+            ]
+        )
+        environment = os.environ.copy()
+        environment["PATH"] = f"{temporary}{os.pathsep}{environment.get('PATH', '')}"
+        environment["SSH_ASKPASS_REQUIRE"] = "never"
+        environment["PYTHONUNBUFFERED"] = "1"
+        try:
+            completed = runner(argv, timeout=timeout, env=environment)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise DistributedLaunchError(
+                f"could not launch CUDA fabric probe: {exc}"
+            ) from exc
+
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        suffix = f": {detail[-2000:]}" if detail else ""
+        raise DistributedLaunchError(
+            f"CUDA fabric probe exited with code {completed.returncode}{suffix}"
+        )
+    if len(completed.stdout.encode()) + len(completed.stderr.encode()) > _REMOTE_OUTPUT_LIMIT:
+        raise DistributedLaunchError("CUDA fabric probe output exceeded the safe limit")
+    records: list[dict[str, Any]] = []
+    for line in completed.stdout.splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("type") == "nccl_fabric_result":
+            records.append(value)
+    ranks = {int(record.get("rank", -1)) for record in records}
+    if ranks != {0, 1} or len(records) != 2:
+        raise DistributedLaunchError(
+            "CUDA fabric probe did not return one result from each worker"
+        )
+    observed = min(float(record.get("payload_bytes_per_second") or 0) for record in records)
+    verified = observed >= minimum_bytes_per_second
+    identity = "\0".join(sorted(host.ssh for host in hosts)).encode()
+    group_id = f"connectx-{hashlib.sha256(identity).hexdigest()[:16]}"
+    return {
+        "ok": True,
+        "verified": verified,
+        "group_id": group_id,
+        "transport": "nccl",
+        "members": [
+            {
+                "node_id": host.node_id,
+                "ssh": host.ssh,
+                "ips": list(host.ips),
+                "interfaces": list(host.interfaces),
+                "rdma_devices": list(host.rdma_devices),
+                "rank": index,
+            }
+            for index, host in enumerate(hosts)
+        ],
+        "payload_mib": payload_mib,
+        "repeats": repeats,
+        "payload_bytes_per_second": observed,
+        "minimum_bytes_per_second": minimum_bytes_per_second,
+        "reason": (
+            "NCCL completed over the selected direct-link interfaces"
+            if verified
+            else "NCCL completed, but measured throughput did not clear the "
+            "ConnectX verification floor"
+        ),
+        "records": sorted(records, key=lambda item: int(item["rank"])),
     }
 
 
@@ -487,6 +734,260 @@ def _run_cluster_ssh(
     return completed
 
 
+def discover_remote_python_executable(
+    ssh_target: str,
+    *,
+    preferred: str = sys.executable,
+    timeout: float = 8.0,
+    runner: SSHRunner = subprocess.run,
+) -> str:
+    """Find the peer interpreter that can import oMLX without user commands."""
+
+    preferred = _validate_python_executable(preferred)
+    candidates = (
+        preferred,
+        "~/.omlx/bin/omlx-cluster-python",
+        "~/.omlx/bin/omlx-source-python",
+        "/opt/omlx-cluster-worker/venv/bin/python",
+        "/opt/omlx/bin/python",
+        "/usr/local/bin/python3",
+        "/usr/bin/python3",
+        "~/omlx-distributed/.venv/bin/python",
+        "python3",
+    )
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        # The packaged macOS app exposes a launcher which assembles PYTHONPATH
+        # for its bundled interpreter.  Returning ``sys.executable`` from that
+        # launcher loses the environment and makes the very next probe fail.
+        # Preserve the launcher itself while still resolving ``~`` to an
+        # absolute path accepted by the launcher's path validation.
+        script = (
+            "import os,omlx; print(os.path.expanduser("
+            f"{candidate!r}))"
+            if candidate.startswith("~")
+            else "import sys,omlx; print(sys.executable)"
+        )
+        command = (
+            f"{candidate} {shlex.join(['-c', script])}"
+            if candidate.startswith("~")
+            else shlex.join([candidate, "-c", script])
+        )
+        completed = _run_cluster_ssh(
+            ssh_target,
+            command,
+            timeout=timeout,
+            runner=runner,
+        )
+        if completed.returncode != 0:
+            continue
+        lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+        if not lines:
+            continue
+        try:
+            return _validate_python_executable(lines[-1])
+        except ValueError:
+            continue
+    raise DistributedLaunchError(
+        f"{ssh_target} has no Python interpreter that can import oMLX"
+    )
+
+
+def discover_remote_system_python(
+    ssh_target: str,
+    *,
+    preferred: str = sys.executable,
+    timeout: float = 8.0,
+    runner: SSHRunner = subprocess.run,
+) -> str:
+    """Find a plain peer Python for read-only pre-install hardware inventory."""
+
+    preferred = _validate_python_executable(preferred)
+    script = "import sys; print(sys.executable)"
+    candidates = (
+        preferred,
+        "/usr/local/bin/python3",
+        "/usr/bin/python3",
+        "python3",
+    )
+    for candidate in dict.fromkeys(candidates):
+        completed = _run_cluster_ssh(
+            ssh_target,
+            shlex.join([candidate, "-c", script]),
+            timeout=timeout,
+            runner=runner,
+        )
+        if completed.returncode != 0:
+            continue
+        lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+        if not lines:
+            continue
+        try:
+            return _validate_python_executable(lines[-1])
+        except ValueError:
+            continue
+    raise DistributedLaunchError(
+        f"{ssh_target} has no Python interpreter for hardware discovery"
+    )
+
+
+_REMOTE_SYSTEM_PROBE = r"""
+import json, os, platform, socket, subprocess, sys
+
+def run(argv):
+    try:
+        value = subprocess.run(
+            argv, capture_output=True, text=True, check=False, timeout=8
+        )
+        return value.returncode, value.stdout
+    except Exception:
+        return 127, ""
+
+def memory_bytes():
+    try:
+        return int(os.sysconf("SC_PHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
+    except Exception:
+        return 0
+
+gpu_code, gpu_output = run([
+    "nvidia-smi", "--query-gpu=name", "--format=csv,noheader"
+])
+cuda = gpu_code == 0 and bool(gpu_output.strip())
+chip = gpu_output.splitlines()[0].strip() if cuda else (
+    "Apple Silicon" if platform.system() == "Darwin" else platform.machine()
+)
+rdma_code, rdma_output = run(["rdma", "-j", "link", "show"])
+try:
+    raw_links = json.loads(rdma_output) if rdma_code == 0 else []
+except Exception:
+    raw_links = []
+devices = []
+addresses = {}
+interfaces = {}
+for item in raw_links if isinstance(raw_links, list) else []:
+    if not isinstance(item, dict):
+        continue
+    device = str(item.get("ifname") or item.get("dev") or "").split("/", 1)[0]
+    interface = str(item.get("netdev") or item.get("netdev_name") or "")
+    if not device or not interface:
+        continue
+    devices.append(device)
+    interfaces[device] = interface
+    code, output = run(["ip", "-j", "address", "show", "dev", interface])
+    try:
+        rows = json.loads(output) if code == 0 else []
+    except Exception:
+        rows = []
+    for row in rows if isinstance(rows, list) else []:
+        for address in row.get("addr_info", []) if isinstance(row, dict) else []:
+            value = str(address.get("local") or "") if isinstance(address, dict) else ""
+            if value and address.get("scope") in (None, "global", "link"):
+                addresses[device] = value
+                break
+        if device in addresses:
+            break
+physical = memory_bytes()
+system = platform.system().lower() or "unknown"
+accelerator = "cuda" if cuda else "metal" if system == "darwin" else "cpu"
+payload = {
+    "protocol_version": None,
+    "node": {
+        "hostname": socket.gethostname(),
+        "platform": platform.platform(),
+        "chip_name": chip,
+        "physical_memory_bytes": physical,
+        "recommended_working_set_bytes": int(physical * 0.90),
+        "admission_ceiling_bytes": 0,
+        "accelerator": accelerator,
+        "accelerator_vendor": "nvidia" if cuda else "apple" if system == "darwin" else "unknown",
+        "memory_kind": "unified" if accelerator in ("metal", "cuda") and platform.machine().lower() in ("arm64", "aarch64") else "system",
+        "distributed_backends": [],
+        "fabric_kind": "connectx-7" if cuda and addresses else None,
+        "fabric_group_id": None,
+        "fabric_verified": False,
+        "worker_runtime_ready": False,
+    },
+    "runtime": {
+        "omlx_version": "",
+        "mlx_version": "",
+        "mlx_lm_version": "",
+        "python_version": platform.python_version(),
+        "python_executable": sys.executable,
+        "macos_version": platform.mac_ver()[0] or "unknown",
+        "os_name": system,
+        "os_version": platform.release() or "unknown",
+    },
+    "transport": {
+        "state": "enabled_no_peer" if devices else "unavailable",
+        "rdma": {
+            "control_status": "enabled" if devices else "unavailable",
+            "enabled": bool(devices),
+            "devices": devices,
+            "addresses": addresses,
+            "network_interfaces": interfaces,
+        },
+        "thunderbolt": {"ports": [], "peer_connected": False},
+        "route": None,
+    },
+    "warnings": ["oMLX worker runtime is not installed on this node."],
+}
+print(json.dumps(payload, sort_keys=True))
+"""
+
+
+def probe_remote_system_host(
+    ssh_target: str,
+    *,
+    preferred_python: str = sys.executable,
+    timeout: float = 15.0,
+    runner: SSHRunner = subprocess.run,
+) -> dict[str, Any]:
+    """Inventory an SSH host before the oMLX worker runtime is installed."""
+
+    python_executable = discover_remote_system_python(
+        ssh_target,
+        preferred=preferred_python,
+        timeout=min(timeout, 8.0),
+        runner=runner,
+    )
+    completed = _run_cluster_ssh(
+        ssh_target,
+        shlex.join([python_executable, "-c", _REMOTE_SYSTEM_PROBE]),
+        timeout=timeout,
+        runner=runner,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise DistributedLaunchError(
+            f"hardware discovery failed for {ssh_target}"
+            + (f": {detail[:500]}" if detail else "")
+        )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise DistributedLaunchError(
+            f"{ssh_target} did not return hardware discovery JSON"
+        ) from exc
+    if not isinstance(payload, dict) or not all(
+        isinstance(payload.get(key), dict) for key in ("node", "runtime", "transport")
+    ):
+        raise DistributedLaunchError(
+            f"{ssh_target} returned incomplete hardware discovery"
+        )
+    return {
+        "ok": False,
+        "ssh": validate_ssh_target(ssh_target),
+        "ssh_reachable": True,
+        "status": payload,
+        "runtime_compatible": False,
+        "runtime_mismatches": ["oMLX worker runtime is not installed"],
+        "bootstrap_required": True,
+    }
+
+
 def probe_remote_admission_ceiling(
     ssh_target: str,
     *,
@@ -555,6 +1056,7 @@ def probe_remote_host(
     """Read peer capability through host-key-verified, non-interactive SSH."""
 
     python_executable = _validate_python_executable(python_executable)
+    effective_python = python_executable
     if timeout <= 0:
         raise ValueError("SSH probe timeout must be positive")
     command = [
@@ -574,11 +1076,58 @@ def probe_remote_host(
         runner=runner,
     )
     if completed.returncode != 0:
+        try:
+            discovered = discover_remote_python_executable(
+                ssh_target,
+                preferred=python_executable,
+                timeout=min(timeout, 8.0),
+                runner=runner,
+            )
+        except DistributedLaunchError:
+            return probe_remote_system_host(
+                ssh_target,
+                preferred_python=python_executable,
+                timeout=min(timeout, 15.0),
+                runner=runner,
+            )
+        if discovered != python_executable:
+            effective_python = discovered
+            command[0] = discovered
+            completed = _run_cluster_ssh(
+                ssh_target,
+                shlex.join(command),
+                timeout=timeout,
+                runner=runner,
+            )
+    if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
-        suffix = f": {detail[:500]}" if detail else ""
-        raise DistributedLaunchError(
-            f"peer capability probe failed for {ssh_target}{suffix}"
-        )
+        # An older packaged oMLX can import successfully while lacking the
+        # cluster CLI/protocol entirely.  Keep that SSH-reachable hardware in
+        # the GUI, but fail it closed for launches until its worker runtime is
+        # upgraded.  A raw inventory is also more useful than presenting this
+        # as a connection failure.
+        try:
+            fallback = probe_remote_system_host(
+                ssh_target,
+                preferred_python=python_executable,
+                timeout=min(timeout, 15.0),
+                runner=runner,
+            )
+        except DistributedLaunchError as fallback_exc:
+            suffix = f": {detail[:500]}" if detail else ""
+            raise DistributedLaunchError(
+                f"peer capability probe failed for {ssh_target}{suffix}"
+            ) from fallback_exc
+        mismatch = "installed oMLX worker does not support the cluster protocol"
+        fallback["runtime_mismatches"] = [mismatch]
+        status = fallback.get("status")
+        if isinstance(status, dict):
+            warnings = status.get("warnings")
+            if isinstance(warnings, list):
+                status["warnings"] = [
+                    "Update the installed oMLX worker to enable cluster execution."
+                ]
+        return fallback
     try:
         payload = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
@@ -598,6 +1147,10 @@ def probe_remote_host(
     transport = payload.get("transport")
     if not all(isinstance(value, dict) for value in (runtime, node, transport)):
         raise DistributedLaunchError(f"{ssh_target} returned incomplete cluster status")
+    # A packaged-app launcher may intentionally report its underlying CPython
+    # binary.  Reusing that binary directly loses the launcher's PYTHONPATH;
+    # carry forward the exact executable that passed this probe instead.
+    runtime["python_executable"] = effective_python
     expected = _local_runtime_versions()
     remote_versions = {
         "omlx": runtime.get("omlx_version"),
@@ -636,8 +1189,20 @@ def preflight_remote_hosts(
         "from omlx.cluster.memory_guard import ceiling_breakdown\n"
         "from omlx.cluster.models import CLUSTER_PROTOCOL_VERSION as p\n"
         "from omlx.cluster.staging import validate_staged_model as validate\n"
+        "from omlx._torch_stub import install as install_torch_stub\n"
+        "install_torch_stub()\n"
+        "import mlx_lm.server\n"
+        "import omlx.adapter.output_parser\n"
+        "def package_version(name):\n"
+        "    try:\n"
+        "        return m.version(name)\n"
+        "    except m.PackageNotFoundError:\n"
+        "        if name == 'omlx':\n"
+        "            from omlx._version import __version__\n"
+        "            return __version__\n"
+        "        return 'unknown'\n"
         "x=pathlib.Path(sys.argv[1]).expanduser()\n"
-        "v={n:m.version(n) for n in ('omlx','mlx','mlx-lm')}\n"
+        "v={n:package_version(n) for n in ('omlx','mlx','mlx-lm')}\n"
         "v['cluster-protocol']=p\n"
         "v['admission-ceiling-bytes']=int("
         "ceiling_breakdown(sys.argv[4]).get('hard_limit',0))\n"
@@ -700,9 +1265,10 @@ def preflight_remote_hosts(
                 }
             )
             continue
+        remote_python = host.python_executable or python_executable
         remote_command = shlex.join(
             [
-                python_executable,
+                remote_python,
                 "-c",
                 script,
                 deployment.model,

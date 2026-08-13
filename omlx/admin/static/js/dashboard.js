@@ -100,7 +100,7 @@
                 server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
-                scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context' },
+                scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false },
                 sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
@@ -299,6 +299,7 @@
             clusterPlanLayerCount: 80,
             clusterPlanModelPath: '',
             clusterPlanModelSource: '127.0.0.1',
+            clusterPlanModelSourcePython: '',
             clusterTargetContextTokens: 8192,
             // Automatic follows the highest context the current model, split,
             // and per-Mac memory allowances can safely serve. Manual keeps a
@@ -353,11 +354,11 @@
                   summary: 'Pick the best split for this model and link',
                   detail: 'Uses tensor parallelism when the model can be split evenly and the link is fast enough, otherwise falls back to pipeline stages.' },
                 { key: 'tensor', label: 'Tensor — faster responses',
-                  summary: 'Both Macs work on every token',
-                  detail: 'Splits every layer across your Macs so both compute each token together. Measured 1.78× on a 27B across two Macs over Thunderbolt RDMA. Needs a fast link and a model whose attention heads divide evenly.' },
+                  summary: 'Every accelerator works on every token',
+                  detail: 'Splits every layer across the selected accelerators so they compute each token together. Needs a verified fast link and a model whose attention heads divide evenly.' },
                 { key: 'pipeline', label: 'Pipeline — bigger models',
-                  summary: 'Each Mac holds different layers',
-                  detail: 'Gives each Mac a slice of the layers, so a model too large for one Mac fits across several. Works on any link and any model, but a single response is no quicker than one Mac.' },
+                  summary: 'Each accelerator holds different layers',
+                  detail: 'Gives each accelerator a slice of the layers, so a model too large for one device fits across several. Works on slower links when the model supports pipeline execution.' },
             ],
             clusterPlanNodes: [
                 { key: 1, node_id: 'this-mac', capacity_gib: 128, reserve_gib: 8, role: 'workstation' },
@@ -400,6 +401,9 @@
             clusterFabric: null,
             clusterFabricLoading: false,
             clusterFabricError: '',
+            clusterCudaFabricVerificationLoading: '',
+            clusterCudaFabricVerificationError: '',
+            clusterCudaFabricVerifications: {},
             clusterKeychainStoring: false,
             clusterExecutionProfile: 'balanced',
             clusterAutoTune: true,
@@ -424,6 +428,14 @@
             clusterPairingTokenLoading: false,
             clusterPairingSecret: '',
             clusterPairingSecretCopied: false,
+            clusterJoinControllerIp: '',
+            clusterJoinCommand: '',
+            clusterJoinId: '',
+            clusterJoinExpiresAt: 0,
+            clusterJoinKeys: [],
+            clusterJoinedNodes: [],
+            clusterJoinLoading: false,
+            clusterJoinError: '',
             clusterSshKey: null,
             clusterSshKeyLoading: false,
             clusterSshKeyGenerating: false,
@@ -892,6 +904,7 @@
                     await Promise.all([
                         this.clusterStatus ? Promise.resolve() : this.loadClusterStatus(),
                         this.loadClusterDeployments(),
+                        this.loadClusterJoinStatus(),
                         this.clusterDiscoveredPeers === null
                             ? this.discoverClusterPeers()
                             : Promise.resolve(),
@@ -1032,6 +1045,225 @@
                     behavior: 'smooth',
                     block: 'center',
                 });
+            },
+
+            clusterJoinSuggestedIp() {
+                const explicit = String(this.clusterJoinControllerIp || '').trim();
+                if (explicit) return explicit;
+                const detected = String(this.clusterLocalIp || '').trim();
+                if (detected) return detected;
+                const browserHost = String(window.location.hostname || '').trim();
+                if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(browserHost)
+                    && !browserHost.startsWith('127.')) {
+                    return browserHost;
+                }
+                return '';
+            },
+
+            clusterJoinLanWarning() {
+                const host = String(window.location.hostname || '').toLowerCase();
+                if (!['localhost', '127.0.0.1', '::1'].includes(host)) return '';
+                return 'This dashboard is open through localhost. Enter the Studio LAN IP, '
+                    + 'and make sure Server host is set to 0.0.0.0 in Settings before running '
+                    + 'the command on a CUDA box.';
+            },
+
+            clusterJoinCommandState() {
+                if (!this.clusterJoinId) return null;
+                return (this.clusterJoinKeys || []).find(
+                    item => item.join_id === this.clusterJoinId
+                ) || null;
+            },
+
+            clusterJoinCommandUsable() {
+                const state = this.clusterJoinCommandState();
+                return Boolean(
+                    this.clusterJoinCommand
+                    && state?.status === 'pending'
+                    && Number(state.expires_at || this.clusterJoinExpiresAt) * 1000 > Date.now()
+                );
+            },
+
+            clusterJoinCommandStatusLabel() {
+                if (!this.clusterJoinCommand) return '';
+                const state = this.clusterJoinCommandState();
+                if (state?.status === 'used') return 'Used · worker is finishing setup';
+                const remaining = Math.ceil(
+                    (Number(state?.expires_at || this.clusterJoinExpiresAt) * 1000 - Date.now())
+                    / 60000
+                );
+                if (!state || remaining <= 0) return 'Expired · generate a new command';
+                return `Single use · expires in ${remaining} min`;
+            },
+
+            clusterJoinedAtLabel(node) {
+                const timestamp = Number(node?.joined_at || 0) * 1000;
+                if (!timestamp) return 'Joined';
+                return `Joined ${new Date(timestamp).toLocaleString()}`;
+            },
+
+            async loadClusterJoinStatus() {
+                try {
+                    const response = await fetch('/admin/api/cluster/join-status', {
+                        cache: 'no-store',
+                    });
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) {
+                        throw new Error(await this.clusterResponseError(
+                            response,
+                            'Could not read CUDA worker enrollment status',
+                        ));
+                    }
+                    const result = await response.json();
+                    const previousIds = new Set(
+                        (this.clusterJoinedNodes || []).map(node => node.node_id)
+                    );
+                    const nodes = Array.isArray(result.nodes) ? result.nodes : [];
+                    const discovered = new Map(
+                        (this.clusterDiscoveredPeers || []).map(peer => [peer.ssh, peer])
+                    );
+                    const selected = new Map(
+                        (this.clusterSelectedPeers || []).map(peer => [peer.ssh, peer])
+                    );
+                    nodes.forEach(node => {
+                        const peer = {
+                            ...discovered.get(node.ssh),
+                            ssh: node.ssh,
+                            name: node.hostname || node.node_id,
+                            service: 'oMLX CUDA Worker',
+                            transport: 'detecting',
+                            accelerator: 'cuda',
+                            accelerator_vendor: 'nvidia',
+                            python_executable: node.python_executable || '',
+                            addresses: node.addresses || [],
+                            enrolled: true,
+                            cached: false,
+                        };
+                        discovered.set(peer.ssh, peer);
+                        // A newly completed GUI enrollment joins the active pool
+                        // once. Manual de-selection later in this browser session
+                        // is respected and polling will not add it back.
+                        if (!previousIds.has(node.node_id) && !selected.has(peer.ssh)) {
+                            selected.set(peer.ssh, peer);
+                        }
+                    });
+                    this.clusterJoinKeys = Array.isArray(result.join_keys)
+                        ? result.join_keys
+                        : [];
+                    this.clusterJoinedNodes = nodes;
+                    this.clusterDiscoveredPeers = [...discovered.values()];
+                    this.clusterSelectedPeers = [...selected.values()];
+                    if (!this.clusterPeerSsh && this.clusterSelectedPeers.length) {
+                        this.clusterPeerSsh = this.clusterSelectedPeers[0].ssh;
+                    }
+                    if (nodes.some(node => !previousIds.has(node.node_id))) {
+                        this._clusterKnownNodesNeedsSync = true;
+                        this.saveClusterKnownNodes();
+                    }
+                    this.clusterJoinError = result.load_error || '';
+                } catch (error) {
+                    this.clusterJoinError = error?.message
+                        || 'Could not read CUDA worker enrollment status';
+                }
+            },
+
+            async revokeClusterJoinCommand() {
+                const joinId = String(this.clusterJoinId || '').trim();
+                if (!joinId) return true;
+                try {
+                    const response = await fetch(
+                        `/admin/api/cluster/join-keys/${encodeURIComponent(joinId)}`,
+                        { method: 'DELETE' },
+                    );
+                    if (!response.ok && response.status !== 404) {
+                        throw new Error(await this.clusterResponseError(
+                            response,
+                            'Could not revoke the join command',
+                        ));
+                    }
+                } catch (error) {
+                    this.clusterJoinError = error?.message
+                        || 'Could not revoke the join command';
+                    return false;
+                }
+                this.clusterJoinCommand = '';
+                this.clusterJoinId = '';
+                this.clusterJoinExpiresAt = 0;
+                await this.loadClusterJoinStatus();
+                return true;
+            },
+
+            async generateClusterCudaJoinCommand() {
+                if (this.clusterJoinLoading) return;
+                const controllerIp = this.clusterJoinSuggestedIp();
+                if (!controllerIp) {
+                    this.clusterJoinError = 'Enter the Studio LAN IPv4 address first.';
+                    return;
+                }
+                this.clusterJoinControllerIp = controllerIp;
+                this.clusterJoinLoading = true;
+                this.clusterJoinError = '';
+                if (
+                    this.clusterJoinId
+                    && this.clusterJoinCommandState()?.status === 'pending'
+                ) {
+                    const revoked = await this.revokeClusterJoinCommand();
+                    if (!revoked) {
+                        this.clusterJoinLoading = false;
+                        return;
+                    }
+                } else {
+                    // A claimed command owns a live installation session. Do
+                    // not revoke it merely because the user is enrolling the
+                    // second CUDA box.
+                    this.clusterJoinCommand = '';
+                    this.clusterJoinId = '';
+                    this.clusterJoinExpiresAt = 0;
+                }
+                try {
+                    const secure = window.location.protocol === 'https:';
+                    const port = Number(window.location.port)
+                        || (secure ? 443 : 80);
+                    const response = await fetch('/admin/api/cluster/join-keys', {
+                        method: 'POST',
+                        cache: 'no-store',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            controller_ip: controllerIp,
+                            controller_port: port,
+                            scheme: secure ? 'https' : 'http',
+                            ttl_seconds: 600,
+                        }),
+                    });
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) {
+                        throw new Error(await this.clusterResponseError(
+                            response,
+                            'Could not generate the CUDA join command',
+                        ));
+                    }
+                    const result = await response.json();
+                    this.clusterJoinCommand = result.command || '';
+                    this.clusterJoinId = result.join_id || '';
+                    this.clusterJoinExpiresAt = Number(result.expires_at || 0);
+                    this.clusterJoinKeys = [
+                        ...(this.clusterJoinKeys || []).filter(
+                            item => item.join_id !== result.join_id
+                        ),
+                        result,
+                    ];
+                } catch (error) {
+                    this.clusterJoinError = error?.message
+                        || 'Could not generate the CUDA join command';
+                } finally {
+                    this.clusterJoinLoading = false;
+                }
             },
 
             async loadClusterStatus() {
@@ -1227,7 +1459,10 @@
                 if (this._clusterDiscoveryRefreshCounter < 5) return;
                 this._clusterDiscoveryRefreshCounter = 0;
                 this.loadClusterPeerHealth();
-                await this.discoverClusterPeers();
+                await Promise.all([
+                    this.discoverClusterPeers(),
+                    this.loadClusterJoinStatus(),
+                ]);
                 await this.initializeClusterSetup();
             },
 
@@ -1347,7 +1582,7 @@
                 if (this.clusterPeerProbeLoading) return;
                 const ssh = this.clusterPeerSsh.trim();
                 if (!ssh) {
-                    this.clusterError = 'Enter the peer Mac SSH name first';
+                    this.clusterError = 'Enter the worker SSH name first';
                     return;
                 }
                 this.clusterPeerProbeLoading = true;
@@ -1383,6 +1618,12 @@
                     this.saveClusterKnownNodes();
                     const status = result.status || {};
                     const node = status.node || {};
+                    if (result.bootstrap_required) {
+                        this.clusterConnectionError =
+                            `${node.hostname || ssh} is online, but its oMLX `
+                            + 'worker runtime is not installed yet.';
+                        this.explainClusterError(this.clusterConnectionError);
+                    }
                     if (this.clusterPlanNodes[1]) {
                         this.clusterPlanNodes[1].ssh = ssh;
                         this.clusterPlanNodes[1].node_id = node.hostname || this.clusterPlanNodes[1].node_id;
@@ -1422,7 +1663,13 @@
                 }
                 await Promise.all(peers.map(async peer => {
                     const ssh = String(peer?.ssh || '').trim();
-                    if (!ssh || probes[ssh]?.status?.node) return;
+                    // Browser-cached hardware is a display hint only. It
+                    // intentionally omits runtime paths and must not suppress
+                    // the live probe needed to launch a heterogeneous host.
+                    if (
+                        !ssh
+                        || (probes[ssh]?.status?.node && !probes[ssh]?.cached)
+                    ) return;
                     try {
                         const request = { ssh };
                         if (this.clusterLocalIp.trim()) {
@@ -1521,6 +1768,18 @@
                         : Number(local.capacity_bytes || 0),
                     reserve_gib: Number(local.reserve_gib || 0),
                     role: 'workstation',
+                    accelerator: this.clusterStatus?.node?.accelerator || 'metal',
+                    accelerator_vendor:
+                        this.clusterStatus?.node?.accelerator_vendor || 'apple',
+                    memory_kind: this.clusterStatus?.node?.memory_kind || 'unified',
+                    fabric_kind: this.clusterStatus?.node?.fabric_kind || '',
+                    fabric_group_id:
+                        this.clusterStatus?.node?.fabric_group_id || '',
+                    fabric_verified: Boolean(
+                        this.clusterStatus?.node?.fabric_verified
+                    ),
+                    python_executable:
+                        this.clusterStatus?.runtime?.python_executable || '',
                 }];
                 this.clusterWorkerPeers().forEach((peer, index) => {
                     const nodeId = this.clusterFriendlyMacName(
@@ -1535,6 +1794,7 @@
                                 : {}
                         );
                     const hardware = this.clusterPeerProbes?.[peer.ssh]?.status?.node || {};
+                    const peerRuntime = this.clusterPeerProbes?.[peer.ssh]?.status?.runtime || {};
                     const exactCapacityBytes = Number(
                         hardware.admission_ceiling_bytes
                         || peer.admission_ceiling_bytes
@@ -1562,8 +1822,41 @@
                             ? Number(previous.reserve_gib || 0)
                             : 0,
                         role: 'headless',
+                        accelerator: hardware.accelerator
+                            || peer.accelerator
+                            || 'metal',
+                        accelerator_vendor: hardware.accelerator_vendor
+                            || peer.accelerator_vendor
+                            || 'apple',
+                        memory_kind: hardware.memory_kind
+                            || peer.memory_kind
+                            || 'unified',
+                        fabric_kind: hardware.fabric_kind
+                            || peer.fabric_kind
+                            || '',
+                        fabric_group_id: hardware.fabric_group_id
+                            || peer.fabric_group_id
+                            || '',
+                        fabric_verified: Boolean(
+                            hardware.fabric_verified || peer.fabric_verified
+                        ),
+                        python_executable: peerRuntime.python_executable
+                            || peer.python_executable
+                            || previous.python_executable
+                            || '',
                     });
                 });
+                const connectxCandidates = nodes.filter(node => (
+                    node.accelerator === 'cuda'
+                    && node.fabric_kind === 'connectx-7'
+                    && !node.fabric_group_id
+                ));
+                if (connectxCandidates.length === 2) {
+                    connectxCandidates.forEach(node => {
+                        node.fabric_group_id = 'connectx-7-auto-pair';
+                        node.fabric_verified = false;
+                    });
+                }
                 this.clusterPlanNodes = nodes;
                 this._clusterNodeKey = Math.max(
                     this._clusterNodeKey,
@@ -1623,6 +1916,12 @@
                     await this.loadClusterTransports();
                 }
                 await this.loadClusterPeerHardware();
+                // The first synchronization can run before SSH answers. Apply
+                // the now-live accelerator identity, ConnectX membership, and
+                // per-host Python paths before memory/model API requests.
+                if (this.clusterWorkerPeers().length) {
+                    this.syncClusterNodesFromPeers();
+                }
                 // A remembered peer skips the selection branch above on page
                 // reload. Its budgets still need to be measured: keeping the
                 // old 8 GiB form defaults here made the workstation look as if
@@ -1952,7 +2251,7 @@
                 if (!this.clusterJoinTokenId) return;
                 try {
                     const query = new URLSearchParams({ token_id: this.clusterJoinTokenId });
-                    const response = await fetch(`/admin/api/cluster/join-status?${query}`);
+                    const response = await fetch(`/admin/api/cluster/join-token-status?${query}`);
                     if (!response.ok) return;
                     const result = await response.json();
                     this.clusterEnrolledPeers = result.enrolled || [];
@@ -2229,7 +2528,7 @@
                         );
                         this.clusterActivationProgress = total
                             ? `Copying model files · ${complete} of ${total}`
-                            : 'Checking model files on each Mac…';
+                            : 'Checking model files on each worker…';
                         await new Promise(resolve => setTimeout(resolve, 500));
                         const status = await fetch(
                             `/admin/api/cluster/stage/${encodeURIComponent(job.job_id)}`
@@ -2594,15 +2893,33 @@
 
             clusterModelInventoryHosts() {
                 const localName = this.clusterStatus?.node?.hostname || 'This Mac';
+                const plannedBySsh = new Map(
+                    (this.clusterPlanNodes || [])
+                        .filter(node => String(node?.ssh || '').trim())
+                        .map(node => [String(node.ssh).trim(), node])
+                );
                 return [
-                    { node_id: localName, ssh: '127.0.0.1' },
-                    ...this.clusterWorkerPeers().map((peer, index) => ({
-                        node_id: this.clusterFriendlyMacName(
+                    {
+                        node_id: localName,
+                        ssh: '127.0.0.1',
+                        python_executable:
+                            this.clusterStatus?.runtime?.python_executable || undefined,
+                    },
+                    ...this.clusterWorkerPeers().map((peer, index) => {
+                        const planned = plannedBySsh.get(peer.ssh) || {};
+                        const runtime = this.clusterPeerProbes?.[peer.ssh]
+                            ?.status?.runtime || {};
+                        return {
+                            node_id: this.clusterFriendlyMacName(
                             peer.name || peer.ssh,
                             `Worker ${index + 1}`,
                         ),
                         ssh: peer.ssh,
-                    })),
+                            python_executable: planned.python_executable
+                                || runtime.python_executable
+                                || undefined,
+                        };
+                    }),
                 ];
             },
 
@@ -2744,7 +3061,7 @@
                 }
                 const recommended = this.clusterRecommendedModels().length;
                 if (!recommended) return index === 0 ? 'All models' : '';
-                if (index === 0) return 'Recommended for these Macs';
+                if (index === 0) return 'Recommended for this pool';
                 if (index === recommended) return 'All other models';
                 return '';
             },
@@ -2969,7 +3286,7 @@
                         const usedBytes = weightBytes + kvBytes;
                         return {
                             ...assignment,
-                            hardwareLabel: this.clusterMacHardwareLabel(
+                            hardwareLabel: this.clusterNodeHardwareLabel(
                                 quickNodes[Number(assignment.rank)] || {
                                     name: assignment.node_id,
                                 }
@@ -3029,9 +3346,9 @@
                 const recommendedIndex = recommended.findIndex(
                     item => item.model_path === model?.model_path
                 );
-                if (recommendedIndex === 0) return 'Best for these Macs';
+                if (recommendedIndex === 0) return 'Best for this pool';
                 if (fit?.nodes_required > 1) {
-                    return `Uses ${fit.nodes_required} Macs`;
+                    return `Uses ${fit.nodes_required} devices`;
                 }
                 if (model?.is_favorite) return 'Favourite';
                 if (model?.loaded) return 'Loaded';
@@ -3061,10 +3378,10 @@
                 const fit = this.clusterCatalogueFit(model.model_path);
                 if (fit?.fits === false) return this.clusterModelFailureLabel(fit);
                 if (fit?.nodes_required > 1) {
-                    return `Uses ${fit.nodes_required} Macs`;
+                    return `Uses ${fit.nodes_required} devices`;
                 }
                 if (this.clusterRecommendedModels()[0]?.model_path === model.model_path) {
-                    return 'Best for these Macs';
+                    return 'Best for this pool';
                 }
                 if (fit?.fits) return 'Fits easily';
                 return '';
@@ -3080,6 +3397,20 @@
                 ) || candidates.find(model => model.model_path === path) || null;
             },
 
+            clusterPythonExecutableForSsh(ssh) {
+                const target = String(ssh || '').trim();
+                if (!target) return '';
+                if (['127.0.0.1', 'localhost', '::1', 'local'].includes(target)) {
+                    return this.clusterStatus?.runtime?.python_executable || '';
+                }
+                const planned = (this.clusterPlanNodes || []).find(
+                    node => String(node?.ssh || '').trim() === target
+                );
+                if (planned?.python_executable) return planned.python_executable;
+                return this.clusterPeerProbes?.[target]?.status?.runtime
+                    ?.python_executable || '';
+            },
+
             selectClusterModel(
                 model,
                 requestedContext = null,
@@ -3090,6 +3421,12 @@
                 this.clusterPlanModelPath = model.model_path;
                 this.clusterPlanModelSource =
                     model.model_source || '127.0.0.1';
+                this.clusterPlanModelSourcePython =
+                    model.model_source_python
+                    || model.python_executable
+                    || this.clusterPythonExecutableForSsh(
+                        this.clusterPlanModelSource
+                    );
                 const fit = this.clusterCatalogueFit(model.model_path);
                 if (fit?.fits === true) {
                     const tensorSize = Number(fit.tensor_parallel_size || 1);
@@ -3142,6 +3479,8 @@
                         JSON.stringify({
                             model_path: model.model_path,
                             model_source: this.clusterPlanModelSource,
+                            model_source_python:
+                                this.clusterPlanModelSourcePython || undefined,
                             target_context_tokens:
                                 this.clusterTargetContextTokens,
                             context_mode: this.clusterContextMode,
@@ -3199,7 +3538,7 @@
                     return {
                         key: 'stopping',
                         label: 'Stopping…',
-                        detail: 'The Macs are finishing their current work safely.',
+                        detail: 'The workers are finishing their current work safely.',
                         tone: 'blue',
                         busy: true,
                     };
@@ -3208,7 +3547,7 @@
                     return {
                         key: 'starting',
                         label: this.clusterActivationProgress || 'Preparing model…',
-                        detail: `oMLX is starting the model on ${this.clusterQuickNodes().length} Macs.`,
+                        detail: `oMLX is starting the model on ${this.clusterQuickNodes().length} devices.`,
                         tone: 'blue',
                         busy: true,
                     };
@@ -3217,7 +3556,7 @@
                     return {
                         key: 'preparing',
                         label: this.clusterLinkSetupLoading
-                            ? 'Connecting the Macs…'
+                            ? 'Connecting the workers…'
                             : 'Preparing the model…',
                         detail: 'Connection, memory, and model split checks are automatic.',
                         tone: 'blue',
@@ -3234,7 +3573,7 @@
                     if (liveJobs.length) {
                         return {
                             key: 'running',
-                            label: `Running on ${this.clusterQuickNodes().length} Macs`,
+                            label: `Running on ${this.clusterQuickNodes().length} devices`,
                             detail: `${name} is loaded and available through oMLX.`,
                             tone: 'green',
                             busy: false,
@@ -3260,8 +3599,8 @@
                 if (!this.clusterPeerSsh.trim()) {
                     return {
                         key: 'finding',
-                        label: 'Finding Macs…',
-                        detail: 'Keep every Mac awake and connected by Thunderbolt.',
+                        label: 'Finding workers…',
+                        detail: 'Keep every worker awake and connected to the cluster network.',
                         tone: 'blue',
                         busy: this.clusterDiscoveryLoading,
                     };
@@ -3273,7 +3612,7 @@
                     return {
                         key: 'checking',
                         label: 'Checking the connection…',
-                        detail: 'oMLX is confirming every Mac and the fastest shared links.',
+                        detail: 'oMLX is confirming every worker and the fastest shared links.',
                         tone: 'blue',
                         busy: true,
                     };
@@ -3282,7 +3621,7 @@
                     return {
                         key: 'choosing',
                         label: 'Choosing a model…',
-                        detail: 'oMLX is checking which downloaded models fit these Macs.',
+                        detail: 'oMLX is checking which downloaded models fit this accelerator pool.',
                         tone: 'blue',
                         busy: true,
                     };
@@ -3305,7 +3644,7 @@
                                 selectedFit.standalone_node_id
                             )} only`
                             : (selectedFit.failure_kind === 'cannot_split'
-                                ? 'Cannot combine Macs'
+                                ? 'Cannot combine these devices'
                                 : 'Choose another model'),
                         detail: selectedFit.reason
                             || 'The selected model cannot run with this cluster configuration.',
@@ -3316,7 +3655,7 @@
                 return {
                     key: 'ready',
                     label: 'Ready',
-                    detail: 'Every Mac and the selected model passed the setup checks.',
+                    detail: 'Every worker and the selected model passed the setup checks.',
                     tone: 'green',
                     busy: false,
                 };
@@ -3359,15 +3698,15 @@
                 if (this.clusterDeactivatingId) return 'Stopping the current deployment…';
                 if (this.clusterActivationLoading) return 'Activation is already running.';
                 const busy = [
-                    ['clusterAutoconfigureLoading', 'measuring the Macs'],
+                    ['clusterAutoconfigureLoading', 'measuring the workers'],
                     ['clusterLinkSetupLoading', 'setting up the link'],
-                    ['clusterPeerProbeLoading', 'probing the peer Mac'],
+                    ['clusterPeerProbeLoading', 'probing the worker'],
                     ['clusterFabricLoading', 'reading the fabric'],
                     ['clusterLinkStatusLoading', 'checking the link'],
                 ].find(([flag]) => this[flag]);
                 if (busy) return `Still ${busy[1]} — wait a moment, then try again.`;
                 if (this.clusterDiscoveryLoading && !this.clusterPeerSsh.trim()) {
-                    return 'Still discovering Macs on the network.';
+                    return 'Still discovering workers on the network.';
                 }
                 const selected = this.clusterSelectedModel();
                 const fit = selected
@@ -3382,9 +3721,9 @@
             clusterPrimaryActionLabel() {
                 if (this.clusterDeactivatingId) return 'Stopping…';
                 if (this.clusterActivationLoading) {
-                    return this.clusterActivationProgress || 'Starting on every Mac…';
+                    return this.clusterActivationProgress || 'Starting on every worker…';
                 }
-                if (this.clusterLinkSetupLoading) return 'Connecting the Macs…';
+                if (this.clusterLinkSetupLoading) return 'Connecting the workers…';
                 if (this.clusterAutoconfigureLoading) return 'Preparing the model…';
                 if (this.clusterPrimaryDeployment() && this.clusterLiveJobs().length) {
                     return 'Stop';
@@ -3392,8 +3731,8 @@
                 if (!this.clusterAllModels().length) return 'Get a model';
                 if (!this.clusterPeerSsh.trim()) {
                     return this.clusterDiscoveryLoading
-                        ? 'Finding Macs…'
-                        : 'Find my Macs';
+                        ? 'Finding workers…'
+                        : 'Find workers';
                 }
                 const model = this.clusterSelectedModel();
                 if (!model) return 'Choose a model';
@@ -3403,7 +3742,7 @@
                 if (this.clusterError || this.clusterAutoconfigureError) {
                     return `Retry ${this.clusterModelDisplayName(model)} setup`;
                 }
-                return `Start ${this.clusterModelDisplayName(model)} on ${this.clusterQuickNodes().length} Macs`;
+                return `Start ${this.clusterModelDisplayName(model)} on ${this.clusterQuickNodes().length} devices`;
             },
 
             async runClusterPrimaryAction() {
@@ -3452,7 +3791,17 @@
                 return value;
             },
 
-            clusterMacHardwareLabel(node) {
+            clusterNodeHardwareLabel(node) {
+                if (Number(node?.memberCount || 0) > 1) {
+                    const members = Number(node.memberCount);
+                    const memory = Number(node.physicalMemory || 0) / (1024 ** 3);
+                    const parts = [
+                        `${members}× ${node.accelerator === 'cuda' ? 'NVIDIA CUDA' : 'accelerator'} ${node.fabricVerified ? 'verified pair' : 'pair'}`,
+                    ];
+                    if (node.chip) parts.push(node.chip);
+                    if (memory > 0) parts.push(`${Math.round(memory)} GB pooled`);
+                    return parts.join(' · ');
+                }
                 const parts = [
                     this.clusterFriendlyMacName(node?.name || node?.ssh, 'Mac'),
                 ];
@@ -3471,6 +3820,26 @@
                 return parts.join(' · ');
             },
 
+            // Kept as a compatibility seam for extensions that used the old
+            // Mac-only helper. New UI code calls clusterNodeHardwareLabel.
+            clusterMacHardwareLabel(node) {
+                return this.clusterNodeHardwareLabel(node);
+            },
+
+            clusterNodeRankLabel(node) {
+                const ranks = Array.isArray(node?.ranks) && node.ranks.length
+                    ? node.ranks
+                    : [Number(node?.rank || 0)];
+                const rankLabel = ranks.length > 1
+                    ? `R${Math.min(...ranks)}–R${Math.max(...ranks)}`
+                    : `R${ranks[0]}`;
+                if (node?.local) return `Coordinator · ${rankLabel}`;
+                if (ranks.length > 1) {
+                    return `${node?.fabricVerified ? 'Verified CUDA pair' : 'CUDA pair'} · ${rankLabel}`;
+                }
+                return `Worker · ${rankLabel}`;
+            },
+
             clusterWorkerPeers() {
                 const selected = this.clusterSelectedPeers || [];
                 if (selected.length) return selected;
@@ -3483,6 +3852,15 @@
             },
 
             clusterQuickNodes() {
+                const localHardware = this.clusterStatus?.node || {};
+                const plannedBySsh = new Map(
+                    (this.clusterPlanNodes || [])
+                        .filter(node => String(node?.ssh || '').trim())
+                        .map(node => [String(node.ssh).trim(), node])
+                );
+                const localPlan = plannedBySsh.get('127.0.0.1')
+                    || this.clusterPlanNodes?.[0]
+                    || {};
                 const local = {
                     rank: 0,
                     name: this.clusterFriendlyMacName(
@@ -3500,9 +3878,18 @@
                     physicalMemory: Number(
                         this.clusterStatus?.node?.physical_memory_bytes || 0
                     ),
+                    accelerator: localHardware.accelerator || 'metal',
+                    acceleratorVendor: localHardware.accelerator_vendor || 'apple',
+                    memoryKind: localHardware.memory_kind || 'unified',
+                    fabricKind: localPlan.fabric_kind || localHardware.fabric_kind || '',
+                    fabricGroup: localPlan.fabric_group_id || localHardware.fabric_group_id || '',
+                    fabricVerified: Boolean(
+                        localPlan.fabric_verified || localHardware.fabric_verified
+                    ),
                 };
-                return [local, ...this.clusterWorkerPeers().map((peer, index) => {
+                const nodes = [local, ...this.clusterWorkerPeers().map((peer, index) => {
                     const ssh = String(peer?.ssh || '').trim();
+                    const planned = plannedBySsh.get(ssh) || {};
                     const probe = this.clusterPeerProbes?.[ssh]
                         || (index === 0 ? this.clusterPeerProbe : null);
                     const hardware = probe?.status?.node || {};
@@ -3518,6 +3905,7 @@
                         connected: Boolean(
                             peer.rdma_available
                             || (peer.transport && peer.transport !== 'detecting')
+                            || probe?.ssh_reachable
                             || compatible
                         ),
                         online: (
@@ -3527,6 +3915,7 @@
                         ) ?? Boolean(
                             peer.rdma_available
                             || (peer.transport && peer.transport !== 'detecting')
+                            || probe?.ssh_reachable
                             || compatible
                         ),
                         chip: hardware.chip_name || peer.chip_name || '',
@@ -3540,10 +3929,216 @@
                             || peer.physical_memory_bytes
                             || 0
                         ),
+                        accelerator: hardware.accelerator
+                            || peer.accelerator
+                            || 'metal',
+                        acceleratorVendor: hardware.accelerator_vendor
+                            || peer.accelerator_vendor
+                            || 'apple',
+                        memoryKind: hardware.memory_kind
+                            || peer.memory_kind
+                            || 'unified',
+                        fabricKind: planned.fabric_kind
+                            || hardware.fabric_kind
+                            || peer.fabric_kind
+                            || '',
+                        fabricGroup: planned.fabric_group_id
+                            || hardware.fabric_group_id
+                            || peer.fabric_group_id
+                            || '',
+                        fabricVerified: Boolean(
+                            planned.fabric_verified
+                            || hardware.fabric_verified
+                            || peer.fabric_verified
+                        ),
                         transport: peer.transport,
                         link_speed_gbps: peer.link_speed_gbps,
                     };
                 })];
+                // Two ConnectX-capable workers with no explicit name are the
+                // common dual-Spark topology. Show them as one candidate pair,
+                // but keep fabricVerified false until the direct-link probe
+                // passes. Larger fabrics require an explicit group ID so
+                // unrelated CUDA nodes are never silently collapsed together.
+                const implicitConnectx = nodes.filter(node => (
+                    node.accelerator === 'cuda'
+                    && node.fabricKind === 'connectx-7'
+                    && !node.fabricGroup
+                ));
+                if (implicitConnectx.length === 2) {
+                    implicitConnectx.forEach(node => {
+                        node.fabricGroup = 'connectx-7-auto-pair';
+                    });
+                }
+                return nodes;
+            },
+
+            clusterLogicalNodes() {
+                const logical = [];
+                const groups = new Map();
+                const physical = this.clusterQuickNodes();
+                const candidateGroups = new Map();
+                physical.forEach(node => {
+                    if (!node.fabricGroup) return;
+                    const members = candidateGroups.get(node.fabricGroup) || [];
+                    members.push(node);
+                    candidateGroups.set(node.fabricGroup, members);
+                });
+                const eligibleGroups = new Set(
+                    [...candidateGroups.entries()]
+                        .filter(([, members]) => (
+                            members.length >= 2
+                            && members.every(item => item.accelerator === 'cuda')
+                        ))
+                        .map(([group]) => group)
+                );
+                physical.forEach(node => {
+                    if (!node.fabricGroup || !eligibleGroups.has(node.fabricGroup)) {
+                        logical.push({ ...node, ranks: [node.rank], memberCount: 1 });
+                        return;
+                    }
+                    let composite = groups.get(node.fabricGroup);
+                    if (!composite) {
+                        composite = {
+                            ...node,
+                            name: 'CUDA fabric pair',
+                            local: false,
+                            ranks: [],
+                            members: [],
+                            memberCount: 0,
+                            memory: 0,
+                            physicalMemory: 0,
+                        };
+                        groups.set(node.fabricGroup, composite);
+                        logical.push(composite);
+                    }
+                    composite.ranks.push(node.rank);
+                    composite.members.push(node);
+                    composite.memberCount += 1;
+                    composite.memory += Number(node.memory || 0);
+                    composite.physicalMemory += Number(node.physicalMemory || 0);
+                    composite.connected = composite.members.every(item => item.connected);
+                    composite.online = composite.members.every(item => item.online);
+                    composite.fabricVerified = composite.members.every(
+                        item => item.fabricVerified
+                    );
+                    composite.chip = composite.members
+                        .map(item => String(item.chip || '').replace(/^NVIDIA\s+/i, ''))
+                        .filter(Boolean)
+                        .filter((value, index, values) => values.indexOf(value) === index)
+                        .join(' + ');
+                    const verification = (this.clusterCudaFabricVerifications || {})[
+                        this.clusterCudaFabricVerificationKey(composite)
+                    ];
+                    if (verification?.verified) {
+                        composite.fabricVerified = true;
+                        composite.fabricVerification = verification;
+                        composite.name = 'Verified CUDA pair';
+                    }
+                });
+                return logical;
+            },
+
+            clusterCudaFabricVerificationKey(node) {
+                return (node?.members || [])
+                    .map(member => String(member?.ssh || '').trim())
+                    .filter(Boolean)
+                    .sort()
+                    .join('|');
+            },
+
+            clusterCanVerifyCudaSupernode(node) {
+                return Boolean(
+                    Number(node?.memberCount || 0) === 2
+                    && node?.accelerator === 'cuda'
+                    && (node.members || []).every(member => member.online)
+                    && !this.clusterActivationLoading
+                    && !this.clusterNeuralFabricJob()?.live
+                );
+            },
+
+            clusterCudaFabricRateLabel(node) {
+                const result = node?.fabricVerification
+                    || (this.clusterCudaFabricVerifications || {})[
+                        this.clusterCudaFabricVerificationKey(node)
+                    ];
+                const rate = Number(result?.payload_bytes_per_second || 0);
+                return rate > 0
+                    ? `${(rate / (1024 ** 3)).toFixed(1)} GiB/s NCCL`
+                    : '';
+            },
+
+            async verifyCudaSupernode(node) {
+                const key = this.clusterCudaFabricVerificationKey(node);
+                if (!key || this.clusterCudaFabricVerificationLoading) return false;
+                if (!this.clusterCanVerifyCudaSupernode(node)) {
+                    this.clusterCudaFabricVerificationError =
+                        'Both CUDA workers must be online before the direct link can be verified.';
+                    return false;
+                }
+                this.clusterCudaFabricVerificationLoading = key;
+                this.clusterCudaFabricVerificationError = '';
+                try {
+                    const response = await fetch('/admin/api/cluster/cuda-fabric/verify', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            hosts: node.members.map(member => ({
+                                node_id: member.name || member.ssh,
+                                ssh: member.ssh,
+                            })),
+                        }),
+                    });
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return false;
+                    }
+                    if (!response.ok) {
+                        throw new Error(
+                            await this.clusterResponseError(
+                                response,
+                                'ConnectX verification failed'
+                            )
+                        );
+                    }
+                    const result = await response.json();
+                    this.clusterCudaFabricVerifications = {
+                        ...this.clusterCudaFabricVerifications,
+                        [key]: result,
+                    };
+                    if (!result.verified) {
+                        this.clusterCudaFabricVerificationError = result.reason
+                            || 'NCCL ran, but the direct link was slower than expected.';
+                        return false;
+                    }
+                    const memberSsh = new Set(node.members.map(member => member.ssh));
+                    this.clusterPlanNodes.forEach(planNode => {
+                        if (!memberSsh.has(String(planNode.ssh || '').trim())) return;
+                        planNode.fabric_kind = 'connectx-7';
+                        planNode.fabric_group_id = result.group_id;
+                        planNode.fabric_verified = true;
+                    });
+                    this.invalidateClusterPlan();
+                    return true;
+                } catch (error) {
+                    this.clusterCudaFabricVerificationError = error?.message
+                        || 'ConnectX verification failed';
+                    return false;
+                } finally {
+                    this.clusterCudaFabricVerificationLoading = '';
+                }
+            },
+
+            async ensureCudaSupernodesVerified() {
+                const candidates = this.clusterLogicalNodes().filter(node => (
+                    node.memberCount === 2
+                    && node.accelerator === 'cuda'
+                    && !node.fabricVerified
+                ));
+                for (const node of candidates) {
+                    if (!await this.verifyCudaSupernode(node)) return false;
+                }
+                return true;
             },
 
             clusterNeuralFabricJob() {
@@ -3599,8 +4194,8 @@
                     inference: 'Ranks are processing a live request',
                     ready: 'Cluster ready for requests',
                     attention: 'Cluster needs attention',
-                    connected: 'Macs connected and standing by',
-                    discovering: 'Looking for another Mac',
+                    connected: 'Workers connected and standing by',
+                    discovering: 'Looking for another worker',
                 }[this.clusterNeuralFabricMode()] || 'Cluster standing by';
             },
 
@@ -3611,7 +4206,7 @@
             },
 
             clusterNeuralFabricNodes() {
-                const nodes = this.clusterQuickNodes();
+                const nodes = this.clusterLogicalNodes();
                 const job = this.clusterNeuralFabricJob();
                 const assignments = job?.assignments || [];
                 const ranks = job?.ranks || [];
@@ -3629,16 +4224,35 @@
                             };
                         }));
                 return nodes.map((node, index) => {
-                    const assignment = assignments.find(
-                        item => Number(item.rank) === Number(node.rank)
+                    const memberRanks = Array.isArray(node.ranks)
+                        ? node.ranks.map(Number)
+                        : [Number(node.rank)];
+                    const memberAssignments = assignments.filter(
+                        item => memberRanks.includes(Number(item.rank))
                     );
-                    const rank = ranks.find(
-                        item => Number(item.rank) === Number(node.rank)
+                    const memberRuntimeRanks = ranks.filter(
+                        item => memberRanks.includes(Number(item.rank))
                     );
-                    const measured = Number(rank?.measured_weight_bytes || 0);
-                    const planned = Number(assignment?.planned_weight_bytes || 0);
-                    const capacity = Number(assignment?.capacity_bytes || 0);
-                    const available = Number(memoryNodes[index]?.usableGiB || 0);
+                    const measured = memberRuntimeRanks.reduce(
+                        (total, rank) => total + Number(rank?.measured_weight_bytes || 0),
+                        0
+                    );
+                    const planned = memberAssignments.reduce(
+                        (total, assignment) => total + Number(assignment?.planned_weight_bytes || 0),
+                        0
+                    );
+                    const capacity = memberAssignments.reduce(
+                        (total, assignment) => total + Number(assignment?.capacity_bytes || 0),
+                        0
+                    );
+                    const available = memberRanks
+                        .reduce(
+                            (total, rank) => total + Number(
+                                memoryNodes[rank]?.usableGiB || 0
+                            ),
+                            0
+                        )
+                        || (Number(node.memory || 0) / (1024 ** 3));
                     let memoryLabel = available > 0
                         ? `${this.clusterMemoryGiBLabel(available)} usable`
                         : 'Memory not measured';
@@ -3918,7 +4532,7 @@
                             : `${this.formatClusterGiB(capacity)} ready`,
                         detail: job
                             ? 'Weights resident / cluster capacity'
-                            : 'Usable across detected Macs',
+                            : 'Usable across detected accelerators',
                         tone: 'amber',
                     },
                 ];
@@ -3928,7 +4542,8 @@
                 const metrics = this.clusterNeuralFabricMetrics();
                 const latency = metrics.find(metric => metric.key === 'latency');
                 const link = metrics.find(metric => metric.key === 'link');
-                return `Neural fabric with ${this.clusterQuickNodes().length} Macs. `
+                return `Neural fabric with ${this.clusterLogicalNodes().length} visual groups `
+                    + `and ${this.clusterQuickNodes().length} execution ranks. `
                     + `${this.clusterNeuralFabricLabel()}. `
                     + `Ring latency ${latency?.value || 'not measured'}. `
                     + `${link?.label || 'Link'} ${link?.value || 'not measured'}.`;
@@ -3959,9 +4574,14 @@
                             : Math.min(capacityGiB, reserveGiB);
                         return {
                             budget,
-                            nodeId: budget.node_id || `mac-${index}`,
-                            name: quick.name || budget.node_id || `Mac ${index + 1}`,
+                            nodeId: budget.node_id || `device-${index}`,
+                            name: quick.name || budget.node_id || `Device ${index + 1}`,
                             chip: quick.chip || '',
+                            accelerator: quick.accelerator || 'metal',
+                            acceleratorVendor: quick.acceleratorVendor || 'apple',
+                            memoryKind: quick.memoryKind || 'unified',
+                            fabricKind: quick.fabricKind || '',
+                            fabricGroup: quick.fabricGroup || '',
                             physicalMemory: Number(quick.physicalMemory || 0),
                             capacityGiB,
                             reserveGiB,
@@ -4051,10 +4671,10 @@
             },
 
             clusterCombinedMemoryLabel() {
-                const count = this.clusterMemoryNodes().length;
-                return `${this.clusterMemoryGiBLabel(
-                    this.clusterCombinedUsableMemoryGiB()
-                )} usable across ${count} Mac${count === 1 ? '' : 's'}`;
+                const physical = this.clusterCombinedPhysicalMemoryGiB();
+                const usable = this.clusterCombinedUsableMemoryGiB();
+                return `${this.clusterMemoryGiBLabel(usable)} model-usable of `
+                    + `${this.clusterMemoryGiBLabel(physical)} installed`;
             },
 
             clusterCombinedMemoryBreakdown() {
@@ -4066,8 +4686,21 @@
             clusterPairTitle() {
                 const nodes = this.clusterQuickNodes();
                 if (nodes.length === 1) return `${nodes[0].name} · finding workers`;
-                if (nodes.length === 2) return `${nodes[0].name} + ${nodes[1].name}`;
-                return `${nodes.length} Macs · ${nodes[0].name} coordinates`;
+                const logical = this.clusterLogicalNodes();
+                const mixed = new Set(nodes.map(node => node.accelerator)).size > 1;
+                if (nodes.length === 2 && !mixed) {
+                    return `${nodes[0].name} + ${nodes[1].name}`;
+                }
+                return `${logical.length} visual group${logical.length === 1 ? '' : 's'} · `
+                    + `${nodes.length} execution rank${nodes.length === 1 ? '' : 's'}`;
+            },
+
+            clusterDeviceCountLabel() {
+                const devices = this.clusterQuickNodes().length;
+                const units = this.clusterLogicalNodes().length;
+                return units === devices
+                    ? `${devices} device${devices === 1 ? '' : 's'}`
+                    : `${units} visual groups · ${devices} execution ranks`;
             },
 
             clusterPeerDisplayName() {
@@ -4164,7 +4797,7 @@
                         : (this.clusterTransports?.transports?.[0]
                             ? this.clusterTransportLabel(this.clusterTransports.transports[0])
                             : 'direct link'));
-                return `${count} Macs · ${this.clusterStatus?.node?.hostname || 'This Mac'} coordinates · ${count - 1} workers · ${link}`;
+                return `${count} devices · ${this.clusterStatus?.node?.hostname || 'This device'} coordinates · ${count - 1} workers · ${link}`;
             },
 
             clusterCatalogueModels() {
@@ -4174,6 +4807,13 @@
                         id: model.id || this.clusterModelDisplayName(model),
                         model_path: model.model_path,
                         model_source: model.model_source || '127.0.0.1',
+                        model_source_python:
+                            model.model_source_python
+                            || model.python_executable
+                            || this.clusterPythonExecutableForSsh(
+                                model.model_source || '127.0.0.1'
+                            )
+                            || undefined,
                         source_node_id: model.source_node_id || '',
                         model_context_length:
                             model.model_context_length || null,
@@ -4329,7 +4969,7 @@
                     ...this.clusterWorkerPeers().map(peer => peer.ssh),
                 ].filter(Boolean);
                 if (hosts.length < 2) {
-                    this.clusterFabricError = 'Add a peer Mac before reading its addresses.';
+                    this.clusterFabricError = 'Add a worker before reading its addresses.';
                     return;
                 }
                 this.clusterFabricLoading = true;
@@ -4343,13 +4983,13 @@
                     }
                     if (!response.ok) {
                         throw new Error(await this.clusterResponseError(
-                            response, 'Could not read the addresses between these Macs'
+                            response, 'Could not read the addresses between these workers'
                         ));
                     }
                     this.adoptClusterFabric(await response.json());
                 } catch (error) {
                     this.clusterFabricError = error?.message
-                        || 'Could not read the addresses between these Macs';
+                        || 'Could not read the addresses between these workers';
                 } finally {
                     this.clusterFabricLoading = false;
                 }
@@ -4384,7 +5024,12 @@
                 }
                 if (this.clusterIpsOverridden) return;
                 const [local, peer] = fabric.hosts;
-                if (local.ips?.length) this.clusterLocalIp = local.ips[0];
+                if (local.ips?.length) {
+                    this.clusterLocalIp = local.ips[0];
+                    if (!this.clusterJoinControllerIp.trim()) {
+                        this.clusterJoinControllerIp = this.clusterLocalIp;
+                    }
+                }
                 if (peer.ips?.length) this.clusterPeerIp = peer.ips[0];
                 this.invalidateClusterPlan();
             },
@@ -4513,6 +5158,10 @@
                         body.model_path = this.clusterPlanModelPath.trim();
                         body.model_source =
                             this.clusterPlanModelSource || '127.0.0.1';
+                        if (this.clusterPlanModelSourcePython) {
+                            body.model_source_python =
+                                this.clusterPlanModelSourcePython;
+                        }
                     } else {
                         body.model_size_bytes = Math.round(
                             Number(this.clusterPlanModelSizeGiB) * (1024 ** 3)
@@ -4612,7 +5261,16 @@
                 }
                 if (!this.clusterPeerSsh.trim()) {
                     this.clusterAutoconfigureError =
-                        'Choose a peer Mac before starting the cluster.';
+                        'Choose a worker before starting the cluster.';
+                    return;
+                }
+                if (
+                    typeof this.ensureCudaSupernodesVerified === 'function'
+                    && !await this.ensureCudaSupernodesVerified()
+                ) {
+                    this.clusterAutoconfigureError =
+                        this.clusterCudaFabricVerificationError
+                        || 'Verify the CUDA direct link before starting the cluster.';
                     return;
                 }
                 const linkStatus = await this.loadClusterLinkStatus();
@@ -4626,14 +5284,14 @@
                 if (!this.clusterLocalIp.trim() || !this.clusterPeerIp.trim()) {
                     this.clusterAutoconfigureError =
                         this.clusterFabricError
-                        || 'The Macs do not have a shared cluster address yet.';
+                        || 'The workers do not have a shared cluster address yet.';
                     return;
                 }
                 let proposal = await this.autoconfigureCluster();
                 if (!proposal) return;
                 if (proposal.fabric_ready === false) {
                     this.clusterAutoconfigureError = proposal.fabric_blocker
-                        || 'The Macs do not have a verified cluster route yet.';
+                        || 'The workers do not have a verified cluster route yet.';
                     return;
                 }
                 if (proposal.staging && !proposal.staging.ready) {
@@ -4645,7 +5303,7 @@
                 if (!proposal.ready_to_activate) {
                     this.clusterAutoconfigureError = proposal.staging?.error
                         || (proposal.staging && !proposal.staging.ready
-                            ? 'The model files could not be prepared on every Mac.'
+                            ? 'The model files could not be prepared on every worker.'
                             : proposal.preflight)
                         || 'Resolve the setup checks below, then try Start Cluster again.';
                     return;
@@ -4829,6 +5487,12 @@
                         memory_guard_tier:
                             this.globalSettings?.memory?.memory_guard_tier || 'balanced',
                     };
+                    if (node.accelerator) payload.accelerator = node.accelerator;
+                    if (node.fabric_kind) payload.fabric_kind = node.fabric_kind;
+                    if (node.fabric_group_id) {
+                        payload.fabric_group_id = node.fabric_group_id;
+                    }
+                    if (node.fabric_verified) payload.fabric_verified = true;
                     const target = Number(
                         (this.clusterWeightTargetsGiB || {})[nodeId]
                     );
@@ -4905,6 +5569,10 @@
                         request.model_path = path;
                         request.model_source =
                             this.clusterPlanModelSource || '127.0.0.1';
+                        if (this.clusterPlanModelSourcePython) {
+                            request.model_source_python =
+                                this.clusterPlanModelSourcePython;
+                        }
                     } else {
                         const modelSizeGiB = Number(this.clusterPlanModelSizeGiB);
                         const layerCount = Number(this.clusterPlanLayerCount);
@@ -4977,7 +5645,7 @@
                 if (this.clusterBudgetsLoading) return;
                 const hosts = this.clusterBudgetHostsPayload();
                 if (!hosts.length) {
-                    this.clusterBudgetsError = 'Add a peer Mac first.';
+                    this.clusterBudgetsError = 'Add a worker first.';
                     return;
                 }
                 this.clusterBudgetsLoading = true;
@@ -4996,7 +5664,7 @@
                     if (!response.ok) {
                         this.clusterBudgetsError = this.clusterErrorMessage(
                             body.detail,
-                            'Could not measure the Macs.',
+                            'Could not measure the workers.',
                         );
                         return;
                     }
@@ -5055,6 +5723,9 @@
                 return nodes.map((node, rank) => ({
                     node_id: String(node.node_id || '').trim(),
                     ssh: sshHosts[rank],
+                    ...(node.python_executable
+                        ? { python_executable: node.python_executable }
+                        : {}),
                 }));
             },
 
@@ -5080,6 +5751,9 @@
                             ? [...fabric.ips]
                             : (fallbackIp ? [fallbackIp] : []),
                         rdma: useDiscoveredFabric ? (fabric?.rdma || []) : [],
+                        ...(node.python_executable
+                            ? { python_executable: node.python_executable }
+                            : {}),
                     };
                 });
             },
@@ -5361,7 +6035,7 @@
                 return [
                     {
                         key: 'pair',
-                        title: 'Connect the Macs',
+                        title: 'Connect the workers',
                         hint: paired
                             ? this.clusterPeerProbe.status.node.hostname
                             : 'Find a peer and exchange keys',
@@ -5481,6 +6155,8 @@
                             model_path: this.clusterPlanModelPath.trim(),
                             model_source:
                                 this.clusterPlanModelSource || '127.0.0.1',
+                            model_source_python:
+                                this.clusterPlanModelSourcePython || undefined,
                             backend: this.clusterBackend,
                             nodes,
                             hosts,
@@ -5879,6 +6555,7 @@
                             embedding_batch_size: this.globalSettings.scheduler.embedding_batch_size,
                             chunked_prefill: this.globalSettings.scheduler.chunked_prefill,
                             prefill_priority: this.globalSettings.scheduler.prefill_priority,
+                            decode_fairness: this.globalSettings.scheduler.decode_fairness,
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,

@@ -544,6 +544,54 @@
     .cluster-fabric-node--local {
         border-color: rgba(129, 140, 248, 0.42);
     }
+    .cluster-fabric-node--cuda {
+        border-color: rgba(118, 185, 0, 0.46);
+    }
+    .cluster-fabric-node--cuda .cluster-fabric-node__orb {
+        color: #b7f34a;
+        background: rgba(74, 112, 0, 0.28);
+    }
+    .cluster-fabric-node--supernode {
+        border-style: double;
+        border-width: 3px;
+        box-shadow:
+            inset 0 0 0 1px rgba(118, 185, 0, 0.12),
+            0 10px 28px rgba(0, 0, 0, 0.24);
+    }
+    .cluster-fabric-node__verify {
+        margin-top: 0.5rem;
+        border: 1px solid rgba(183, 243, 74, 0.42);
+        border-radius: 0.55rem;
+        padding: 0.3rem 0.55rem;
+        color: #d9f99d;
+        background: rgba(74, 112, 0, 0.22);
+        font-size: 0.68rem;
+        font-weight: 750;
+    }
+    .cluster-fabric-node__verify:hover:not(:disabled) {
+        background: rgba(74, 112, 0, 0.38);
+    }
+    .cluster-fabric-node__verify:disabled {
+        cursor: not-allowed;
+        opacity: 0.48;
+    }
+    .cluster-fabric-node__verified-rate {
+        margin-top: 0.35rem;
+        color: #bef264;
+        font-size: 0.68rem;
+        font-weight: 700;
+    }
+    .cluster-fabric__verification-error {
+        position: relative;
+        z-index: 4;
+        margin: 0 1rem 0.75rem;
+        border: 1px solid rgba(248, 113, 113, 0.36);
+        border-radius: 0.65rem;
+        padding: 0.55rem 0.7rem;
+        color: #fecaca;
+        background: rgba(127, 29, 29, 0.24);
+        font-size: 0.72rem;
+    }
     .cluster-fabric-node--working {
         border-color: rgba(103, 232, 249, 0.62);
         box-shadow:
@@ -616,6 +664,13 @@
         font-variant-numeric: tabular-nums;
         text-overflow: ellipsis;
         white-space: nowrap;
+    }
+    .cluster-fabric-node__fabric {
+        margin-top: 0.35rem;
+        color: #b7f34a;
+        font-size: 0.62rem;
+        font-weight: 700;
+        letter-spacing: 0.015em;
     }
     .cluster-fabric__memory {
         position: relative;

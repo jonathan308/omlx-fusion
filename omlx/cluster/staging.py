@@ -484,6 +484,7 @@ def stage_manifest(
     hosts_by_node: dict[str, str],
     *,
     source_host: str = "127.0.0.1",
+    source_python_executable: str = DEFAULT_REMOTE_PYTHON,
 ) -> dict[str, Any]:
     """What must move before this plan can run, per node.
 
@@ -509,7 +510,9 @@ def stage_manifest(
         }
     else:
         shards, sidecar_sizes = remote_model_staging_inventory(
-            source_host, remote_dir
+            source_host,
+            remote_dir,
+            python_executable=source_python_executable,
         )
     present_by_node = {}
     for assignment in assignments:
@@ -1038,12 +1041,23 @@ def run_remote_python(
     side expands it in Python.
     """
 
+    executable = str(python_executable).strip()
+    if executable == DEFAULT_REMOTE_PYTHON:
+        # This one fixed internal default intentionally keeps ``~`` for the
+        # peer shell. All discovered/user-carried paths must be absolute and
+        # are quoted as a single word below.
+        executable_word = executable
+    else:
+        path = Path(executable)
+        if not path.is_absolute() or "\x00" in executable or len(executable) > 4096:
+            raise ValueError("remote Python executable must be an absolute path")
+        executable_word = shlex.quote(executable)
     result = subprocess.run(
         [
             "ssh",
             *cluster_ssh_options(connect_timeout=10),
             ssh_target,
-            f"{python_executable} -c {shlex.quote(snippet)} {shlex.quote(argument)}",
+            f"{executable_word} -c {shlex.quote(snippet)} {shlex.quote(argument)}",
         ],
         capture_output=True,
         text=True,

@@ -500,7 +500,7 @@ def test_manifest_can_be_built_from_a_peer_shard_index(tmp_path, monkeypatch):
     monkeypatch.setattr(
         staging,
         "remote_model_staging_inventory",
-        lambda _host, _path: (shards, {"config.json": 2}),
+        lambda _host, _path, **_kwargs: (shards, {"config.json": 2}),
     )
     monkeypatch.setattr(
         staging,

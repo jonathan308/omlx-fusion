@@ -88,6 +88,31 @@ def test_cluster_dashboard_uses_authenticated_cluster_apis():
     assert "job.layers_total" in javascript
 
 
+def test_cuda_workers_join_from_a_gui_generated_one_time_command():
+    cluster = _read("omlx/admin/templates/dashboard/_cluster.html")
+    javascript = _read("omlx/admin/static/js/dashboard.js")
+
+    assert "data-cluster-cuda-enrollment" in cluster
+    assert "data-cluster-generate-cuda-join" in cluster
+    assert "data-cluster-cuda-join-command" in cluster
+    assert "data-cluster-joined-cuda-nodes" in cluster
+    assert "Add a CUDA worker" in cluster
+    assert "Generate a fresh command for the second CUDA worker" in cluster
+    assert "Server host is set to 0.0.0.0 in Settings" in javascript
+    assert "async generateClusterCudaJoinCommand()" in javascript
+    assert "async loadClusterJoinStatus()" in javascript
+    assert "async revokeClusterJoinCommand()" in javascript
+    assert "/admin/api/cluster/join-keys" in javascript
+    assert "/admin/api/cluster/join-status" in javascript
+    assert "service: 'oMLX CUDA Worker'" in javascript
+    assert "selected.set(peer.ssh, peer)" in javascript
+    # The command contains the one-time credential and therefore stays only
+    # in current page memory. Persisted known-node hints contain identities,
+    # hardware, and SSH targets, never the enrollment command.
+    assert "localStorage.setItem('omlx.cluster.join" not in javascript
+    assert "localStorage.getItem('omlx.cluster.join" not in javascript
+
+
 def test_cluster_dashboard_renders_advanced_activation_controls():
     cluster = _read("omlx/admin/templates/dashboard/_cluster.html")
 
@@ -163,7 +188,7 @@ def test_cluster_dashboard_leads_with_one_click_setup():
     assert "data-cluster-quick-start" in cluster
     assert "data-cluster-topology" in cluster
     assert "data-cluster-neural-fabric" in cluster
-    assert "Your Macs" in cluster
+    assert "Your compute pool" in cluster
     assert "clusterPairTitle()" in cluster
     assert "Change model" in cluster
     assert "data-cluster-model-picker" in cluster
@@ -183,9 +208,10 @@ def test_cluster_dashboard_leads_with_one_click_setup():
     assert "refreshClusterExperience()" in javascript
 
     # The default path is generated from every detected Mac.
-    assert "clusterQuickNodes()" in quick_start
-    assert "Coordinator · R0" in quick_start
-    assert "Worker · R" in quick_start
+    assert "clusterDeviceCountLabel()" in quick_start
+    assert "clusterNodeRankLabel(node)" in quick_start
+    assert "Coordinator · ${rankLabel}" in javascript
+    assert "Worker · ${rankLabel}" in javascript
     assert "Multi-node preview" not in quick_start
     assert "Refresh node" not in quick_start
 
@@ -203,7 +229,7 @@ def test_cluster_dashboard_leads_with_one_click_setup():
         panel = cluster.split(technical_panel, 1)[0].rsplit("<div", 1)[1]
         assert 'x-show="clusterShowSetupDetails"' in panel
 
-    memory_heading = cluster.index("Memory each Mac gives")
+    memory_heading = cluster.index("Memory each accelerator gives")
     memory_panel_prefix = cluster[max(0, memory_heading - 500) : memory_heading]
     assert 'x-show="clusterShowSetupDetails"' in memory_panel_prefix
     assert (
@@ -215,7 +241,7 @@ def test_cluster_dashboard_leads_with_one_click_setup():
 def test_cluster_model_search_keeps_the_icon_clear_of_the_text():
     cluster = _read("omlx/admin/templates/dashboard/_cluster.html")
 
-    assert cluster.count('placeholder="Search models on every Mac"') == 2
+    assert cluster.count('placeholder="Search models across the pool"') == 2
     assert cluster.count(
         "pointer-events-none absolute left-3 top-1/2 -translate-y-1/2"
     ) == 2
@@ -229,9 +255,9 @@ def test_cluster_model_picker_uses_omlx_models_not_repository_directories():
     assert "Choose a downloaded model" in cluster
     assert 'x-for="model in clusterModelOptions()"' in cluster
     assert "clusterCatalogueFit(model.model_path)" in cluster
-    assert "Recommended for these Macs" in javascript
-    assert "Best for these Macs" in javascript
-    assert "Uses ${fit.nodes_required} Macs" in javascript
+    assert "Recommended for this pool" in javascript
+    assert "Best for this pool" in javascript
+    assert "Uses ${fit.nodes_required} devices" in javascript
     assert "Mac Studio only" not in javascript
     assert "clusterModelFailureLabel(fit)" in javascript
     assert "single_node_only" in javascript
@@ -244,7 +270,7 @@ def test_cluster_model_picker_uses_omlx_models_not_repository_directories():
     assert "clusterModelHostsLabel(model)" in cluster
     assert "this.clusterFriendlyMacName(location.node_id)" in javascript
     assert "(?:omlx\\s+on\\s+)?(?:mac\\s+)?studio" in javascript
-    assert "Search models on every Mac" in cluster
+    assert "Search models across the pool" in cluster
     assert "model_source: model.model_source" in javascript
     assert "models," in javascript
     assert "model_dir: dir" not in javascript
@@ -268,9 +294,9 @@ def test_cluster_quick_start_shows_truthful_combined_memory():
     javascript = _read("omlx/admin/static/js/dashboard.js")
 
     assert "data-cluster-memory-allowances" in cluster
-    assert "Memory allowed" in cluster
-    assert "Set the most oMLX may use" in cluster
-    assert "Model splitting stays automatic" in cluster
+    assert "Pooled accelerator memory" in cluster
+    assert "Installed memory is shown separately" in cluster
+    assert "Splitting stays automatic" in cluster
     assert "clusterCombinedUsableMemoryGiB()" in javascript
     assert "clusterCombinedPhysicalMemoryGiB()" in javascript
     assert "clusterCombinedMemoryLabel()" in cluster
@@ -328,14 +354,38 @@ def test_cluster_nodes_show_dynamic_hardware_identity_for_every_peer():
     assert "clusterPeerProbes: {}" in javascript
     assert "async loadClusterPeerHardware()" in javascript
     assert "await this.loadClusterPeerHardware()" in javascript
+    assert "result.bootstrap_required" in javascript
+    assert "worker runtime is not installed yet" in javascript
+    assert "probe?.ssh_reachable" in javascript
     assert "this.clusterPeerProbes?.[ssh]" in javascript
     assert "hardware.chip_name" in javascript
     assert "hardware.physical_memory_bytes" in javascript
-    assert "clusterMacHardwareLabel(node)" in javascript
+    assert "clusterNodeHardwareLabel(node)" in javascript
     assert "replace(/^Apple\\s+/i, '')" in javascript
-    assert cluster.count("clusterMacHardwareLabel(node)") >= 3
+    assert cluster.count("clusterNodeHardwareLabel(node)") >= 3
     assert "M5 Max" not in cluster
     assert "128 GB" not in cluster
+
+
+def test_cluster_dashboard_groups_cuda_workers_and_shows_pooled_memory():
+    cluster = _read("omlx/admin/templates/dashboard/_cluster.html")
+    javascript = _read("omlx/admin/static/js/dashboard.js")
+    stylesheet = _read("omlx/admin/static/css/dashboard.css")
+
+    assert "Pooled accelerator memory" in cluster
+    assert "model-usable of" in javascript
+    assert "clusterLogicalNodes()" in javascript
+    assert "connectx-7-auto-pair" in javascript
+    assert "Verified CUDA pair" in javascript
+    assert "ConnectX-7 verified" in cluster
+    assert "direct link not verified" in cluster
+    assert "Verify ConnectX" in cluster
+    assert "/admin/api/cluster/cuda-fabric/verify" in javascript
+    assert "<title>NVIDIA CUDA</title>" in cluster
+    assert "cluster-fabric-node--cuda" in stylesheet
+    assert "cluster-fabric-node--supernode" in stylesheet
+    assert "Model shard balance" in cluster
+    assert "clusterSetWeightTarget(" in cluster
 
 
 def test_cluster_neural_fabric_uses_real_runtime_measurements():

@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
+import ipaddress
 import json
 import re
 import secrets
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import asdict, replace
@@ -17,7 +20,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query, Response
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..exceptions import ModelBusyError, ModelNotFoundError
@@ -45,14 +49,17 @@ from .discovery import (
     record_peer_transports,
     verify_pairing_token,
 )
+from .enrollment import EnrolledNode, EnrollmentError, get_cluster_enrollment
 from .guidance import explain
 from .launch import (
+    CudaFabricProbeHost,
     DistributedLaunchError,
     check_orphaned_wired_memory,
     preflight_remote_hosts,
     probe_remote_admission_ceiling,
     probe_remote_host,
     run_cluster_performance_probe,
+    run_cuda_fabric_probe,
 )
 from .liveness import (
     PeerLostError,
@@ -85,6 +92,7 @@ from .probe import collect_cluster_status
 from .registry import get_cluster_registry
 from .runtime import read_runtime_markers
 from .staging import (
+    DEFAULT_REMOTE_PYTHON,
     InsufficientDiskError,
     index_shards,
     model_staging_inventory,
@@ -106,8 +114,15 @@ from .transport import (
     resolve_link_addresses,
     verify_link_reachability,
 )
+from .worker_bundle import (
+    build_cuda_join_command,
+    cuda_bootstrap_program,
+    worker_source_bundle,
+    worker_source_digest,
+)
 
 router = APIRouter(prefix="/admin/api/cluster", tags=["cluster"])
+join_router = APIRouter(prefix="/cluster/join", tags=["cluster-enrollment"])
 
 # Peer-facing endpoints that cannot require an admin session: a Mac running
 # ``omlx cluster join`` has no admin cookie, so it authenticates with the
@@ -144,6 +159,89 @@ class ClusterJoinRedeemRequest(BaseModel):
     versions: dict[str, str] = Field(min_length=1, max_length=8)
     # HMAC-SHA256 hex digest over the canonical redeem payload.
     signature: str = Field(min_length=64, max_length=64)
+
+
+class ClusterJoinKeyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    controller_ip: str = Field(min_length=2, max_length=64)
+    controller_port: int = Field(ge=1, le=65535)
+    scheme: Literal["http", "https"] = "http"
+    ttl_seconds: int = Field(default=600, ge=30, le=600)
+
+
+class ClusterWorkerClaimRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str = Field(pattern=r"^[A-Za-z0-9._-]{1,255}$")
+    hostname: str = Field(pattern=r"^[A-Za-z0-9._-]{1,255}$")
+    ssh_user: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
+    ssh_port: int = Field(default=22, ge=1, le=65535)
+    addresses: list[str] = Field(min_length=1, max_length=8)
+    accelerator: Literal["cuda"]
+    platform: str = Field(min_length=1, max_length=255)
+
+
+class ClusterWorkerCompleteRequest(ClusterWorkerClaimRequest):
+    python_executable: str = Field(
+        pattern=r"^/[A-Za-z0-9._/+:-]{1,1023}$",
+    )
+    source_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    ssh_host_public_key: str = Field(min_length=32, max_length=8192)
+    ssh_host_fingerprint: str = Field(
+        pattern=r"^SHA256:[A-Za-z0-9+/]{40,64}$"
+    )
+    runtime: dict[str, str] = Field(default_factory=dict, max_length=16)
+
+
+def _join_bearer(authorization: str | None) -> str:
+    prefix = "Bearer "
+    if (
+        not isinstance(authorization, str)
+        or not authorization.startswith(prefix)
+        or not 32 <= len(authorization.removeprefix(prefix)) <= 512
+    ):
+        raise HTTPException(status_code=401, detail="invalid enrollment credential")
+    token = authorization.removeprefix(prefix)
+    if token != token.strip() or any(char.isspace() for char in token):
+        raise HTTPException(status_code=401, detail="invalid enrollment credential")
+    return token
+
+
+def _join_addresses(values: list[str]) -> tuple[str, ...]:
+    addresses: list[str] = []
+    for value in values:
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid worker IP address") from exc
+        if address.is_unspecified or address.is_multicast or address.is_loopback:
+            raise HTTPException(status_code=400, detail="worker IP must be LAN-reachable")
+        if address.version != 4 or not (address.is_private or address.is_link_local):
+            raise HTTPException(
+                status_code=400,
+                detail="worker must use a private or link-local IPv4 address",
+            )
+        normalized = str(address)
+        if normalized not in addresses:
+            addresses.append(normalized)
+    return tuple(addresses)
+
+
+def _controller_url(request: ClusterJoinKeyRequest) -> str:
+    try:
+        address = ipaddress.ip_address(request.controller_ip)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="controller must be a literal IP") from exc
+    if (
+        address.version != 4
+        or address.is_unspecified
+        or address.is_multicast
+        or address.is_loopback
+        or not (address.is_private or address.is_link_local)
+    ):
+        raise HTTPException(status_code=400, detail="controller must use a local IP")
+    return f"{request.scheme}://{address}:{request.controller_port}"
 
 
 def _validated_ssh_targets(hosts: str) -> list[str]:
@@ -200,6 +298,7 @@ def _package_version_or_none(name: str) -> str:
 _DIAGNOSTIC_SECRET_FIELDS = {
     "api_key",
     "authorization",
+    "join_key",
     "pairing_token",
     "password",
     "private_key",
@@ -276,6 +375,15 @@ class ClusterPlanNodeRequest(BaseModel):
         "balanced"
     )
     performance: dict[str, Any] | None = None
+    accelerator: Literal["metal", "cuda", "cpu"] | None = None
+    fabric_kind: str | None = Field(default=None, max_length=64)
+    fabric_group_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+    )
+    fabric_verified: bool = False
 
 
 class ClusterPlanRequest(BaseModel):
@@ -285,6 +393,10 @@ class ClusterPlanRequest(BaseModel):
     # SSH target of the Mac that owns the complete model. Empty/local keeps
     # planning on the coordinator; a peer source is measured on that peer.
     model_source: str | None = Field(default=None, max_length=255)
+    # Interpreter reported by the source node's live probe. macOS and Linux
+    # installations do not share a filesystem layout, so the coordinator's
+    # executable must never be assumed to exist on a remote model owner.
+    model_source_python: str | None = Field(default=None, max_length=4096)
     model_size_bytes: int | None = Field(default=None, gt=0)
     layer_count: int = Field(default=80, gt=0, le=2048)
     nodes: list[ClusterPlanNodeRequest] = Field(min_length=1, max_length=64)
@@ -301,6 +413,7 @@ class ClusterHostRequest(BaseModel):
     ssh: str = Field(min_length=1, max_length=255)
     ips: list[str] = Field(min_length=1, max_length=16)
     rdma: list[str | list[str] | None] = Field(default_factory=list, max_length=64)
+    python_executable: str | None = Field(default=None, max_length=4096)
 
 
 def _validate_cluster_hosts(hosts: list[ClusterHostRequest]) -> None:
@@ -313,6 +426,7 @@ def _validate_cluster_hosts(hosts: list[ClusterHostRequest]) -> None:
                 ssh=host.ssh,
                 ips=tuple(host.ips),
                 rdma=tuple(host.rdma),
+                python_executable=host.python_executable,
             )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -324,6 +438,7 @@ class ClusterDeploymentRequest(BaseModel):
     deployment_id: str | None = Field(default=None, max_length=128)
     model_path: str = Field(min_length=1, max_length=4096)
     model_source: str | None = Field(default=None, max_length=255)
+    model_source_python: str | None = Field(default=None, max_length=4096)
     backend: Literal["ring", "jaccl", "jaccl-ring"]
     nodes: list[ClusterPlanNodeRequest] = Field(min_length=2, max_length=64)
     hosts: list[ClusterHostRequest] = Field(min_length=2, max_length=64)
@@ -351,6 +466,23 @@ class ClusterPeerProbeRequest(BaseModel):
 
     ssh: str = Field(min_length=1, max_length=255)
     route_to: str | None = Field(default=None, max_length=64)
+
+
+class ClusterCudaFabricMemberRequest(BaseModel):
+    """One dashboard-selected CUDA worker in a proposed direct-link pair."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str = Field(min_length=1, max_length=128)
+    ssh: str = Field(min_length=1, max_length=255)
+
+
+class ClusterCudaFabricVerifyRequest(BaseModel):
+    """A bounded two-worker NCCL verification started from the dashboard."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    hosts: list[ClusterCudaFabricMemberRequest] = Field(min_length=2, max_length=2)
 
 
 class ClusterLinkSetupRequest(BaseModel):
@@ -435,6 +567,47 @@ def _node_budgets(
     return budgets
 
 
+def _coalesce_verified_cuda_groups(
+    host_order: list[str],
+    hosts: list[ClusterHostRequest],
+    nodes: list[ClusterPlanNodeRequest],
+) -> list[str]:
+    """Keep a verified two-worker CUDA fabric adjacent in the outer Ring."""
+
+    node_by_id = {node.node_id.strip(): node for node in nodes}
+    group_by_ssh: dict[str, str] = {}
+    members_by_group: dict[str, list[str]] = {}
+    for host in hosts:
+        node = node_by_id.get(host.node_id.strip())
+        if (
+            node is None
+            or node.accelerator != "cuda"
+            or not node.fabric_verified
+            or not node.fabric_group_id
+        ):
+            continue
+        group = node.fabric_group_id
+        group_by_ssh[host.ssh] = group
+        members_by_group.setdefault(group, []).append(host.ssh)
+    eligible = {
+        group: set(members)
+        for group, members in members_by_group.items()
+        if len(set(members)) == 2
+    }
+    ordered: list[str] = []
+    emitted: set[str] = set()
+    for ssh in host_order:
+        group = group_by_ssh.get(ssh)
+        if group not in eligible:
+            ordered.append(ssh)
+            continue
+        if group in emitted:
+            continue
+        ordered.extend(item for item in host_order if item in eligible[group])
+        emitted.add(group)
+    return ordered
+
+
 def _model_and_nodes(request: ClusterPlanRequest):
     """Resolve the request's model layout and rank-ordered node budgets."""
 
@@ -450,7 +623,13 @@ def _model_and_nodes(request: ClusterPlanRequest):
             "localhost",
             "::1",
         }:
-            model = remote_model_layout(validate_ssh_target(source), model_path)
+            model = remote_model_layout(
+                validate_ssh_target(source),
+                model_path,
+                python_executable=(
+                    request.model_source_python or DEFAULT_REMOTE_PYTHON
+                ),
+            )
         else:
             # A coordinator may retain only its previous pipeline stage.  Such
             # a directory is not a smaller complete model and must never be
@@ -623,6 +802,7 @@ class ClusterAutoconfigureRequest(BaseModel):
 
     model_path: str | None = Field(default=None, max_length=4096)
     model_source: str | None = Field(default=None, max_length=255)
+    model_source_python: str | None = Field(default=None, max_length=4096)
     model_size_bytes: int | None = Field(default=None, gt=0)
     layer_count: int = Field(default=80, gt=0, le=2048)
     nodes: list[ClusterPlanNodeRequest] = Field(min_length=1, max_length=64)
@@ -700,6 +880,9 @@ def _staging_for(
                 "127.0.0.1"
                 if _local_ssh_target(source_host)
                 else validate_ssh_target(source_host)
+            ),
+            source_python_executable=(
+                request.model_source_python or DEFAULT_REMOTE_PYTHON
             ),
         )
     except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
@@ -852,6 +1035,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     plan_request = ClusterPlanRequest(
         model_path=request.model_path,
         model_source=request.model_source,
+        model_source_python=request.model_source_python,
         model_size_bytes=request.model_size_bytes,
         layer_count=request.layer_count,
         nodes=request.nodes,
@@ -959,6 +1143,16 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 peer_import_issues,
                 {host.node_id: host.ssh for host in request.hosts},
                 model_path=request.model_path,
+                python_by_node={
+                    node_id: str(
+                        ((status or {}).get("status") or {})
+                        .get("runtime", {})
+                        .get("python_executable")
+                        or ""
+                    )
+                    for node_id, status in peer_statuses.items()
+                    if status
+                },
             )
         except (OSError, RuntimeError, ValueError) as exc:
             warnings.append(f"Peer environment check failed: {exc}")
@@ -983,11 +1177,21 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         link_profiles,
     )
     warnings.extend(placement.warnings)
+    placed_host_order = list(placement.hosts or requested_host_order)
+    grouped_host_order = _coalesce_verified_cuda_groups(
+        placed_host_order,
+        list(request.hosts),
+        list(request.nodes),
+    )
+    if grouped_host_order != placed_host_order:
+        warnings.append(
+            "Verified ConnectX CUDA workers were kept adjacent in the outer Ring."
+        )
     ordered_hosts = list(request.hosts)
     ordered_request_nodes = list(request.nodes)
-    if placement.hosts:
+    if grouped_host_order:
         by_ssh = {host.ssh: host for host in request.hosts}
-        ordered_hosts = [by_ssh[ssh] for ssh in placement.hosts if ssh in by_ssh]
+        ordered_hosts = [by_ssh[ssh] for ssh in grouped_host_order if ssh in by_ssh]
         request_node_by_id = {node.node_id: node for node in request.nodes}
         budget_by_id = {node.node_id: node for node in nodes}
         ordered_request_nodes = [
@@ -1111,6 +1315,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                         ssh=str(host["ssh"]),
                         ips=tuple(host.get("ips") or ()),
                         rdma=tuple(host.get("rdma") or ()),
+                        python_executable=host.get("python_executable"),
                     )
                     for host in activation_hosts
                 ),
@@ -1226,6 +1431,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         "activation": {
             "model_path": request.model_path,
             "model_source": request.model_source,
+            "model_source_python": request.model_source_python,
             "backend": backend,
             "execution_profile": request.execution_profile,
             "auto_tune": request.auto_tune,
@@ -1682,6 +1888,206 @@ async def cluster_verify_pairing_token(
     }
 
 
+@router.post("/join-keys")
+async def cluster_create_join_key(
+    request: ClusterJoinKeyRequest,
+    response: Response,
+):
+    """Create one expiring, single-use CUDA worker join command."""
+
+    from .ssh_keys import get_or_create_ssh_key
+
+    controller_url = _controller_url(request)
+    try:
+        source_digest = await asyncio.to_thread(worker_source_digest)
+        key_pair = await asyncio.to_thread(get_or_create_ssh_key)
+        join_key, record = get_cluster_enrollment().issue_join_key(
+            controller_url=controller_url,
+            source_digest=source_digest,
+            ttl=request.ttl_seconds,
+        )
+    except (EnrollmentError, OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    command = build_cuda_join_command(
+        controller_url=controller_url,
+        join_key=join_key,
+        controller_key_fingerprint=key_pair.fingerprint,
+        source_digest=source_digest,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return record | {
+        "command": command,
+        "controller_key_fingerprint": key_pair.fingerprint,
+        "single_use": True,
+    }
+
+
+@router.get("/join-status")
+async def cluster_join_status():
+    """List pending commands and credential-free enrolled CUDA nodes."""
+
+    try:
+        return get_cluster_enrollment().to_dict()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.delete("/join-keys/{join_id}")
+async def cluster_revoke_join_key(join_id: str):
+    if not re.fullmatch(r"[a-f0-9]{16}", join_id):
+        raise HTTPException(status_code=400, detail="invalid join-key ID")
+    if not get_cluster_enrollment().revoke_join_key(join_id):
+        raise HTTPException(status_code=404, detail="join key not found")
+    return {"ok": True, "join_id": join_id}
+
+
+@join_router.get("/bootstrap.py")
+async def cluster_cuda_bootstrap_program():
+    """Serve the bootstrap whose SHA-256 is pinned in the admin command."""
+
+    return PlainTextResponse(
+        cuda_bootstrap_program(),
+        media_type="text/x-python; charset=utf-8",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@join_router.post("/claim")
+async def cluster_claim_join_key(
+    request: ClusterWorkerClaimRequest,
+    response: Response,
+    authorization: str | None = Header(default=None),
+):
+    """Consume a join key and return a short-lived source-download session."""
+
+    from .ssh_keys import get_or_create_ssh_key
+
+    raw_key = _join_bearer(authorization)
+    addresses = _join_addresses(request.addresses)
+    try:
+        session_token, session = get_cluster_enrollment().claim(
+            raw_key,
+            node_id=request.node_id,
+            hostname=request.hostname,
+            ssh_user=request.ssh_user,
+            ssh_port=request.ssh_port,
+            addresses=addresses,
+        )
+        key_pair = await asyncio.to_thread(get_or_create_ssh_key)
+    except (EnrollmentError, RuntimeError):
+        # Bearer failures intentionally have one response so callers cannot
+        # distinguish expired, revoked, and already-used credentials.
+        raise HTTPException(
+            status_code=401, detail="invalid enrollment credential"
+        ) from None
+    response.headers["Cache-Control"] = "no-store"
+    return {
+        "session_token": session_token,
+        "session_expires_at": session.expires_at,
+        "source_digest": session.source_digest,
+        "controller_public_key": key_pair.public_key,
+        "controller_key_fingerprint": key_pair.fingerprint,
+    }
+
+
+@join_router.get("/source")
+async def cluster_cuda_worker_source(
+    authorization: str | None = Header(default=None),
+):
+    """Download the exact controller source snapshot under a join session."""
+
+    raw_session = _join_bearer(authorization)
+    try:
+        get_cluster_enrollment().authorize_session(raw_session)
+    except (EnrollmentError, RuntimeError):
+        raise HTTPException(
+            status_code=401, detail="invalid enrollment credential"
+        ) from None
+    bundle = await asyncio.to_thread(worker_source_bundle)
+    return Response(
+        content=bundle,
+        media_type="application/gzip",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": 'attachment; filename="omlx-cluster-worker.tar.gz"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@join_router.post("/complete")
+async def cluster_complete_worker_join(
+    request: ClusterWorkerCompleteRequest,
+    authorization: str | None = Header(default=None),
+):
+    """Pin the worker's SSH identity and persist it without join secrets."""
+
+    from .ssh_keys import pin_enrolled_host_key, ssh_public_key_fingerprint
+
+    raw_session = _join_bearer(authorization)
+    addresses = _join_addresses(request.addresses)
+    try:
+        session = get_cluster_enrollment().authorize_session(raw_session)
+    except (EnrollmentError, RuntimeError):
+        raise HTTPException(
+            status_code=401, detail="invalid enrollment credential"
+        ) from None
+    try:
+        observed_fingerprint = ssh_public_key_fingerprint(
+            request.ssh_host_public_key
+        )
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail="invalid worker SSH host key") from exc
+    if not hmac.compare_digest(observed_fingerprint, request.ssh_host_fingerprint):
+        raise HTTPException(status_code=400, detail="worker SSH fingerprint mismatch")
+    if request.source_digest != session.source_digest:
+        raise HTTPException(status_code=400, detail="worker source digest mismatch")
+    if (
+        request.node_id != session.node_id
+        or request.hostname != session.hostname
+        or request.ssh_user != session.ssh_user
+        or request.ssh_port != session.ssh_port
+        or addresses != session.addresses
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="worker identity changed after claiming the join key",
+        )
+
+    primary_address = addresses[0]
+    ssh_target = f"{request.ssh_user}@{primary_address}"
+    now = time.time()
+    node = EnrolledNode(
+        node_id=request.node_id,
+        hostname=request.hostname,
+        ssh=ssh_target,
+        ssh_user=request.ssh_user,
+        ssh_port=request.ssh_port,
+        addresses=addresses,
+        accelerator=request.accelerator,
+        platform=request.platform,
+        python_executable=request.python_executable,
+        source_digest=request.source_digest,
+        ssh_host_fingerprint=request.ssh_host_fingerprint,
+        joined_at=now,
+        last_seen_at=now,
+    )
+    try:
+        await asyncio.to_thread(
+            pin_enrolled_host_key,
+            hostname=primary_address,
+            public_key=request.ssh_host_public_key,
+        )
+        enrolled = get_cluster_enrollment().complete(raw_session, node)
+    except (EnrollmentError, OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return enrolled.to_dict()
+
+
 @router.get("/ssh-key")
 async def cluster_ssh_key():
     """Get the current SSH key pair information."""
@@ -1768,9 +2174,12 @@ async def cluster_mint_join_token():
     return get_join_token_store().mint()
 
 
-@router.get("/join-status")
-async def cluster_join_status(token_id: str = Query(default="")):
-    """Poll a pending join and list enrolled peers for the dashboard."""
+@router.get("/join-token-status")
+async def cluster_join_token_status(token_id: str = Query(default="")):
+    """Poll a pending join and list enrolled peers for the dashboard.
+
+    Path note: upstream's ``/join-status`` serves the headless CUDA-worker
+    enrollment store; the guided "Add a Mac" flow polls this endpoint."""
 
     from .enrollment import get_join_token_store
 
@@ -2040,6 +2449,100 @@ async def cluster_peer_probe(request: ClusterPeerProbeRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/cuda-fabric/verify")
+async def cluster_cuda_fabric_verify(request: ClusterCudaFabricVerifyRequest):
+    """Prove a selected CUDA pair with an isolated NCCL direct-link test."""
+
+    try:
+        members = [
+            host.model_copy(update={"ssh": validate_ssh_target(host.ssh.strip())})
+            for host in request.hosts
+        ]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if len({host.ssh for host in members}) != 2:
+        raise HTTPException(
+            status_code=400,
+            detail="CUDA fabric verification requires two distinct workers",
+        )
+
+    async def capability_for(host: ClusterCudaFabricMemberRequest) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(probe_remote_host, host.ssh)
+        except (DistributedLaunchError, OSError, ValueError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Could not inspect {host.node_id}: {exc}",
+            ) from exc
+
+    capabilities = await asyncio.gather(
+        *(capability_for(host) for host in members)
+    )
+    probe_hosts: list[CudaFabricProbeHost] = []
+    for host, capability in zip(members, capabilities):
+        status = capability.get("status") or {}
+        node = status.get("node") or {}
+        runtime = status.get("runtime") or {}
+        transport = status.get("transport") or {}
+        rdma = transport.get("rdma") or {}
+        if node.get("accelerator") != "cuda":
+            raise HTTPException(
+                status_code=409,
+                detail=f"{host.node_id} did not report a CUDA accelerator",
+            )
+        if "nccl" not in set(node.get("distributed_backends") or []):
+            raise HTTPException(
+                status_code=409,
+                detail=f"{host.node_id} did not report MLX NCCL support",
+            )
+        if node.get("fabric_kind") != "connectx-7":
+            raise HTTPException(
+                status_code=409,
+                detail=f"{host.node_id} did not report a ConnectX interface",
+            )
+        addresses = rdma.get("addresses") or {}
+        interfaces = rdma.get("network_interfaces") or {}
+        endpoints = [
+            (
+                str(addresses[device]),
+                str(interfaces[device]),
+                str(device),
+            )
+            for device in rdma.get("devices") or []
+            if addresses.get(device) and interfaces.get(device)
+        ]
+        if not endpoints:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{host.node_id} has ConnectX hardware but no direct-link IP. "
+                    "Assign the ConnectX link in the device network settings, "
+                    "then press Verify again."
+                ),
+            )
+        try:
+            probe_hosts.append(
+                CudaFabricProbeHost(
+                    node_id=host.node_id,
+                    ssh=host.ssh,
+                    ips=tuple(endpoint[0] for endpoint in endpoints),
+                    interfaces=tuple(endpoint[1] for endpoint in endpoints),
+                    rdma_devices=tuple(endpoint[2] for endpoint in endpoints),
+                    python_executable=runtime.get("python_executable") or None,
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    try:
+        return await asyncio.to_thread(
+            run_cuda_fabric_probe,
+            (probe_hosts[0], probe_hosts[1]),
+        )
+    except DistributedLaunchError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @router.post("/worker-smoke")
 async def cluster_worker_smoke(
     timeout: float = Query(default=5.0, gt=0.0, le=30.0),
@@ -2152,7 +2655,12 @@ def _request_performance_profiles(
 def _create_deployment(
     request: ClusterDeploymentRequest,
 ) -> tuple[ClusterDeployment, dict[str, Any]]:
-    model_path = Path(request.model_path).expanduser().resolve()
+    source = (request.model_source or "").strip()
+    model_path = (
+        Path(request.model_path)
+        if source and not _local_ssh_target(source)
+        else Path(request.model_path).expanduser().resolve()
+    )
     requested_microbatch = execution_profile(
         request.execution_profile,
         auto_tune=request.auto_tune,
@@ -2161,6 +2669,7 @@ def _create_deployment(
     plan_request = ClusterPlanRequest(
         model_path=str(model_path),
         model_source=request.model_source,
+        model_source_python=request.model_source_python,
         nodes=request.nodes,
         execution_profile=request.execution_profile,
         pipeline_microbatch_size=requested_microbatch,
@@ -2199,6 +2708,7 @@ def _create_deployment(
                 ssh=host.ssh,
                 ips=tuple(host.ips),
                 rdma=tuple(host.rdma),
+                python_executable=host.python_executable,
             )
             for host in request.hosts
         ),
@@ -2254,7 +2764,13 @@ def _performance_optimized_deployment(
         raise ValueError("performance probe did not return every cluster rank")
     source = (request.model_source or "").strip()
     model = (
-        remote_model_layout(validate_ssh_target(source), deployment.model)
+        remote_model_layout(
+            validate_ssh_target(source),
+            deployment.model,
+            python_executable=(
+                request.model_source_python or DEFAULT_REMOTE_PYTHON
+            ),
+        )
         if source
         and source not in {LOCAL_NODE, "127.0.0.1", "localhost", "::1"}
         else inspect_safetensors_layout(deployment.model)
@@ -2314,6 +2830,7 @@ class ClusterCatalogueModelRequest(BaseModel):
     id: str = Field(min_length=1, max_length=512)
     model_path: str = Field(min_length=1, max_length=4096)
     model_source: str = Field(default="127.0.0.1", min_length=1, max_length=255)
+    model_source_python: str | None = Field(default=None, max_length=4096)
     source_node_id: str = Field(default="", max_length=128)
     model_context_length: int | None = Field(default=None, gt=0)
 
@@ -2331,10 +2848,11 @@ class ClusterCatalogueRequest(BaseModel):
 
 
 class ClusterInventoryHostRequest(BaseModel):
-    """A selected Mac whose local oMLX model inventory should be included."""
+    """A selected worker whose local oMLX model inventory should be included."""
 
     node_id: str = Field(min_length=1, max_length=128)
     ssh: str = Field(min_length=1, max_length=255)
+    python_executable: str | None = Field(default=None, max_length=4096)
 
 
 class ClusterModelInventoryRequest(BaseModel):
@@ -2351,6 +2869,7 @@ class ClusterNodeBudgetHostRequest(BaseModel):
 
     node_id: str = Field(min_length=1, max_length=128)
     ssh: str = Field(min_length=1, max_length=255)
+    python_executable: str | None = Field(default=None, max_length=4096)
 
 
 class ClusterNodeBudgetRequest(BaseModel):
@@ -2410,6 +2929,7 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
             capacity_bytes = await asyncio.to_thread(
                 probe_remote_admission_ceiling,
                 host.ssh,
+                python_executable=host.python_executable or sys.executable,
             )
             capacity_source = "admission_ceiling"
         budget = await asyncio.to_thread(
@@ -2450,17 +2970,31 @@ async def cluster_models(request: ClusterModelInventoryRequest) -> dict[str, Any
         target = host.ssh.strip()
         if _local_ssh_target(target):
             try:
+                models = [
+                    dict(model, python_executable=sys.executable)
+                    for model in engine_pool_model_inventory(_engine_pool())
+                ]
                 return (
                     host.node_id,
                     "127.0.0.1",
-                    engine_pool_model_inventory(_engine_pool()),
+                    models,
                     "",
                 )
             except (HTTPException, RuntimeError, ValueError) as exc:
                 return host.node_id, "127.0.0.1", [], str(exc)
         try:
             validated = validate_ssh_target(target)
-            models = await asyncio.to_thread(remote_model_inventory, validated)
+            models = await asyncio.to_thread(
+                remote_model_inventory,
+                validated,
+                python_executable=(
+                    host.python_executable or "~/omlx-distributed/.venv/bin/python"
+                ),
+            )
+            source_python = host.python_executable or DEFAULT_REMOTE_PYTHON
+            models = [
+                dict(model, python_executable=source_python) for model in models
+            ]
             return host.node_id, validated, models, ""
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
             return host.node_id, target, [], str(exc)
@@ -2511,7 +3045,11 @@ def _catalogue_for_candidates(
                 complete_model_layout(candidate.model_path)
                 if _local_ssh_target(source)
                 else remote_model_layout(
-                    validate_ssh_target(source), candidate.model_path
+                    validate_ssh_target(source),
+                    candidate.model_path,
+                    python_executable=(
+                        candidate.model_source_python or DEFAULT_REMOTE_PYTHON
+                    ),
                 )
             )
             fit = assess_model(
