@@ -2132,6 +2132,12 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
 
 
 class Model(nn.Module):
+    # The distributed generation loop may ask non-coordinator ranks to advance
+    # their local stage and KV cache without constructing vocabulary logits.
+    # Keep this an explicit adapter contract: forwarding ``skip_logits`` through
+    # an arbitrary model would otherwise be an unsafe, version-dependent guess.
+    _omlx_supports_rank_zero_logits = True
+
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.args = config
@@ -2139,8 +2145,22 @@ class Model(nn.Module):
         self.model = DeepseekV4Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def __call__(self, inputs: mx.array, cache: Optional[Any] = None):
-        return self.lm_head(self.model(inputs, cache))
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: Optional[Any] = None,
+        skip_logits: bool = False,
+    ):
+        hidden = self.model(inputs, cache)
+        if skip_logits:
+            return hidden
+        return self.lm_head(hidden)
+
+    @property
+    def _omlx_output_vocab_size(self) -> int:
+        """Vocabulary width for rank-local placeholder log probabilities."""
+
+        return int(self.args.vocab_size)
 
     @property
     def layers(self):
@@ -2327,7 +2347,13 @@ class Model(nn.Module):
                 group=group,
             )
             shard_inplace(layer.attn.wo_a, "sharded-to-all", group=group)
-            layer.attn.attn_sink = mx.split(layer.attn.attn_sink, N)[rank]
+            # wq_b is sharded per o_group, so a rank holds an interleaved
+            # slice of the flat head range; the per-head sinks must follow
+            # the same layout, not one contiguous span of it.
+            sink_groups = mx.split(
+                layer.attn.attn_sink.reshape(self.args.o_groups, -1), N, axis=1
+            )
+            layer.attn.attn_sink = sink_groups[rank].reshape(-1)
             layer.attn.n_heads //= N
 
             layer.ffn.sharding_group = group

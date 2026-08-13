@@ -372,3 +372,108 @@ def _run_local_minimax_decode_smoke(
         "elapsed_seconds": time.monotonic() - started_at,
         "ranks": [by_rank[rank] for rank in (0, 1)],
     }
+
+
+def run_local_deepseek_tp_smoke(
+    *,
+    timeout: float = 30.0,
+    runner: LauncherRunner = _run_launcher,
+    starting_port: int | None = None,
+) -> dict[str, Any]:
+    """Prove a tiny DeepSeek-V4 forward survives two-rank tensor parallelism.
+
+    Each rank compares a whole-model reference against the same model sharded
+    by ``apply_tensor_strategy`` — the native layer-wise path the cluster
+    worker uses — so a dropped collective or mis-sliced projection fails here
+    rather than after a hundred-gigabyte staging run.
+    """
+
+    if timeout <= 0:
+        raise ValueError("timeout must be greater than zero")
+    if starting_port is None:
+        starting_port = _find_loopback_port_span(2)
+    if not 1 <= starting_port <= 65534:
+        raise ValueError("starting_port must leave room for two ranks")
+
+    launcher = (
+        "from mlx._distributed_utils.launch import main; raise SystemExit(main() or 0)"
+    )
+    argv = [
+        sys.executable,
+        "-c",
+        launcher,
+        "--backend",
+        "ring",
+        "--hosts",
+        "127.0.0.1",
+        "--repeat-hosts",
+        "2",
+        "--starting-port",
+        str(starting_port),
+        "--",
+        sys.executable,
+        "-m",
+        "omlx.cluster.deepseek_tp_smoke_worker",
+    ]
+    started_at = time.monotonic()
+    try:
+        completed = runner(argv, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CollectiveSmokeError(
+            f"could not launch DeepSeek TP smoke: {exc}"
+        ) from exc
+
+    records: list[dict[str, Any]] = []
+    for line in completed.stdout.splitlines():
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and payload.get("type") == "deepseek_tp_result":
+            records.append(payload)
+    detail = completed.stderr.strip()
+    if completed.returncode != 0:
+        suffix = f": {detail}" if detail else ""
+        raise CollectiveSmokeError(
+            f"MLX DeepSeek TP smoke exited with code "
+            f"{completed.returncode}{suffix}"
+        )
+    by_rank = {
+        record["rank"]: record
+        for record in records
+        if isinstance(record.get("rank"), int)
+    }
+    if len(records) != 2 or set(by_rank) != {0, 1}:
+        suffix = f": {detail}" if detail else ""
+        raise CollectiveSmokeError(
+            "DeepSeek TP smoke did not return one result from each rank" + suffix
+        )
+    for rank, record in by_rank.items():
+        if (
+            record.get("size") != 2
+            or record.get("model_type") != "deepseek_v4"
+            or record.get("strategy") != "native"
+            or record.get("layers") != 3
+            or record.get("heads_per_rank") != 2
+            or record.get("reference_token") != record.get("sharded_token")
+            or float(record.get("max_abs_diff", 1.0)) > 1e-3
+        ):
+            raise CollectiveSmokeError(
+                f"rank {rank} returned an invalid DeepSeek TP result: {record}"
+            )
+    tokens = [int(by_rank[rank]["sharded_token"]) for rank in (0, 1)]
+    if tokens[0] != tokens[1]:
+        raise CollectiveSmokeError(f"DeepSeek TP rank tokens differ: {tokens}")
+    checksums = [float(by_rank[rank]["checksum"]) for rank in (0, 1)]
+    if abs(checksums[0] - checksums[1]) > 1e-4:
+        raise CollectiveSmokeError(f"DeepSeek TP rank checksums differ: {checksums}")
+    return {
+        "ok": True,
+        "backend": "ring",
+        "loopback_only": True,
+        "model_type": "deepseek_v4",
+        "rank_count": 2,
+        "starting_port": starting_port,
+        "elapsed_seconds": time.monotonic() - started_at,
+        "ranks": [by_rank[rank] for rank in (0, 1)],
+    }

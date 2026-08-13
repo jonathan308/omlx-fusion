@@ -18,6 +18,7 @@ def test_cluster_help_is_exposed():
     assert "worker-smoke" in result.stdout
     assert "collective-smoke" in result.stdout
     assert "pipeline-smoke" in result.stdout
+    assert "deepseek-tp-smoke" in result.stdout
     assert "plan" in result.stdout
 
 
@@ -75,6 +76,27 @@ def test_cluster_pipeline_smoke_json_is_runnable():
     payload = json.loads(result.stdout)
     assert payload["ok"] is True
     assert payload["model_type"] == "nemotron_h"
+    assert payload["rank_count"] == 2
+
+
+def test_cluster_deepseek_tp_smoke_json_is_runnable():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "omlx.cli",
+            "cluster",
+            "deepseek-tp-smoke",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["model_type"] == "deepseek_v4"
     assert payload["rank_count"] == 2
 
 

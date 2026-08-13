@@ -612,8 +612,13 @@ def _tensor_parallel_divisors(config: dict[str, Any]) -> tuple[int, ...]:
     """All model dimensions an architecture-specific TP strategy divides."""
 
     heads = _config_int(config, "num_attention_heads", 1)
-    kv_heads = _config_int(config, "num_key_value_heads", heads)
-    values = [heads, kv_heads]
+    values = [heads]
+    if not _kv_cache_replicated_across_tp(config):
+        # A replicated KV cache is not divided by shard(), so its head count
+        # does not bound the TP degree: MLA models store one latent per layer
+        # and DeepSeek-V4 one shared KV row plus pooled compressor state,
+        # none of it partitioned across members.
+        values.append(_config_int(config, "num_key_value_heads", heads))
     model_type = config.get("model_type")
     if model_type in {"qwen3_next", "qwen3_next_moe", "qwen3_5", "qwen3_5_moe"}:
         values.extend(
@@ -732,6 +737,11 @@ def _kv_cache_replicated_across_tp(config: dict[str, Any]) -> bool:
     by the TP degree under-reserved each rank by exactly that factor.
     """
 
+    if config.get("model_type") == "deepseek_v4":
+        # DeepSeek-V4 declares no kv_lora_rank, but its cache is not per-head
+        # either: each layer keeps one shared KV row plus pooled compressor
+        # and indexer state, and its native shard() splits none of it.
+        return True
     return (
         _config_int(config, "kv_lora_rank", 0) > 0
         and _config_int(config, "qk_rope_head_dim", 0) > 0
@@ -754,10 +764,14 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
     # Stored cache is fp16/bf16 even when weights are quantised.
     dtype_size = 2
 
-    if _kv_cache_replicated_across_tp(config):
+    # Key the latent formula on the MLA config fields rather than the wider
+    # _kv_cache_replicated_across_tp flag: DeepSeek-V4's cache is replicated
+    # too, but it stores one shared KV row of head_dim width per layer, which
+    # the standard formula below prices correctly (num_key_value_heads=1).
+    kv_lora_rank = _config_int(config, "kv_lora_rank", 0)
+    rope_dim = _config_int(config, "qk_rope_head_dim", 0)
+    if kv_lora_rank > 0 and rope_dim > 0:
         # One KV head holding latent + RoPE, not expanded K/V tensors.
-        kv_lora_rank = _config_int(config, "kv_lora_rank", 0)
-        rope_dim = _config_int(config, "qk_rope_head_dim", 0)
         return (kv_lora_rank + rope_dim) * dtype_size
 
     heads = _config_int(config, "num_attention_heads", 0)

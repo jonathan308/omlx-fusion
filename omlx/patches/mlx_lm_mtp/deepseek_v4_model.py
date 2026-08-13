@@ -351,7 +351,15 @@ def _patch_model(dsv4: Any) -> None:
         return_hidden: bool = False,
         n_confirmed: int = 0,
         skip_lm_head: bool = False,
+        skip_logits: bool = False,
     ):
+        if skip_logits:
+            # Rank-zero-logits contract (cluster/runtime_optimizations.py):
+            # non-coordinator ranks advance their stage and KV cache without
+            # the vocabulary projection. Used for single-token decode steps,
+            # so no prompt-capture side effects run here — prefill still
+            # takes the full path below on every rank.
+            return self.model(inputs, cache)
         if skip_lm_head:
             # Chunked prefill discards per-chunk logits (the prompt's final
             # token is scored by the first decode step instead). Run the

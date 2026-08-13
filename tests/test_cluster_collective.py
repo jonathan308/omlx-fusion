@@ -10,6 +10,7 @@ from omlx.cluster.collective import (
     CollectiveSmokeError,
     _run_local_minimax_decode_smoke,
     run_local_collective_smoke,
+    run_local_deepseek_tp_smoke,
     run_local_pipeline_smoke,
 )
 
@@ -176,3 +177,76 @@ def test_local_minimax_decode_smoke_validates_real_rank_roles():
     assert result["steps"] == 3
     assert result["ranks"][0]["skip_logits"] is False
     assert result["ranks"][1]["skip_logits"] is True
+
+
+def _deepseek_tp_records(sharded_token_rank1=53):
+    tokens = (53, sharded_token_rank1)
+    return [
+        {
+            "type": "deepseek_tp_result",
+            "model_type": "deepseek_v4",
+            "rank": rank,
+            "size": 2,
+            "strategy": "native",
+            "layers": 3,
+            "heads_per_rank": 2,
+            "reference_token": tokens[rank],
+            "sharded_token": tokens[rank],
+            "max_abs_diff": 3e-7,
+            "checksum": 10.78,
+        }
+        for rank in (0, 1)
+    ]
+
+
+def test_local_deepseek_tp_smoke_validates_sharded_agreement():
+    def runner(argv, *, timeout):
+        assert "omlx.cluster.deepseek_tp_smoke_worker" in argv
+        assert timeout == 9.0
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout="\n".join(json.dumps(record) for record in _deepseek_tp_records()),
+            stderr="",
+        )
+
+    result = run_local_deepseek_tp_smoke(
+        timeout=9.0,
+        runner=runner,
+        starting_port=43000,
+    )
+
+    assert result["ok"] is True
+    assert result["model_type"] == "deepseek_v4"
+    assert result["loopback_only"] is True
+    assert [record["rank"] for record in result["ranks"]] == [0, 1]
+
+
+def test_local_deepseek_tp_smoke_rejects_divergent_tokens():
+    def runner(argv, *, timeout):
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout="\n".join(
+                json.dumps(record) for record in _deepseek_tp_records(54)
+            ),
+            stderr="",
+        )
+
+    with pytest.raises(CollectiveSmokeError, match="tokens differ"):
+        run_local_deepseek_tp_smoke(runner=runner, starting_port=43000)
+
+
+def test_local_deepseek_tp_smoke_rejects_a_reference_mismatch():
+    def runner(argv, *, timeout):
+        records = _deepseek_tp_records()
+        records[1]["sharded_token"] = 7
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout="\n".join(json.dumps(record) for record in records),
+            stderr="",
+        )
+
+    with pytest.raises(CollectiveSmokeError, match="invalid DeepSeek TP result"):
+        run_local_deepseek_tp_smoke(runner=runner, starting_port=43000)

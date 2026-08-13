@@ -875,6 +875,27 @@ def cluster_command(args) -> int:
             print(f"Elapsed:     {result['elapsed_seconds']:.3f}s")
         return 0
 
+    if action == "deepseek-tp-smoke":
+        from .cluster.collective import (
+            CollectiveSmokeError,
+            run_local_deepseek_tp_smoke,
+        )
+
+        try:
+            result = run_local_deepseek_tp_smoke(timeout=args.timeout)
+        except (CollectiveSmokeError, OSError, RuntimeError, ValueError) as exc:
+            print(f"Cluster DeepSeek TP smoke failed: {exc}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            print("oMLX two-rank DeepSeek-V4 tensor-parallel smoke passed")
+            print(f"Backend:     {result['backend']} (loopback only)")
+            print(f"Ranks:       {result['rank_count']}")
+            print(f"Token:       {result['ranks'][0]['sharded_token']}")
+            print(f"Elapsed:     {result['elapsed_seconds']:.3f}s")
+        return 0
+
     if action == "plan":
         import socket
 
@@ -956,7 +977,7 @@ def cluster_command(args) -> int:
 
     print(
         "Unknown cluster action. Available: status, worker-smoke, "
-        "collective-smoke, pipeline-smoke, plan",
+        "collective-smoke, pipeline-smoke, deepseek-tp-smoke, plan",
         file=sys.stderr,
     )
     return 2
@@ -1342,6 +1363,21 @@ Example directory structure:
         help="Overall pipeline deadline in seconds (default: 30)",
     )
     cluster_pipeline_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON",
+    )
+    cluster_deepseek_tp_parser = cluster_subparsers.add_parser(
+        "deepseek-tp-smoke",
+        help="Run a two-rank tensor-parallel DeepSeek-V4 forward",
+    )
+    cluster_deepseek_tp_parser.add_argument(
+        "--timeout",
+        type=_positive_float,
+        default=30.0,
+        help="Overall tensor-parallel deadline in seconds (default: 30)",
+    )
+    cluster_deepseek_tp_parser.add_argument(
         "--json",
         action="store_true",
         help="Emit machine-readable JSON",
