@@ -4,6 +4,7 @@
 import contextlib
 import json
 import threading
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -195,10 +196,167 @@ def test_pure_tensor_stage_accepts_an_unset_pipeline_end_index():
     _validate_loaded_stage(model, assignment)
 
 
-def test_launcher_watchdog_records_reason_and_exits_reparented_rank():
+def test_release_metal_for_exit_unwires_before_clearing(monkeypatch):
+    """set_wired_limit(0) must precede the cache drains to actually free RAM."""
+
+    calls: list[str] = []
+
+    class FakeMetal:
+        @staticmethod
+        def clear_cache():
+            calls.append("metal.clear_cache")
+
+    class FakeMx:
+        metal = FakeMetal()
+
+        @staticmethod
+        def set_wired_limit(value):
+            calls.append(f"set_wired_limit({value})")
+
+        @staticmethod
+        def clear_cache():
+            calls.append("clear_cache")
+
+    monkeypatch.setattr(
+        inference_worker.gc, "collect", lambda: calls.append("gc.collect")
+    )
+
+    assert (
+        inference_worker._release_metal_for_exit("test", mx_module=FakeMx) is True
+    )
+
+    assert calls == [
+        "set_wired_limit(0)",
+        "gc.collect",
+        "clear_cache",
+        "metal.clear_cache",
+    ]
+
+
+def test_release_metal_for_exit_does_not_outlive_its_deadline():
+    """A wedged Metal queue cannot block the exit path the release protects."""
+
+    class WedgedMx:
+        @staticmethod
+        def set_wired_limit(_value):
+            pass
+
+        @staticmethod
+        def clear_cache():
+            threading.Event().wait(30)
+
+    started = time.monotonic()
+
+    assert (
+        inference_worker._release_metal_for_exit(
+            "wedged",
+            timeout_s=0.05,
+            mx_module=WedgedMx,
+        )
+        is False
+    )
+    assert time.monotonic() - started < 5
+
+
+def test_graceful_rank_exit_releases_then_sigterms_instead_of_hard_exit():
+    calls: list[tuple] = []
+
+    inference_worker._begin_graceful_rank_exit(
+        "peer gone",
+        release=lambda reason: calls.append(("release", reason)),
+        signal_self=lambda: calls.append(("sigterm",)),
+        arm_deadman=lambda delay, **kwargs: calls.append(("deadman", delay)),
+        exit_process=lambda code: calls.append(("os._exit", code)),
+        deadman_s=7.5,
+    )
+
+    # The dead-man timer is armed first, so even a wedged release is bounded;
+    # self-SIGTERM — not os._exit — is what actually ends the rank.
+    assert calls == [
+        ("deadman", 7.5),
+        ("release", "peer gone"),
+        ("sigterm",),
+    ]
+
+
+def test_graceful_rank_exit_deadman_fires_when_the_release_wedges():
+    exited: list[int] = []
+    signaled: list[str] = []
+    release_started = threading.Event()
+
+    def wedged_release(_reason):
+        release_started.set()
+        threading.Event().wait(30)
+
+    thread = threading.Thread(
+        target=inference_worker._begin_graceful_rank_exit,
+        kwargs={
+            "reason": "wedged",
+            "release": wedged_release,
+            "signal_self": lambda: signaled.append("sigterm"),
+            "deadman_s": 0.05,
+            "exit_process": exited.append,
+        },
+        daemon=True,
+    )
+    thread.start()
+
+    assert release_started.wait(2)
+    deadline = time.monotonic() + 5
+    while not exited and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    # SIGTERM-self was never reached because the release never returned; the
+    # dead-man timer is what still ends the rank.
+    assert exited == [1]
+    assert signaled == []
+
+
+def test_launcher_watchdog_defers_exit_while_the_control_plane_answers():
     updates: list[tuple[str, dict]] = []
     events: list[dict] = []
-    exit_codes: list[int] = []
+    calls: list[str] = []
+    marker = SimpleNamespace(
+        update=lambda phase, **extra: updates.append((phase, extra))
+    )
+
+    class _StopLoopError(Exception):
+        pass
+
+    def wait(_seconds):
+        # The survive path never returns; cut the outer loop once the
+        # deferral has been recorded so the test can assert on it.
+        if any(event.get("type") == "launcher_lost_deferred" for event in events):
+            raise _StopLoopError()
+
+    with pytest.raises(_StopLoopError):
+        _watch_launcher_parent(
+            42,
+            marker,
+            poll_interval=0.001,
+            grace_s=0.01,
+            get_parent_pid=lambda: 1,
+            wait=wait,
+            control_plane_live=lambda: True,
+            release=lambda _reason: calls.append("release"),
+            signal_self=lambda: calls.append("sigterm"),
+            arm_deadman=lambda *_a, **_k: calls.append("deadman"),
+            exit_process=lambda code: calls.append(f"os._exit({code})"),
+            emit_event=events.append,
+        )
+
+    assert [event["type"] for event in events] == ["launcher_lost_deferred"]
+    # A survived hiccup must not look like a rank failure to the supervisor.
+    assert "reason" not in events[0]
+    assert "error" not in events[0]
+    assert updates[0][0] == "launcher_lost_deferred"
+    assert calls == []
+
+
+def test_launcher_watchdog_exits_through_the_graceful_path_when_orphaned():
+    updates: list[tuple[str, dict]] = []
+    events: list[dict] = []
+    calls: list[tuple] = []
     marker = SimpleNamespace(
         update=lambda phase, **extra: updates.append((phase, extra))
     )
@@ -206,9 +364,15 @@ def test_launcher_watchdog_records_reason_and_exits_reparented_rank():
     _watch_launcher_parent(
         42,
         marker,
+        poll_interval=0.001,
+        grace_s=0.01,
         get_parent_pid=lambda: 1,
         wait=lambda _seconds: None,
-        exit_process=exit_codes.append,
+        control_plane_live=lambda: False,
+        release=lambda reason: calls.append(("release", reason)),
+        signal_self=lambda: calls.append(("sigterm",)),
+        arm_deadman=lambda delay, **kwargs: calls.append(("deadman", delay)),
+        exit_process=lambda code: calls.append(("os._exit", code)),
         emit_event=events.append,
     )
 
@@ -224,7 +388,47 @@ def test_launcher_watchdog_records_reason_and_exits_reparented_rank():
         )
     ]
     assert events[0]["type"] == "launcher_lost"
-    assert exit_codes == [1]
+    reason = updates[0][1]["error"]
+    assert calls[0][0] == "deadman"
+    assert calls.index(("release", reason)) < calls.index(("sigterm",))
+    assert not any(call[0] == "os._exit" for call in calls)
+
+
+def test_launcher_watchdog_grace_window_comes_from_the_environment(monkeypatch):
+    def grace_poll_count() -> int:
+        clock = [0.0]
+        polls = [0]
+        marker = SimpleNamespace(update=lambda *_a, **_k: None)
+
+        def wait(_seconds):
+            clock[0] += 0.1
+
+        def getppid():
+            polls[0] += 1
+            return 1
+
+        _watch_launcher_parent(
+            42,
+            marker,
+            poll_interval=0.1,
+            get_parent_pid=getppid,
+            wait=wait,
+            control_plane_live=lambda: False,
+            release=lambda _reason: None,
+            signal_self=lambda: None,
+            arm_deadman=lambda *_a, **_k: None,
+            exit_process=lambda _code: None,
+            emit_event=lambda _payload: None,
+            monotonic=lambda: clock[0],
+        )
+        return polls[0]
+
+    monkeypatch.setenv("OMLX_RANK_LAUNCHER_GRACE_S", "0.2")
+    short_grace_polls = grace_poll_count()
+    monkeypatch.setenv("OMLX_RANK_LAUNCHER_GRACE_S", "1.0")
+    long_grace_polls = grace_poll_count()
+
+    assert long_grace_polls > short_grace_polls
 
 
 def test_worker_execution_contract_reaches_mlx_lm_and_runtime_optimizations():
@@ -595,7 +799,9 @@ def _run_rank(
     )
     monkeypatch.setattr(inference_worker, "_install_signal_handlers", lambda: None)
     monkeypatch.setattr(
-        inference_worker, "_start_launcher_watchdog", lambda _m, _pid: None
+        inference_worker,
+        "_start_launcher_watchdog",
+        lambda *_args, **_kwargs: None,
     )
 
     def fake_wired(desired):

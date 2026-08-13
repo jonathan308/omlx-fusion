@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import signal
@@ -20,7 +21,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from .deployment import decode_worker_contract
-from .liveness import PeerWatchdog
+from .liveness import PeerWatchdog, check_peers
 from .memory_guard import (
     admission_budget,
     assignment_memory_safety,
@@ -276,40 +277,297 @@ def _install_signal_handlers() -> None:
     signal.signal(signal.SIGINT, interrupt)
 
 
+# Exit-path budgets, env-tunable because the right values depend on the
+# resident set a rank holds. The defaults below are sized for a ~100 GiB rank.
+_RANK_EXIT_CLEAR_TIMEOUT_ENV = "OMLX_RANK_EXIT_CLEAR_TIMEOUT_S"
+_RANK_EXIT_DEADMAN_ENV = "OMLX_RANK_EXIT_DEADMAN_S"
+_LAUNCHER_LOST_GRACE_ENV = "OMLX_RANK_LAUNCHER_GRACE_S"
+_DEFAULT_RANK_EXIT_CLEAR_TIMEOUT_S = 10.0
+_DEFAULT_RANK_EXIT_DEADMAN_S = 20.0
+_DEFAULT_LAUNCHER_LOST_GRACE_S = 30.0
+
+
+def _env_seconds(name: str, default: float) -> float:
+    """A positive seconds value from the environment, or the default."""
+
+    raw = os.environ.get(name, "").strip()
+    if raw:
+        with suppress(ValueError):
+            value = float(raw)
+            if value > 0:
+                return value
+    return default
+
+
+def _release_metal_for_exit(
+    reason: str,
+    *,
+    timeout_s: float | None = None,
+    mx_module: Any = None,
+) -> bool:
+    """Best-effort Metal release before this rank dies, under a deadline.
+
+    ``os._exit`` runs no Python or MLX teardown at all: a rank that dies that
+    way leaves its unified-memory allocation — tens of GiB of GPU/RDMA-pinned
+    pages — owned by no process, and only a reboot reclaims it (observed: a
+    watchdog ``os._exit`` stranded ~100 GiB of wired memory per rank). Every
+    exit path in this file therefore releases Metal state first, so a rank
+    death is cheap instead of machine-fatal.
+
+    The order of the steps is the whole point:
+
+    1. ``mx.set_wired_limit(0)`` FIRST. ``mx.clear_cache()`` only drains the
+       allocator's cache pool; it does not unwire the resident model
+       allocation. Dropping the wired ceiling marks those pages reclaimable,
+       so the kernel takes them back when the process dies.
+    2. ``gc.collect()`` next, so the last Python references to MLX arrays are
+       dropped before the caches are asked to drain.
+    3. ``mx.clear_cache()`` — plus ``mx.metal.clear_cache()`` where MLX
+       exposes it — last, returning the cached Metal buffers to the OS.
+
+    A wedged Metal queue can make any of these calls hang forever, which
+    would block the exit path they exist to protect. The release therefore
+    runs on a helper thread and the caller waits at most ``timeout_s``
+    (``OMLX_RANK_EXIT_CLEAR_TIMEOUT_S``, default 10 s) before moving on; the
+    dead-man timer armed by the caller still bounds the whole exit.
+    """
+
+    if timeout_s is None:
+        timeout_s = _env_seconds(
+            _RANK_EXIT_CLEAR_TIMEOUT_ENV,
+            _DEFAULT_RANK_EXIT_CLEAR_TIMEOUT_S,
+        )
+
+    def release() -> None:
+        module = mx_module
+        if module is None:
+            try:
+                import mlx.core as imported
+            except Exception as exc:
+                print(
+                    f"rank exit: could not import mlx.core to release Metal "
+                    f"({reason}): {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                return
+            module = imported
+        # Unwire first: this is what actually releases the memory the weights
+        # hold. A failure must not skip the remaining steps — each one frees
+        # something the kernel would otherwise keep.
+        for step, action in (
+            ("set_wired_limit(0)", lambda: module.set_wired_limit(0)),
+            ("gc.collect()", gc.collect),
+            ("clear_cache()", module.clear_cache),
+        ):
+            try:
+                action()
+            except Exception as exc:
+                print(
+                    f"rank exit: Metal release step {step} failed "
+                    f"({reason}): {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+        metal = getattr(module, "metal", None)
+        metal_clear = getattr(metal, "clear_cache", None)
+        if callable(metal_clear):
+            try:
+                metal_clear()
+            except Exception as exc:
+                print(
+                    f"rank exit: Metal release step metal.clear_cache() failed "
+                    f"({reason}): {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
+    worker = threading.Thread(
+        target=release,
+        name="omlx-cluster-rank-metal-release",
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout=max(0.0, timeout_s))
+    if worker.is_alive():
+        print(
+            f"rank exit: Metal release did not finish within "
+            f"{timeout_s:.1f}s ({reason}); continuing the exit with memory "
+            f"possibly still wired",
+            flush=True,
+        )
+        return False
+    return True
+
+
+def _signal_self_sigterm() -> None:
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+def _arm_exit_deadman(
+    delay_s: float,
+    *,
+    reason: str = "",
+    exit_process: Any = os._exit,
+) -> threading.Timer:
+    """Hard-exit this rank if the graceful path does not finish in time.
+
+    The graceful path ends in self-SIGTERM, which this worker's signal
+    handler turns into ``KeyboardInterrupt`` on the main thread. A main
+    thread wedged inside a collective or a Metal evaluation never observes
+    that exception, so this dead-man timer is what guarantees the rank still
+    dies — late, and only after the Metal release has had its chance, rather
+    than instantly with its whole allocation still pinned.
+    """
+
+    def fire() -> None:
+        print(
+            f"rank exit: graceful exit did not finish within "
+            f"{delay_s:.1f}s ({reason}); forcing process exit",
+            flush=True,
+        )
+        exit_process(1)
+
+    timer = threading.Timer(max(0.0, delay_s), fire)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+def _begin_graceful_rank_exit(
+    reason: str,
+    *,
+    release: Any = _release_metal_for_exit,
+    signal_self: Any = _signal_self_sigterm,
+    arm_deadman: Any = _arm_exit_deadman,
+    exit_process: Any = os._exit,
+    deadman_s: float | None = None,
+) -> None:
+    """Leave through normal teardown instead of vanishing mid-collective.
+
+    Replaces a bare ``os._exit``: release Metal state first, then ask the
+    main thread to unwind by sending this process SIGTERM. The installed
+    handler raises ``KeyboardInterrupt`` there, so ``run_worker`` returns
+    normally and atexit handlers, the garbage collector and the distributed
+    finalizers all run — the teardown ``os._exit`` skips. The dead-man timer
+    (``OMLX_RANK_EXIT_DEADMAN_S``, default 20 s) bounds the unwind for the
+    wedged-in-collective case.
+    """
+
+    if deadman_s is None:
+        deadman_s = _env_seconds(
+            _RANK_EXIT_DEADMAN_ENV,
+            _DEFAULT_RANK_EXIT_DEADMAN_S,
+        )
+    # Armed before the release, not after: if the release itself wedges past
+    # its own deadline and the main thread is stuck with it, this is the only
+    # thread still guaranteed to run.
+    arm_deadman(deadman_s, reason=reason, exit_process=exit_process)
+    release(reason)
+    signal_self()
+
+
 def _watch_launcher_parent(
     parent_pid: int,
     marker: RuntimeMarker,
     *,
     poll_interval: float = 0.2,
+    grace_s: float | None = None,
     get_parent_pid: Any = os.getppid,
     wait: Any = time.sleep,
+    control_plane_live: Any = None,
+    release: Any = _release_metal_for_exit,
+    signal_self: Any = _signal_self_sigterm,
+    arm_deadman: Any = _arm_exit_deadman,
     exit_process: Any = os._exit,
     emit_event: Any = _emit_event,
+    monotonic: Any = time.monotonic,
 ) -> None:
-    """Fail fast if MLX's launcher exits without reaping this rank.
+    """Fail safely if MLX's launcher exits without reaping this rank.
 
     MLX-LM owns background generation threads that may keep a worker alive
     after its main thread handles SIGTERM. The launcher is the lifetime owner
     of every rank, so a reparented worker cannot make useful collective
     progress and must not remain resident on a node.
+
+    A ppid flip is not, on its own, proof that the control plane is gone: an
+    ordinary supervisor stop SIGTERMs the rank and retires the launcher/SSH
+    parent in the same instant, and the instant ``os._exit`` this watchdog
+    used to call won that race — skipping every Python/MLX finalizer and
+    stranding the rank's wired unified-memory allocation in the kernel
+    (~100 GiB per rank, reclaimable only by reboot). The watchdog therefore
+    waits out a grace window (``OMLX_RANK_LAUNCHER_GRACE_S``, default 30 s) —
+    long enough for a concurrent SIGTERM to unwind the main thread through
+    normal teardown — and then asks the liveness machinery whether the
+    control plane is actually still answering before concluding death. A
+    surviving rank logs ``launcher_lost_deferred`` and keeps watching; a
+    genuinely orphaned one exits through the graceful path, which releases
+    Metal state first. The check stays fail-closed: a control plane that
+    cannot be proven alive is treated as gone.
     """
+
+    if grace_s is None:
+        grace_s = _env_seconds(
+            _LAUNCHER_LOST_GRACE_ENV,
+            _DEFAULT_LAUNCHER_LOST_GRACE_S,
+        )
 
     while True:
         wait(poll_interval)
-        if get_parent_pid() == parent_pid:
-            continue
         current_parent = get_parent_pid()
+        if current_parent == parent_pid:
+            continue
         reason = (
             f"rank launcher parent changed from {parent_pid} to "
             f"{current_parent}; the rank cannot safely continue"
         )
+        # Grace window. If the parent pid comes back the flip was a launcher
+        # handoff, not a death; if the rest of the control plane still
+        # answers, the collective can make progress and this rank stays
+        # resident for it. Either way the watchdog keeps watching afterwards,
+        # so a later genuine death is still caught.
+        deadline = monotonic() + grace_s
+        survived = False
+        parent_returned = False
+        while monotonic() < deadline:
+            wait(poll_interval)
+            if get_parent_pid() == parent_pid:
+                survived = True
+                parent_returned = True
+                break
+        if not survived and control_plane_live is not None:
+            with suppress(Exception):
+                survived = bool(control_plane_live())
+        if survived:
+            detail = (
+                f"rank launcher parent changed from {parent_pid} to "
+                f"{current_parent}, but the control plane is still "
+                f"answering; treating the loss as a hiccup and staying "
+                f"resident"
+            )
+            # No "reason"/"error" keys here: the supervisor reads those as a
+            # rank failure, and a survived hiccup is not one.
+            emit_event({"type": "launcher_lost_deferred", "detail": detail})
+            marker.update("launcher_lost_deferred", detail=detail)
+            # Adopt the new parent as the owner to watch. Without this a
+            # permanent reparent re-enters the full grace window on every
+            # poll, and the watchdog spends the rest of its life logging
+            # deferred hiccups instead of watching anything. Skipped when the
+            # original parent came back on its own — there is nothing new to
+            # adopt in that case.
+            if not parent_returned:
+                parent_pid = current_parent
+            continue
         # Keep the marker as bounded crash evidence. The next activation
         # overwrites the deterministic path, and liveness already ignores a
         # marker whose owner is dead. Removing it here reduced this exact
         # failure to "heartbeat missing" with no explanation.
         marker.update("launcher_lost", error=reason)
         emit_event({"type": "launcher_lost", "reason": reason})
-        exit_process(1)
+        _begin_graceful_rank_exit(
+            reason,
+            release=release,
+            signal_self=signal_self,
+            arm_deadman=arm_deadman,
+            exit_process=exit_process,
+        )
         return
 
 
@@ -335,6 +593,48 @@ def _peer_hosts_by_rank(
         for assignment in assignments
         if assignment.rank != rank and 0 <= assignment.rank < len(hosts)
     }
+
+
+def _control_plane_live(
+    assignments: Sequence[PipelineAssignment],
+    hosts: Sequence[str],
+    deployment_id: str,
+    state_dir: str,
+    *,
+    rank: int,
+) -> bool:
+    """Is the rest of this rank's control plane still answering?
+
+    Consulted by the launcher-parent watchdog after a ppid flip, before the
+    rank concludes it is orphaned. Every peer this rank can observe must be
+    healthy: a half-dead control plane cannot complete a collective, so one
+    lost peer already means gone.
+
+    There is a deliberate asymmetry in what ranks can see. The plan's SSH
+    targets are written from the coordinator's point of view, so on a remote
+    rank the coordinator's target is ``127.0.0.1`` — the remote Mac itself,
+    which holds no rank-zero marker. That entry can never read healthy there,
+    which makes this check fail-closed on remote ranks: a genuinely lost
+    launcher parent always ends the rank after the grace window. On the
+    coordinator every peer is a real SSH target, so the check is informative
+    and a hiccup can be survived.
+    """
+
+    hosts_by_rank = _peer_hosts_by_rank(assignments, hosts, rank=rank)
+    if not hosts_by_rank:
+        return False
+    try:
+        health = check_peers(
+            hosts_by_rank,
+            state_dir=state_dir,
+            deployment_id=deployment_id,
+            require_heartbeat=True,
+        )
+    except Exception:
+        # Fail closed: a check that cannot run must not keep an orphaned,
+        # memory-pinned rank resident.
+        return False
+    return bool(health) and all(item.healthy for item in health)
 
 
 def _start_peer_watchdog(
@@ -379,7 +679,11 @@ def _start_peer_watchdog(
     def on_lost(reason: str) -> None:
         marker.update("peer_lost", error=reason)
         _emit_event({"type": "peer_lost", "reason": reason})
-        os._exit(1)
+        # Not os._exit: the PeerWatchdog has already waited out its failure
+        # tolerance, so there is no haste left to justify skipping teardown.
+        # Release Metal state, then unwind through self-SIGTERM so the rank's
+        # wired allocation comes back instead of being stranded in the kernel.
+        _begin_graceful_rank_exit(reason)
 
     watchdog = PeerWatchdog(
         hosts_by_rank,
@@ -394,10 +698,29 @@ def _start_peer_watchdog(
     return watchdog
 
 
-def _start_launcher_watchdog(marker: RuntimeMarker, parent_pid: int) -> None:
+def _start_launcher_watchdog(
+    marker: RuntimeMarker,
+    parent_pid: int,
+    assignments: Sequence[PipelineAssignment],
+    hosts: Sequence[str],
+    deployment_id: str,
+    state_dir: str,
+    *,
+    rank: int,
+) -> None:
+    def control_plane_live() -> bool:
+        return _control_plane_live(
+            assignments,
+            hosts,
+            deployment_id,
+            state_dir,
+            rank=rank,
+        )
+
     thread = threading.Thread(
         target=_watch_launcher_parent,
         args=(parent_pid, marker),
+        kwargs={"control_plane_live": control_plane_live},
         name="omlx-cluster-launcher-watchdog",
         daemon=True,
     )
@@ -774,14 +1097,23 @@ def run_worker(args: argparse.Namespace) -> int:
     )
     marker.start_heartbeat()
     _install_signal_handlers()
-    _start_launcher_watchdog(marker, launcher_parent_pid)
+    peer_hosts = [host for host in args.peer_hosts.split(",") if host]
+    _start_launcher_watchdog(
+        marker,
+        launcher_parent_pid,
+        assignments,
+        peer_hosts,
+        args.deployment_id,
+        args.state_dir,
+        rank=rank,
+    )
     # Before the load, not after it. Loading a 300 GB model takes twenty
     # minutes, and a peer that goes away inside that window left every other
     # rank blocked in its first collective with nothing watching at all.
     _start_peer_watchdog(
         marker,
         assignments,
-        [host for host in args.peer_hosts.split(",") if host],
+        peer_hosts,
         args.deployment_id,
         args.state_dir,
         rank=rank,

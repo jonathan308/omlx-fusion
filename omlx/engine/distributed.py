@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -24,6 +25,26 @@ logger = logging.getLogger(__name__)
 
 class DistributedInferenceError(RuntimeError):
     """A bounded error surfaced when the private rank-zero backend fails."""
+
+
+# How long engine stop waits for in-flight requests before the supervisor
+# SIGTERMs the rank group. A request cut mid-decode is also a rank killed
+# mid-Metal-eval — the exact sequence that strands wired unified memory in
+# the kernel — so the kill waits, but not forever: a wedged rank must still
+# be torn down, and the supervisor's own TERM→KILL grace bounds it next.
+_QUIESCE_TIMEOUT_ENV = "OMLX_CLUSTER_QUIESCE_TIMEOUT_S"
+_DEFAULT_QUIESCE_TIMEOUT_S = 30.0
+_QUIESCE_POLL_S = 0.1
+
+
+def _quiesce_timeout_s() -> float:
+    raw = os.environ.get(_QUIESCE_TIMEOUT_ENV, "").strip()
+    if raw:
+        with suppress(ValueError):
+            value = float(raw)
+            if value > 0:
+                return value
+    return _DEFAULT_QUIESCE_TIMEOUT_S
 
 
 class DistributedBatchedEngine(BatchedEngine):
@@ -72,6 +93,11 @@ class DistributedBatchedEngine(BatchedEngine):
         self._model_type: str | None = None
         self._active_requests = 0
         self._active_lock = asyncio.Lock()
+        # Set by stop() before anything else: new requests are refused from
+        # that instant, so the in-flight set can only shrink while stop waits
+        # for it to drain.
+        self._stopping = False
+        self._quiesce_timeout_s = _quiesce_timeout_s()
 
     def _new_client(self, endpoint: str) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -110,6 +136,13 @@ class DistributedBatchedEngine(BatchedEngine):
     async def start(self) -> None:
         if self._loaded:
             return
+        # Requests auto-start a not-yet-loaded engine. Once stop() has begun
+        # that convenience becomes a race that would relaunch ranks the
+        # supervisor is actively tearing down, so it is refused outright.
+        if self._stopping:
+            raise DistributedInferenceError(
+                "distributed engine is stopping and cannot accept new work"
+            )
         self._validate_model_settings()
 
         # Tokenizer/config metadata stays in the oMLX process. No model weights
@@ -182,6 +215,13 @@ class DistributedBatchedEngine(BatchedEngine):
             )
 
     async def stop(self) -> None:
+        # Quiesce before the supervisor SIGTERMs the rank group. New work is
+        # refused from this line on, then in-flight requests get a bounded
+        # window to reach a token boundary: a rank killed mid-Metal-eval is
+        # how wired unified memory ends up orphaned in the kernel.
+        self._stopping = True
+        self._loaded = False
+        await self._quiesce_in_flight(self._quiesce_timeout_s)
         client, self._client = self._client, None
         try:
             if client is not None:
@@ -194,6 +234,32 @@ class DistributedBatchedEngine(BatchedEngine):
                 self._model_type = None
                 self._loaded = False
         logger.info("Distributed engine stopped: %s", self.deployment.deployment_id)
+
+    async def _quiesce_in_flight(self, timeout_s: float) -> bool:
+        """Wait for in-flight requests to drain, up to ``timeout_s``.
+
+        Returns True when the engine went idle. On timeout the stop proceeds
+        anyway — a wedged rank cannot be allowed to make the deployment
+        unstoppable, and the supervisor's TERM→KILL grace is the next bound.
+        """
+
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            async with self._active_lock:
+                active = self._active_requests
+            if active <= 0:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    "Distributed engine stop: %d request(s) still in flight "
+                    "after %.1fs of %s; tearing down the rank group anyway",
+                    active,
+                    timeout_s,
+                    _QUIESCE_TIMEOUT_ENV,
+                )
+                return False
+            await asyncio.sleep(min(_QUIESCE_POLL_S, remaining))
 
     def _ensure_available(self) -> httpx.AsyncClient:
         client = self._client
@@ -486,6 +552,13 @@ class DistributedBatchedEngine(BatchedEngine):
 
     async def _enter_request(self) -> None:
         async with self._active_lock:
+            # Checked here and not only in _ensure_available: a request that
+            # passed availability just before stop() began must not slip into
+            # the in-flight set after the quiesce has already counted it.
+            if self._stopping:
+                raise DistributedInferenceError(
+                    "distributed engine is stopping and cannot accept new work"
+                )
             self._active_requests += 1
 
     async def _leave_request(self) -> None:

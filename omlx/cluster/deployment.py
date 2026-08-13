@@ -323,7 +323,21 @@ class ClusterDeployment:
     def hostfile_dict(self) -> dict[str, Any]:
         return {
             "backend": self.backend,
-            "envs": ["MLX_METAL_FAST_SYNCH=1"],
+            "envs": [
+                # Kept as-is: fast synch relies on the patched-MLX fence fix;
+                # against stock MLX it reorders completion and corrupts
+                # decode. Do not "modernize" this flag away independently of
+                # that patch.
+                "MLX_METAL_FAST_SYNCH=1",
+                # Cap command-buffer fan-out. Without these a long decode
+                # queues enough work per buffer to trip
+                # kIOGPUCommandBufferCallbackErrorTimeout — the driver kills
+                # the rank outright, which is a teardown-free death and
+                # strands its wired allocation in the kernel (production
+                # values from the ThunderMLX two-Mac deployment).
+                "MLX_MAX_OPS_PER_BUFFER=16",
+                "MLX_MAX_MB_PER_BUFFER=512",
+            ],
             "hosts": [
                 {
                     "ssh": host.ssh,

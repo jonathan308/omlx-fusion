@@ -160,6 +160,11 @@ def _install_ready_pool(
     # established. Do not let their synthetic ``studio.local`` host escape to
     # the real SSH liveness probe; peer-loss behavior has dedicated coverage.
     monkeypatch.setattr(routes, "check_peers", lambda *args, **kwargs: ())
+    # Same for the orphaned wired-memory preflight: it would SSH the fake
+    # hosts and pay a real connect timeout before failing open.
+    monkeypatch.setattr(
+        routes, "check_orphaned_wired_memory", lambda *args, **kwargs: None
+    )
     return pool
 
 

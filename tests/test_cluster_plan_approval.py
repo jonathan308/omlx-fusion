@@ -279,6 +279,9 @@ def cluster(tmp_path, monkeypatch):
     monkeypatch.setattr(routes, "inspect_safetensors_layout", _layout)
     monkeypatch.setattr(routes, "check_peers", lambda *args, **kwargs: ())
     monkeypatch.setattr(
+        routes, "check_orphaned_wired_memory", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
         routes,
         "preflight_remote_hosts",
         lambda deployment: [{"rank": rank} for rank in range(deployment.world_size)],

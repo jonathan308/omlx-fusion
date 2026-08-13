@@ -83,7 +83,14 @@ def test_deployment_round_trip_and_worker_plan_are_json_only():
     assert restored == deployment
     assert plan_hash == deployment.plan_hash
     assert assignments == deployment.assignments
-    assert deployment.hostfile_dict()["envs"] == ["MLX_METAL_FAST_SYNCH=1"]
+    # Fast synch stays (it needs the patched-MLX fence fix); the two buffer
+    # caps keep a long decode from tripping the driver's command-buffer
+    # timeout kill.
+    assert deployment.hostfile_dict()["envs"] == [
+        "MLX_METAL_FAST_SYNCH=1",
+        "MLX_MAX_OPS_PER_BUFFER=16",
+        "MLX_MAX_MB_PER_BUFFER=512",
+    ]
     assert deployment.distributed_init_backend == "jaccl"
 
 
