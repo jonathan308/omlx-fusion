@@ -14,6 +14,29 @@ from typing import Any
 
 from .performance import ExecutionSettings
 
+# Floor for the prefill-loop buffer-pool clear, mirroring the single-node
+# ``Scheduler._periodic_clear_threshold_bytes`` formula (memory_limit/3 with
+# a 2 GiB floor). Kept as a separate copy rather than imported: the cluster
+# worker must not pull in the single-node scheduler module, and both sides
+# point at each other so the formula cannot silently drift apart.
+_DEFAULT_PREFILL_CLEAR_THRESHOLD_BYTES = 2 * 1024**3
+
+
+def prefill_clear_threshold_bytes(memory_limit_bytes: int) -> int:
+    """Pool-bytes threshold above which the prefill loop may clear the pool.
+
+    Same rule as the scheduler's decode-time gate: a clear that fires when
+    the MLX buffer pool holds little produces IOGPUFamily refcount bursts for
+    no benefit, while a clear that never fires lets a long prefill pin the
+    pool. Keep the two formulas in sync with
+    ``omlx/scheduler.py::_periodic_clear_threshold_bytes``.
+    """
+
+    memory_limit_bytes = int(memory_limit_bytes)
+    if memory_limit_bytes > 0:
+        return max(memory_limit_bytes // 3, _DEFAULT_PREFILL_CLEAR_THRESHOLD_BYTES)
+    return _DEFAULT_PREFILL_CLEAR_THRESHOLD_BYTES
+
 
 def _capability(
     *,
@@ -198,8 +221,15 @@ def install_runtime_optimizations(
     *,
     batchable: bool,
     pipeline_parallel: bool = True,
+    memory_limit_bytes: int = 0,
 ) -> Iterator[dict[str, dict[str, Any]]]:
-    """Install opt-in token-only output while reporting every capability."""
+    """Install opt-in token-only output while reporting every capability.
+
+    ``memory_limit_bytes`` is this host's admission ceiling; it sizes the
+    pressure gate on the staggered prefill loop's buffer-pool clear (see
+    ``prefill_clear_threshold_bytes``). 0 means "unknown" and falls back to
+    the absolute floor.
+    """
 
     import mlx.core as mx
 
@@ -361,6 +391,26 @@ def install_runtime_optimizations(
             sent = original_send(value, *args, **kwargs)
             mx.async_eval(sent)
 
+    prefill_clear_threshold = prefill_clear_threshold_bytes(memory_limit_bytes)
+
+    def clear_prefill_pool_if_pressured() -> None:
+        """Pressure-gate the prefill loop's Metal buffer-pool clear.
+
+        The unconditional per-chunk ``mx.clear_cache()`` this replaces (both
+        upstream mlx-vlm and the first version of this override) returned the
+        whole pool to the OS after EVERY chunk: ThunderMLX measured its
+        pipeline rank sawtoothing 3 GiB <-> 89 GiB wired during every long
+        prefill, unwiring and rewiring the working set per chunk. The clear
+        survives only as the pressure safety valve: once the allocator cache
+        itself exceeds the admission-derived threshold, handing it back is
+        worth the rewire. Below the threshold the pool stays resident — the
+        IOGPU residency set is already bounded by the wired ceiling the rank
+        admitted against, and a sawtooth-free prefill keeps its buffers.
+        """
+
+        if mx.get_cache_memory() > prefill_clear_threshold:
+            mx.clear_cache()
+
     def staggered_pipeline_prompt(instance: Any, tokens: list[list[int]]) -> None:
         """Pinned PromptProcessingBatch.prompt with pipeline fill/drain."""
 
@@ -419,7 +469,7 @@ def install_runtime_optimizations(
                     local_state.queue_prefill_sends = False
                 flush_prefill_sends()
                 mx.eval([cache.state for cache in instance.prompt_cache])
-                mx.clear_cache()
+                clear_prefill_pool_if_pressured()
         finally:
             local_state.queue_prefill_sends = False
             # A cancelled/failed prefill must never leak an old activation into
@@ -430,7 +480,7 @@ def install_runtime_optimizations(
             for cache in instance.prompt_cache:
                 cache.finalize()
             mx.eval([cache.state for cache in instance.prompt_cache])
-            mx.clear_cache()
+            clear_prefill_pool_if_pressured()
 
     def coordinator_generation_step(instance: Any) -> Any:
         """Pinned GenerationBatch._step with one token collective per batch."""

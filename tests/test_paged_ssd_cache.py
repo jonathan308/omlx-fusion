@@ -4168,3 +4168,95 @@ class TestTurboquantBitsSignature:
             assert payload["turboquant_kv_bits"] == 6.0
         finally:
             mgr.close()
+
+
+class TestLiveMaxSizeTuning:
+    """Live SSD-cap retuning within clamp rails (no model reload)."""
+
+    GiB = 1024**3
+
+    def _manager(self, tmp_path: Path, max_size_bytes: int) -> PagedSSDCacheManager:
+        return PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=max_size_bytes,
+        )
+
+    def _track(self, manager, tmp_path: Path, index: int, file_size: int):
+        """Index an entry whose on-disk file is tiny but whose recorded size
+        is GiB-scale — the enforcement math only reads the recorded size."""
+        file_path = tmp_path / "ssd_cache" / "0" / f"fake{index}.safetensors"
+        file_path.write_bytes(b"x")
+        manager._index.add(
+            PagedSSDBlockMetadata(
+                block_hash=bytes([index + 1]) * 32,
+                file_path=file_path,
+                file_size=file_size,
+                token_count=1,
+                created_at=float(index),
+                last_access=float(index),
+                num_layers=1,
+                model_name="test-model",
+            )
+        )
+        return file_path
+
+    def test_clamp_rails(self):
+        from omlx.cache.paged_ssd_cache import (
+            SSD_CACHE_LIVE_MAX_SIZE_MAX_BYTES,
+            SSD_CACHE_LIVE_MAX_SIZE_MIN_BYTES,
+            clamp_live_ssd_cache_max_size,
+        )
+
+        min_rail = SSD_CACHE_LIVE_MAX_SIZE_MIN_BYTES
+        max_rail = SSD_CACHE_LIVE_MAX_SIZE_MAX_BYTES
+        assert min_rail == 50 * self.GiB
+        assert max_rail == 400 * self.GiB
+        assert clamp_live_ssd_cache_max_size(1) == 50 * self.GiB
+        assert clamp_live_ssd_cache_max_size(10**15) == 400 * self.GiB
+        inside = 250 * self.GiB
+        assert clamp_live_ssd_cache_max_size(inside) == inside
+
+    def test_set_max_size_applies_and_clamps(self, tmp_path: Path):
+        manager = self._manager(tmp_path, 100 * self.GiB)
+        try:
+            assert manager.set_max_size(250 * self.GiB) == 250 * self.GiB
+            assert manager.configured_max_size == 250 * self.GiB
+            assert manager.max_size == 250 * self.GiB
+
+            # Out-of-rail asks clamp instead of raising.
+            assert manager.set_max_size(self.GiB) == 50 * self.GiB
+            assert manager.configured_max_size == 50 * self.GiB
+            assert manager.set_max_size(10**15) == 400 * self.GiB
+        finally:
+            manager.close()
+
+    def test_growth_never_evicts(self, tmp_path: Path):
+        manager = self._manager(tmp_path, 60 * self.GiB)
+        try:
+            self._track(manager, tmp_path, 0, 40 * self.GiB)
+            manager.set_max_size(300 * self.GiB)
+            assert manager._tracked_ssd_size() == 40 * self.GiB
+        finally:
+            manager.close()
+
+    def test_live_retune_keeps_tracked_capacity_bounded(self, tmp_path: Path):
+        """The bounded-capacity invariant: after a live shrink the tracked
+        size is bounded by the NEW cap, not the configured-at-boot one —
+        the same acceptance property ThunderMLX's
+        check_ssd_restore_append_capacity_is_bounded probes."""
+        manager = self._manager(tmp_path, 100 * self.GiB)
+        try:
+            oldest = self._track(manager, tmp_path, 0, 40 * self.GiB)
+            newest = self._track(manager, tmp_path, 1, 40 * self.GiB)
+            assert manager._tracked_ssd_size() == 80 * self.GiB
+
+            effective = manager.set_max_size(50 * self.GiB)
+
+            assert effective == 50 * self.GiB
+            # Enforcement evicts LRU-first down to 90% of the new cap.
+            assert manager._tracked_ssd_size() == 40 * self.GiB
+            assert manager._tracked_ssd_size() <= effective
+            assert not oldest.exists(), "the LRU entry's file was unlinked"
+            assert newest.exists()
+        finally:
+            manager.close()

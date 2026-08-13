@@ -27,6 +27,7 @@ from omlx.cluster.planner import (
 from omlx.cluster.runtime_optimizations import (
     install_runtime_optimizations,
     pipeline_prefill_schedule,
+    prefill_clear_threshold_bytes,
 )
 
 mlx_generate = importlib.import_module("mlx_lm.generate")
@@ -565,6 +566,132 @@ def test_staggered_prompt_matches_stock_chunking_padding_and_cache_lifecycle(
     assert [len(chunk[0]) for chunk in patched.model.seen] == [8, 1]
     assert patched.tokens == stock.tokens == prompts
     assert patched.prompt_cache[0].events == stock.prompt_cache[0].events
+
+
+def _run_staggered_prompt(monkeypatch, cache_memory_bytes, memory_limit_bytes=0):
+    """Run the patched staggered prompt with a scripted allocator pool size."""
+
+    clears = []
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: cache_memory_bytes)
+    monkeypatch.setattr(mx, "clear_cache", lambda: clears.append(1))
+    monkeypatch.setattr(mx.distributed, "send", lambda value, *_a, **_k: value)
+    monkeypatch.setattr(mx.distributed, "all_gather", lambda value, **_k: value)
+    monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
+
+    class Cache:
+        state = mx.array([0])
+
+        def prepare(self, *, lengths, right_padding):
+            pass
+
+        def finalize(self):
+            pass
+
+    class Batch:
+        uids = ["request"]
+        tokens = [[]]
+        prompt_cache = [Cache()]
+        prefill_step_size = 8
+
+        def __init__(self):
+            self.model = _ValidatedPipeline()
+            self.model.pipeline_rank = 1
+
+    settings = replace(
+        execution_profile("balanced"),
+        sampling_rank_only=True,
+        async_overlap=True,
+        prefill_step_size=8,
+    )
+    batch = Batch()
+    with install_runtime_optimizations(
+        SimpleNamespace(model=_ValidatedPipeline()),
+        _Group(),
+        settings,
+        batchable=True,
+        memory_limit_bytes=memory_limit_bytes,
+    ):
+        mlx_generate.PromptProcessingBatch.prompt(batch, [list(range(9))])
+    return clears
+
+
+def test_prefill_clear_threshold_mirrors_the_scheduler_formula():
+    """memory_limit/3 with a 2 GiB floor — keep scheduler.py in sync."""
+    assert prefill_clear_threshold_bytes(0) == 2 * 1024**3
+    assert prefill_clear_threshold_bytes(-5) == 2 * 1024**3
+    assert prefill_clear_threshold_bytes(3 * 1024**3) == 2 * 1024**3
+    assert prefill_clear_threshold_bytes(120 * 1024**3) == 40 * 1024**3
+
+
+def test_staggered_prompt_never_clears_a_small_pool_per_chunk(monkeypatch):
+    """The sawtooth fix: a 9-token, 2-chunk prefill with a 1 GiB pool must
+    not return the pool to the OS after every chunk."""
+    clears = _run_staggered_prompt(monkeypatch, cache_memory_bytes=1024**3)
+    assert clears == []
+
+
+def test_staggered_prompt_keeps_the_pressure_safety_clear(monkeypatch):
+    """Above the threshold the clear still fires — once per real chunk."""
+    clears = _run_staggered_prompt(monkeypatch, cache_memory_bytes=3 * 1024**3)
+    assert clears == [1, 1]
+
+
+def test_staggered_prompt_threshold_tracks_the_memory_limit(monkeypatch):
+    """A 3 GiB pool is pressure on a 6 GiB host (limit/3) but not on a 90 GiB one."""
+    assert (
+        _run_staggered_prompt(monkeypatch, 3 * 1024**3, memory_limit_bytes=90 * 1024**3)
+        == []
+    )
+    assert _run_staggered_prompt(
+        monkeypatch, 3 * 1024**3, memory_limit_bytes=6 * 1024**3
+    ) == [1, 1]
+
+
+def test_staggered_prompt_gates_the_padded_finalize_clear(monkeypatch):
+    """The finalize path after right-padded batches is gated the same way."""
+    clears = []
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 3 * 1024**3)
+    monkeypatch.setattr(mx, "clear_cache", lambda: clears.append(1))
+    monkeypatch.setattr(mx.distributed, "send", lambda value, *_a, **_k: value)
+    monkeypatch.setattr(mx.distributed, "all_gather", lambda value, **_k: value)
+    monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
+
+    class Cache:
+        state = mx.array([0])
+
+        def prepare(self, *, lengths, right_padding):
+            pass
+
+        def finalize(self):
+            pass
+
+    class Batch:
+        uids = ["first", "second"]
+        prefill_step_size = 8
+
+        def __init__(self):
+            self.tokens = [[], []]
+            self.prompt_cache = [Cache()]
+            self.model = _ValidatedPipeline()
+            self.model.pipeline_rank = 1
+
+    settings = replace(
+        execution_profile("balanced"),
+        sampling_rank_only=True,
+        async_overlap=True,
+        prefill_step_size=8,
+    )
+    with install_runtime_optimizations(
+        SimpleNamespace(model=_ValidatedPipeline()),
+        _Group(),
+        settings,
+        batchable=True,
+    ):
+        mlx_generate.PromptProcessingBatch.prompt(
+            Batch(),
+            [list(range(9)), list(range(20, 25))],
+        )
+    assert clears == [1, 1, 1], "two chunks plus one gated finalize clear"
 
 
 def test_sampling_rank_optimization_keeps_normal_path_for_unvalidated_model():

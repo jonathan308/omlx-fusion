@@ -25,6 +25,7 @@ from .liveness import PeerWatchdog, check_peers
 from .memory_guard import (
     admission_budget,
     assignment_memory_safety,
+    ceiling_breakdown,
     check_rank_fits,
     guard_rank_load,
     watch_rank_load,
@@ -1262,12 +1263,22 @@ def run_worker(args: argparse.Namespace) -> int:
             # Doing it here as well would shard every projection twice.
             measured_weight_bytes = _measured_weight_bytes(provider.model)
             _validate_measured_weight_bytes(measured_weight_bytes, assignment)
+            # The prefill pool-clear gate is sized from the same admission
+            # ceiling the prefill guard votes against; an unmeasurable host
+            # falls back to the absolute floor (fail-open, same as the guard).
+            try:
+                prefill_memory_limit = int(
+                    ceiling_breakdown(guard_tier).get("hard_limit", 0)
+                )
+            except Exception:
+                prefill_memory_limit = 0
             with install_runtime_optimizations(
                 provider.model,
                 group,
                 execution,
                 batchable=provider.is_batchable,
                 pipeline_parallel=tensor_parallel_size == 1,
+                memory_limit_bytes=prefill_memory_limit,
             ) as optimizations:
                 marker.update(
                     "ready",

@@ -104,6 +104,19 @@ class CacheProbeRequest(BaseModel):
     thinking_budget: int | None = None
 
 
+class SSDCacheMaxSizeRequest(BaseModel):
+    """Request model for live SSD cache cap tuning.
+
+    ``max_size`` is a human-readable size ("250GB", "1TB"); the value is
+    clamped into the live-tuning rails rather than rejected, so a disk-budget
+    response never fails on an out-of-range ask. ``persist`` also writes the
+    clamped value to the global settings file so it survives a restart.
+    """
+
+    max_size: str
+    persist: bool = True
+
+
 class ModelSettingsRequest(BaseModel):
     """Request model for updating per-model settings."""
 
@@ -5100,6 +5113,82 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
                 logger.warning("Failed to clean SSD cache directory: %s", exc)
 
     return {"status": "ok", "total_deleted": total_deleted}
+
+
+@router.post("/api/ssd-cache/max-size")
+async def set_ssd_cache_max_size(
+    request: SSDCacheMaxSizeRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Live-retune the SSD cache size cap without a model reload.
+
+    ``_apply_cache_settings_runtime`` changes this cap by unloading every
+    model; this route instead pushes the clamped value straight into each
+    loaded model's ``PagedSSDCacheManager``, whose enforcement sites re-read
+    the cap on every save. The pool's scheduler config is updated too, so
+    models loaded later inherit the retune. Values parse via ``parse_size``
+    and clamp into the 50-400 GiB rails (never rejected) — see
+    ``clamp_live_ssd_cache_max_size``.
+    """
+    from ..cache.paged_ssd_cache import clamp_live_ssd_cache_max_size
+    from ..config import parse_size
+
+    try:
+        requested = parse_size(request.max_size)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid max_size '{request.max_size}': {exc}",
+        ) from exc
+    if requested <= 0:
+        raise HTTPException(status_code=400, detail="max_size must be positive")
+
+    effective = clamp_live_ssd_cache_max_size(requested)
+
+    models_updated = 0
+    for model_id, scheduler in _iter_loaded_schedulers():
+        ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+        if ssd_manager is None or not hasattr(ssd_manager, "set_max_size"):
+            continue
+        try:
+            ssd_manager.set_max_size(effective)
+            models_updated += 1
+        except Exception as exc:
+            logger.warning(
+                "Failed to retune SSD cache cap for model '%s': %s",
+                model_id,
+                exc,
+            )
+
+    # Future loads inherit the retune through the pool's scheduler config.
+    pool = _get_engine_pool()
+    if pool is not None and getattr(pool, "_scheduler_config", None) is not None:
+        pool._scheduler_config.paged_ssd_cache_max_size = effective
+
+    persisted = False
+    if request.persist:
+        global_settings = _get_global_settings()
+        if global_settings is not None:
+            gib = 1024**3
+            global_settings.cache.ssd_cache_max_size = (
+                f"{effective // gib}GB" if effective % gib == 0 else f"{effective}B"
+            )
+            try:
+                global_settings.save()
+                persisted = True
+            except OSError as exc:
+                # The live retune already took effect; only the restart-surviving
+                # copy failed, so report instead of 500ing the whole request.
+                logger.warning("Failed to persist SSD cache cap: %s", exc)
+
+    return {
+        "status": "ok",
+        "requested_bytes": requested,
+        "effective_bytes": effective,
+        "clamped": effective != requested,
+        "models_updated": models_updated,
+        "persisted": persisted,
+    }
 
 
 @router.post("/api/hot-cache/clear")
