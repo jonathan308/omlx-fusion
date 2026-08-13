@@ -266,6 +266,101 @@ class EnginePool:
         except Exception:  # noqa: BLE001
             return 0
 
+    def _admission_size_for_entry(
+        self, entry: EngineEntry, force_lm: bool = False
+    ) -> tuple[int, str]:
+        """Resident bytes a load of this entry must admit, and its label.
+
+        A distributed coordinator admits only rank zero's planned shard, not
+        the complete model. A local VLM-shaped checkpoint served by the text
+        engine (force_lm or a model_type_override that flipped engine_type to
+        "batched") loads only its language weights, so admit that path by the
+        text-only estimate instead of the vision-inclusive file size (#2385).
+        """
+        deployment = self._distributed_deployment_for_entry(entry)
+        admission_size = self._entry_resident_size(entry)
+        if deployment is None and entry.text_only_size and (
+            force_lm or entry.engine_type == "batched"
+        ):
+            admission_size = entry.text_only_size
+        admission_kind = "local shard" if deployment is not None else "model"
+        return admission_size, admission_kind
+
+    def _admission_targets(self) -> tuple[int, int, bool]:
+        """Resolve (ceiling, evict_target, best_effort) for pre-load admission.
+
+        ceiling == 0 means the guard is disabled and no fallback ceiling
+        exists: callers skip admission entirely. When the enforcer's dynamic
+        ceiling reads 0, the best-effort static admission ceiling keeps
+        eviction working on model swap without ever refusing a load (#2290).
+        Eviction targets the soft watermark so the old model unloads before
+        the new weights allocate (#2319); refusal still uses the ceiling.
+        """
+        ceiling = self._current_ceiling()
+        best_effort = False
+        if ceiling <= 0:
+            ceiling = self._fallback_admission_ceiling()
+            best_effort = ceiling > 0
+        if ceiling <= 0:
+            return 0, 0, False
+        soft_target = self._admission_soft_target()
+        evict_target = min(soft_target, ceiling) if soft_target > 0 else ceiling
+        return ceiling, evict_target, best_effort
+
+    def entry_is_distributed(self, entry: EngineEntry) -> bool:
+        """True when the entry belongs to the distributed cluster path."""
+        return (
+            entry.source_type == "cluster"
+            or self._distributed_deployment_for_entry(entry) is not None
+        )
+
+    def eviction_pressure_for_load(
+        self, model_id: str, force_lm: bool = False
+    ) -> bool:
+        """Advisory: True when loading this model would trigger LRU eviction.
+
+        Read-only pre-check for the gateway arbiter (omlx/gateway.py) so a
+        request-driven switch can be arbitrated before it evicts a resident
+        model. Lock-free and approximate by design — get_engine() re-runs the
+        authoritative admission under the pool lock.
+        """
+        entry = self._entries.get(model_id)
+        if entry is None or entry.engine is not None:
+            return False
+        ceiling, evict_target, _best_effort = self._admission_targets()
+        if ceiling <= 0:
+            return False
+        admission_size, _ = self._admission_size_for_entry(entry, force_lm)
+        current = max(
+            mx.get_active_memory(),
+            get_phys_footprint(),
+            self._current_model_memory,
+        )
+        return current + admission_size > evict_target
+
+    def residency_snapshot(self) -> dict[str, dict[str, object]]:
+        """Advisory per-model residency/busy state for the gateway arbiter.
+
+        Covers loaded models only; the same predicates the eviction paths
+        use (pinned, in-use leases, active engine requests) so the arbiter
+        reasons about the same victims the pool would pick.
+        """
+        snapshot: dict[str, dict[str, object]] = {}
+        for mid, entry in self._entries.items():
+            if entry.engine is None:
+                continue
+            snapshot[mid] = {
+                "pinned": entry.is_pinned,
+                "is_loading": entry.is_loading,
+                "busy": self._entry_is_busy(entry),
+                "last_access": entry.last_access,
+                "distributed": self._distributed_deployment_for_entry(entry)
+                is not None,
+                "source_type": entry.source_type,
+                "engine_type": entry.engine_type,
+            }
+        return snapshot
+
     def _ceiling_binding_and_advice(
         self, *, ceiling: int, current: int, tail: str
     ) -> tuple[str | None, str | None]:
@@ -1103,21 +1198,11 @@ class EnginePool:
             # engine_type to "batched") loads only its language weights, so
             # admit that path by the text-only estimate instead of the
             # vision-inclusive file size (#2385).
-            deployment = self._distributed_deployment_for_entry(entry)
-            admission_size = self._entry_resident_size(entry)
-            if deployment is None and entry.text_only_size and (
-                force_lm or entry.engine_type == "batched"
-            ):
-                admission_size = entry.text_only_size
-            admission_kind = "local shard" if deployment is not None else "model"
-            ceiling = self._current_ceiling()
-            best_effort = False
-            if ceiling <= 0:
-                ceiling = self._fallback_admission_ceiling()
-                best_effort = ceiling > 0
+            admission_size, admission_kind = self._admission_size_for_entry(
+                entry, force_lm
+            )
+            ceiling, evict_target, best_effort = self._admission_targets()
             if ceiling > 0:
-                soft_target = self._admission_soft_target()
-                evict_target = min(soft_target, ceiling) if soft_target > 0 else ceiling
                 evicted_any = unloaded_for_admission
                 while True:
                     # Consult the tracked accumulator alongside live memory:
