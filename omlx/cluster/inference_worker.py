@@ -1292,6 +1292,7 @@ def run_worker(args: argparse.Namespace) -> int:
     stall_watchdog.start()
 
     preserve_failure_marker = False
+    kv_tier = None
     try:
         # Register oMLX's model classes before MLX-LM resolves the
         # architecture. Several types oMLX serves — glm_moe_dsa, deepseek_v4,
@@ -1443,6 +1444,27 @@ def run_worker(args: argparse.Namespace) -> int:
                 )
             except Exception:
                 prefill_memory_limit = 0
+            # The durable rank-local KV tier, when the plan opted in. Built
+            # after the load so its artifact fingerprint binds the loaded
+            # model's actual cache stack; built even when the local probes
+            # fail, so this rank still reaches the between-requests restore
+            # vote its peers wait on (it just offers nothing).
+            from .kv_tier import build_rank_kv_tier
+
+            kv_tier = build_rank_kv_tier(
+                plan_enabled=execution.kv_tier,
+                rank=rank,
+                world_size=world_size,
+                model_path=args.model,
+                model=provider.model,
+                start_layer=assignment.start_layer,
+                end_layer=assignment.end_layer,
+                tensor_parallel_size=tensor_parallel_size,
+                max_kv_size=execution.max_kv_size,
+                # The saver thread adopts this stream: cache state is created
+                # on it, and an MLX stream only exists on its creating thread.
+                eval_stream=generation_stream,
+            )
             with install_runtime_optimizations(
                 provider.model,
                 group,
@@ -1508,6 +1530,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         execution=execution,
                         assignment=assignment,
                         stall_watchdog=stall_watchdog,
+                        kv_tier=kv_tier,
                         prefill_guard=build_guard(
                             provider.model,
                             rank=rank,
@@ -1556,6 +1579,11 @@ def run_worker(args: argparse.Namespace) -> int:
     finally:
         stall_watchdog.stop()
         marker.stop_heartbeat()
+        if kv_tier is not None:
+            # Drain queued autosaves before the rank's wired release; a save
+            # abandoned mid-write is reclaimed by the next boot's sweep.
+            with suppress(Exception):
+                kv_tier.close()
         if not preserve_failure_marker:
             marker.remove()
     return 0
