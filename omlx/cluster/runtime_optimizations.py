@@ -3,17 +3,23 @@
 
 from __future__ import annotations
 
+import gc
 import importlib
 import inspect
+import logging
 import math
 import os
 import threading
+import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
+from ..idle_maintenance import metal_keepwarm_touch
 from .performance import ExecutionSettings
+
+logger = logging.getLogger(__name__)
 
 # Floor for the prefill-loop buffer-pool clear, mirroring the single-node
 # ``Scheduler._periodic_clear_threshold_bytes`` formula (memory_limit/3 with
@@ -200,6 +206,123 @@ def _is_shutdown_sentinel(value: Any) -> bool:
     return isinstance(value, dict) and value.get("omlx_cluster_shutdown") is True
 
 
+# Payload key for an idle-maintenance op (keepwarm touch, all-rank cache
+# drop) riding the same idle request-share channel as the shutdown sentinel.
+# Distinct key so neither sentinel parser can mistake the other payload.
+_IDLE_OP_PAYLOAD_KEY = "omlx_cluster_idle_op"
+
+
+def _idle_op_slow_seconds() -> float:
+    """Loud-log threshold for a fanned-out idle op (ThunderMLX's 5s alarm).
+
+    Read per call from the environment; the worker process env is uniform
+    across ranks (one argv under mlx.launch), so this cannot drift
+    rank-to-rank.
+    """
+
+    raw = os.environ.get("OMLX_BACKGROUND_OP_SLOW_SECONDS", "5.0").strip()
+    try:
+        return max(0.1, float(raw or "5.0"))
+    except ValueError:
+        return 5.0
+
+
+def _is_idle_op_payload(value: Any) -> bool:
+    return isinstance(value, dict) and isinstance(value.get(_IDLE_OP_PAYLOAD_KEY), dict)
+
+
+def _drop_rank_prompt_cache(
+    instance: Any,
+    mx_module: Any,
+    *,
+    clear_memory: bool,
+    reason: str,
+) -> dict[str, Any]:
+    """Drop this rank's whole resident prompt cache; optionally drain Metal.
+
+    The wholesale drop is the rank-convergent action: every rank's cache ends
+    empty at the same share-channel rendezvous, so the next request starts
+    from identical (miss) state everywhere — a selective or rank-local drop
+    would seed the per-rank cache divergence the admission ladder's
+    collective-free invariant documents. Entry enumeration reuses the
+    ladder's drift-tolerant walk; an mlx-lm internals drift raises on every
+    rank alike and is contained by the caller's guard. ``clear_memory`` is
+    the deep release: gc -> clear_cache -> metal.clear_cache, in the
+    documented order, so just-collected buffers are actually unwired.
+    """
+
+    from .prefill_guard import _idle_prompt_cache_evictables
+
+    prompt_cache = getattr(instance, "prompt_cache", None)
+    dropped = 0
+    for item in _idle_prompt_cache_evictables(prompt_cache):
+        item["drop"]()
+        dropped += 1
+    if clear_memory:
+        gc.collect()
+        mx_module.clear_cache()
+        metal = getattr(mx_module, "metal", None)
+        metal_clear = getattr(metal, "clear_cache", None)
+        if callable(metal_clear):
+            metal_clear()
+    logger.info(
+        "cluster idle op drop_caches (%s): dropped %d prompt-cache entries, "
+        "clear_memory=%s",
+        reason,
+        dropped,
+        clear_memory,
+    )
+    return {"ok": True, "dropped_entries": dropped, "clear_memory": bool(clear_memory)}
+
+
+def _execute_idle_op(instance: Any, op: dict[str, Any], *, mx_module: Any) -> dict[str, Any]:
+    """Run one fanned-out idle op on this rank's generation thread.
+
+    Called from the pinned share-object path at the idle rendezvous, so no
+    request work is in flight on any rank: the op is collective-free local
+    work (a bounded matmul, a rank-local cache drop) executed at the one
+    point where it cannot interleave with model collectives. Never raises —
+    a rank that fails an op logs and continues, keeping the share-channel
+    protocol intact. A slow op logs loudly (the A3 slow-op alarm: background
+    GPU work is meant to be sub-second).
+    """
+
+    started = time.time()
+    name = str(op.get("op") or "")
+    reason = str(op.get("reason") or name)[:128]
+    try:
+        if name == "keepwarm":
+            event = metal_keepwarm_touch(
+                mx_module,
+                size=int(op.get("matrix_size") or 64),
+                repeats=1,
+                reason=reason,
+            )
+        elif name == "drop_caches":
+            event = _drop_rank_prompt_cache(
+                instance,
+                mx_module,
+                clear_memory=bool(op.get("clear_memory")),
+                reason=reason,
+            )
+        else:
+            return {"ok": False, "error": f"unknown idle op {name!r}"[:200]}
+    except Exception as exc:
+        logger.warning("cluster idle op %s failed on this rank: %s", name, exc)
+        return {"ok": False, "error": str(exc)[:200]}
+    elapsed = time.time() - started
+    slow_seconds = _idle_op_slow_seconds()
+    if elapsed >= slow_seconds:
+        logger.warning(
+            "cluster idle op %s took %.2fs on this rank (>= %.1fs slow-op "
+            "threshold) — background GPU work is meant to be sub-second",
+            name,
+            elapsed,
+            slow_seconds,
+        )
+    return event
+
+
 class LockstepCancelController:
     """One worker process's view of cancel/shutdown requests.
 
@@ -223,6 +346,8 @@ class LockstepCancelController:
         self._prefill_fired_epoch = 0
         self._shutdown_pending = False
         self._removal_uids: list[int] = []
+        self._idle_op_pending: dict[str, Any] | None = None
+        self._idle_op_broadcast = threading.Event()
         self.stop_token_ids: tuple[int, ...] = ()
         self.decode_cancel_active = False
         self.prefill_cancel_active = False
@@ -244,6 +369,8 @@ class LockstepCancelController:
             self._prefill_fired_epoch = 0
             self._shutdown_pending = False
             self._removal_uids = []
+            self._idle_op_pending = None
+            self._idle_op_broadcast.clear()
             self.stop_token_ids = tuple(int(token) for token in stop_token_ids)
             self.decode_cancel_active = bool(decode_cancel_active)
             self.prefill_cancel_active = bool(prefill_cancel_active)
@@ -325,6 +452,41 @@ class LockstepCancelController:
 
     def wait_sentinel_broadcast(self, timeout_s: float) -> bool:
         return self._broadcast.wait(timeout=max(0.0, timeout_s))
+
+    def request_idle_op(self, op: dict[str, Any]) -> None:
+        """Queue one idle-maintenance op for the next idle share. Rank zero only.
+
+        Ops coalesce under a fixed priority — shutdown > drop_caches >
+        keepwarm: a queued keepwarm is replaced by any newer op, while a
+        queued cache drop is only replaced by another cache drop. The drop is
+        the rarer, more deliberate action and must not be lost to a keepwarm
+        tick that happens to land while it waits for an idle rendezvous.
+        """
+
+        with self._lock:
+            pending = self._idle_op_pending
+            if (
+                pending is not None
+                and pending.get("op") == "drop_caches"
+                and op.get("op") != "drop_caches"
+            ):
+                return
+            self._idle_op_pending = dict(op)
+            self._idle_op_broadcast.clear()
+
+    def take_pending_idle_op(self) -> dict[str, Any] | None:
+        """Consume the queued idle op (the pinned share path, rank zero)."""
+
+        with self._lock:
+            op = self._idle_op_pending
+            self._idle_op_pending = None
+            return op
+
+    def note_idle_op_broadcast(self) -> None:
+        self._idle_op_broadcast.set()
+
+    def wait_idle_op_broadcast(self, timeout_s: float) -> bool:
+        return self._idle_op_broadcast.wait(timeout=max(0.0, timeout_s))
 
 
 _LOCKSTEP_CONTROLLER = LockstepCancelController()
@@ -702,6 +864,21 @@ def install_runtime_optimizations(
                     raise LockstepClusterShutdownError(
                         "rank zero broadcast the shutdown sentinel"
                     )
+                if obj is None:
+                    # Same swap discipline as the shutdown sentinel, for the
+                    # idle-maintenance ops (keepwarm touch, all-rank cache
+                    # drop). The op only crosses on an idle share, so it can
+                    # never land mid-request: a request that arrives first
+                    # makes this a request share instead, and the latch stays
+                    # queued for the next idle poll. Rank zero runs the op
+                    # locally AFTER the broadcast, at the same rendezvous the
+                    # workers run theirs — cache state can never diverge.
+                    idle_op = controller.take_pending_idle_op()
+                    if idle_op is not None:
+                        original_share_object(instance, {_IDLE_OP_PAYLOAD_KEY: idle_op})
+                        _execute_idle_op(instance, idle_op, mx_module=mx)
+                        controller.note_idle_op_broadcast()
+                        return None
                 if isinstance(obj, list):
                     # The server shares a list only for its per-round
                     # uids_to_remove broadcast. Folding the cancelled prefill
@@ -717,6 +894,11 @@ def install_runtime_optimizations(
                 raise LockstepClusterShutdownError(
                     "received the shutdown sentinel from rank zero"
                 )
+            if _is_idle_op_payload(result):
+                # Execute rank-zero's fanned-out idle op at the same idle
+                # rendezvous, then keep polling as if the share were idle.
+                _execute_idle_op(instance, result[_IDLE_OP_PAYLOAD_KEY], mx_module=mx)
+                return None
             return result
 
         mlx_server.ResponseGenerator._share_object = lockstep_share_object

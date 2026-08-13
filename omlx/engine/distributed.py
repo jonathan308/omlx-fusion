@@ -397,6 +397,77 @@ class DistributedBatchedEngine(BatchedEngine):
                 return
             await asyncio.sleep(min(_COOPERATIVE_STOP_POLL_S, remaining))
 
+    async def release_idle_caches(self, *, deep: bool = False, reason: str = "idle_maintenance") -> bool:
+        """Fan a cache drop out to every rank (coordinated TTL/idle release).
+
+        ``deep=False`` is the cache-TTL rung: every rank drops its resident
+        prompt cache but keeps weights and buffer pools wired, so TTFT stays
+        warm. ``deep=True`` is the timed idle release: the drop plus a Metal
+        heap drain on every rank. The drop only ever happens at the idle
+        share-channel rendezvous, so ranks cannot diverge on cache state.
+        """
+
+        return await self._post_idle_maintenance(
+            {
+                "op": "drop_caches",
+                "clear_memory": bool(deep),
+                "reason": reason,
+            }
+        )
+
+    async def keepwarm_touch(self, *, size: int = 64, reason: str = "keepwarm") -> bool:
+        """Fan one bounded Metal keepwarm touch out to every rank.
+
+        The touch rides the idle request-share channel and runs at the
+        lockstep rendezvous on each rank's generation thread — never
+        concurrent with model collectives (the A2 race), and symmetric
+        across ranks by construction.
+        """
+
+        return await self._post_idle_maintenance(
+            {
+                "op": "keepwarm",
+                "matrix_size": int(size),
+                "reason": reason,
+            }
+        )
+
+    async def _post_idle_maintenance(self, payload: dict[str, Any]) -> bool:
+        """POST one idle-maintenance op to rank zero's admin surface.
+
+        Returns True only when rank zero confirmed the op crossed the idle
+        share channel. Returns False — leaving every rank untouched — when
+        the engine is down, the worker predates the route (404), the share
+        channel is inactive, or the broadcast was not confirmed in time; the
+        caller (the engine pool's TTL ladder) treats False as "try the next
+        rung later", never as a reason to unload.
+        """
+
+        try:
+            client = self._ensure_available()
+        except DistributedInferenceError as e:
+            logger.debug("idle-maintenance skipped (engine unavailable): %s", e)
+            return False
+        try:
+            response = await client.post(
+                "/admin/idle-maintenance",
+                json=payload,
+                timeout=_ADMIN_POST_TIMEOUT_S,
+            )
+        except httpx.HTTPError as e:
+            logger.debug("idle-maintenance POST failed: %s", e)
+            return False
+        if response.status_code != 200:
+            logger.debug(
+                "idle-maintenance POST returned HTTP %s", response.status_code
+            )
+            return False
+        try:
+            body = response.json()
+        except ValueError:
+            return False
+        return bool(isinstance(body, dict) and body.get("broadcast"))
+
     async def _quiesce_in_flight(self, timeout_s: float) -> bool:
         """Wait for in-flight requests to drain, up to ``timeout_s``.
 
