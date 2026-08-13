@@ -191,6 +191,12 @@ from .exceptions import (
     PrefillMemoryExceededError,
     SchedulerQueueFullError,
 )
+from .gateway import (
+    GatewayAttributionMiddleware,
+    GatewayConfig,
+    ModelSwitchArbiter,
+    ModelSwitchDeferredError,
+)
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
 from .server_metrics import get_server_metrics, reset_server_metrics
 
@@ -270,6 +276,9 @@ class ServerState:
     # Snapshot at init_server(). Settings may be edited while this process is
     # running, but routes, navigation, and Bonjour switch together on restart.
     distributed_inference_enabled: bool = False
+    # Model-switch arbiter (omlx/gateway.py). None unless OMLX_GATEWAY_ENABLED
+    # was set at init_server(); request handling is unchanged without it.
+    gateway_arbiter: object | None = None
 
 
 # Global server state instance
@@ -1026,6 +1035,19 @@ async def get_engine(
         HTTPException: If model not found, wrong type, or memory error
     """
     pool = get_engine_pool()
+    arbiter = _server_state.gateway_arbiter
+    explicit_model = bool(model_id and str(model_id).strip())
+
+    # Sticky default (gateway A3): a model-less request follows the model the
+    # session is already on instead of swapping to the configured default out
+    # from under it. Only the arbiter treats "" as empty; without it the
+    # historical resolve-and-404 path is preserved.
+    if not explicit_model and engine_type == EngineType.LLM and arbiter is not None:
+        sticky = arbiter.sticky_default_model(pool)
+        if sticky is not None:
+            model_id = sticky
+        elif model_id is not None and not str(model_id).strip():
+            model_id = None
 
     # Default model only applies to LLM
     if model_id is None:
@@ -1063,6 +1085,23 @@ async def get_engine(
     else:
         model_id = pool.resolve_model_id(model_id, sm)
     _wake_process_memory_enforcer(active=True)
+
+    # Gateway arbiter (A1/A2/A6): an explicit id updates stickiness; a load
+    # that would evict a resident model is arbitrated before the pool runs
+    # its admission/eviction. Cluster entries bypass the gate entirely.
+    if arbiter is not None and engine_type == EngineType.LLM:
+        if explicit_model:
+            arbiter.note_explicit_model(model_id)
+        try:
+            await arbiter.before_model_load(pool, model_id)
+        except ModelBusyError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        except ModelSwitchDeferredError as e:
+            raise HTTPException(
+                status_code=409,
+                detail=str(e),
+                headers={"Retry-After": str(max(1, int(e.retry_after)))},
+            ) from e
 
     # Only thread optional kwargs through when they are needed, so the common
     # path keeps the original pool.get_engine(model_id) call shape.
@@ -1919,6 +1958,23 @@ def init_server(
     else:
         _server_state.default_model = None
 
+    # Model-switch arbiter (omlx/gateway.py): ports the ThunderMLX gateway's
+    # grace-window/busy-refusal/sticky-default semantics onto resident-model
+    # switching. Strictly opt-in; without it request routing is unchanged.
+    gateway_config = GatewayConfig.from_env()
+    if gateway_config.enabled:
+        _server_state.gateway_arbiter = ModelSwitchArbiter(gateway_config)
+        app.add_middleware(GatewayAttributionMiddleware)
+        logger.info(
+            "Gateway arbiter enabled (switch grace %.0fs, sticky empty "
+            "model: %s, probe no-wake: %s)",
+            gateway_config.switch_grace_seconds,
+            "on" if gateway_config.sticky_empty_model else "off",
+            "on" if gateway_config.probe_no_wake else "off",
+        )
+    else:
+        _server_state.gateway_arbiter = None
+
     # Reset server metrics for fresh start (with all-time persistence)
     stats_path = base_path / "stats.json"
     reset_server_metrics(stats_path=stats_path)
@@ -2428,6 +2484,19 @@ async def server_status(_: bool = Depends(verify_api_key)):
         ),
         "custom_kernels": native_kernel_status(),
     }
+
+
+@app.get("/v1/gateway/status")
+async def gateway_status(_: bool = Depends(verify_api_key)):
+    """Model-switch arbiter state and forensic event ring.
+
+    Returns ``{"enabled": False}`` when the arbiter is not configured
+    (OMLX_GATEWAY_ENABLED unset) so pollers can feature-detect it.
+    """
+    arbiter = _server_state.gateway_arbiter
+    if arbiter is None:
+        return {"enabled": False}
+    return arbiter.get_status(_server_state.engine_pool)
 
 
 def _markitdown_virtual_model_status() -> dict:
@@ -5719,6 +5788,20 @@ async def count_anthropic_tokens(
             status_code=503,
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
+
+    # Gateway A5 (passive-probe no-wakeup): agent CLIs poll count_tokens
+    # between turns. When the arbiter is on and the model is not loaded,
+    # answer with a bytes/4 estimate instead of loading a multi-GB model
+    # (and possibly evicting the resident one) just to count tokens.
+    arbiter = _server_state.gateway_arbiter
+    if arbiter is not None:
+        estimate = arbiter.count_tokens_no_wake(
+            get_engine_pool(),
+            resolve_model_id(request.model) or request.model,
+            request.model_dump_json(),
+        )
+        if estimate is not None:
+            return TokenCountResponse(input_tokens=estimate)
 
     lease = _LLMEngineLease()
     try:
