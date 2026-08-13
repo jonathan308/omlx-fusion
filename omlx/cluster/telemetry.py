@@ -782,11 +782,15 @@ def install_server_telemetry(
                 # MLX-LM catches tokenization failures for batched requests.
                 # Keeping the rank vote inside that boundary rejects just this
                 # request; raising from its later cache lookup kills the whole
-                # generation thread.
+                # generation thread. The resident prompt cache is handed over
+                # as the admission ladder's eviction source: entries are only
+                # ever dropped after a rank-agreed deficit vote, never
+                # unilaterally (see prefill_guard's collective-free invariant).
                 prefill_guard.check_collective(
                     len(prompt),
                     cached_tokens=len(prompt) - len(rest),
                     mx_module=mx,
+                    prompt_cache=self.prompt_cache,
                 )
             except Exception:
                 self.prompt_cache.discard_prefetched_cache()
