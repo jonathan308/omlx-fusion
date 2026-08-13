@@ -108,6 +108,12 @@ from .transport import (
 
 router = APIRouter(prefix="/admin/api/cluster", tags=["cluster"])
 
+# Peer-facing endpoints that cannot require an admin session: a Mac running
+# ``omlx cluster join`` has no admin cookie, so it authenticates with the
+# single-use join token's HMAC signature instead. server.py registers this
+# router with only the distributed-inference 404-hiding dependency.
+peer_router = APIRouter(prefix="/admin/api/cluster", tags=["cluster"])
+
 _get_engine_pool: Any | None = None
 
 
@@ -125,6 +131,18 @@ class ClusterKeyExchangeTokenRequest(ClusterPairingTokenRequest):
 
 class ClusterKeyExchangeRequest(ClusterPairingTokenRequest):
     exchange_token: str = Field(min_length=1, max_length=64 * 1024)
+
+
+class ClusterJoinRedeemRequest(BaseModel):
+    """Peer-side join redeem call, authenticated by the join token itself."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(min_length=1, max_length=4096)
+    exchange_token: str = Field(min_length=1, max_length=64 * 1024)
+    versions: dict[str, str] = Field(min_length=1, max_length=8)
+    # HMAC-SHA256 hex digest over the canonical redeem payload.
+    signature: str = Field(min_length=64, max_length=64)
 
 
 def _validated_ssh_targets(hosts: str) -> list[str]:
@@ -1738,6 +1756,51 @@ async def cluster_store_key_in_keychain():
 
     success = await asyncio.to_thread(store_key_in_keychain)
     return {"stored": success}
+
+
+@router.post("/join-token")
+async def cluster_mint_join_token():
+    """Mint a short-lived, single-use join token for one peer enrollment."""
+
+    from .enrollment import get_join_token_store
+
+    return get_join_token_store().mint()
+
+
+@router.get("/join-status")
+async def cluster_join_status(token_id: str = Query(default="")):
+    """Poll a pending join and list enrolled peers for the dashboard."""
+
+    from .enrollment import get_join_token_store
+
+    store = get_join_token_store()
+    return {
+        "token": store.status(token_id) if token_id else None,
+        "enrolled": store.enrolled(),
+    }
+
+
+@peer_router.post("/join/redeem")
+async def cluster_redeem_join_token(request: ClusterJoinRedeemRequest):
+    """Redeem a join token: exchange SSH keys and record the peer's runtime.
+
+    There is deliberately no admin session here; the peer proves possession
+    of the join token secret by HMAC-signing the exact payload, the same
+    pattern the pairing-token endpoints use with the shared secret.
+    """
+
+    from .enrollment import redeem_join_token
+
+    result = await asyncio.to_thread(
+        redeem_join_token,
+        token=request.token,
+        exchange_token=request.exchange_token,
+        versions=request.versions,
+        signature=request.signature,
+    )
+    if not result["success"]:
+        raise HTTPException(status_code=result["status"], detail=result["detail"])
+    return result
 
 
 @router.get("/transports")

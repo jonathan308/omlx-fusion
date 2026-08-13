@@ -19,6 +19,21 @@ def test_cluster_help_is_exposed():
     assert "collective-smoke" in result.stdout
     assert "pipeline-smoke" in result.stdout
     assert "plan" in result.stdout
+    assert "join" in result.stdout
+
+
+def test_cluster_join_help_is_exposed():
+    result = subprocess.run(
+        [sys.executable, "-m", "omlx.cli", "cluster", "join", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0
+    assert "COORDINATOR" in result.stdout
+    assert "TOKEN" in result.stdout
+    assert "--ssh-name" in result.stdout
+    assert "never installs packages" in result.stdout
 
 
 def test_cluster_status_json_is_runnable():

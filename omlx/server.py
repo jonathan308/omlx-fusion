@@ -625,6 +625,7 @@ def _register_cluster_routes() -> None:
     global _cluster_routes_registered
     if _cluster_routes_registered:
         return
+    from .cluster.routes import peer_router as cluster_peer_router
     from .cluster.routes import router as cluster_router
     from .cluster.routes import set_cluster_getters
 
@@ -633,6 +634,15 @@ def _register_cluster_routes() -> None:
         cluster_router,
         dependencies=[
             Depends(require_admin),
+            Depends(require_distributed_inference_enabled),
+        ],
+    )
+    # The join redeem endpoint authenticates with the single-use join token's
+    # HMAC signature instead of an admin session — a joining peer has no admin
+    # cookie. It stays behind the same distributed-inference 404-hiding.
+    app.include_router(
+        cluster_peer_router,
+        dependencies=[
             Depends(require_distributed_inference_enabled),
         ],
     )

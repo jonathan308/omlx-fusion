@@ -427,6 +427,19 @@
             clusterPeerExchangeToken: '',
             clusterKeyExchangeLoading: false,
             clusterKeyExchangeResult: null,
+            // Guided "Add a Mac" enrollment: one single-use token, one
+            // copyable command, and a poll that turns waiting into joined.
+            clusterJoinToken: null,
+            clusterJoinTokenId: '',
+            clusterJoinExpiresAt: 0,
+            clusterJoinLoading: false,
+            clusterJoinError: '',
+            clusterJoinCopied: false,
+            clusterJoinState: '',
+            clusterJoinPeer: null,
+            clusterJoinSecondsLeft: 0,
+            clusterEnrolledPeers: [],
+            _clusterJoinPollTimer: null,
             clusterDeployments: [],
             clusterDeploymentsError: '',
             clusterActivationLoading: false,
@@ -1860,6 +1873,125 @@
                     this.showNotification('Keychain storage failed: ' + error.message, 'error');
                 }
                 this.clusterKeychainStoring = false;
+            },
+
+            // The join command points at the origin this browser already
+            // reaches, which the other Mac can usually reach on the same LAN.
+            clusterJoinCommandText() {
+                if (!this.clusterJoinToken) return '';
+                return `omlx cluster join ${window.location.origin} ${this.clusterJoinToken}`;
+            },
+
+            async generateClusterJoinCommand() {
+                if (this.clusterJoinLoading) return;
+                this.clusterJoinLoading = true;
+                this.clusterJoinError = '';
+                this.stopClusterJoinPolling();
+                this.clusterJoinToken = null;
+                this.clusterJoinPeer = null;
+                this.clusterJoinState = '';
+                try {
+                    const response = await fetch('/admin/api/cluster/join-token', {
+                        method: 'POST',
+                    });
+                    if (!response.ok) {
+                        throw new Error(await this.clusterResponseError(response, 'Join token generation failed'));
+                    }
+                    const result = await response.json();
+                    this.clusterJoinToken = result.token;
+                    this.clusterJoinTokenId = result.token_id;
+                    this.clusterJoinExpiresAt = result.expires_at;
+                    this.clusterJoinSecondsLeft = Math.max(
+                        0,
+                        Math.round(result.expires_at - Date.now() / 1000),
+                    );
+                    this.clusterJoinCopied = false;
+                    this.clusterJoinState = 'pending';
+                    this.startClusterJoinPolling();
+                } catch (error) {
+                    this.clusterJoinError = error?.message || 'Join token generation failed';
+                } finally {
+                    this.clusterJoinLoading = false;
+                }
+            },
+
+            copyClusterJoinCommand() {
+                const command = this.clusterJoinCommandText();
+                if (!command) return;
+                this.copyToClipboard(command);
+                this.clusterJoinCopied = true;
+                setTimeout(() => { this.clusterJoinCopied = false; }, 2000);
+            },
+
+            startClusterJoinPolling() {
+                this.stopClusterJoinPolling();
+                this._clusterJoinPollTimer = setInterval(
+                    () => this.pollClusterJoinStatus(),
+                    3000,
+                );
+            },
+
+            stopClusterJoinPolling() {
+                if (this._clusterJoinPollTimer) {
+                    clearInterval(this._clusterJoinPollTimer);
+                    this._clusterJoinPollTimer = null;
+                }
+            },
+
+            async pollClusterJoinStatus() {
+                if (!this.clusterJoinTokenId) return;
+                try {
+                    const query = new URLSearchParams({ token_id: this.clusterJoinTokenId });
+                    const response = await fetch(`/admin/api/cluster/join-status?${query}`);
+                    if (!response.ok) return;
+                    const result = await response.json();
+                    this.clusterEnrolledPeers = result.enrolled || [];
+                    const token = result.token;
+                    if (!token) {
+                        // The store no longer knows this token (swept after
+                        // expiry or evicted by newer mints): stop polling and
+                        // ask for a fresh command instead of waiting forever.
+                        this.clusterJoinState = 'expired';
+                        this.stopClusterJoinPolling();
+                        return;
+                    }
+                    this.clusterJoinState = token.status;
+                    this.clusterJoinSecondsLeft = Math.max(
+                        0,
+                        Math.round(this.clusterJoinExpiresAt - Date.now() / 1000),
+                    );
+                    if (token.status === 'redeemed') {
+                        this.clusterJoinPeer = token.peer;
+                        // The command is spent; replace it with the outcome.
+                        this.clusterJoinToken = null;
+                        this.stopClusterJoinPolling();
+                        // The new peer may already advertise SSH, so one
+                        // refresh lets its chip appear without a manual rescan.
+                        this.discoverClusterPeers();
+                    } else if (token.status === 'expired') {
+                        this.stopClusterJoinPolling();
+                    }
+                } catch (error) {
+                    // A transient read failure must not kill a pending join;
+                    // the next interval retries while the token is alive.
+                    console.debug('Join status poll failed:', error);
+                }
+            },
+
+            async selectClusterEnrolledPeer(peer) {
+                await this.selectClusterDiscoveredPeer({
+                    ssh: peer.node_id,
+                    name: peer.node_id,
+                });
+            },
+
+            // Discovery can distinguish a Mac advertising only _ssh._tcp
+            // (Remote Login on, oMLX service absent) from one advertising the
+            // _omlx._tcp service; only the former needs the join command.
+            clusterSshOnlyDiscoveredPeers() {
+                return (this.clusterDiscoveredPeers || []).filter(
+                    peer => peer.service === '_ssh._tcp.local.'
+                );
             },
 
             async selectClusterDiscoveredPeer(peer) {

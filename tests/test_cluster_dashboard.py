@@ -406,6 +406,32 @@ def test_pairing_failure_exposes_omlx_and_terminal_recovery_paths():
     assert "openClusterPairingSetup()" in javascript
 
 
+def test_cluster_dashboard_offers_guided_add_a_mac_enrollment():
+    cluster = _read("omlx/admin/templates/dashboard/_cluster.html")
+    javascript = _read("omlx/admin/static/js/dashboard.js")
+
+    # The panel renders the copyable join command and its outcome states.
+    assert "data-cluster-add-mac" in cluster
+    assert "Generate join command" in cluster
+    assert "clusterJoinCommandText()" in cluster
+    assert "copyClusterJoinCommand()" in cluster
+    assert "Joined Macs" in cluster
+    assert "clusterJoinPeer.runtime_mismatches" in cluster
+    assert "selectClusterEnrolledPeer(peer)" in cluster
+    # Bonjour SSH-only peers get the join hint.
+    assert "clusterSshOnlyDiscoveredPeers()" in cluster
+
+    # The JS mints, polls, and renders against the enrollment endpoints.
+    assert "'/admin/api/cluster/join-token'" in javascript
+    assert "/admin/api/cluster/join-status" in javascript
+    assert "async generateClusterJoinCommand()" in javascript
+    assert "async pollClusterJoinStatus()" in javascript
+    assert "omlx cluster join ${window.location.origin}" in javascript
+    assert "clusterJoinState = 'pending'" in javascript
+    assert "token.status === 'redeemed'" in javascript
+    assert "clusterEnrolledPeers: []" in javascript
+
+
 def test_every_dashboard_locale_names_cluster_tab():
     locale_dir = ROOT / "omlx/admin/i18n"
     required = {

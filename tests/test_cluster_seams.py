@@ -230,6 +230,9 @@ def test_no_unreachable_functions_in_the_cluster_package():
         # Peer import preflight, exposed ahead of the /autoconfigure handler
         # that will call it alongside preflight_issues.
         ("autoconfigure.py", "peer_import_issues"),
+        # Test-only lifecycle reset for the in-memory enrollment store; a
+        # server process keeps one store for its whole lifetime.
+        ("enrollment.py", "reset_join_token_store"),
     }
 
     sources = {
@@ -356,6 +359,8 @@ def test_post_routes_reject_a_bad_body_rather_than_crashing():
         "/admin/api/cluster/deployments",
         "/admin/api/cluster/pairing-token",
         "/admin/api/cluster/verify-pairing-token",
+        # Minting records a pending token in the enrollment store.
+        "/admin/api/cluster/join-token",
     }
 
     permissive = {"/admin/api/cluster/guidance"}
@@ -380,6 +385,17 @@ def test_post_routes_reject_a_bad_body_rather_than_crashing():
             )
             checked += 1
     assert checked >= 1
+
+    # The peer-facing join redeem route takes no admin session; its body
+    # contract must reject a bad payload before any token is touched.
+    peer_app = FastAPI()
+    peer_app.include_router(routes.peer_router)
+    with TestClient(peer_app) as client:
+        response = client.post(
+            "/admin/api/cluster/join/redeem",
+            json={"deliberately": "invalid"},
+        )
+        assert response.status_code == 422
 
 
 def test_key_exchange_token_round_trips():

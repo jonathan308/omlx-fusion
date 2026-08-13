@@ -76,7 +76,8 @@ On both Macs:
 1. Run the same oMLX build and matching MLX/MLX-LM versions.
 2. Keep the downloaded model at the same absolute path.
 3. Enable Remote Login and use key-based SSH for the coordinator account.
-4. Pair the Macs in oMLX. The first connection records a new hostname or
+4. Pair the Macs with the **Add a Mac** join flow (below), or pair them
+   manually as a fallback. The first connection records a new hostname or
    Thunderbolt address without prompting; an identity change is still refused.
 5. For JACCL, configure Thunderbolt RDMA outside oMLX and confirm `rdma_ctl
    status` and `ibv_devices` report the link.
@@ -92,27 +93,55 @@ Start this source build on both Macs. In **Settings > Advanced**, enable
 API routes, and Bonjour advertisement remain off until this explicit opt-in is
 enabled.
 
+### Add a Mac (guided enrollment)
+
+The primary onboarding path is a single command carried to the second Mac:
+
+1. On the coordinator, open **Cluster**, expand the setup details, and press
+   **Generate join command** in the **Add a Mac** panel.
+2. Copy the printed command — `omlx cluster join <coordinator-url> <token>` —
+   and run it in a terminal on the other Mac.
+3. The panel polls while the token is pending and flips to the outcome when
+   the peer redeems it. A version mismatch is listed explicitly; the peer must
+   install the coordinator's pinned `omlx`/`mlx`/`mlx-lm` versions (the join
+   output prints the exact `pip install` line) and re-join with a fresh token.
+
+The token is short-lived (ten minutes), single-use, and HMAC-SHA256 signed.
+Redeeming it exchanges the dedicated `~/.ssh/omlx_cluster` keys in both
+directions and records the peer's reported versions, so the joined Mac appears
+in the panel and can be selected for the usual **Check peer** verification.
+The redeem endpoint authenticates with the token itself — the joining peer has
+no admin session — and stays behind the same Distributed Inference opt-in as
+the rest of the cluster API.
+
+The join command never installs packages. If the other Mac has no compatible
+oMLX yet, its output states exactly which pinned versions to install; re-run
+join with a fresh token afterwards.
+
 ### Automatic Peer Discovery
 
 
 oMLX uses Bonjour/mDNS to discover nearby Macs advertising SSH or the oMLX
 specific `_omlx._tcp` service. The discovery is read-only and never implies
 trust. Discovered peers appear under **Detected nearby** with their hostname
-and service type.
+and service type. A Mac advertising only SSH is not running (or not
+advertising) oMLX; enroll it with the join command above.
 
-For manual pairing, generate a shared pairing secret on one Mac and copy it to
-the other. Enter the same secret on both dashboards before generating and
-exchanging the short-lived SSH key tokens. The secret authenticates the token
-with HMAC-SHA256; an unkeyed or altered token is rejected.
+For manual pairing — the fallback when the join command cannot be used —
+generate a shared pairing secret on one Mac and copy it to the other. Enter
+the same secret on both dashboards before generating and exchanging the
+short-lived SSH key tokens. The secret authenticates the token with
+HMAC-SHA256; an unkeyed or altered token is rejected.
 
 ### Setup Flow
 
 
 On the coordinator:
 
-1. Connect the Thunderbolt cable. A nearby Mac should appear under
-   **Detected nearby**; if it does not, you can enter its SSH hostname
-   directly in the next step. Pairing itself is the shared-secret exchange
+1. Connect the Thunderbolt cable. Enroll the other Mac with the **Add a Mac**
+   join command (above); it then appears under **Detected nearby** or in the
+   panel's joined-Mac list. If it does not, you can enter its SSH hostname
+   directly in the next step. Manual pairing is the shared-secret exchange
    described above — there is no QR-code or camera-based flow.
 2. Select the peer or enter its SSH hostname. **Check peer** records a new host
    alias automatically, refuses a changed key, and requires a non-interactive
@@ -344,7 +373,10 @@ is incomplete.
 
 ## Admin API
 
-All cluster endpoints use the existing oMLX admin authentication:
+All cluster endpoints use the existing oMLX admin authentication, except
+`/admin/api/cluster/join/redeem`, which the joining peer calls without an
+admin session and which authenticates with the single-use join token's
+HMAC-SHA256 signature instead:
 
 ```text
 Status and discovery:
@@ -353,6 +385,9 @@ GET    /admin/api/cluster/runtime
 GET    /admin/api/cluster/diagnostics
 GET    /admin/api/cluster/discover
 GET    /admin/api/cluster/peer-health
+POST   /admin/api/cluster/join-token
+GET    /admin/api/cluster/join-status
+POST   /admin/api/cluster/join/redeem
 POST   /admin/api/cluster/peer-probe
 
 Pairing and SSH keys:

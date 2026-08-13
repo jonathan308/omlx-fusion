@@ -954,9 +954,62 @@ def cluster_command(args) -> int:
                 print(f"Measured:    {holder.node} (the node holding the model)")
         return 0
 
+    if action == "join":
+        from .cluster.enrollment import join_cluster
+
+        result = join_cluster(
+            args.coordinator,
+            args.token,
+            ssh_name=args.ssh_name,
+            timeout=args.timeout,
+        )
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        elif result["success"]:
+            coordinator = result["coordinator"]
+            peer = result["peer"]
+            print(f"Joined the cluster at {result['coordinator_url']}")
+            print(f"Coordinator:   {coordinator['node_id']} ({coordinator['fingerprint']})")
+            print(f"This Mac:      {peer['node_id']} ({peer['fingerprint']})")
+            print("SSH trust:     both directions installed (dedicated oMLX key)")
+            if result["runtime_compatible"]:
+                expected = result["expected_versions"]
+                print(
+                    "Versions:      match "
+                    + ", ".join(f"{name} {expected[name]}" for name in expected)
+                )
+            else:
+                print("Versions:      MISMATCH on this Mac:")
+                for mismatch in result["runtime_mismatches"]:
+                    print(f"  {mismatch}")
+                print(
+                    "Install the coordinator's pinned versions, then ask its "
+                    "admin for a fresh join token and run join again:"
+                )
+                pinned = " ".join(
+                    f'"{name}=={version}"'
+                    for name, version in result["expected_versions"].items()
+                )
+                print(f"  python3 -m pip install {pinned}")
+            print(
+                "Next: this Mac now appears under Cluster > Add a Mac on the "
+                "coordinator's dashboard."
+            )
+        else:
+            print(f"Cluster join failed: {result['detail']}", file=sys.stderr)
+        if not result["success"]:
+            usage_errors = {
+                "invalid_coordinator_url",
+                "invalid_join_token",
+                "invalid_ssh_name",
+                "invalid_timeout",
+            }
+            return 2 if result["error"] in usage_errors else 1
+        return 0
+
     print(
         "Unknown cluster action. Available: status, worker-smoke, "
-        "collective-smoke, pipeline-smoke, plan",
+        "collective-smoke, pipeline-smoke, plan, join",
         file=sys.stderr,
     )
     return 2
@@ -1395,6 +1448,50 @@ Example directory structure:
         ),
     )
     cluster_plan_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON",
+    )
+    cluster_join_parser = cluster_subparsers.add_parser(
+        "join",
+        help="Enroll this Mac into a cluster with a coordinator's join token",
+        description=(
+            "Enroll this Mac into a distributed cluster. Mint a join token in "
+            "the coordinator's dashboard (Cluster > Add a Mac), then run the "
+            "printed command here. The command exchanges the dedicated oMLX "
+            "SSH keys in both directions and reports this Mac's runtime "
+            "versions; it never installs packages by itself."
+        ),
+    )
+    cluster_join_parser.add_argument(
+        "coordinator",
+        metavar="COORDINATOR",
+        help=(
+            "Coordinator address from the join command, for example "
+            "http://studio.local:8000 or studio.local (default port 8000)"
+        ),
+    )
+    cluster_join_parser.add_argument(
+        "token",
+        metavar="TOKEN",
+        help="Single-use join token minted on the coordinator",
+    )
+    cluster_join_parser.add_argument(
+        "--ssh-name",
+        metavar="[USER@]HOST",
+        default=None,
+        help=(
+            "SSH name the coordinator uses to reach this Mac "
+            "(default: this Mac's hostname)"
+        ),
+    )
+    cluster_join_parser.add_argument(
+        "--timeout",
+        type=_positive_float,
+        default=10.0,
+        help="Coordinator request deadline in seconds (default: 10)",
+    )
+    cluster_join_parser.add_argument(
         "--json",
         action="store_true",
         help="Emit machine-readable JSON",
