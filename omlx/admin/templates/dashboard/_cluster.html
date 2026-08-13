@@ -233,6 +233,29 @@
                                                 : 'Copy API details'"></span>
                                         </button>
                                         <button type="button"
+                                                x-show="clusterNeuralFabricJob()?.phase === 'ready'"
+                                                x-cloak
+                                                @click="runClusterWarmup()"
+                                                :disabled="clusterWarmupLoading"
+                                                class="cluster-fabric__copy"
+                                                data-cluster-warmup
+                                                :title="'Run one tiny generation through the cluster now'">
+                                            <i data-lucide="flame" class="w-3.5 h-3.5"></i>
+                                            <span x-text="clusterWarmupLoading ? 'Warming…' : 'Warm up'"></span>
+                                        </button>
+                                        <button type="button"
+                                                @click="stopClusterGeneration()"
+                                                :disabled="clusterStopGenerationLoading
+                                                    || !Number(clusterNeuralFabricJob()?.metrics?.active_requests || 0)"
+                                                class="cluster-fabric__stop"
+                                                data-cluster-stop-generation
+                                                :title="'Abort every in-flight request; the cluster keeps running'">
+                                            <i data-lucide="octagon-x" class="w-3.5 h-3.5"></i>
+                                            <span x-text="clusterStopGenerationLoading
+                                                ? 'Stopping…'
+                                                : 'Stop generating'"></span>
+                                        </button>
+                                        <button type="button"
                                                 @click="runClusterPrimaryAction()"
                                                 :disabled="clusterPrimaryActionDisabled()"
                                                 class="cluster-fabric__stop"
@@ -240,6 +263,15 @@
                                             <i data-lucide="square" class="w-3.5 h-3.5"></i>
                                             <span x-text="clusterPrimaryActionLabel()"></span>
                                         </button>
+                                    </div>
+                                    <div x-show="clusterWarmupResult || clusterStopGenerationResult"
+                                         x-cloak
+                                         class="cluster-fabric__op-result"
+                                         data-cluster-op-result>
+                                        <span x-show="clusterWarmupResult"
+                                              x-text="clusterWarmupResult"></span>
+                                        <span x-show="clusterStopGenerationResult"
+                                              x-text="clusterStopGenerationResult"></span>
                                     </div>
                                 </div>
 
@@ -1091,6 +1123,44 @@
                                             x-text="clusterStatus.transport.rdma.devices.join(', ') || 'None reported'"></dd>
                                     </div>
                                 </dl>
+
+                                <!-- Live per-host serving state from this rank's
+                                     own runtime marker, carried on the peer-health
+                                     channel. Nothing here is estimated. -->
+                                <template x-if="clusterPeerTelemetry(0)">
+                                    <div class="mt-4 pt-4 border-t border-neutral-200 space-y-2 text-xs"
+                                         :data-rank-telemetry="0">
+                                        <div class="flex items-center justify-between gap-3">
+                                            <span class="text-neutral-400">Weights resident</span>
+                                            <span class="font-medium text-neutral-700"
+                                                  x-text="formatClusterGiB(clusterPeerTelemetry(0).measured_weight_bytes
+                                                        || clusterPeerTelemetry(0).planned_weight_bytes || 0)"></span>
+                                        </div>
+                                        <div class="flex items-center justify-between gap-3"
+                                             x-show="clusterPeerTelemetry(0).load_memory_bytes">
+                                            <span class="text-neutral-400">Memory in use</span>
+                                            <span class="font-medium text-neutral-700"
+                                                  x-text="formatClusterGiB(clusterPeerTelemetry(0).load_memory_bytes)"></span>
+                                        </div>
+                                        <div class="flex items-center justify-between gap-3">
+                                            <span class="text-neutral-400">Active requests</span>
+                                            <span class="font-medium text-neutral-700"
+                                                  x-text="formatClusterCount(clusterPeerTelemetry(0).metrics?.active_requests || 0)"></span>
+                                        </div>
+                                        <div class="flex items-center justify-between gap-3"
+                                             x-show="clusterPeerTelemetry(0).metrics?.last_request?.decode_tps">
+                                            <span class="text-neutral-400">Decode</span>
+                                            <span class="font-medium text-green-700"
+                                                  x-text="formatClusterRate(clusterPeerTelemetry(0).metrics.last_request.decode_tps)"></span>
+                                        </div>
+                                        <div class="flex items-center justify-between gap-3"
+                                             x-show="clusterPeerTelemetry(0).metrics?.cache">
+                                            <span class="text-neutral-400">Prompt cache</span>
+                                            <span class="font-medium text-neutral-700"
+                                                  x-text="formatClusterPercent(clusterPeerTelemetry(0).metrics.cache.hit_rate)"></span>
+                                        </div>
+                                    </div>
+                                </template>
                             </div>
 
                             <!-- Workers -->
@@ -1138,6 +1208,42 @@
                                                     ? formatClusterGiB(node.memory)
                                                     : 'Measured at setup'"></span>
                                         </div>
+                                        <!-- Live per-host state from this rank's
+                                             own marker, read over the peer-health
+                                             channel. Nothing here is estimated. -->
+                                        <template x-if="clusterPeerTelemetry(node.rank)">
+                                            <div class="space-y-2" :data-rank-telemetry="node.rank">
+                                                <div class="flex items-center justify-between gap-3">
+                                                    <span class="text-neutral-400">Weights resident</span>
+                                                    <span class="font-medium text-neutral-700"
+                                                          x-text="formatClusterGiB(clusterPeerTelemetry(node.rank).measured_weight_bytes
+                                                                || clusterPeerTelemetry(node.rank).planned_weight_bytes || 0)"></span>
+                                                </div>
+                                                <div class="flex items-center justify-between gap-3"
+                                                     x-show="clusterPeerTelemetry(node.rank).load_memory_bytes">
+                                                    <span class="text-neutral-400">Memory in use</span>
+                                                    <span class="font-medium text-neutral-700"
+                                                          x-text="formatClusterGiB(clusterPeerTelemetry(node.rank).load_memory_bytes)"></span>
+                                                </div>
+                                                <div class="flex items-center justify-between gap-3">
+                                                    <span class="text-neutral-400">Active requests</span>
+                                                    <span class="font-medium text-neutral-700"
+                                                          x-text="formatClusterCount(clusterPeerTelemetry(node.rank).metrics?.active_requests || 0)"></span>
+                                                </div>
+                                                <div class="flex items-center justify-between gap-3"
+                                                     x-show="clusterPeerTelemetry(node.rank).metrics?.last_request?.decode_tps">
+                                                    <span class="text-neutral-400">Decode</span>
+                                                    <span class="font-medium text-green-700"
+                                                          x-text="formatClusterRate(clusterPeerTelemetry(node.rank).metrics.last_request.decode_tps)"></span>
+                                                </div>
+                                                <div class="flex items-center justify-between gap-3"
+                                                     x-show="clusterPeerTelemetry(node.rank).metrics?.cache">
+                                                    <span class="text-neutral-400">Prompt cache</span>
+                                                    <span class="font-medium text-neutral-700"
+                                                          x-text="formatClusterPercent(clusterPeerTelemetry(node.rank).metrics.cache.hit_rate)"></span>
+                                                </div>
+                                            </div>
+                                        </template>
                                     </div>
                                 </div>
                             </template>
@@ -1297,6 +1403,58 @@
                                   class="text-xs text-neutral-400">Not run in this browser session</span>
                             <span x-show="clusterPipelineRunning"
                                   class="text-xs text-neutral-500 animate-pulse">Executing hybrid graph…</span>
+                        </div>
+                    </div>
+
+                    <div class="bg-white border border-neutral-200 rounded-2xl p-6">
+                        <div class="flex items-start justify-between gap-4">
+                            <div>
+                                <div class="flex items-center gap-2">
+                                    <i data-lucide="cpu" class="w-4 h-4 text-neutral-500"></i>
+                                    <h4 class="text-sm font-semibold text-neutral-900">Kernel known-answer</h4>
+                                </div>
+                                <p class="text-xs text-neutral-500 mt-2 max-w-sm">
+                                    Computes the hot-path ops on GPU and CPU and requires agreement. Run after any MLX wheel swap, on each Mac's own dashboard.
+                                </p>
+                            </div>
+                            <button @click="runClusterKnownAnswer()"
+                                    :disabled="clusterKnownAnswerLoading"
+                                    class="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-neutral-700 bg-neutral-100 rounded-lg hover:bg-neutral-200 disabled:opacity-50 transition-all"
+                                    data-cluster-known-answer>
+                                <i data-lucide="play" class="w-3.5 h-3.5"></i>
+                                <span x-text="clusterKnownAnswerLoading ? 'Running…' : 'Run check'"></span>
+                            </button>
+                        </div>
+                        <div class="mt-5 h-12 flex items-center">
+                            <template x-if="clusterKnownAnswerResult">
+                                <div class="w-full px-3 py-2.5 rounded-xl border"
+                                     :class="clusterKnownAnswerResult.ok
+                                        ? 'bg-green-50 border-green-200'
+                                        : 'bg-red-50 border-red-200'">
+                                    <span class="flex items-center gap-2 text-xs font-medium"
+                                          :class="clusterKnownAnswerResult.ok ? 'text-green-700' : 'text-red-700'">
+                                        <i :data-lucide="clusterKnownAnswerResult.ok ? 'circle-check' : 'circle-alert'"
+                                           class="w-4 h-4"></i>
+                                        <span x-text="(clusterKnownAnswerResult.ok
+                                                ? 'GPU and CPU agree'
+                                                : clusterKnownAnswerResult.failures.length + ' divergence' +
+                                                  (clusterKnownAnswerResult.failures.length === 1 ? '' : 's'))
+                                            + ' · MLX ' + clusterKnownAnswerResult.mlx_version"></span>
+                                    </span>
+                                    <template x-if="!clusterKnownAnswerResult.ok">
+                                        <ul class="mt-1.5 space-y-0.5">
+                                            <template x-for="failure in clusterKnownAnswerResult.failures"
+                                                      :key="failure">
+                                                <li class="text-[11px] font-mono text-red-700" x-text="failure"></li>
+                                            </template>
+                                        </ul>
+                                    </template>
+                                </div>
+                            </template>
+                            <span x-show="!clusterKnownAnswerResult && !clusterKnownAnswerLoading"
+                                  class="text-xs text-neutral-400">Not run in this browser session</span>
+                            <span x-show="clusterKnownAnswerLoading"
+                                  class="text-xs text-neutral-500 animate-pulse">Comparing GPU and CPU kernels…</span>
                         </div>
                     </div>
                 </div>

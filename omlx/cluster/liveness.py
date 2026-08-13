@@ -59,6 +59,9 @@ class PeerHealth:
     be ``unknown`` because no worker is expected. During a deployment,
     ``heartbeat_required`` makes health fail closed: the rank marker must be
     visible, fresh, and owned by a live process.
+
+    ``telemetry`` is the per-host serving digest from the rank's marker,
+    present only when the caller asked for it and a marker was read.
     """
 
     node_id: str
@@ -69,6 +72,7 @@ class PeerHealth:
     detail: str = ""
     heartbeat_required: bool = False
     process_live: bool | None = None
+    telemetry: dict[str, Any] | None = None
 
     @property
     def healthy(self) -> bool:
@@ -104,7 +108,7 @@ class PeerHealth:
         return "healthy"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "node_id": self.node_id,
             "rank": self.rank,
             "reachable": self.reachable,
@@ -117,6 +121,9 @@ class PeerHealth:
             "process_live": self.process_live,
             "detail": self.detail,
         }
+        if self.telemetry is not None:
+            result["telemetry"] = self.telemetry
+        return result
 
 
 class PeerLostError(RuntimeError):
@@ -304,6 +311,129 @@ def marker_age_seconds(marker: dict[str, Any], *, now: float | None = None) -> f
     return max(0.0, current - stamp.timestamp())
 
 
+def _digest_int(value: Any) -> int | None:
+    """One bounded counter from a marker, or None when it is unusable."""
+
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if 0 <= parsed <= 2**63 - 1 else None
+
+
+def _digest_float(value: Any, *, ceiling: float | None = None) -> float | None:
+    """One bounded measurement from a marker, or None when it is unusable."""
+
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed or parsed < 0 or parsed == float("inf"):
+        return None
+    if ceiling is not None and parsed > ceiling:
+        return None
+    return parsed
+
+
+def marker_telemetry_digest(marker: dict[str, Any]) -> dict[str, Any]:
+    """Bounded per-host serving telemetry from one rank's runtime marker.
+
+    The marker is the one channel every rank already publishes on — locally
+    for rank 0, over the fixed SSH read for its peers — so this digest costs
+    no extra round trip: ``check_peers`` reads the marker for liveness and,
+    when asked, also keeps the fields the dashboard renders per host. Every
+    field is fail-soft: a malformed value drops just that field, never the
+    health check the marker was read for.
+    """
+
+    digest: dict[str, Any] = {}
+    load_stage = marker.get("load_stage")
+    if isinstance(load_stage, str) and load_stage:
+        digest["load_stage"] = load_stage[:64]
+    for key in ("start_layer", "end_layer"):
+        parsed = _digest_int(marker.get(key))
+        if parsed is not None:
+            digest[key] = parsed
+    for key in (
+        "planned_weight_bytes",
+        "measured_weight_bytes",
+        "capacity_bytes",
+        "reserve_bytes",
+        "headroom_bytes",
+        "admission_budget_bytes",
+        "wired_limit_bytes",
+        "load_memory_bytes",
+    ):
+        parsed = _digest_int(marker.get(key))
+        if parsed is not None:
+            digest[key] = parsed
+
+    metrics = marker.get("metrics")
+    if isinstance(metrics, dict):
+        digest_metrics: dict[str, Any] = {}
+        for key in (
+            "active_requests",
+            "requests_completed",
+            "requests_failed",
+            "requests_cancelled",
+            "prompt_tokens_total",
+            "completion_tokens_total",
+            "cached_tokens_total",
+        ):
+            parsed = _digest_int(metrics.get(key))
+            if parsed is not None:
+                digest_metrics[key] = parsed
+        parsed = _digest_float(metrics.get("aggregate_decode_tps"))
+        if parsed is not None:
+            digest_metrics["aggregate_decode_tps"] = parsed
+        cache = metrics.get("cache")
+        if isinstance(cache, dict):
+            digest_cache: dict[str, Any] = {}
+            hit_rate = _digest_float(cache.get("hit_rate"), ceiling=1.0)
+            if hit_rate is not None:
+                digest_cache["hit_rate"] = hit_rate
+            for key in ("tokens_reused", "entries", "bytes"):
+                parsed = _digest_int(cache.get(key))
+                if parsed is not None:
+                    digest_cache[key] = parsed
+            if digest_cache:
+                digest_metrics["cache"] = digest_cache
+        pipeline = metrics.get("pipeline")
+        if isinstance(pipeline, dict):
+            digest_pipeline: dict[str, Any] = {}
+            utilization = _digest_float(pipeline.get("utilization"), ceiling=1.0)
+            if utilization is not None:
+                digest_pipeline["utilization"] = utilization
+            batch_steps = _digest_int(pipeline.get("batch_steps"))
+            if batch_steps is not None:
+                digest_pipeline["batch_steps"] = batch_steps
+            if digest_pipeline:
+                digest_metrics["pipeline"] = digest_pipeline
+        last_request = metrics.get("last_request")
+        if isinstance(last_request, dict):
+            digest_request: dict[str, Any] = {}
+            status = last_request.get("status")
+            if status in {"running", "completed", "failed", "cancelled"}:
+                digest_request["status"] = status
+            for key in ("prompt_tokens", "cached_tokens", "completion_tokens"):
+                parsed = _digest_int(last_request.get(key))
+                if parsed is not None:
+                    digest_request[key] = parsed
+            for key in ("ttft_seconds", "prefill_tps", "decode_tps"):
+                parsed = _digest_float(last_request.get(key))
+                if parsed is not None:
+                    digest_request[key] = parsed
+            if digest_request:
+                digest_metrics["last_request"] = digest_request
+        if digest_metrics:
+            digest["metrics"] = digest_metrics
+    return digest
+
+
 def check_peers(
     hosts_by_rank: dict[int, tuple[str, str]],
     *,
@@ -315,6 +445,7 @@ def check_peers(
         [str, str], tuple[dict[str, Any] | None, bool | None, float | None, str]
     ] = read_remote_marker,
     require_heartbeat: bool = False,
+    include_telemetry: bool = False,
 ) -> tuple[PeerHealth, ...]:
     """Health of every rank: reachable, and how fresh its heartbeat is.
 
@@ -331,6 +462,10 @@ def check_peers(
     A marker whose writing process is gone is treated as absent rather than
     stale. It is the debris of a crashed run, not evidence about this one, and
     calling it stale wedged every subsequent activation of the same model.
+
+    ``include_telemetry`` attaches :func:`marker_telemetry_digest` of the
+    marker that was already read for the heartbeat, so the dashboard can show
+    per-host serving state without a second channel.
     """
 
     local_root = Path(state_dir).expanduser()
@@ -371,6 +506,11 @@ def check_peers(
                 detail=detail,
                 heartbeat_required=require_heartbeat,
                 process_live=process_live,
+                telemetry=(
+                    marker_telemetry_digest(marker)
+                    if include_telemetry and marker is not None
+                    else None
+                ),
             )
         )
     return tuple(health)
