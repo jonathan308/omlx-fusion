@@ -1,6 +1,8 @@
 # Distributed inference across Macs
 
-Status: experimental, source-build preview
+Status: experimental, source-build preview. See
+[cluster-roadmap.md](cluster-roadmap.md) for the phased plan beyond this
+snapshot.
 
 oMLX can run one downloaded MLX model across two unequal-memory Macs while
 preserving its existing OpenAI-compatible API. The first implementation uses
@@ -109,7 +111,9 @@ with HMAC-SHA256; an unkeyed or altered token is rejected.
 On the coordinator:
 
 1. Connect the Thunderbolt cable. A nearby Mac should appear under
-   **Detected nearby** or via the QR code pairing.
+   **Detected nearby**; if it does not, you can enter its SSH hostname
+   directly in the next step. Pairing itself is the shared-secret exchange
+   described above — there is no QR-code or camera-based flow.
 2. Select the peer or enter its SSH hostname. **Check peer** records a new host
    alias automatically, refuses a changed key, and requires a non-interactive
    SSH login key.
@@ -220,24 +224,174 @@ Only safetensors headers are read. Fixed weights such as embeddings and the
 language-model head are conservatively accounted on every rank. The plan
 contains a SHA-256 digest checked by every worker before loading.
 
+## Troubleshooting
+
+The dashboard maps the common setup failures to plain-language guidance with
+copyable fix commands. This section covers the failures that need more than
+one click, in roughly the order a new cluster meets them.
+
+### RDMA is not available or not used
+
+Thunderbolt RDMA is off by default and can only be enabled from macOS
+Recovery: shut down, hold the power button to enter Recovery, open
+**Utilities > Terminal**, and run `rdma_ctl enable`. It cannot be enabled
+remotely, and oMLX never attempts it. RDMA then requires a Thunderbolt 5
+link on both ends — a Thunderbolt 4 link (40 Gb/s against TB5's 80 Gb/s)
+connects but reports no active RDMA port.
+
+Check the state on both Macs:
+
+```bash
+rdma_ctl status            # enabled / disabled
+ibv_devices                # should list rdma_* devices
+ibv_devinfo -d <device>    # port state should be PORT_ACTIVE
+```
+
+The same read-only probes are available without a terminal: `omlx cluster
+status --json` runs them locally, and `GET /admin/api/cluster/link-status`
+classifies the link between paired Macs as `rdma_ready`,
+`rdma_needs_setup`, `rdma_not_enabled`, `thunderbolt`, or `ethernet`, with
+the matching remedy. `GET /admin/api/cluster/fabric` reports the addresses
+each Mac answers on and the backend they allow. When the devices exist and
+the ports are active but have no IP address (`rdma_needs_setup`), starting
+the cluster asks macOS for administrator approval and configures the link;
+oMLX never does this silently.
+
+Without usable RDMA the cluster falls back to the TCP Ring backend — over
+the Thunderbolt cable when one is present, otherwise over the network. That
+works, but every collective crosses TCP, so expect a visible slowdown, and
+expect tensor parallelism over Ethernet or Wi-Fi to be slower than a single
+Mac. The multi-connection Ring tuning applies only to this fallback;
+JACCL owns its own Thunderbolt connection strategy.
+
+### The SSH control channel drops while ranks serve
+
+Ranks converse over RDMA or the ring while the SSH session that launched a
+remote rank sits idle — and an idle channel is the one that gets dropped,
+taking the remote rank down with SIGHUP. Launch SSH commands therefore run
+with keepalive (`ServerAliveInterval=15`, `ServerAliveCountMax=4`,
+`TCPKeepAlive=yes`, from `omlx/cluster/ssh_policy.py`), and the same options
+wrap the SSH calls MLX's launcher makes internally.
+
+Independently, every rank publishes a heartbeat marker, including a fixed
+interval heartbeat while idle. The coordinator reads remote markers over SSH
+against the peer's own clock, so unsynchronized wall clocks do not read as
+stale. A marker older than 45 seconds is stale; a marker whose writing
+process is gone is treated as dead rather than stale, so the debris of a
+crashed run cannot wedge the next activation. The watchdog probes every
+15 seconds while ranks load and every 3 seconds once every rank reports
+ready, and only two consecutive failures declare a peer lost — one flaky
+probe during a twenty-minute weight load does not throw the deployment
+away. A lost peer ends the deployment with an error that names the missing
+Mac instead of hanging inside a collective; fix the cause and activate the
+cluster again.
+
+### The peer's SSH host key changed
+
+The `accept-new` policy records a first-seen key and refuses a changed one;
+oMLX never overwrites an existing identity. If a Mac was reinstalled, or its
+address moved to a different machine:
+
+1. Confirm the address still belongs to the expected Mac by comparing the
+   host-key fingerprint shown on that Mac
+   (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`).
+2. Remove only the stale entry with `ssh-keygen -R <host>`.
+3. Retry **Check peer**; the new key is recorded as a first-seen alias.
+
+### A rank runs its Mac out of memory while loading
+
+Each rank is admitted against the same ceiling single-node oMLX uses: the
+minimum of installed RAM minus the tier reserve, the memory `vm_stat` says
+is reclaimable right now, and the GPU wired limit (read from `sysctl -n
+iogpu.wired_limit_mb`, not the installed-RAM figure, which can be ~20 GiB
+higher). The resident budget follows the node role: **Headless** admits the
+full ceiling, while **Workstation** holds half the Mac back — at least
+32 GiB — so the person using it keeps working.
+
+Admission is a prediction, so a watchdog keeps sampling while the weights
+arrive and aborts the rank if it crosses the stage budget plus load
+headroom (30% of the stage's weights, with a 2 GiB floor). Dequantisation
+buffers and `sanitize` copies are alive on the way in and gone once the
+stage is resident, so a stage that fits can still exceed the Mac mid-load;
+the abort is what stands between that and a jetsam kill of the wrong
+process.
+
+When a load is refused or aborted: give the node fewer layers, set it
+Headless if nobody is using it, close other applications, or add a Mac.
+Raising the planner reserve for that node shrinks the stage it is assigned
+in the first place.
+
+### The Macs run different versions
+
+Preflight compares the oMLX, MLX, MLX-LM, and cluster-protocol versions
+between the Macs and reports a `runtime_mismatch` per package; **Check
+peer** shows the same comparison before anything launches. Ranks must run
+identical versions — a mismatch produces subtly wrong results rather than a
+clean error. Update both Macs to the same oMLX build with matching
+MLX/MLX-LM versions, then re-run **Check peer** to confirm.
+
+### Staging stops partway
+
+Weight files are copied to a hidden `.omlx-stage-*.part` name, size-checked,
+and atomically renamed into place; a failed or interrupted transfer discards
+the partial file. Nothing half-written ever appears under a real model
+filename, so there is nothing to roll back by hand. Retrying **Start**
+re-plans staging and copies only the files still missing, then verifies
+every landed file's size before the rank is allowed to load. If a rank
+still reports a missing shard, confirm the complete model exists on the
+source Mac named in the model card, and re-download it there if that copy
+is incomplete.
+
 ## Admin API
 
 All cluster endpoints use the existing oMLX admin authentication:
 
 ```text
+Status and discovery:
 GET    /admin/api/cluster/status
 GET    /admin/api/cluster/runtime
+GET    /admin/api/cluster/diagnostics
 GET    /admin/api/cluster/discover
+GET    /admin/api/cluster/peer-health
 POST   /admin/api/cluster/peer-probe
+
+Pairing and SSH keys:
+POST   /admin/api/cluster/pairing-token
+POST   /admin/api/cluster/verify-pairing-token
+GET    /admin/api/cluster/ssh-key
+POST   /admin/api/cluster/ssh-key/generate
+POST   /admin/api/cluster/ssh-key/exchange-token
+POST   /admin/api/cluster/ssh-key/exchange
+POST   /admin/api/cluster/ssh-key/store-keychain
+
+Link and fabric:
+GET    /admin/api/cluster/transports
+GET    /admin/api/cluster/fabric
+GET    /admin/api/cluster/link-status
+POST   /admin/api/cluster/link-setup
+
+Planning, models, and smoke tests:
+POST   /admin/api/cluster/autoconfigure
+POST   /admin/api/cluster/plan
+GET    /admin/api/cluster/node-roles
+POST   /admin/api/cluster/node-budgets
+POST   /admin/api/cluster/models
+POST   /admin/api/cluster/catalogue
+POST   /admin/api/cluster/guidance
 POST   /admin/api/cluster/worker-smoke
 POST   /admin/api/cluster/collective-smoke
 POST   /admin/api/cluster/pipeline-smoke
-POST   /admin/api/cluster/plan
+
+Staging and deployments:
+POST   /admin/api/cluster/stage
+GET    /admin/api/cluster/stage/{job_id}
 GET    /admin/api/cluster/deployments
 POST   /admin/api/cluster/deployments
 DELETE /admin/api/cluster/deployments/{deployment_id}
 ```
 
+`/diagnostics` returns a local-only support bundle (status, runtime, registry,
+peer health, staging jobs) with credentials and remote stderr redacted.
 Deployment records contain hostnames, communication IPs, RDMA device names,
 assignments, and the plan hash. They never contain passwords, private keys, or
 SSH options. The registry is written atomically with mode `0600`.
