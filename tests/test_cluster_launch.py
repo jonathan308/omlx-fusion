@@ -826,3 +826,201 @@ def test_a_planned_workstation_reaches_the_rank_as_a_workstation(tmp_path):
     assert [item.planned_weight_bytes for item in assignments] == [
         item.planned_weight_bytes for item in plan.assignments
     ]
+
+
+# ---------------------------------------------------------------------------
+# SIGTERM→SIGKILL grace sizing
+#
+# The kill that lands before a rank has unwired its unified-memory allocation
+# is the orphan path: the pages stay kernel-owned until a reboot. The grace
+# therefore scales with the largest resident rank the plan knows about.
+# ---------------------------------------------------------------------------
+
+_GIB = 1024**3
+
+
+def test_size_aware_stop_timeout_scales_floors_and_caps():
+    assert launch._size_aware_stop_timeout_s(None) == 30.0
+    assert launch._size_aware_stop_timeout_s(0) == 30.0
+    # Even a 1-byte rank gets the floor: a collective unwind is never free.
+    assert launch._size_aware_stop_timeout_s(1) == 30.0
+    assert launch._size_aware_stop_timeout_s(90 * _GIB) == 45.0
+    assert launch._size_aware_stop_timeout_s(400 * _GIB) == 120.0
+
+
+def test_supervisor_sizes_stop_timeout_from_the_plan_when_unset():
+    assignments = (
+        PipelineAssignment("local", 0, 3, 8, 90 * _GIB, 1, 1, 400 * _GIB),
+        PipelineAssignment("studio", 1, 0, 3, 3, 1, 1, 8),
+    )
+    deployment = ClusterDeployment(
+        deployment_id="cluster-test",
+        model="org/model",
+        backend="ring",
+        hosts=(
+            ClusterHost("local", "127.0.0.1", ("10.0.0.1",)),
+            ClusterHost("studio", "user@studio.local", ("10.0.0.2",)),
+        ),
+        assignments=assignments,
+        plan_hash="c" * 64,
+    )
+
+    supervisor = launch.DistributedJobSupervisor(deployment, preflight=False)
+
+    assert supervisor.stop_timeout == launch._size_aware_stop_timeout_s(
+        90 * _GIB + 1
+    )
+
+
+def test_supervisor_stop_timeout_explicit_value_still_wins():
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        stop_timeout=7.5,
+    )
+    assert supervisor.stop_timeout == 7.5
+
+    # The tiny plan in _deployment() collapses to the floor, never to the
+    # old flat 10 s that orphaned a ~90 GiB rank.
+    assert (
+        launch.DistributedJobSupervisor(_deployment(), preflight=False).stop_timeout
+        == 30.0
+    )
+
+    with pytest.raises(ValueError, match="positive"):
+        launch.DistributedJobSupervisor(
+            _deployment(),
+            preflight=False,
+            stop_timeout=0,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Orphaned wired-memory guard
+#
+# A rank that died without MLX teardown leaves wired pages no process owns;
+# vm_stat keeps counting them and only a reboot returns them. Activation
+# refuses to stage on top of that residue — but a broken probe must never
+# block activation, so every probe failure fails open with a warning.
+# ---------------------------------------------------------------------------
+
+_VM_STAT = """\
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                               10168234.
+Pages active:                               721817.
+Pages inactive:                            5417022.
+Pages speculative:                          126628.
+Pages throttled:                                 0.
+Pages wired down:                           286597.
+Pages purgeable:                             24323.
+"""
+
+
+def _vm_stat_with_wired_bytes(wired_bytes: int) -> str:
+    return _VM_STAT.replace("286597", str(wired_bytes // 16384))
+
+
+def test_vm_stat_wired_memory_parsing():
+    assert launch._wired_memory_bytes_from_vm_stat(_VM_STAT) == 286597 * 16384
+    # A non-standard page-size header is honoured rather than assumed.
+    assert launch._wired_memory_bytes_from_vm_stat(
+        _VM_STAT.replace("page size of 16384", "page size of 4096")
+    ) == 286597 * 4096
+    assert launch._wired_memory_bytes_from_vm_stat("no wired line here") is None
+
+
+def test_orphan_guard_refuses_and_tells_the_operator_to_reboot():
+    with pytest.raises(DistributedLaunchError, match="reboot") as excinfo:
+        launch.check_orphaned_wired_memory(
+            _deployment(),
+            threshold_gb=100.0,
+            local_probe=lambda: 150 * _GIB,
+        )
+
+    message = str(excinfo.value)
+    assert "local" in message
+    assert "studio" in message
+    assert "150.0 GiB wired" in message
+    assert "OMLX_CLUSTER_ORPHAN_WIRED_GB" in message
+    # The operator message names the only cure for orphaned wired pages.
+    assert "reboot" in message
+
+
+def test_orphan_guard_passes_below_the_threshold_and_when_disabled():
+    launch.check_orphaned_wired_memory(
+        _deployment(),
+        threshold_gb=100.0,
+        local_probe=lambda: 4 * _GIB,
+    )
+    # 0 disables the guard outright — no probes, no refusal.
+    launch.check_orphaned_wired_memory(
+        _deployment(),
+        threshold_gb=0.0,
+        local_probe=lambda: 400 * _GIB,
+    )
+
+
+def test_orphan_guard_threshold_comes_from_the_environment(monkeypatch):
+    monkeypatch.setenv("OMLX_CLUSTER_ORPHAN_WIRED_GB", "5")
+    with pytest.raises(DistributedLaunchError, match="reboot"):
+        launch.check_orphaned_wired_memory(
+            _deployment(),
+            local_probe=lambda: 10 * _GIB,
+        )
+
+    monkeypatch.setenv("OMLX_CLUSTER_ORPHAN_WIRED_GB", "0")
+    launch.check_orphaned_wired_memory(
+        _deployment(),
+        local_probe=lambda: 10 * _GIB,
+    )
+
+
+def test_orphan_guard_fails_open_with_a_warning_when_the_probe_errors(caplog):
+    def broken_probe():
+        raise OSError("vm_stat exploded")
+
+    launch.check_orphaned_wired_memory(
+        _deployment(),
+        threshold_gb=1.0,
+        local_probe=broken_probe,
+    )
+
+    assert "orphaned wired-memory probe failed" in caplog.text
+
+
+def test_orphan_guard_probes_peers_over_ssh_and_survives_ssh_failure():
+    calls: list[list[str]] = []
+
+    def runner(argv, **_kwargs):
+        calls.append(argv)
+        if argv[0] == "vm_stat":
+            # The loopback host is read directly instead of SSHing to itself.
+            return subprocess.CompletedProcess(argv, 0, stdout=_VM_STAT, stderr="")
+        raise OSError("ssh: connect to host studio.local port 22: timed out")
+
+    launch.check_orphaned_wired_memory(
+        _deployment(),
+        threshold_gb=100.0,
+        runner=runner,
+    )
+
+    assert calls[0] == ["vm_stat"]
+    assert calls[1][-1] == "vm_stat"
+    assert "user@studio.local" in calls[1]
+
+
+def test_orphan_guard_refuses_on_real_vm_stat_output_over_threshold():
+    def runner(argv, **_kwargs):
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=_vm_stat_with_wired_bytes(150 * _GIB),
+            stderr="",
+        )
+
+    with pytest.raises(DistributedLaunchError, match="reboot"):
+        launch.check_orphaned_wired_memory(
+            _deployment(),
+            threshold_gb=100.0,
+            runner=runner,
+        )

@@ -48,6 +48,7 @@ from .discovery import (
 from .guidance import explain
 from .launch import (
     DistributedLaunchError,
+    check_orphaned_wired_memory,
     preflight_remote_hosts,
     probe_remote_admission_ceiling,
     probe_remote_host,
@@ -2523,6 +2524,11 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
             deployment_id=deployment.deployment_id,
         )
         raise_if_peer_lost(health)
+        # The peers answer, but a Mac still holding the wired residue of a
+        # rank that died without teardown does not actually have the memory
+        # this plan budgets against. Refuse before staging; the guard itself
+        # is fail-open when a probe errors.
+        await asyncio.to_thread(check_orphaned_wired_memory, deployment)
         preflight = await asyncio.to_thread(
             preflight_remote_hosts,
             deployment,

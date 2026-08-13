@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import json
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -641,3 +643,85 @@ async def test_distributed_preflight_rejects_features_before_stream_starts():
             )
     finally:
         await engine._client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Quiesce-before-stop
+#
+# supervisor.stop() SIGTERMs the rank group. A request cut mid-decode is a
+# rank killed mid-Metal-eval — the sequence that strands wired unified
+# memory in the kernel — so stop first refuses new work and waits for the
+# in-flight set to drain, bounded by a timeout.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stop_waits_for_in_flight_requests_before_stopping_the_ranks(
+    monkeypatch,
+):
+    engine = _ready_engine(lambda request: httpx.Response(200, json={}))
+    engine._quiesce_timeout_s = 5.0
+    stopped: list[float] = []
+    monkeypatch.setattr(
+        engine._supervisor,
+        "stop",
+        lambda: stopped.append(time.monotonic()),
+    )
+
+    await engine._enter_request()
+    drained_at = 0.0
+
+    async def finish_request():
+        nonlocal drained_at
+        await asyncio.sleep(0.3)
+        drained_at = time.monotonic()
+        await engine._leave_request()
+
+    finisher = asyncio.create_task(finish_request())
+    stopper = asyncio.create_task(engine.stop())
+    # Mid-quiesce: the ranks must not be killed while a request is flying.
+    await asyncio.sleep(0.1)
+    assert stopped == []
+
+    await asyncio.wait_for(stopper, timeout=5)
+    await finisher
+
+    assert stopped and stopped[0] >= drained_at
+    assert engine._loaded is False
+    # stop() took ownership of the client and closed it.
+    assert engine._client is None
+
+
+@pytest.mark.asyncio
+async def test_engine_refuses_new_requests_once_stop_has_begun():
+    engine = _ready_engine(lambda request: httpx.Response(200, json={}))
+    engine._stopping = True
+    engine._loaded = False
+    try:
+        with pytest.raises(DistributedInferenceError, match="stopping"):
+            await engine._enter_request()
+        # The auto-start convenience in chat/generate must not relaunch
+        # ranks the supervisor is actively tearing down.
+        with pytest.raises(DistributedInferenceError, match="stopping"):
+            await engine.start()
+    finally:
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stop_quiesce_is_bounded_so_a_wedged_rank_still_dies(monkeypatch):
+    engine = _ready_engine(lambda request: httpx.Response(200, json={}))
+    engine._quiesce_timeout_s = 0.2
+    stopped: list[bool] = []
+    monkeypatch.setattr(engine._supervisor, "stop", lambda: stopped.append(True))
+
+    # A wedged decode never leaves; stop must proceed anyway, bounded.
+    await engine._enter_request()
+    started = time.monotonic()
+    await asyncio.wait_for(engine.stop(), timeout=5)
+
+    assert time.monotonic() - started < 2
+    assert stopped == [True]
+    # The wedged request was not faked away — the stop outlasted it.
+    assert engine.has_active_requests()
+    assert engine._client is None

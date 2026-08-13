@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import logging
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -23,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from .deployment import ClusterDeployment, validate_ssh_target
-from .liveness import read_marker, read_remote_marker
+from .liveness import _LOOPBACK_TARGETS, read_marker, read_remote_marker
 from .models import CLUSTER_PROTOCOL_VERSION
 from .performance import performance_profiles_from_records
 from .ssh_policy import cluster_ssh_options
@@ -33,6 +35,8 @@ _EVENT_PREFIX = "OMLX_CLUSTER_EVENT:"
 _LOG_LINE_LIMIT = 8192
 _LOG_HISTORY = 200
 _REMOTE_OUTPUT_LIMIT = 64 * 1024
+
+logger = logging.getLogger(__name__)
 
 
 class DistributedLaunchError(RuntimeError):
@@ -857,6 +861,148 @@ def _staged_model_failure(status: dict[str, Any]) -> str:
     return "; ".join(problems) or "rank-local validation did not pass"
 
 
+# Above this much wired memory on any node, activation is refused: the
+# residue of an untorn-down rank looks exactly like this.
+_ORPHAN_WIRED_THRESHOLD_ENV = "OMLX_CLUSTER_ORPHAN_WIRED_GB"
+_DEFAULT_ORPHAN_WIRED_THRESHOLD_GB = 100.0
+_VM_STAT_TIMEOUT_S = 5.0
+
+
+def _wired_memory_bytes_from_vm_stat(text: str) -> int | None:
+    """Wired bytes parsed from ``vm_stat`` output, or None when unparseable.
+
+    Apple Silicon page size is 16384; the header is still honoured when it
+    says otherwise, because a guessed page size silently scales the result.
+    """
+
+    page_size = 16384
+    header = re.search(r"page size of (\d+) bytes", text)
+    if header is not None:
+        page_size = int(header.group(1))
+    wired = re.search(r"^Pages wired down:\s*(\d+)", text, re.MULTILINE)
+    if wired is None:
+        return None
+    return int(wired.group(1)) * page_size
+
+
+def _local_wired_memory_bytes(*, runner: SSHRunner = subprocess.run) -> int:
+    completed = runner(
+        ["vm_stat"],
+        capture_output=True,
+        text=True,
+        timeout=_VM_STAT_TIMEOUT_S,
+        check=False,
+    )
+    if getattr(completed, "returncode", 1) != 0:
+        raise DistributedLaunchError("vm_stat failed on the coordinator")
+    wired = _wired_memory_bytes_from_vm_stat(completed.stdout or "")
+    if wired is None:
+        raise DistributedLaunchError("could not parse vm_stat on the coordinator")
+    return wired
+
+
+def _remote_wired_memory_bytes(
+    ssh_target: str,
+    *,
+    timeout: float,
+    runner: SSHRunner,
+) -> int:
+    completed = _run_cluster_ssh(
+        ssh_target,
+        "vm_stat",
+        timeout=timeout,
+        runner=runner,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        suffix = f": {detail[:500]}" if detail else ""
+        raise DistributedLaunchError(f"vm_stat failed for {ssh_target}{suffix}")
+    wired = _wired_memory_bytes_from_vm_stat(completed.stdout)
+    if wired is None:
+        raise DistributedLaunchError(f"could not parse vm_stat from {ssh_target}")
+    return wired
+
+
+def _orphan_wired_threshold_gb() -> float:
+    raw = os.environ.get(_ORPHAN_WIRED_THRESHOLD_ENV, "").strip()
+    if raw:
+        with suppress(ValueError):
+            return float(raw)
+    return _DEFAULT_ORPHAN_WIRED_THRESHOLD_GB
+
+
+def check_orphaned_wired_memory(
+    deployment: ClusterDeployment,
+    *,
+    threshold_gb: float | None = None,
+    timeout: float = 8.0,
+    runner: SSHRunner = subprocess.run,
+    local_probe: Callable[[], int] | None = None,
+) -> None:
+    """Refuse to activate on a Mac still holding orphaned GPU wired memory.
+
+    A rank that dies without MLX teardown — a watchdog ``os._exit``, or a
+    SIGKILL landing mid-Metal-eval — leaves its wired unified-memory pages
+    owned by no process. ``vm_stat`` keeps counting them, the kernel cannot
+    reclaim them, and only a reboot returns them (observed: ~100 GiB per
+    rank). Activating on top of that residue stages and loads a fresh model
+    against memory the machine does not actually have, which ends in jetsam
+    or a wedged collective twenty minutes later.
+
+    Threshold is ``OMLX_CLUSTER_ORPHAN_WIRED_GB`` (default 100 GiB); 0
+    disables the check. Fail-open by contract: a probe that errors logs a
+    warning and is skipped, because a probe bug must never block activation.
+    """
+
+    if threshold_gb is None:
+        threshold_gb = _orphan_wired_threshold_gb()
+    if threshold_gb <= 0:
+        return
+    threshold_bytes = threshold_gb * 1024**3
+    gib = 1024**3
+    offenders: list[tuple[str, int]] = []
+    for host in deployment.hosts:
+        probe = local_probe
+        if probe is None:
+            if host.ssh in _LOOPBACK_TARGETS:
+                # Rank zero is the coordinator itself; read it directly
+                # rather than SSHing to loopback.
+                probe = lambda: _local_wired_memory_bytes(runner=runner)  # noqa: E731
+            else:
+                probe = lambda ssh_target=host.ssh: _remote_wired_memory_bytes(  # noqa: E731
+                    ssh_target,
+                    timeout=timeout,
+                    runner=runner,
+                )
+        try:
+            wired_bytes = int(probe())
+        except Exception as exc:
+            logger.warning(
+                "orphaned wired-memory probe failed for %s; skipping it: %s: %s",
+                host.node_id,
+                type(exc).__name__,
+                exc,
+            )
+            continue
+        if wired_bytes > threshold_bytes:
+            offenders.append((host.node_id, wired_bytes))
+    if not offenders:
+        return
+    observed = "; ".join(
+        f"{node_id} reports {wired / gib:.1f} GiB wired" for node_id, wired in offenders
+    )
+    names = ", ".join(node_id for node_id, _wired in offenders)
+    raise DistributedLaunchError(
+        f"refusing to activate the cluster: {observed}, above the "
+        f"{threshold_bytes / gib:.0f} GiB orphan guard "
+        f"({_ORPHAN_WIRED_THRESHOLD_ENV}). Wired memory left behind by a rank "
+        "that died without teardown is owned by no process and cannot be "
+        f"reclaimed while the machine runs — reboot {names} to clear the "
+        f"orphaned GPU memory, then activate again. If this memory is "
+        f"legitimately in use, raise {_ORPHAN_WIRED_THRESHOLD_ENV}."
+    )
+
+
 @dataclass(frozen=True)
 class DistributedJobStatus:
     deployment_id: str
@@ -885,6 +1031,51 @@ class DistributedJobStatus:
         }
 
 
+# SIGTERM→SIGKILL grace sizing. The old flat 10 s was tuned for a launcher
+# that owns only itself; the supervised process group actually ends when the
+# slowest rank has unwound its Metal evaluation, unwired its unified-memory
+# allocation and exited. A SIGKILL landing before that — mid-Metal-eval — is
+# exactly the path that strands wired GPU/RDMA pages in the kernel with no
+# owning process (only a reboot reclaims them). The grace therefore scales
+# with the largest resident rank in the plan.
+_STOP_TIMEOUT_FLOOR_S = 30.0
+_STOP_TIMEOUT_CAP_S = 120.0
+# Conservative rank-teardown rate: unwiring tens of GiB of GPU/RDMA-pinned
+# pages and draining the Metal/jaccl state on top of it, per second. 2 GiB/s
+# sizes a ~90 GiB rank at 45 s — well clear of the 10 s that orphaned it.
+_METAL_RELEASE_BYTES_PER_S = 2 * 1024**3
+
+
+def _size_aware_stop_timeout_s(resident_bytes: int | None) -> float:
+    """SIGTERM→SIGKILL grace sized to the largest rank, floored and capped.
+
+    Unknown (or zero) resident bytes collapse to the floor: even a small rank
+    needs room to unwind a collective, and a probe gap must never reintroduce
+    the 10 s kill window this replaced.
+    """
+
+    if not resident_bytes or resident_bytes <= 0:
+        return _STOP_TIMEOUT_FLOOR_S
+    scaled = resident_bytes / _METAL_RELEASE_BYTES_PER_S
+    return min(_STOP_TIMEOUT_CAP_S, max(_STOP_TIMEOUT_FLOOR_S, scaled))
+
+
+def _deployment_max_resident_bytes(deployment: ClusterDeployment) -> int:
+    """Largest per-rank resident bytes the plan knows about, or 0.
+
+    ``planned_weight_bytes`` already folds in the stage's KV cache, so it is
+    the closest the plan gets to what a rank actually holds wired. Anything
+    that cannot be computed means "unknown", and unknown sizes the floor.
+    """
+
+    with suppress(AttributeError, TypeError, ValueError):
+        return max(
+            int(assignment.planned_weight_bytes)
+            for assignment in deployment.assignments
+        )
+    return 0
+
+
 class DistributedJobSupervisor:
     """Own the launcher process group and enforce readiness/teardown deadlines."""
 
@@ -896,17 +1087,28 @@ class DistributedJobSupervisor:
         cwd: Path | None = None,
         state_dir: str = "~/.omlx/cluster/runtime",
         load_timeout: float = 1800.0,
-        stop_timeout: float = 10.0,
+        stop_timeout: float | None = None,
         preflight: bool = True,
     ) -> None:
-        if load_timeout <= 0 or stop_timeout <= 0:
+        if load_timeout <= 0 or (stop_timeout is not None and stop_timeout <= 0):
             raise ValueError("supervisor timeouts must be positive")
         self.deployment = deployment
         self.python_executable = _validate_python_executable(python_executable)
         self.cwd = cwd
         self.state_dir = state_dir
         self.load_timeout = load_timeout
-        self.stop_timeout = stop_timeout
+        # Unset means "size it from the plan": the grace between SIGTERM and
+        # SIGKILL must cover the slowest rank's Metal release, and 10 s flat
+        # was measured to be too short for a ~90 GiB rank. An explicit value
+        # always wins — tests and operators know their ranks better than the
+        # heuristic does.
+        self.stop_timeout = (
+            stop_timeout
+            if stop_timeout is not None
+            else _size_aware_stop_timeout_s(
+                _deployment_max_resident_bytes(deployment)
+            )
+        )
         self.preflight = preflight
         self.process: subprocess.Popen[str] | None = None
         self.port: int | None = None
@@ -1104,6 +1306,11 @@ class DistributedJobSupervisor:
         process = self.process
         if process is not None:
             process_group = process.pid
+            # The grace between TERM and KILL is sized to the plan's largest
+            # resident rank (see _size_aware_stop_timeout_s): a rank needs the
+            # window to unwire its unified-memory allocation and unwind Metal
+            # state. KILL arriving earlier is not a faster stop — it is the
+            # orphan path that leaves the pages kernel-owned until a reboot.
             deadline = time.monotonic() + self.stop_timeout
             if _process_group_alive(process_group):
                 with suppress(ProcessLookupError):
