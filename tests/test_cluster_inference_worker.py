@@ -2,6 +2,7 @@
 """Fail-closed validation of the model stage loaded by a cluster rank."""
 
 import contextlib
+import io
 import json
 import threading
 import time
@@ -23,6 +24,10 @@ from omlx.cluster.inference_worker import (
     build_parser,
 )
 from omlx.cluster.planner import PipelineAssignment
+from omlx.cluster.runtime_optimizations import (
+    LockstepClusterShutdownError,
+    get_lockstep_controller,
+)
 
 GiB = 1024**3
 
@@ -1316,3 +1321,144 @@ def test_the_marker_is_removed_when_the_rank_exits_cleanly(monkeypatch, tmp_path
     _run_rank(monkeypatch, tmp_path, rank=0)
 
     assert list(tmp_path.glob("*.json")) == []
+
+
+# ---------------------------------------------------------------------------
+# Lockstep cancel admin surface + shutdown interception
+# ---------------------------------------------------------------------------
+
+
+class _FakeAdminBase:
+    """The slice of the mlx-lm APIHandler contract the admin routes use."""
+
+    def _set_completion_headers(self, status_code):
+        self.status_code = status_code
+
+    def send_header(self, *_args):
+        pass
+
+    def end_headers(self):
+        pass
+
+    def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler verb API
+        self.status_code = 404
+
+
+def _admin_request(handler_type, path, host):
+    handler = handler_type.__new__(handler_type)
+    handler.path = path
+    handler.client_address = (host, 49152)
+    handler.wfile = io.BytesIO()
+    return handler
+
+
+def test_cluster_admin_routes_arm_the_latch_for_localhost_only():
+    controller = get_lockstep_controller()
+    controller.reset(stop_token_ids=(99,), decode_cancel_active=True)
+    handler_type = inference_worker._cluster_admin_handler_class(
+        _FakeAdminBase,
+        controller,
+    )
+    try:
+        cancel = _admin_request(handler_type, "/admin/cancel", "127.0.0.1")
+        cancel.do_POST()
+        assert cancel.status_code == 200
+        body = json.loads(cancel.wfile.getvalue())
+        assert body["status"] == "armed"
+        assert body["decode_cancel_active"] is True
+        # The armed latch reaches the pinned generation step as a stop id.
+        assert controller.decode_swap_token() == 99
+
+        remote = _admin_request(handler_type, "/admin/cancel", "10.0.0.5")
+        remote.do_POST()
+        assert remote.status_code == 403
+        # The refused request did not arm anything: the latch was consumed by
+        # the local cancel above and stays consumed.
+        assert controller.decode_swap_token() is None
+
+        shutdown = _admin_request(handler_type, "/admin/shutdown", "::1")
+        controller.mark_sentinel_broadcast()
+        shutdown.do_POST()
+        assert shutdown.status_code == 200
+        assert json.loads(shutdown.wfile.getvalue())["status"] == "broadcast"
+        assert controller.shutdown_pending is True
+
+        unknown = _admin_request(handler_type, "/v1/completions", "127.0.0.1")
+        unknown.do_POST()
+        assert unknown.status_code == 404
+    finally:
+        controller.deactivate()
+
+
+def test_lockstep_shutdown_interception_exits_through_the_graceful_path(
+    monkeypatch,
+):
+    exits = []
+    monkeypatch.setattr(
+        inference_worker,
+        "_begin_graceful_rank_exit",
+        lambda reason: exits.append(reason),
+    )
+
+    class _Generator:
+        def _generate(self):
+            raise LockstepClusterShutdownError("sentinel received")
+
+    original = _Generator._generate
+    with inference_worker._intercept_lockstep_shutdown(_Generator):
+        assert _Generator._generate is not original
+        # The sentinel unwinds into the graceful exit instead of killing the
+        # generation thread — and never a bare os._exit.
+        _Generator()._generate()
+    assert _Generator._generate is original
+    assert len(exits) == 1
+    assert "coordinated cluster shutdown" in exits[0]
+
+
+def test_lockstep_shutdown_interception_leaves_normal_errors_alone():
+    class _Generator:
+        def _generate(self):
+            raise RuntimeError("unrelated")
+
+    with (
+        inference_worker._intercept_lockstep_shutdown(_Generator),
+        pytest.raises(RuntimeError, match="unrelated"),
+    ):
+        _Generator()._generate()
+
+
+def test_server_run_args_adds_the_admin_handler_only_when_supported():
+    provider = object()
+
+    def modern_run(host, port, provider, handler_class=None):
+        pass
+
+    args, kwargs = inference_worker._server_run_args(
+        modern_run,
+        _FakeAdminBase,
+        provider,
+        8080,
+    )
+    assert args == ("127.0.0.1", 8080, provider)
+    assert issubclass(kwargs["handler_class"], _FakeAdminBase)
+
+    def legacy_run(host, port, provider):
+        pass
+
+    args, kwargs = inference_worker._server_run_args(
+        legacy_run,
+        _FakeAdminBase,
+        provider,
+        8080,
+    )
+    assert args == ("127.0.0.1", 8080, provider)
+    assert kwargs == {}
+
+
+def test_worker_stop_token_ids_normalize_the_tokenizer_shapes():
+    stop_ids = inference_worker._worker_stop_token_ids
+    assert stop_ids(SimpleNamespace(eos_token_ids={5, 2})) == (2, 5)
+    assert stop_ids(SimpleNamespace(eos_token_ids=[7])) == (7,)
+    assert stop_ids(SimpleNamespace(eos_token_id=9)) == (9,)
+    assert stop_ids(SimpleNamespace()) == ()
+    assert stop_ids(SimpleNamespace(eos_token_ids="bogus")) == ()

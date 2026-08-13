@@ -6,8 +6,9 @@ from __future__ import annotations
 import importlib
 import inspect
 import math
+import os
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -150,6 +151,278 @@ def _supports_pipeline_prompt(prompt_batch: Any) -> tuple[bool, str]:
     return True, "validated staggered chunk scheduler and queued inter-stage sends"
 
 
+_LOCKSTEP_CANCEL_ENV = "OMLX_CLUSTER_LOCKSTEP_CANCEL"
+
+
+def _lockstep_cancel_enabled() -> bool:
+    """Kill switch for the whole lockstep cancel/sentinel surface.
+
+    ``mlx.launch`` runs one argv under one environment on every host, so an
+    env toggle cannot desync the group: either every rank installs the pins or
+    none does.
+    """
+
+    return os.environ.get(_LOCKSTEP_CANCEL_ENV, "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+class LockstepPrefillCancelError(Exception):
+    """Raised inside the pinned prompt loop when the chunk collective fires.
+
+    Every rank reads the same int32 all-sum result at the same chunk boundary,
+    so every rank raises at the same point in the schedule. That is the
+    step-boundary rule from the batch-cancel design: on a pipeline group,
+    generation may only end at a boundary all ranks agreed on. The pinned
+    ``BatchGenerator.next`` converts this into the stock removal path; nothing
+    half-prefilled is allowed to reach decode or the prompt cache.
+    """
+
+
+class LockstepClusterShutdownError(Exception):
+    """Raised on every rank when the shutdown sentinel crosses the share channel.
+
+    The worker's generation-loop interposition turns this into the graceful
+    rank exit from the stability wave (release Metal, then self-SIGTERM), so a
+    coordinated stop releases wired memory instead of orphaning it.
+    """
+
+
+_LOCKSTEP_SHUTDOWN_SENTINEL = {"omlx_cluster_shutdown": True}
+
+
+def _is_shutdown_sentinel(value: Any) -> bool:
+    # The share channel otherwise carries None (idle), request tuples, and uid
+    # lists — never a dict — so this marker cannot collide with a request.
+    return isinstance(value, dict) and value.get("omlx_cluster_shutdown") is True
+
+
+class LockstepCancelController:
+    """One worker process's view of cancel/shutdown requests.
+
+    Only rank zero's localhost admin handler ever arms this latch; every other
+    rank learns the decision through the collective that carries it — the
+    token all-sum in decode, one int32 all-sum per prefill chunk, or the idle
+    request-share channel for shutdown. Per-rank latch state is therefore
+    allowed to diverge: lockstep is a property of the collectives, never of
+    this object.
+
+    The latch is epoch-based so a cancel consumed by one phase cannot leak
+    into the next request: each consumer records the epoch it reacted to, and
+    work that starts after the arm observes an already-consumed epoch.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._broadcast = threading.Event()
+        self._armed_epoch = 0
+        self._decode_fired_epoch = 0
+        self._prefill_fired_epoch = 0
+        self._shutdown_pending = False
+        self._removal_uids: list[int] = []
+        self.stop_token_ids: tuple[int, ...] = ()
+        self.decode_cancel_active = False
+        self.prefill_cancel_active = False
+        self.share_channel_active = False
+
+    def reset(
+        self,
+        *,
+        stop_token_ids: Sequence[int] = (),
+        decode_cancel_active: bool = False,
+        prefill_cancel_active: bool = False,
+        share_channel_active: bool = False,
+    ) -> None:
+        """Re-arm the latch for a fresh serving session (or a test)."""
+
+        with self._lock:
+            self._armed_epoch = 0
+            self._decode_fired_epoch = 0
+            self._prefill_fired_epoch = 0
+            self._shutdown_pending = False
+            self._removal_uids = []
+            self.stop_token_ids = tuple(int(token) for token in stop_token_ids)
+            self.decode_cancel_active = bool(decode_cancel_active)
+            self.prefill_cancel_active = bool(prefill_cancel_active)
+            self.share_channel_active = bool(share_channel_active)
+            self._broadcast.clear()
+
+    def deactivate(self) -> None:
+        self.reset()
+
+    def arm_cancel(self) -> int:
+        """Begin cancelling everything currently in flight. Rank zero only."""
+
+        with self._lock:
+            self._armed_epoch += 1
+            return self._armed_epoch
+
+    def request_shutdown(self) -> None:
+        """Arm the cancel drain and the shutdown sentinel together."""
+
+        with self._lock:
+            self._armed_epoch += 1
+            self._shutdown_pending = True
+
+    @property
+    def shutdown_pending(self) -> bool:
+        with self._lock:
+            return self._shutdown_pending
+
+    def decode_swap_token(self) -> int | None:
+        """The stop id to swap into this step's token all-sum, once per arm.
+
+        Called from the pinned generation step on rank zero only. Consuming
+        the epoch here — and in ``consume_decode_latch`` when a prefill cancel
+        drains the cluster first — is what keeps a cancel aimed at one moment
+        from killing a later request's first decode step.
+        """
+
+        with self._lock:
+            if not self.decode_cancel_active or not self.stop_token_ids:
+                return None
+            if self._armed_epoch <= self._decode_fired_epoch:
+                return None
+            self._decode_fired_epoch = self._armed_epoch
+            return self.stop_token_ids[0]
+
+    def prefill_cancel_contribution(self, rank: int) -> int:
+        """This rank's int32 all-sum contribution for one prefill chunk."""
+
+        with self._lock:
+            if rank != 0 or not self.prefill_cancel_active:
+                return 0
+            return 1 if self._armed_epoch > self._prefill_fired_epoch else 0
+
+    def note_prefill_cancel_fired(self, uids: Sequence[int]) -> None:
+        """Record the uids a fired cancel removed, for the uid-share cleanup."""
+
+        with self._lock:
+            self._prefill_fired_epoch = max(
+                self._prefill_fired_epoch,
+                self._armed_epoch,
+            )
+            self._removal_uids.extend(int(uid) for uid in uids)
+
+    def consume_decode_latch(self) -> None:
+        with self._lock:
+            self._decode_fired_epoch = max(
+                self._decode_fired_epoch,
+                self._armed_epoch,
+            )
+
+    def take_pending_removals(self) -> list[int]:
+        with self._lock:
+            uids = self._removal_uids
+            self._removal_uids = []
+            return uids
+
+    def mark_sentinel_broadcast(self) -> None:
+        self._broadcast.set()
+
+    def wait_sentinel_broadcast(self, timeout_s: float) -> bool:
+        return self._broadcast.wait(timeout=max(0.0, timeout_s))
+
+
+_LOCKSTEP_CONTROLLER = LockstepCancelController()
+
+
+def get_lockstep_controller() -> LockstepCancelController:
+    """The process-wide latch shared by the admin handler and the pinned loops."""
+
+    return _LOCKSTEP_CONTROLLER
+
+
+def _lockstep_cancel_reason(
+    *,
+    lockstep_enabled: bool,
+    decode_cancel_active: bool,
+    prefill_cancel_active: bool,
+    decode_cancel_reason: str,
+    batch_removal_reason: str,
+    share_channel_reason: str,
+    sampling_active: bool,
+    sampling_reason: str,
+) -> str:
+    """Explain precisely which cancel half is armed and which fell back."""
+
+    if not lockstep_enabled:
+        return f"{_LOCKSTEP_CANCEL_ENV} disables the lockstep cancel pins"
+    if decode_cancel_active and prefill_cancel_active:
+        return (
+            "decode swaps a stop id in ahead of the token all-sum; prefill "
+            "reads one async int32 all-sum per chunk boundary"
+        )
+    if decode_cancel_active:
+        return (
+            "decode swaps a stop id in ahead of the token all-sum; prefill "
+            f"keeps the stock path ({batch_removal_reason}; "
+            f"{share_channel_reason})"
+        )
+    if prefill_cancel_active:
+        return (
+            "prefill reads one async int32 all-sum per chunk boundary; "
+            f"decode keeps the stock path ({decode_cancel_reason})"
+        )
+    if not sampling_active:
+        return f"requires the validated rank-zero sampling path ({sampling_reason})"
+    return f"{decode_cancel_reason}; {batch_removal_reason}"
+
+
+def _supports_lockstep_decode_cancel(
+    mx_module: Any,
+    stop_token_ids: Sequence[int],
+) -> tuple[bool, str]:
+    if not callable(getattr(mx_module, "depends", None)):
+        return False, "pinned MLX has no mx.depends dependency fence"
+    if not callable(getattr(mx_module, "full", None)):
+        return False, "pinned MLX has no mx.full constant constructor"
+    if not stop_token_ids:
+        return False, "worker tokenizer declares no stop token id to swap in"
+    return True, "rank zero swaps the sampled ids for a stop id ahead of the token all-sum"
+
+
+def _supports_batch_cancel_removal(batch_generator_cls: Any) -> tuple[bool, str]:
+    """Validate the BatchGenerator contract the cancel cleanup rides on."""
+
+    if batch_generator_cls is None:
+        return False, "MLX-LM has no continuous-batching generator"
+    next_method = getattr(batch_generator_cls, "next", None)
+    remove_method = getattr(batch_generator_cls, "remove", None)
+    if not callable(next_method) or not callable(remove_method):
+        return False, "batch generator lacks the next/remove removal contract"
+    try:
+        next_source = inspect.getsource(next_method)
+        remove_source = inspect.getsource(remove_method)
+    except (OSError, TypeError):
+        return False, "batch generator source is unavailable for validation"
+    if "mx.stream" not in next_source or "_next(" not in next_source:
+        return False, "batch generator next() does not match the validated contract"
+    required = ("_unprocessed_sequences", "_prompt_batch", "_generation_batch")
+    if any(token not in remove_source for token in required):
+        return False, "batch generator remove() does not match the validated contract"
+    return True, "cancelled sequences leave through the stock uid-removal broadcast"
+
+
+def _supports_share_channel(response_generator_cls: Any) -> tuple[bool, str]:
+    """Validate the idle request-share channel the shutdown sentinel rides."""
+
+    share = getattr(response_generator_cls, "_share_object", None)
+    if not callable(share):
+        return False, "MLX-LM response generator has no request share channel"
+    try:
+        source = inspect.getsource(share)
+    except (OSError, TypeError):
+        return False, "request share channel source is unavailable for validation"
+    required = ("pickle.dumps", "pickle.loads", "all_sum")
+    if any(token not in source for token in required):
+        return False, "request share channel does not match the validated contract"
+    return True, "the idle request share channel can carry the shutdown sentinel"
+
+
 @dataclass(frozen=True)
 class PrefillSlot:
     """One rank's work in a fill/drain pipeline timeline."""
@@ -222,6 +495,7 @@ def install_runtime_optimizations(
     batchable: bool,
     pipeline_parallel: bool = True,
     memory_limit_bytes: int = 0,
+    stop_token_ids: Sequence[int] | None = None,
 ) -> Iterator[dict[str, dict[str, Any]]]:
     """Install opt-in token-only output while reporting every capability.
 
@@ -234,6 +508,7 @@ def install_runtime_optimizations(
     import mlx.core as mx
 
     mlx_generate = importlib.import_module("mlx_lm.generate")
+    mlx_server = importlib.import_module("mlx_lm.server")
 
     pipeline_model = getattr(model, "model", None)
     world_size = int(group.size())
@@ -273,6 +548,35 @@ def install_runtime_optimizations(
     )
     batching_enabled = execution.pipeline_microbatch_size > 1
     batching_active = batching_enabled and batchable
+    lockstep_enabled = _lockstep_cancel_enabled()
+    stop_ids = tuple(stop_token_ids or ())
+    decode_cancel_ok, decode_cancel_reason = _supports_lockstep_decode_cancel(
+        mx,
+        stop_ids,
+    )
+    share_channel_ok, share_channel_reason = _supports_share_channel(
+        getattr(mlx_server, "ResponseGenerator", None)
+    )
+    batch_removal_ok, batch_removal_reason = _supports_batch_cancel_removal(
+        getattr(mlx_generate, "BatchGenerator", None)
+    )
+    # The decode swap lives in the pinned generation step, the prefill cancel
+    # in the pinned prompt loop, and the shutdown sentinel in the request
+    # share channel. Each falls back independently: a capability that cannot
+    # be installed leaves exactly today's behavior behind.
+    decode_cancel_active = (
+        lockstep_enabled and sampling_active and decode_cancel_ok
+    )
+    share_channel_active = lockstep_enabled and share_channel_ok
+    prefill_cancel_active = (
+        lockstep_enabled
+        and prefill_active
+        and batch_removal_ok
+        # The cancelled uids leave the batch through the uid-removal
+        # broadcast, which the share-channel pin extends — without the channel
+        # the server could not drop its per-request bookkeeping in lockstep.
+        and share_channel_ok
+    )
     capabilities = {
         "coalesced_batching": _capability(
             enabled=batching_enabled,
@@ -337,250 +641,453 @@ def install_runtime_optimizations(
                 )
             ),
         ),
+        "lockstep_cancel": _capability(
+            enabled=lockstep_enabled,
+            active=decode_cancel_active or prefill_cancel_active,
+            reason=_lockstep_cancel_reason(
+                lockstep_enabled=lockstep_enabled,
+                decode_cancel_active=decode_cancel_active,
+                prefill_cancel_active=prefill_cancel_active,
+                decode_cancel_reason=decode_cancel_reason,
+                batch_removal_reason=batch_removal_reason,
+                share_channel_reason=share_channel_reason,
+                sampling_active=sampling_active,
+                sampling_reason=sampling_reason,
+            ),
+        ),
+        "coordinated_shutdown": _capability(
+            enabled=lockstep_enabled,
+            active=share_channel_active,
+            reason=(
+                f"{_LOCKSTEP_CANCEL_ENV} disables the shutdown sentinel"
+                if not lockstep_enabled
+                else share_channel_reason
+            ),
+        ),
     }
-    if not sampling_active:
-        yield capabilities
-        return
-
-    original_all_gather = mx.distributed.all_gather
-    original_send = mx.distributed.send
-    original_pipeline_call = type(pipeline_model).__call__
-    original_generation_step = mlx_generate.GenerationBatch._step
-    original_prompt = (
-        mlx_generate.PromptProcessingBatch.prompt if prefill_active else None
+    controller = get_lockstep_controller()
+    controller.reset(
+        stop_token_ids=stop_ids,
+        decode_cancel_active=decode_cancel_active,
+        prefill_cancel_active=prefill_cancel_active,
+        share_channel_active=share_channel_active,
     )
-    local_state = threading.local()
 
-    def selective_all_gather(value: Any, *args: Any, **kwargs: Any) -> Any:
-        if getattr(local_state, "skip_final_gather", False):
-            return value
-        return original_all_gather(value, *args, **kwargs)
+    original_share_object = None
+    if share_channel_active:
+        original_share_object = mlx_server.ResponseGenerator._share_object
 
-    def local_pipeline_output(
-        instance: Any,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
-        previous = getattr(local_state, "skip_final_gather", False)
-        local_state.skip_final_gather = True
-        try:
-            return original_pipeline_call(instance, *args, **kwargs)
-        finally:
-            local_state.skip_final_gather = previous
+        def lockstep_share_object(instance: Any, obj: Any) -> Any:
+            """Carry cancel removals and the shutdown sentinel on one channel.
 
-    def queued_pipeline_send(value: Any, *args: Any, **kwargs: Any) -> Any:
-        """Materialize a stage output and defer only the transport operation."""
+            MLX-LM's request share is the one collective every rank reaches
+            the moment it goes idle: rank zero shares, the workers follow the
+            same object protocol. That makes it the only channel that can end
+            an *idle* cluster in lockstep — the token all-sum stops flowing as
+            soon as quiesce drains the batch, and a per-token collective of our
+            own would run concurrent with model collectives on the same QP/CQ
+            (the historical wedge). The sentinel therefore rides this channel:
+            it crosses between request rounds, never mid-step, so no rank ever
+            leaves a model collective unpaired.
+            """
 
-        if not getattr(local_state, "queue_prefill_sends", False):
-            return original_send(value, *args, **kwargs)
-        # Breaking the graph here is essential. Without it, the send remains
-        # entangled with the entire layer graph and the downstream recv cannot
-        # make forward progress while this rank starts its next chunk.
-        mx.eval(value)
-        pending = getattr(local_state, "pending_prefill_sends", None)
-        if pending is None:
-            pending = []
-            local_state.pending_prefill_sends = pending
-        pending.append((value, args, kwargs))
-        return value
-
-    def flush_prefill_sends() -> None:
-        pending = getattr(local_state, "pending_prefill_sends", [])
-        local_state.pending_prefill_sends = []
-        for value, args, kwargs in pending:
-            sent = original_send(value, *args, **kwargs)
-            mx.async_eval(sent)
-
-    prefill_clear_threshold = prefill_clear_threshold_bytes(memory_limit_bytes)
-
-    def clear_prefill_pool_if_pressured() -> None:
-        """Pressure-gate the prefill loop's Metal buffer-pool clear.
-
-        The unconditional per-chunk ``mx.clear_cache()`` this replaces (both
-        upstream mlx-vlm and the first version of this override) returned the
-        whole pool to the OS after EVERY chunk: ThunderMLX measured its
-        pipeline rank sawtoothing 3 GiB <-> 89 GiB wired during every long
-        prefill, unwiring and rewiring the working set per chunk. The clear
-        survives only as the pressure safety valve: once the allocator cache
-        itself exceeds the admission-derived threshold, handing it back is
-        worth the rewire. Below the threshold the pool stays resident — the
-        IOGPU residency set is already bounded by the wired ceiling the rank
-        admitted against, and a sawtooth-free prefill keeps its buffers.
-        """
-
-        if mx.get_cache_memory() > prefill_clear_threshold:
-            mx.clear_cache()
-
-    def staggered_pipeline_prompt(instance: Any, tokens: list[list[int]]) -> None:
-        """Pinned PromptProcessingBatch.prompt with pipeline fill/drain."""
-
-        if len(instance.uids) != len(tokens):
-            raise ValueError("The batch length doesn't match the number of inputs")
-        if not tokens:
-            return
-        before_prompt = getattr(instance, "_omlx_before_prompt", None)
-        if callable(before_prompt):
-            before_prompt()
-
-        for stored, incoming in zip(instance.tokens, tokens):
-            stored += incoming
-
-        lengths = [len(prompt) for prompt in tokens]
-        max_length = max(lengths)
-        padding = [max_length - length for length in lengths]
-        max_padding = max(padding)
-        if max_padding > 0:
-            tokens_array = mlx_generate._right_pad_prompts(
-                tokens,
-                max_length=max_length,
-            )
-            for cache in instance.prompt_cache:
-                cache.prepare(lengths=lengths, right_padding=padding)
-        else:
-            tokens_array = mx.array(tokens)
-
-        # ``prefill_step_size`` is already the memory-admitted chunk size used
-        # by MLX-LM and the rank prefill guard. Dividing it by the world size
-        # here made a two-rank 4096-token deployment execute 2048-token chunks,
-        # doubling every cache-state barrier and send boundary on long prompts.
-        #
-        # Staggering still overlaps adjacent stages: it is the rank offset in
-        # ``pipeline_prefill_schedule`` that creates fill/steady/drain, not a
-        # private reduction of the guarded compute chunk.
-        step = max(1, int(instance.prefill_step_size))
-        schedule = pipeline_prefill_schedule(
-            int(tokens_array.shape[1]),
-            step,
-            rank=int(group.rank()),
-            world_size=world_size,
-        )
-        local_state.pending_prefill_sends = []
-        try:
-            for slot in schedule:
-                if not slot.is_real:
-                    continue
-                local_state.queue_prefill_sends = True
-                try:
-                    instance.model(
-                        tokens_array[:, slot.start : slot.end],
-                        cache=instance.prompt_cache,
+            if int(group.rank()) == 0:
+                if obj is None and controller.shutdown_pending:
+                    # Swap the idle "no request" share for the sentinel. The
+                    # workers branch on the shared size exactly as they would
+                    # for a real request, so the size/data all-sums stay
+                    # matched; only the payload differs.
+                    original_share_object(instance, _LOCKSTEP_SHUTDOWN_SENTINEL)
+                    controller.mark_sentinel_broadcast()
+                    raise LockstepClusterShutdownError(
+                        "rank zero broadcast the shutdown sentinel"
                     )
-                finally:
-                    local_state.queue_prefill_sends = False
-                flush_prefill_sends()
+                if isinstance(obj, list):
+                    # The server shares a list only for its per-round
+                    # uids_to_remove broadcast. Folding the cancelled prefill
+                    # uids into it keeps every rank on the same removal set
+                    # and lets the server drop its per-request bookkeeping in
+                    # the same pass, at the same loop position everywhere.
+                    extra = controller.take_pending_removals()
+                    if extra:
+                        obj = obj + [uid for uid in extra if uid not in obj]
+                return original_share_object(instance, obj)
+            result = original_share_object(instance, obj)
+            if _is_shutdown_sentinel(result):
+                raise LockstepClusterShutdownError(
+                    "received the shutdown sentinel from rank zero"
+                )
+            return result
+
+        mlx_server.ResponseGenerator._share_object = lockstep_share_object
+
+    try:
+        if not sampling_active:
+            yield capabilities
+            return
+
+        original_all_gather = mx.distributed.all_gather
+        original_send = mx.distributed.send
+        original_pipeline_call = type(pipeline_model).__call__
+        original_generation_step = mlx_generate.GenerationBatch._step
+        original_prompt = (
+            mlx_generate.PromptProcessingBatch.prompt if prefill_active else None
+        )
+        original_batch_next = (
+            mlx_generate.BatchGenerator.next if prefill_cancel_active else None
+        )
+        local_state = threading.local()
+
+        def selective_all_gather(value: Any, *args: Any, **kwargs: Any) -> Any:
+            if getattr(local_state, "skip_final_gather", False):
+                return value
+            return original_all_gather(value, *args, **kwargs)
+
+        def local_pipeline_output(
+            instance: Any,
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            previous = getattr(local_state, "skip_final_gather", False)
+            local_state.skip_final_gather = True
+            try:
+                return original_pipeline_call(instance, *args, **kwargs)
+            finally:
+                local_state.skip_final_gather = previous
+
+        def queued_pipeline_send(value: Any, *args: Any, **kwargs: Any) -> Any:
+            """Materialize a stage output and defer only the transport operation."""
+
+            if not getattr(local_state, "queue_prefill_sends", False):
+                return original_send(value, *args, **kwargs)
+            # Breaking the graph here is essential. Without it, the send remains
+            # entangled with the entire layer graph and the downstream recv cannot
+            # make forward progress while this rank starts its next chunk.
+            mx.eval(value)
+            pending = getattr(local_state, "pending_prefill_sends", None)
+            if pending is None:
+                pending = []
+                local_state.pending_prefill_sends = pending
+            pending.append((value, args, kwargs))
+            return value
+
+        def flush_prefill_sends() -> None:
+            pending = getattr(local_state, "pending_prefill_sends", [])
+            local_state.pending_prefill_sends = []
+            for value, args, kwargs in pending:
+                sent = original_send(value, *args, **kwargs)
+                mx.async_eval(sent)
+
+        prefill_clear_threshold = prefill_clear_threshold_bytes(memory_limit_bytes)
+
+        def clear_prefill_pool_if_pressured() -> None:
+            """Pressure-gate the prefill loop's Metal buffer-pool clear.
+
+            The unconditional per-chunk ``mx.clear_cache()`` this replaces (both
+            upstream mlx-vlm and the first version of this override) returned the
+            whole pool to the OS after EVERY chunk: ThunderMLX measured its
+            pipeline rank sawtoothing 3 GiB <-> 89 GiB wired during every long
+            prefill, unwiring and rewiring the working set per chunk. The clear
+            survives only as the pressure safety valve: once the allocator cache
+            itself exceeds the admission-derived threshold, handing it back is
+            worth the rewire. Below the threshold the pool stays resident — the
+            IOGPU residency set is already bounded by the wired ceiling the rank
+            admitted against, and a sawtooth-free prefill keeps its buffers.
+            """
+
+            if mx.get_cache_memory() > prefill_clear_threshold:
+                mx.clear_cache()
+
+        def staggered_pipeline_prompt(instance: Any, tokens: list[list[int]]) -> None:
+            """Pinned PromptProcessingBatch.prompt with pipeline fill/drain."""
+
+            if len(instance.uids) != len(tokens):
+                raise ValueError("The batch length doesn't match the number of inputs")
+            if not tokens:
+                return
+            before_prompt = getattr(instance, "_omlx_before_prompt", None)
+            if callable(before_prompt):
+                before_prompt()
+
+            for stored, incoming in zip(instance.tokens, tokens):
+                stored += incoming
+
+            lengths = [len(prompt) for prompt in tokens]
+            max_length = max(lengths)
+            padding = [max_length - length for length in lengths]
+            max_padding = max(padding)
+            if max_padding > 0:
+                tokens_array = mlx_generate._right_pad_prompts(
+                    tokens,
+                    max_length=max_length,
+                )
+                for cache in instance.prompt_cache:
+                    cache.prepare(lengths=lengths, right_padding=padding)
+            else:
+                tokens_array = mx.array(tokens)
+
+            # ``prefill_step_size`` is already the memory-admitted chunk size used
+            # by MLX-LM and the rank prefill guard. Dividing it by the world size
+            # here made a two-rank 4096-token deployment execute 2048-token chunks,
+            # doubling every cache-state barrier and send boundary on long prompts.
+            #
+            # Staggering still overlaps adjacent stages: it is the rank offset in
+            # ``pipeline_prefill_schedule`` that creates fill/steady/drain, not a
+            # private reduction of the guarded compute chunk.
+            step = max(1, int(instance.prefill_step_size))
+            rank = int(group.rank())
+            schedule = pipeline_prefill_schedule(
+                int(tokens_array.shape[1]),
+                step,
+                rank=rank,
+                world_size=world_size,
+            )
+            pending_cancel = None
+            cancelled = False
+            local_state.pending_prefill_sends = []
+            try:
+                for slot in schedule:
+                    if not slot.is_real:
+                        continue
+                    if pending_cancel is not None:
+                        # Read the PREVIOUS chunk's cancel all-sum. It was
+                        # launched one real slot earlier and its ring
+                        # round-trip overlapped that chunk's compute, so this
+                        # read does not stall the pipeline. Every rank reads
+                        # the same collective result and breaks at the same
+                        # chunk boundary — cancel latency is one chunk, not
+                        # one prompt. A blocking read here instead was
+                        # measured at 20-25% of prefill wall time, which is
+                        # why the launch is async and the read deferred.
+                        hit = int(pending_cancel.item()) > 0
+                        pending_cancel = None
+                        if hit:
+                            cancelled = True
+                            break
+                    if prefill_cancel_active:
+                        # Launch THIS chunk's cancel all-sum without blocking,
+                        # then compute the chunk. One int32 per chunk boundary
+                        # — never per token — and the launch predicate is a
+                        # pure function of the schedule position, so the
+                        # all-sum count and order match on every rank (a
+                        # mismatch would desync the group). Only rank zero's
+                        # contribution can be nonzero; the collective is what
+                        # carries its cancel decision to the workers.
+                        pending_cancel = mx.distributed.all_sum(
+                            mx.array(
+                                controller.prefill_cancel_contribution(rank),
+                                dtype=mx.int32,
+                            ),
+                            group=group,
+                        )
+                        mx.async_eval(pending_cancel)
+                    local_state.queue_prefill_sends = True
+                    try:
+                        instance.model(
+                            tokens_array[:, slot.start : slot.end],
+                            cache=instance.prompt_cache,
+                        )
+                    finally:
+                        local_state.queue_prefill_sends = False
+                    flush_prefill_sends()
+                    mx.eval([cache.state for cache in instance.prompt_cache])
+                    clear_prefill_pool_if_pressured()
+            finally:
+                local_state.queue_prefill_sends = False
+                # A cancelled/failed prefill must never leak an old activation into
+                # the next request.
+                local_state.pending_prefill_sends = []
+
+            if not cancelled and pending_cancel is not None:
+                # Catch a cancel that landed on the final launched chunk
+                # before the sequences fall through to decode, where the EOS
+                # swap takes over.
+                cancelled = int(pending_cancel.item()) > 0
+            if cancelled:
+                # The collective result is identical on every rank, so every
+                # rank raises at the same chunk boundary. The pinned
+                # BatchGenerator.next turns this into the stock uid-removal
+                # broadcast; the half-filled caches are dropped there, never
+                # finished into the prompt cache.
+                raise LockstepPrefillCancelError(
+                    "prefill cancelled at a chunk boundary after "
+                    f"{sum(slot.is_real for slot in schedule)} scheduled chunk(s)"
+                )
+
+            if max_padding > 0:
+                for cache in instance.prompt_cache:
+                    cache.finalize()
                 mx.eval([cache.state for cache in instance.prompt_cache])
                 clear_prefill_pool_if_pressured()
-        finally:
-            local_state.queue_prefill_sends = False
-            # A cancelled/failed prefill must never leak an old activation into
-            # the next request.
-            local_state.pending_prefill_sends = []
 
-        if max_padding > 0:
-            for cache in instance.prompt_cache:
-                cache.finalize()
-            mx.eval([cache.state for cache in instance.prompt_cache])
-            clear_prefill_pool_if_pressured()
+        def coordinator_generation_step(instance: Any) -> Any:
+            """Pinned GenerationBatch._step with one token collective per batch."""
 
-    def coordinator_generation_step(instance: Any) -> Any:
-        """Pinned GenerationBatch._step with one token collective per batch."""
+            instance._current_tokens = instance._next_tokens
+            instance._current_logprobs = instance._next_logprobs
+            inputs = instance._current_tokens
+            coordinator = int(group.rank()) == 0
 
-        instance._current_tokens = instance._next_tokens
-        instance._current_logprobs = instance._next_logprobs
-        inputs = instance._current_tokens
-        coordinator = int(group.rank()) == 0
-
-        if coordinator or not rank_zero_logits_active:
-            logits = instance.model(inputs[:, None], cache=instance.prompt_cache)
-            logits = logits[:, -1, :]
-        else:
-            instance.model(
-                inputs[:, None],
-                cache=instance.prompt_cache,
-                skip_logits=True,
-            )
-            # The token all-sum must be issued after this rank's stage send.
-            # MiniMax anchors that lazy send in its last KV cache entry, so
-            # materializing the cache state both advances the cache and fixes
-            # the distributed operation order without paying for an LM head.
-            cache_states = [cache.state for cache in instance.prompt_cache]
-            if not cache_states:
-                raise RuntimeError(
-                    "rank-zero logits requires a cache state to anchor the "
-                    "worker-stage send"
-                )
-            mx.eval(cache_states)
-            logits = None
-
-        token_context = []
-        if any(instance.logits_processors):
-            token_context = [
-                token_buffer.update_and_fetch(inputs[index : index + 1])
-                for index, token_buffer in enumerate(instance._token_context)
-            ]
-            if logits is not None:
-                processed_logits = []
-                for index in range(len(instance.uids)):
-                    sample_logits = logits[index : index + 1]
-                    for processor in instance.logits_processors[index]:
-                        sample_logits = processor(
-                            token_context[index],
-                            sample_logits,
-                        )
-                    processed_logits.append(sample_logits)
-                logits = mx.concatenate(processed_logits, axis=0)
-
-        if logits is not None:
-            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        else:
-            # Worker ResponseGenerator instances still index this vector while
-            # draining their private response queues. Its values never leave
-            # the worker, but it must retain the real vocabulary width.
-            placeholder = mx.zeros((output_vocab_size,), dtype=mx.float32)
-            logprobs = mx.stack([placeholder] * len(instance.uids))
-
-        if coordinator:
-            if any(instance.samplers):
-                all_samples = []
-                for index in range(len(instance.uids)):
-                    sampler = instance.samplers[index] or instance.fallback_sampler
-                    all_samples.append(sampler(logprobs[index : index + 1]))
-                sampled = mx.concatenate(all_samples, axis=0)
+            if coordinator or not rank_zero_logits_active:
+                logits = instance.model(inputs[:, None], cache=instance.prompt_cache)
+                logits = logits[:, -1, :]
             else:
-                sampled = instance.fallback_sampler(logprobs)
-        else:
-            sampled = mx.zeros((len(instance.uids),), dtype=mx.uint32)
+                instance.model(
+                    inputs[:, None],
+                    cache=instance.prompt_cache,
+                    skip_logits=True,
+                )
+                # The token all-sum must be issued after this rank's stage send.
+                # MiniMax anchors that lazy send in its last KV cache entry, so
+                # materializing the cache state both advances the cache and fixes
+                # the distributed operation order without paying for an LM head.
+                cache_states = [cache.state for cache in instance.prompt_cache]
+                if not cache_states:
+                    raise RuntimeError(
+                        "rank-zero logits requires a cache state to anchor the "
+                        "worker-stage send"
+                    )
+                mx.eval(cache_states)
+                logits = None
 
-        # Rank zero contributes the selected IDs; all other ranks contribute
-        # zeros. Every rank therefore advances the same local KV state without
-        # gathering a hidden-state tensor.
-        sampled = mx.distributed.all_sum(sampled, group=group)
-        instance._next_tokens = sampled
-        instance._next_logprobs = list(logprobs)
-        mx.async_eval(
-            instance._next_tokens,
-            instance._next_logprobs,
-            token_context,
-        )
+            token_context = []
+            if any(instance.logits_processors):
+                token_context = [
+                    token_buffer.update_and_fetch(inputs[index : index + 1])
+                    for index, token_buffer in enumerate(instance._token_context)
+                ]
+                if logits is not None:
+                    processed_logits = []
+                    for index in range(len(instance.uids)):
+                        sample_logits = logits[index : index + 1]
+                        for processor in instance.logits_processors[index]:
+                            sample_logits = processor(
+                                token_context[index],
+                                sample_logits,
+                            )
+                        processed_logits.append(sample_logits)
+                    logits = mx.concatenate(processed_logits, axis=0)
 
-        mx.eval(inputs, instance._current_logprobs)
-        input_values = inputs.tolist()
-        for sequence_tokens, token in zip(instance.tokens, input_values):
-            sequence_tokens.append(token)
-        return input_values, instance._current_logprobs
+            if logits is not None:
+                logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            else:
+                # Worker ResponseGenerator instances still index this vector while
+                # draining their private response queues. Its values never leave
+                # the worker, but it must retain the real vocabulary width.
+                placeholder = mx.zeros((output_vocab_size,), dtype=mx.float32)
+                logprobs = mx.stack([placeholder] * len(instance.uids))
 
-    mx.distributed.all_gather = selective_all_gather
-    mx.distributed.send = queued_pipeline_send
-    type(pipeline_model).__call__ = local_pipeline_output
-    mlx_generate.GenerationBatch._step = coordinator_generation_step
-    if prefill_active:
-        mlx_generate.PromptProcessingBatch.prompt = staggered_pipeline_prompt
-    try:
-        yield capabilities
+            if coordinator:
+                if any(instance.samplers):
+                    all_samples = []
+                    for index in range(len(instance.uids)):
+                        sampler = instance.samplers[index] or instance.fallback_sampler
+                        all_samples.append(sampler(logprobs[index : index + 1]))
+                    sampled = mx.concatenate(all_samples, axis=0)
+                else:
+                    sampled = instance.fallback_sampler(logprobs)
+            else:
+                sampled = mx.zeros((len(instance.uids),), dtype=mx.uint32)
+
+            if decode_cancel_active and coordinator:
+                forced_token = controller.decode_swap_token()
+                if forced_token is not None:
+                    # Lockstep in-flight cancel, from the batch-cancel design:
+                    # rank zero swaps the sampled ids for a stop id BEFORE the
+                    # token all-sum, so every rank consumes the identical
+                    # stream and the server's stop-sequence matching ends every
+                    # sequence at the identical step boundary. Generation may
+                    # only end at a step boundary agreed by all ranks — a
+                    # mid-stream break wedged the group every time it was
+                    # tried — and this swap adds no collective of its own, so
+                    # nothing runs concurrent with model collectives.
+                    #
+                    # mx.depends is LOAD-BEARING: it keeps this step's all-sum
+                    # downstream of the sampled-token graph, so issuing the
+                    # collective still forces this rank's forward (and posts
+                    # the peer's pipeline recv) in the same order as an
+                    # uncancelled step. A bare mx.full constant would let the
+                    # all-sum complete without the forward, starving the
+                    # peer's pipeline send.
+                    eos = mx.full(sampled.shape, forced_token, dtype=sampled.dtype)
+                    sampled = mx.depends(eos, sampled)
+
+            # Rank zero contributes the selected IDs; all other ranks contribute
+            # zeros. Every rank therefore advances the same local KV state without
+            # gathering a hidden-state tensor.
+            sampled = mx.distributed.all_sum(sampled, group=group)
+            instance._next_tokens = sampled
+            instance._next_logprobs = list(logprobs)
+            mx.async_eval(
+                instance._next_tokens,
+                instance._next_logprobs,
+                token_context,
+            )
+
+            mx.eval(inputs, instance._current_logprobs)
+            input_values = inputs.tolist()
+            for sequence_tokens, token in zip(instance.tokens, input_values):
+                sequence_tokens.append(token)
+            return input_values, instance._current_logprobs
+
+        mx.distributed.all_gather = selective_all_gather
+        mx.distributed.send = queued_pipeline_send
+        type(pipeline_model).__call__ = local_pipeline_output
+        mlx_generate.GenerationBatch._step = coordinator_generation_step
+        if prefill_active:
+            mlx_generate.PromptProcessingBatch.prompt = staggered_pipeline_prompt
+        if original_batch_next is not None:
+
+            def lockstep_batch_next(instance: Any) -> Any:
+                """Turn a lockstep prefill cancel into the stock removal path.
+
+                Every rank's pinned prompt raised at the same chunk boundary,
+                so every rank computes the same removal set here. The uids go
+                to the controller; rank zero folds them into the server's next
+                ``uids_to_remove`` broadcast, which is what drops the
+                per-request bookkeeping on every rank at the same loop
+                position. Decoding sequences are handled by the EOS swap in
+                the pinned step; the ones that already finished inside the
+                cancelled round are swept here so their server-side entries
+                cannot leak.
+                """
+
+                decoding_before = tuple(instance._generation_batch.uids)
+                try:
+                    return original_batch_next(instance)
+                except LockstepPrefillCancelError:
+                    still_decoding = set(instance._generation_batch.uids)
+                    uids = [
+                        uid
+                        for uid in decoding_before
+                        if uid not in still_decoding
+                    ]
+                    uids.extend(instance._prompt_batch.uids)
+                    uids.extend(
+                        sequence[0] for sequence in instance._unprocessed_sequences
+                    )
+                    controller.note_prefill_cancel_fired(uids)
+                    if not still_decoding:
+                        # Nothing survived into decode, so the armed decode
+                        # latch has no in-flight sequence left to stop.
+                        # Consuming it here keeps the next request's first
+                        # decode step alive.
+                        controller.consume_decode_latch()
+                    return [], []
+
+            mlx_generate.BatchGenerator.next = lockstep_batch_next
+        try:
+            yield capabilities
+        finally:
+            if original_batch_next is not None:
+                mlx_generate.BatchGenerator.next = original_batch_next
+            if original_prompt is not None:
+                mlx_generate.PromptProcessingBatch.prompt = original_prompt
+            mlx_generate.GenerationBatch._step = original_generation_step
+            type(pipeline_model).__call__ = original_pipeline_call
+            mx.distributed.send = original_send
+            mx.distributed.all_gather = original_all_gather
     finally:
-        if original_prompt is not None:
-            mlx_generate.PromptProcessingBatch.prompt = original_prompt
-        mlx_generate.GenerationBatch._step = original_generation_step
-        type(pipeline_model).__call__ = original_pipeline_call
-        mx.distributed.send = original_send
-        mx.distributed.all_gather = original_all_gather
+        if original_share_object is not None:
+            mlx_server.ResponseGenerator._share_object = original_share_object
+        controller.deactivate()

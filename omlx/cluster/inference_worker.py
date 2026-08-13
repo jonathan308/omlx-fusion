@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import inspect
 import json
 import os
 import signal
@@ -39,7 +40,11 @@ from .pipeline_compat import (
 from .planner import PipelineAssignment
 from .prefill_guard import build_guard
 from .progressive_loading import install_progressive_loader
-from .runtime_optimizations import install_runtime_optimizations
+from .runtime_optimizations import (
+    LockstepClusterShutdownError,
+    get_lockstep_controller,
+    install_runtime_optimizations,
+)
 from .stall_watchdog import StallWatchdog
 from .telemetry import install_server_telemetry
 
@@ -89,6 +94,27 @@ def _bind_generation_thread_stream(
         yield
     finally:
         response_generator_type._generate = original_generate
+
+
+def _worker_stop_token_ids(tokenizer: Any) -> tuple[int, ...]:
+    """The stop ids the rank-zero EOS swap may inject, from the served tokenizer.
+
+    MLX-LM registers every ``eos_token_ids`` entry as a stop sequence in each
+    request's state machine, so any of them ends generation at the next step
+    boundary on every rank. Anything unreadable degrades to "no swap": the
+    capability check then leaves the stock, uncancellable path in place.
+    """
+
+    ids = getattr(tokenizer, "eos_token_ids", None)
+    if ids is None:
+        single = getattr(tokenizer, "eos_token_id", None)
+        ids = () if single is None else (single,)
+    elif isinstance(ids, int) and not isinstance(ids, bool):
+        ids = (ids,)
+    try:
+        return tuple(sorted({int(token) for token in ids}))
+    except (TypeError, ValueError):
+        return ()
 
 
 class RuntimeMarker:
@@ -224,6 +250,24 @@ def _server_arguments(
         prompt_cache_bytes=args.prompt_cache_bytes,
         max_kv_size=args.max_kv_size,
     )
+
+
+def _server_run_args(run: Any, api_handler_type: Any, provider: Any, port: int) -> tuple:
+    """Rank-zero serve arguments, with the admin handler when mlx-lm allows it.
+
+    The pinned mlx-lm ``run`` accepts a handler class, which is where the
+    localhost-only cancel/shutdown routes live. An older pinned server without
+    that parameter simply gets the stock call; the engine's admin POSTs then
+    404 into the TERM-only fallback they already tolerate.
+    """
+
+    if "handler_class" in inspect.signature(run).parameters:
+        handler_class = _cluster_admin_handler_class(
+            api_handler_type,
+            get_lockstep_controller(),
+        )
+        return ("127.0.0.1", port, provider), {"handler_class": handler_class}
+    return ("127.0.0.1", port, provider), {}
 
 
 def _distributed_model_type(model_path: str | Path) -> str:
@@ -465,6 +509,104 @@ def _begin_graceful_rank_exit(
     arm_deadman(deadman_s, reason=reason, exit_process=exit_process)
     release(reason)
     signal_self()
+
+
+@contextmanager
+def _intercept_lockstep_shutdown(response_generator_type: Any):
+    """Turn the shutdown sentinel into the graceful rank exit on every rank.
+
+    The pinned request-share channel raises ``LockstepClusterShutdownError``
+    once the sentinel crosses — always between request rounds, never mid-step,
+    so no model collective is left unpaired. Left uncaught it would merely
+    kill the generation thread; catching it here routes the unwind through
+    the stability wave's graceful path, which releases Metal state before the
+    process dies instead of stranding the wired allocation in the kernel.
+    """
+
+    original_generate = response_generator_type._generate
+
+    @wraps(original_generate)
+    def generate_until_shutdown(instance: Any) -> Any:
+        try:
+            return original_generate(instance)
+        except LockstepClusterShutdownError as exc:
+            _begin_graceful_rank_exit(f"coordinated cluster shutdown: {exc}")
+
+    response_generator_type._generate = generate_until_shutdown
+    try:
+        yield
+    finally:
+        response_generator_type._generate = original_generate
+
+
+def _cluster_admin_handler_class(api_handler_type: Any, controller: Any) -> Any:
+    """A localhost-only admin surface on the rank-zero worker server.
+
+    The worker's HTTP server is the private loopback endpoint the oMLX engine
+    proxies to; these two routes are how the engine reaches the lockstep
+    cancel latch and the coordinated-shutdown sentinel without going through
+    a client disconnect and hoping a write fails. Both are in-memory latch
+    operations — the collectives that carry the decision to the workers are
+    issued by the pinned generation loops, not by these handlers.
+    """
+
+    class ClusterAdminAPIHandler(api_handler_type):
+        def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler verb API
+            if self.path == "/admin/cancel":
+                self._omlx_handle_cancel()
+                return
+            if self.path == "/admin/shutdown":
+                self._omlx_handle_shutdown()
+                return
+            super().do_POST()
+
+        def _omlx_localhost_only(self) -> bool:
+            client_host = self.client_address[0] if self.client_address else ""
+            return client_host in ("127.0.0.1", "::1")
+
+        def _omlx_respond(self, status_code: int, payload: dict) -> None:
+            body = json.dumps(payload).encode()
+            self._set_completion_headers(status_code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _omlx_handle_cancel(self) -> None:
+            if not self._omlx_localhost_only():
+                self._omlx_respond(403, {"error": "admin cancel is localhost-only"})
+                return
+            epoch = controller.arm_cancel()
+            self._omlx_respond(
+                200,
+                {
+                    "status": "armed",
+                    "epoch": epoch,
+                    "decode_cancel_active": controller.decode_cancel_active,
+                    "prefill_cancel_active": controller.prefill_cancel_active,
+                },
+            )
+
+        def _omlx_handle_shutdown(self) -> None:
+            if not self._omlx_localhost_only():
+                self._omlx_respond(
+                    403, {"error": "admin shutdown is localhost-only"}
+                )
+                return
+            controller.request_shutdown()
+            # The sentinel crosses on the next idle share-channel poll (the
+            # cancel drain shortens any in-flight work to one step or one
+            # chunk first). Report rather than block: the supervisor's
+            # TERM->KILL grace remains the bound either way.
+            broadcast = controller.wait_sentinel_broadcast(2.0)
+            self._omlx_respond(
+                200,
+                {
+                    "status": "broadcast" if broadcast else "pending",
+                    "sentinel_active": controller.share_channel_active,
+                },
+            )
+
+    return ClusterAdminAPIHandler
 
 
 def _watch_launcher_parent(
@@ -1296,6 +1438,7 @@ def run_worker(args: argparse.Namespace) -> int:
                 batchable=provider.is_batchable,
                 pipeline_parallel=tensor_parallel_size == 1,
                 memory_limit_bytes=prefill_memory_limit,
+                stop_token_ids=_worker_stop_token_ids(provider.tokenizer),
             ) as optimizations:
                 marker.update(
                     "ready",
@@ -1373,11 +1516,18 @@ def run_worker(args: argparse.Namespace) -> int:
                         mx,
                         generation_stream,
                     ),
+                    _intercept_lockstep_shutdown(ResponseGenerator),
                 ):
                     # install_server_telemetry also runs the idle heartbeat for
                     # the length of this block, so "stale" means stalled rather
                     # than "nobody has asked anything for 45 seconds".
-                    run("127.0.0.1", args.port, provider)
+                    run_args, run_kwargs = _server_run_args(
+                        run,
+                        mlx_server.APIHandler,
+                        provider,
+                        args.port,
+                    )
+                    run(*run_args, **run_kwargs)
     except KeyboardInterrupt:
         return 0
     except Exception as exc:

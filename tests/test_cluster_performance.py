@@ -25,12 +25,16 @@ from omlx.cluster.planner import (
     plan_unequal_pipeline,
 )
 from omlx.cluster.runtime_optimizations import (
+    LockstepClusterShutdownError,
+    LockstepPrefillCancelError,
+    get_lockstep_controller,
     install_runtime_optimizations,
     pipeline_prefill_schedule,
     prefill_clear_threshold_bytes,
 )
 
 mlx_generate = importlib.import_module("mlx_lm.generate")
+mlx_server = importlib.import_module("mlx_lm.server")
 
 
 def _profile(node_id: str, rank: int, rate: float) -> NodePerformanceProfile:
@@ -327,6 +331,8 @@ def test_sampling_rank_optimization_is_capability_gated_and_restored():
     original_call = _ValidatedPipeline.__call__
     original_step = mlx_generate.GenerationBatch._step
     original_prompt = mlx_generate.PromptProcessingBatch.prompt
+    original_batch_next = mlx_generate.BatchGenerator.next
+    original_share_object = mlx_server.ResponseGenerator._share_object
 
     with install_runtime_optimizations(
         model,
@@ -339,17 +345,25 @@ def test_sampling_rank_optimization_is_capability_gated_and_restored():
         assert capabilities["pipeline_prefill_overlap"]["active"] is True, (
             capabilities["pipeline_prefill_overlap"]["reason"]
         )
+        # No stop ids were handed over, so the decode EOS swap stays off —
+        # but the prefill cancel/removal and the shutdown sentinel validated.
+        assert capabilities["lockstep_cancel"]["active"] is True
+        assert capabilities["coordinated_shutdown"]["active"] is True
         assert mx.distributed.all_gather is not original_gather
         assert mx.distributed.send is not original_send
         assert _ValidatedPipeline.__call__ is not original_call
         assert mlx_generate.GenerationBatch._step is not original_step
         assert mlx_generate.PromptProcessingBatch.prompt is not original_prompt
+        assert mlx_generate.BatchGenerator.next is not original_batch_next
+        assert mlx_server.ResponseGenerator._share_object is not original_share_object
 
     assert mx.distributed.all_gather is original_gather
     assert mx.distributed.send is original_send
     assert _ValidatedPipeline.__call__ is original_call
     assert mlx_generate.GenerationBatch._step is original_step
     assert mlx_generate.PromptProcessingBatch.prompt is original_prompt
+    assert mlx_generate.BatchGenerator.next is original_batch_next
+    assert mlx_server.ResponseGenerator._share_object is original_share_object
 
 
 def test_worker_rank_skips_vocab_projection_when_adapter_declares_contract(
@@ -464,6 +478,13 @@ def test_staggered_prompt_queues_and_flushes_every_real_chunk(monkeypatch):
         "all_gather",
         lambda value, **kwargs: gathers.append(value) or value,
     )
+    # The lockstep prefill cancel rides one int32 all-sum per chunk boundary;
+    # nothing is armed here, so every contribution reads back as zero.
+    monkeypatch.setattr(
+        mx.distributed,
+        "all_sum",
+        lambda value, group=None: value,
+    )
     monkeypatch.setattr(mx, "async_eval", lambda *values: async_values.extend(values))
 
     class Cache:
@@ -501,9 +522,11 @@ def test_staggered_prompt_queues_and_flushes_every_real_chunk(monkeypatch):
 
     # The scheduler honours the same eight-token step the memory guard approved,
     # so 9 tokens make two real chunks. Each chunk reaches send; the final
-    # hidden-state gather is skipped.
+    # hidden-state gather is skipped. Each chunk also launches one scalar
+    # cancel all-sum (0-dim), deferred-read, alongside its queued send flush.
     assert sends == [0, 0]
-    assert len(async_values) == 2
+    assert len([value for value in async_values if value.ndim > 0]) == 2
+    assert len([value for value in async_values if value.ndim == 0]) == 2
     assert gathers == []
     assert batch.tokens == [list(range(9))]
     assert mlx_generate.PromptProcessingBatch.prompt is original_prompt
@@ -517,6 +540,7 @@ def test_staggered_prompt_matches_stock_chunking_padding_and_cache_lifecycle(
     original_prompt = mlx_generate.PromptProcessingBatch.prompt
     monkeypatch.setattr(mx.distributed, "send", lambda value, *_a, **_k: value)
     monkeypatch.setattr(mx.distributed, "all_gather", lambda value, **_k: value)
+    monkeypatch.setattr(mx.distributed, "all_sum", lambda value, group=None: value)
     monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
 
     class Cache:
@@ -727,3 +751,361 @@ def test_non_batchable_model_never_reports_continuous_batching_active():
         assert batching["enabled"] is True
         assert batching["active"] is False
         assert "sequentially" in batching["reason"]
+
+
+# ---------------------------------------------------------------------------
+# Lockstep in-flight cancel + coordinated shutdown sentinel
+#
+# The step-boundary rule from the batch-cancel design: on a pipeline group,
+# generation may only end at a boundary every rank agreed on. Decode cancels
+# by rank zero swapping a stop id in ahead of the token all-sum; prefill
+# reads one async int32 all-sum per chunk boundary; the shutdown sentinel
+# rides the idle request-share channel. Each path falls back to stock
+# behavior when its capability check fails.
+# ---------------------------------------------------------------------------
+
+
+class _CancelCache:
+    state = mx.array([0])
+
+
+class _LogitsAdapter:
+    """Batch-facing model wrapper returning fixed logits for the pinned step."""
+
+    def __init__(self, vocab=64):
+        self.model = _ValidatedPipeline()
+        self._vocab = vocab
+
+    def __call__(self, value, cache=None):
+        return mx.zeros((1, 1, self._vocab))
+
+
+class _CoordinatorBatch:
+    """The state consumed by the pinned GenerationBatch._step."""
+
+    def __init__(self, model):
+        self.model = model
+        self.uids = [1]
+        self.prompt_cache = [_CancelCache()]
+        self.tokens = [[]]
+        self.samplers = [None]
+        self.fallback_sampler = lambda value: mx.argmax(value, axis=-1)
+        self.logits_processors = [[]]
+        self._current_tokens = None
+        self._current_logprobs = []
+        self._next_tokens = mx.array([3], dtype=mx.uint32)
+        self._next_logprobs = []
+        self._token_context = []
+
+
+def test_lockstep_cancel_swaps_a_stop_id_before_the_token_all_sum(monkeypatch):
+    calls = []
+    original_depends = mx.depends
+
+    def recording_depends(*args, **kwargs):
+        calls.append("depends")
+        return original_depends(*args, **kwargs)
+
+    def fake_all_sum(value, group=None):
+        calls.append("all_sum")
+        mx.eval(value)
+        calls.append(int(value.reshape(-1)[0].item()))
+        return value
+
+    monkeypatch.setattr(mx, "depends", recording_depends)
+    monkeypatch.setattr(mx.distributed, "all_sum", fake_all_sum)
+    monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
+
+    settings = replace(execution_profile("balanced"), sampling_rank_only=True)
+    with install_runtime_optimizations(
+        SimpleNamespace(model=_ValidatedPipeline()),
+        _Group(),
+        settings,
+        batchable=True,
+        stop_token_ids=(99,),
+    ) as capabilities:
+        assert capabilities["lockstep_cancel"]["active"] is True
+        controller = get_lockstep_controller()
+        controller.arm_cancel()
+        batch = _CoordinatorBatch(_LogitsAdapter())
+        mlx_generate.GenerationBatch._step(batch)
+
+        # The mx.depends fence ties the swap to the sampled-token graph and
+        # must land BEFORE the cross-rank token all-sum consumes it — that
+        # order is what keeps the peer's pipeline send fed.
+        assert calls.index("depends") < calls.index("all_sum")
+        assert calls[-1] == 99
+        mx.eval(batch._next_tokens)
+        assert int(batch._next_tokens[0].item()) == 99
+        # One swap per arm: the latch is consumed, the next request lives.
+        assert controller.decode_swap_token() is None
+
+
+def test_lockstep_cancel_breaks_both_ranks_at_the_identical_step(monkeypatch):
+    monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
+    settings = replace(execution_profile("balanced"), sampling_rank_only=True)
+    steps = 5
+    arm_at = 2
+
+    rank_zero_wire = []
+
+    def record_all_sum(value, group=None):
+        mx.eval(value)
+        rank_zero_wire.append(value)
+        return value
+
+    monkeypatch.setattr(mx.distributed, "all_sum", record_all_sum)
+    with install_runtime_optimizations(
+        SimpleNamespace(model=_ValidatedPipeline()),
+        _Group(),
+        settings,
+        batchable=True,
+        stop_token_ids=(99,),
+    ):
+        controller = get_lockstep_controller()
+        batch = _CoordinatorBatch(_LogitsAdapter())
+        rank_zero_stream = []
+        for step in range(steps):
+            if step == arm_at:
+                controller.arm_cancel()
+            tokens, _ = mlx_generate.GenerationBatch._step(batch)
+            rank_zero_stream.extend(tokens)
+
+    # The worker never sees the latch: its token all-sum replays rank zero's
+    # exact contributions, which is what the real ring delivers to it.
+    replay = iter(rank_zero_wire)
+    monkeypatch.setattr(
+        mx.distributed,
+        "all_sum",
+        lambda value, group=None: next(replay),
+    )
+    with install_runtime_optimizations(
+        SimpleNamespace(model=_ValidatedPipeline()),
+        _WorkerGroup(),
+        settings,
+        batchable=True,
+        stop_token_ids=(99,),
+    ):
+        batch = _CoordinatorBatch(_LogitsAdapter())
+        worker_stream = []
+        for _ in range(steps):
+            tokens, _ = mlx_generate.GenerationBatch._step(batch)
+            worker_stream.extend(tokens)
+
+    assert rank_zero_stream == worker_stream
+    # EOS enters the consumed stream one step after the armed swap, and both
+    # ranks meet it at the same index — the identical step boundary.
+    assert 99 in rank_zero_stream
+    assert rank_zero_stream.index(99) == arm_at + 1
+
+
+def test_prefill_cancel_breaks_at_a_chunk_boundary(monkeypatch):
+    sends = []
+    async_values = []
+    monkeypatch.setattr(
+        mx.distributed,
+        "send",
+        lambda value, destination, **_k: sends.append(destination) or value,
+    )
+    monkeypatch.setattr(mx.distributed, "all_gather", lambda value, **_k: value)
+    monkeypatch.setattr(mx.distributed, "all_sum", lambda value, group=None: value)
+    monkeypatch.setattr(mx, "async_eval", lambda *values: async_values.extend(values))
+
+    class Cache:
+        state = mx.array([0])
+
+    class Batch:
+        uids = ["request"]
+        tokens = [[]]
+        prompt_cache = [Cache()]
+        prefill_step_size = 8
+
+        def __init__(self):
+            self.model = _ValidatedPipeline()
+            self.model.pipeline_rank = 1
+
+    settings = replace(
+        execution_profile("balanced"),
+        sampling_rank_only=True,
+        async_overlap=True,
+        prefill_step_size=8,
+    )
+    batch = Batch()
+    with install_runtime_optimizations(
+        SimpleNamespace(model=_ValidatedPipeline()),
+        _Group(),
+        settings,
+        batchable=True,
+        stop_token_ids=(99,),
+    ) as capabilities:
+        assert capabilities["lockstep_cancel"]["active"] is True
+        get_lockstep_controller().arm_cancel()
+        with pytest.raises(LockstepPrefillCancelError):
+            mlx_generate.PromptProcessingBatch.prompt(batch, [list(range(9))])
+
+    # Nine tokens at an eight-token step is two chunks; the collective fired
+    # at the first boundary, so only the first chunk ever computed.
+    assert [len(chunk[0]) for chunk in batch.model.seen] == [8]
+    assert sends == [0]
+    # Exactly one async cancel launch: the break precedes the second chunk's.
+    assert len([value for value in async_values if value.ndim == 0]) == 1
+
+
+def test_cancelled_prefill_uids_ride_the_next_removal_broadcast(monkeypatch):
+    def raising_next(self):
+        # Keeps the validated source contract: mx.stream ... self._next(
+        raise LockstepPrefillCancelError("fired")
+
+    monkeypatch.setattr(mlx_generate.BatchGenerator, "next", raising_next)
+
+    class _PromptBatchView:
+        uids = [11]
+
+    class _GenerationBatchView:
+        uids = []
+
+    class _Batch:
+        _prompt_batch = _PromptBatchView()
+        _generation_batch = _GenerationBatchView()
+        _unprocessed_sequences = [(13, None, None, None, None, None, None, None)]
+
+    with install_runtime_optimizations(
+        SimpleNamespace(model=_ValidatedPipeline()),
+        _Group(),
+        replace(execution_profile("balanced"), sampling_rank_only=True),
+        batchable=True,
+        stop_token_ids=(99,),
+    ):
+        controller = get_lockstep_controller()
+        controller.arm_cancel()
+        assert mlx_generate.BatchGenerator.next(_Batch()) == ([], [])
+        # The cancelled prefill and queued uids are handed to rank zero's next
+        # uid-removal share. The empty generation batch consumed the decode
+        # latch, so no EOS swap can leak into the next request's first step.
+        assert controller.take_pending_removals() == [11, 13]
+        assert controller.decode_swap_token() is None
+
+
+def test_share_channel_injects_removals_and_broadcasts_the_sentinel(monkeypatch):
+    shared = []
+
+    def fake_share(self, obj):
+        # Keeps the validated source contract: pickle.dumps pickle.loads all_sum
+        shared.append(obj)
+        return obj
+
+    monkeypatch.setattr(mlx_server.ResponseGenerator, "_share_object", fake_share)
+    with install_runtime_optimizations(
+        SimpleNamespace(model=_ValidatedPipeline()),
+        _Group(),
+        replace(execution_profile("balanced"), sampling_rank_only=True),
+        batchable=True,
+        stop_token_ids=(99,),
+    ) as capabilities:
+        assert capabilities["coordinated_shutdown"]["active"] is True
+        controller = get_lockstep_controller()
+        pinned = mlx_server.ResponseGenerator._share_object
+
+        controller.note_prefill_cancel_fired([7, 9])
+        assert pinned(object(), [1]) == [1, 7, 9]
+        assert shared[-1] == [1, 7, 9]
+
+        # The idle "no request" share becomes the shutdown sentinel.
+        controller.request_shutdown()
+        with pytest.raises(LockstepClusterShutdownError):
+            pinned(object(), None)
+        assert shared[-1] == {"omlx_cluster_shutdown": True}
+        assert controller.wait_sentinel_broadcast(0.1) is True
+
+
+def test_share_channel_raises_on_the_sentinel_for_worker_ranks(monkeypatch):
+    def fake_share(self, obj):
+        # Keeps the validated source contract: pickle.dumps pickle.loads all_sum
+        return obj
+
+    monkeypatch.setattr(mlx_server.ResponseGenerator, "_share_object", fake_share)
+    with install_runtime_optimizations(
+        SimpleNamespace(model=_ValidatedPipeline()),
+        _WorkerGroup(),
+        replace(execution_profile("balanced"), sampling_rank_only=True),
+        batchable=True,
+        stop_token_ids=(99,),
+    ):
+        pinned = mlx_server.ResponseGenerator._share_object
+        # An ordinary idle share passes through untouched.
+        assert pinned(object(), None) is None
+        # The worker learns about the shutdown only from rank zero's payload.
+        with pytest.raises(LockstepClusterShutdownError):
+            pinned(object(), {"omlx_cluster_shutdown": True})
+
+
+def test_lockstep_cancel_falls_back_without_stop_token_ids(monkeypatch):
+    calls = []
+    original_depends = mx.depends
+    monkeypatch.setattr(
+        mx,
+        "depends",
+        lambda *a, **k: calls.append("depends") or original_depends(*a, **k),
+    )
+    monkeypatch.setattr(mx.distributed, "all_sum", lambda value, group=None: value)
+    monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
+
+    with install_runtime_optimizations(
+        SimpleNamespace(model=_ValidatedPipeline()),
+        _Group(),
+        replace(execution_profile("balanced"), sampling_rank_only=True),
+        batchable=True,
+    ):
+        controller = get_lockstep_controller()
+        assert controller.decode_cancel_active is False
+        # The prefill half still validated; only the EOS swap is off.
+        assert controller.prefill_cancel_active is True
+        controller.arm_cancel()
+        batch = _CoordinatorBatch(_LogitsAdapter())
+        mlx_generate.GenerationBatch._step(batch)
+        assert "depends" not in calls
+        assert int(batch._next_tokens[0].item()) != 99
+
+
+def test_lockstep_cancel_kill_switch_leaves_everything_stock(monkeypatch):
+    monkeypatch.setenv("OMLX_CLUSTER_LOCKSTEP_CANCEL", "0")
+    original_next = mlx_generate.BatchGenerator.next
+    original_share = mlx_server.ResponseGenerator._share_object
+    original_step = mlx_generate.GenerationBatch._step
+    with install_runtime_optimizations(
+        SimpleNamespace(model=_ValidatedPipeline()),
+        _Group(),
+        replace(execution_profile("balanced"), sampling_rank_only=True),
+        batchable=True,
+        stop_token_ids=(99,),
+    ) as capabilities:
+        assert capabilities["lockstep_cancel"]["active"] is False
+        assert capabilities["coordinated_shutdown"]["active"] is False
+        assert mlx_generate.BatchGenerator.next is original_next
+        assert mlx_server.ResponseGenerator._share_object is original_share
+        # The kill switch is scoped: the sampling pins are unaffected.
+        assert mlx_generate.GenerationBatch._step is not original_step
+
+
+def test_coordinated_shutdown_falls_back_when_the_share_channel_drifts(monkeypatch):
+    def bare_share(self, obj):
+        return obj
+
+    monkeypatch.setattr(mlx_server.ResponseGenerator, "_share_object", bare_share)
+    with install_runtime_optimizations(
+        SimpleNamespace(model=_ValidatedPipeline()),
+        _Group(),
+        replace(execution_profile("balanced"), sampling_rank_only=True),
+        batchable=True,
+        stop_token_ids=(99,),
+    ) as capabilities:
+        assert capabilities["coordinated_shutdown"]["active"] is False
+        assert "share channel" in capabilities["coordinated_shutdown"]["reason"]
+        # The pin was never installed.
+        assert mlx_server.ResponseGenerator._share_object is bare_share
+        controller = get_lockstep_controller()
+        assert controller.share_channel_active is False
+        # The decode EOS swap still validated; the prefill cancel refuses to
+        # install without the uid-removal cleanup channel.
+        assert controller.decode_cancel_active is True
+        assert controller.prefill_cancel_active is False
