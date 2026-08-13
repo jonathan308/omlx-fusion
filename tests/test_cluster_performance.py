@@ -600,6 +600,9 @@ def _run_staggered_prompt(monkeypatch, cache_memory_bytes, memory_limit_bytes=0)
     monkeypatch.setattr(mx, "clear_cache", lambda: clears.append(1))
     monkeypatch.setattr(mx.distributed, "send", lambda value, *_a, **_k: value)
     monkeypatch.setattr(mx.distributed, "all_gather", lambda value, **_k: value)
+    # The lockstep prefill-cancel all_sum needs a real Group; stub it like the
+    # other prefill tests (contribution is 0, so no cancel fires).
+    monkeypatch.setattr(mx.distributed, "all_sum", lambda value, group=None: value)
     monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
 
     class Cache:
@@ -678,6 +681,9 @@ def test_staggered_prompt_gates_the_padded_finalize_clear(monkeypatch):
     monkeypatch.setattr(mx, "clear_cache", lambda: clears.append(1))
     monkeypatch.setattr(mx.distributed, "send", lambda value, *_a, **_k: value)
     monkeypatch.setattr(mx.distributed, "all_gather", lambda value, **_k: value)
+    # The lockstep prefill-cancel all_sum needs a real Group; stub it like the
+    # other prefill tests (contribution is 0, so no cancel fires).
+    monkeypatch.setattr(mx.distributed, "all_sum", lambda value, group=None: value)
     monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
 
     class Cache:
