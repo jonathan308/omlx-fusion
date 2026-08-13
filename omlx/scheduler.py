@@ -8642,6 +8642,78 @@ class Scheduler:
             after / 1024**3,
         )
 
+    def release_idle_caches(
+        self, *, deep: bool = False, reason: str = "idle_maintenance"
+    ) -> dict[str, Any]:
+        """Drop idle cache state and hand MLX/Metal buffers back to the OS.
+
+        This is the single-node half of the graduated idle-TTL ladder
+        (``EnginePool.check_ttl_expirations`` dispatches it here, onto this
+        scheduler's MLX executor thread). The idle gate is the same one
+        ``_process_pending_reclaim`` uses, plus the async store-cache
+        pipeline: dropping prefix state or clearing Metal buffers that an
+        in-flight prefill/decode/store still references is the crash class
+        this ordering exists to prevent. Weights and the pre-allocated paged
+        block pool stay resident (the pool never shrinks, see
+        ``_reclaim_prefill_headroom``), so the model remains servable and the
+        next request re-warms from the SSD tier when one is configured.
+        ``deep=True`` is the timed deep-idle release: it additionally drains
+        the Metal heap itself (``mx.metal.clear_cache``), in the documented
+        gc -> clear_cache -> metal order.
+
+        Never stamps any activity clock: the engine pool's TTL ladder reads
+        ``last_access``, and a background release that refreshed it would
+        keep the ladder from ever firing.
+        """
+
+        if (
+            self.running
+            or self.prefilling
+            or self.waiting
+            or self._pending_async_removes
+            or self._inflight_store_futures
+        ):
+            return {"ok": False, "skipped": "busy", "reason": reason}
+
+        dropped = 0
+        if self.block_aware_cache is not None:
+            try:
+                dropped = int(self.block_aware_cache.clear())
+            except Exception as e:
+                logger.warning(f"Idle cache release: prefix clear failed ({reason}): {e}")
+                return {"ok": False, "error": str(e), "reason": reason}
+
+        # Drop Python references first so their MLX buffers enter the
+        # allocator cache before the flush asks for them back.
+        gc.collect()
+        _sync_and_clear_cache(self._stream)
+        metal_cleared = False
+        if deep:
+            metal_clear = getattr(getattr(mx, "metal", None), "clear_cache", None)
+            if callable(metal_clear):
+                try:
+                    metal_clear()
+                    metal_cleared = True
+                except Exception as e:
+                    logger.warning(
+                        f"Idle cache release: metal clear failed ({reason}): {e}"
+                    )
+        logger.info(
+            "Idle cache release (%s): dropped %d prefix-cache entries, "
+            "deep=%s, metal_cleared=%s",
+            reason,
+            dropped,
+            deep,
+            metal_cleared,
+        )
+        return {
+            "ok": True,
+            "dropped_entries": dropped,
+            "deep": bool(deep),
+            "metal_cleared": metal_cleared,
+            "reason": reason,
+        }
+
     def _do_abort_request(self, request_id: str) -> bool:
         """
         Actually abort a request. Must be called from the step() context.

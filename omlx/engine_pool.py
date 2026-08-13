@@ -18,7 +18,8 @@ import gc
 import json
 import logging
 import time
-from contextlib import asynccontextmanager
+from collections import deque
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -47,6 +48,13 @@ from .exceptions import (
     ModelTooLargeError,
     ModelUnavailableError,
     describe_ceiling_binding,
+)
+from .idle_maintenance import (
+    IdleMaintenanceSettings,
+    KeepwarmTracker,
+    eviction_grace_seconds,
+    graduated_idle_action,
+    metal_keepwarm_touch,
 )
 from .model_discovery import discover_models, format_size, is_realtime_stt_model
 from .scheduler import SchedulerConfig
@@ -116,6 +124,11 @@ class EngineEntry:
     load_failed: bool = False  # Sticky until the next discovery refresh
     load_failure_message: str | None = None
     load_failure_at: float | None = None
+    # Idle-maintenance rung markers (graduated TTL ladder). Each rung fires at
+    # most once per idle period: the marker is compared against last_access,
+    # which only real requests stamp, so a reload re-arms both rungs.
+    last_cache_drop_at: float = 0.0  # cache-tier TTL drop attempted at
+    last_deep_release_at: float = 0.0  # deep idle-release attempted at
 
 
 class EnginePool:
@@ -164,6 +177,12 @@ class EnginePool:
         self._load_seconds_per_gb_ema: float | None = None
         self._load_time_observations: int = 0
         self._lease_release_tasks: set[asyncio.Task[None]] = set()
+        # Keepwarm throttle state per loaded model (opt-in; see
+        # idle_maintenance). Pruned when an engine unloads.
+        self._keepwarm_trackers: dict[str, KeepwarmTracker] = {}
+        # Bounded eviction-attribution log (C5): which mechanism evicted or
+        # released what, when, and on whose behalf. Surfaced via get_status.
+        self._eviction_attribution: deque[dict] = deque(maxlen=64)
         self.configure_hot_cache_budget()
 
     def _distributed_deployment_for_entry(
@@ -554,7 +573,7 @@ class EnginePool:
         return model_type == "diffusion_gemma"
 
     def apply_settings_overrides(
-        self, settings_manager: "ModelSettingsManager"
+        self, settings_manager: ModelSettingsManager
     ) -> None:
         """Apply model_type_override from persisted settings to discovered entries."""
         for model_id, entry in self._entries.items():
@@ -1143,6 +1162,13 @@ class EnginePool:
                             f"({format_size(projected)} > "
                             f"{format_size(evict_target)})"
                         )
+                        self._record_eviction(
+                            "admission_lru",
+                            victim,
+                            beneficiary=model_id,
+                            projected_bytes=projected,
+                            target_bytes=evict_target,
+                        )
                         await self._unload_engine(victim)
                         evicted_any = True
                         continue
@@ -1334,7 +1360,8 @@ class EnginePool:
         Find the least recently used non-pinned loaded model.
 
         Skips models with active inference requests to avoid interrupting
-        in-flight generation.
+        in-flight generation. When OMLX_EVICTION_GRACE_SECONDS is set,
+        recently-used models are deprioritized (see _prefer_grace_exempt).
 
         Returns:
             Model ID of the LRU victim, or None if no evictable model found
@@ -1349,9 +1376,47 @@ class EnginePool:
                 logger.debug(f"Skipping victim '{mid}': has active requests")
                 continue
             candidates.append((e.last_access, mid))
+        return self._prefer_grace_exempt(candidates)
+
+    @staticmethod
+    def _prefer_grace_exempt(candidates: list[tuple[float, str]]) -> str | None:
+        """Pick the LRU victim, deprioritizing models inside the recency grace.
+
+        C4 (ThunderMLX gateway grace windows): a model touched moments ago is
+        likely to be needed again, so when OMLX_EVICTION_GRACE_SECONDS is set,
+        victims whose last access is within the grace window are only chosen
+        when every idle model is inside it — grace is a preference, never a
+        veto, so a load cannot fail because every resident model is recent.
+        The default (0) is today's pure-LRU choice.
+
+        ``candidates`` items are ``(last_access, model_id)``.
+        """
+
         if not candidates:
             return None
         candidates.sort()  # Sort by last_access (oldest first)
+        grace = eviction_grace_seconds()
+        if grace <= 0:
+            return candidates[0][1]
+        now = time.time()
+        exempt = [(ts, mid) for ts, mid in candidates if now - ts >= grace]
+        if exempt:
+            if len(exempt) < len(candidates):
+                logger.info(
+                    "Eviction grace %.0fs: skipping %d recently-used model(s), "
+                    "evicting '%s' instead",
+                    grace,
+                    len(candidates) - len(exempt),
+                    exempt[0][1],
+                )
+            return exempt[0][1]
+        logger.info(
+            "Eviction grace %.0fs: all %d idle model(s) are within the grace "
+            "window; falling back to plain LRU victim '%s'",
+            grace,
+            len(candidates),
+            candidates[0][1],
+        )
         return candidates[0][1]
 
     async def _unload_other_dflash_engines(self, model_id: str) -> None:
@@ -1396,6 +1461,7 @@ class EnginePool:
                 victim,
                 model_id,
             )
+            self._record_eviction("dflash_switch", victim, beneficiary=model_id)
             await self._unload_engine(victim)
 
     @staticmethod
@@ -1431,10 +1497,7 @@ class EnginePool:
                 continue
             if self._is_idle_for_prefill_eviction(entry):
                 candidates.append((entry.last_access, mid))
-        if not candidates:
-            return None
-        candidates.sort()
-        return candidates[0][1]
+        return self._prefer_grace_exempt(candidates)
 
     async def _evict_idle_lru_for_prefill(
         self,
@@ -1511,6 +1574,14 @@ class EnginePool:
                     request_id,
                     format_size(current + predicted),
                     format_size(target),
+                )
+                self._record_eviction(
+                    "prefill_headroom",
+                    victim,
+                    beneficiary=exclude_model_id,
+                    request_id=request_id,
+                    projected_bytes=current + predicted,
+                    target_bytes=target,
                 )
                 await self._unload_engine(victim)
                 evicted_any = True
@@ -1698,6 +1769,7 @@ class EnginePool:
         entry.abort_requested = False
         entry.pending_unload_reason = None
         entry.runtime_settings_signature = None
+        self._keepwarm_trackers.pop(model_id, None)
 
         if distributed:
             # Cluster weights live in supervised rank processes, not this
@@ -2092,10 +2164,8 @@ class EnginePool:
                         f"DFlash start failed for {model_id}: {start_error}. "
                         f"Falling back to {effective_type} engine."
                     )
-                    try:
+                    with suppress(Exception):
                         await engine.stop()
-                    except Exception:
-                        pass
                     gc.collect()
                     loop = asyncio.get_running_loop()
                     await loop.run_in_executor(
@@ -2139,10 +2209,8 @@ class EnginePool:
                         f"(force_lm=True), falling back to VLM engine: "
                         f"{start_error}"
                     )
-                    try:
+                    with suppress(Exception):
                         await engine.stop()
-                    except Exception:
-                        pass
                     gc.collect()
                     loop = asyncio.get_running_loop()
                     await loop.run_in_executor(
@@ -2175,10 +2243,8 @@ class EnginePool:
                         f"VLM loading failed for {model_id}, "
                         f"falling back to LLM: {start_error}"
                     )
-                    try:
+                    with suppress(Exception):
                         await engine.stop()
-                    except Exception:
-                        pass
                     gc.collect()
                     loop = asyncio.get_running_loop()
                     await loop.run_in_executor(
@@ -2436,6 +2502,7 @@ class EnginePool:
             ),
             "load_seconds_per_gb_estimate": self._load_seconds_per_gb_ema,
             "load_time_observations": self._load_time_observations,
+            "recent_evictions": list(self._eviction_attribution),
             "models": [
                 {
                     "id": mid,
@@ -2479,6 +2546,14 @@ class EnginePool:
         Models with active requests are skipped and their last_access is refreshed.
         Suppressed during benchmark runs via _suppress_ttl flag.
 
+        Before the full-unload rung, each idle loaded engine gets the opt-in
+        idle-maintenance pass (``omlx/idle_maintenance.py``): the graduated
+        cache-TTL drop and timed deep idle release (both keep the engine
+        resident and servable), then the keepwarm Metal touch. All of it is
+        off at default env settings, and none of it stamps ``last_access`` —
+        background work must never reset the idle clock the unload rung
+        reads (ThunderMLX B4 invariant).
+
         Args:
             settings_manager: The settings manager to read TTL values from.
             global_idle_timeout_seconds: Global idle timeout fallback (None = no global TTL).
@@ -2490,36 +2565,329 @@ class EnginePool:
             return []
 
         now = time.time()
+        maintenance = IdleMaintenanceSettings.from_env()
         expired: list[str] = []
 
         async with self._lock:
-            for model_id, entry in self._entries.items():
-                if entry.engine is None or entry.is_loading or entry.is_pinned:
-                    continue
-
-                settings = settings_manager.get_settings(model_id)
-                effective_ttl = settings.ttl_seconds
-                if effective_ttl is None:
-                    effective_ttl = global_idle_timeout_seconds
-                if effective_ttl is None:
-                    continue
-
-                idle_time = now - entry.last_access
-                if idle_time < effective_ttl:
+            # Snapshot the items: the maintenance rungs await (executor
+            # dispatch, worker admin POST), which widens the window in which
+            # discover_models() can mutate _entries mid-iteration.
+            for model_id, entry in list(self._entries.items()):
+                if entry.engine is None or entry.is_loading:
                     continue
 
                 # Check if model has active requests
                 has_active = entry.engine.has_active_requests() or entry.in_use > 0
 
-                if has_active:
-                    entry.last_access = now
+                settings = settings_manager.get_settings(model_id)
+                effective_ttl = settings.ttl_seconds
+                if effective_ttl is None:
+                    effective_ttl = global_idle_timeout_seconds
+                if entry.is_pinned:
+                    effective_ttl = None
+
+                idle_time = now - entry.last_access
+                if effective_ttl is not None and idle_time >= effective_ttl:
+                    if has_active:
+                        entry.last_access = now
+                        continue
+                    logger.info(
+                        f"TTL expired for model '{model_id}' "
+                        f"(idle {idle_time:.0f}s > ttl {effective_ttl}s)"
+                    )
+                    self._record_eviction(
+                        "engine_ttl",
+                        model_id,
+                        idle_seconds=round(idle_time, 3),
+                        ttl_seconds=effective_ttl,
+                    )
+                    await self._unload_engine(model_id)
+                    expired.append(model_id)
                     continue
 
-                logger.info(
-                    f"TTL expired for model '{model_id}' "
-                    f"(idle {idle_time:.0f}s > ttl {effective_ttl}s)"
-                )
-                await self._unload_engine(model_id)
-                expired.append(model_id)
+                if not has_active and maintenance.any_enabled:
+                    await self._maintain_idle_entry(model_id, entry, maintenance, now)
+                    if entry.engine is None:
+                        continue
+                    await self._maybe_keepwarm_entry(model_id, entry, maintenance, now)
 
         return expired
+
+    async def _maintain_idle_entry(
+        self,
+        model_id: str,
+        entry: EngineEntry,
+        maintenance: IdleMaintenanceSettings,
+        now: float,
+    ) -> None:
+        """Run the graduated idle-TTL rungs for one idle engine.
+
+        The ladder below full engine unload (ThunderMLX ``_janitor_tick``):
+        a cache-tier TTL drop at ``OMLX_CACHE_TTL_SECONDS`` (drop prefix
+        cache + MLX buffers, keep weights wired and TTFT warm), then the
+        timed deep idle release at ``OMLX_IDLE_RELEASE_SECONDS``
+        (additionally drain the Metal heap; the model stays servable and the
+        next request re-warms). Each rung fires at most once per idle period,
+        and the deep release satisfies the shallow rung too.
+        """
+
+        action = graduated_idle_action(
+            now,
+            entry.last_access,
+            cache_ttl_seconds=maintenance.cache_ttl_seconds,
+            idle_release_seconds=maintenance.idle_release_seconds,
+            last_cache_drop_at=entry.last_cache_drop_at,
+            last_deep_release_at=entry.last_deep_release_at,
+        )
+        if action is None:
+            return
+        deep = action == "deep_release"
+        reason = "idle_release" if deep else "cache_ttl_expired"
+        idle_seconds = now - entry.last_access
+        logger.info(
+            "Idle maintenance: %s for '%s' (idle %.0fs; cache_ttl=%.0fs, "
+            "idle_release=%.0fs)",
+            reason,
+            model_id,
+            idle_seconds,
+            maintenance.cache_ttl_seconds,
+            maintenance.idle_release_seconds,
+        )
+        ok = await self._release_entry_caches(
+            model_id,
+            entry,
+            deep=deep,
+            reason=reason,
+            slow_seconds=maintenance.background_op_slow_seconds,
+        )
+        if ok is None:
+            # The engine was swapped mid-release; the outcome belongs to the
+            # old engine, so leave the replacement's rung markers untouched.
+            return
+        # Stamp the rung on attempt, not just success: a failed drop (an
+        # inactive cluster share channel, an engine mid-teardown) must not
+        # retry on every 1s TTL pass. The full engine TTL remains the
+        # backstop for what the graduated rungs could not release.
+        entry.last_cache_drop_at = now
+        if deep:
+            entry.last_deep_release_at = now
+        if ok:
+            self._record_eviction(
+                "idle_release" if deep else "cache_ttl",
+                model_id,
+                idle_seconds=round(idle_seconds, 3),
+                deep=deep,
+            )
+
+    async def _release_entry_caches(
+        self,
+        model_id: str,
+        entry: EngineEntry,
+        *,
+        deep: bool,
+        reason: str,
+        slow_seconds: float,
+    ) -> bool | None:
+        """Drop one idle engine's caches; distributed entries fan out to all ranks.
+
+        A local engine runs ``Scheduler.release_idle_caches`` on its own MLX
+        executor, so the drop serializes with generation steps — the same
+        dispatch ``_reclaim_pooled_buffers_for_prefill`` uses. A distributed
+        entry instead goes through the worker admin route, which carries the
+        drop to every rank on the idle request-share channel: a rank-0-only
+        drop would leave per-rank prompt caches diverged and wedge the next
+        request's first unmatched collective, so when the fan-out is
+        unavailable or unconfirmed this returns False and leaves every rank
+        untouched (the engine-TTL unload remains the backstop).
+
+        Returns True/False for a completed drop, or None when the engine was
+        swapped mid-release (the CAS owner check) — the caller must not
+        stamp rung markers for an outcome that belongs to the old engine.
+        """
+
+        engine = entry.engine
+        if engine is None:
+            return False
+        started = time.time()
+        if self._distributed_deployment_for_entry(entry) is not None:
+            release = getattr(engine, "release_idle_caches", None)
+            if not callable(release):
+                return False
+            try:
+                ok = bool(await release(deep=deep, reason=reason))
+            except Exception as e:
+                logger.warning(
+                    "Idle maintenance %s failed for distributed '%s': %s",
+                    reason,
+                    model_id,
+                    e,
+                )
+                return False
+            self._log_slow_background_op(reason, started, slow_seconds, model_id)
+            return ok
+
+        core = self._resolve_engine_core_from_engine(engine)
+        scheduler = getattr(core, "scheduler", None)
+        release = getattr(scheduler, "release_idle_caches", None)
+        executor = getattr(core, "_mlx_executor", None)
+        if not callable(release) or executor is None:
+            return False
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(
+                executor, lambda: release(deep=deep, reason=reason)
+            )
+        except Exception as e:
+            logger.warning(
+                "Idle maintenance %s failed for '%s': %s", reason, model_id, e
+            )
+            return False
+        if entry.engine is not engine:
+            # CAS owner check: the engine was swapped while the release was
+            # queued; the outcome belongs to the old engine, so the caller
+            # leaves the replacement's rung markers untouched.
+            return None
+        self._log_slow_background_op(reason, started, slow_seconds, model_id)
+        return bool(isinstance(result, dict) and result.get("ok"))
+
+    async def _maybe_keepwarm_entry(
+        self,
+        model_id: str,
+        entry: EngineEntry,
+        maintenance: IdleMaintenanceSettings,
+        now: float,
+    ) -> None:
+        """Fire one keepwarm Metal touch for an idle engine when due.
+
+        Port of ThunderMLX's prompt-cache keepwarm: a tiny bounded matmul
+        keeps GPU clocks and the prefill/decode path ramped between turns.
+        The touch is dispatched onto the engine's single-worker MLX executor,
+        which is the A2 submit-lock discipline in oMLX terms — it can queue
+        behind a step but never runs concurrent with one. Tenure is bounded
+        by the clamped matrix size, and a slow touch is logged loudly (A3).
+        The touch never stamps ``entry.last_access`` (B4), so keepwarm
+        cannot keep the TTL ladder from firing.
+        """
+
+        if not maintenance.keepwarm_enabled:
+            return
+        engine = entry.engine
+        if engine is None or entry.last_access <= 0:
+            return
+        tracker = self._keepwarm_trackers.get(model_id)
+        if tracker is None:
+            tracker = KeepwarmTracker()
+            self._keepwarm_trackers[model_id] = tracker
+        if not tracker.should_touch(
+            now,
+            idle_seconds=now - entry.last_access,
+            large_context=self._entry_has_large_context(entry, maintenance),
+            settings=maintenance,
+        ):
+            return
+
+        started = time.time()
+        if self._distributed_deployment_for_entry(entry) is not None:
+            touch = getattr(engine, "keepwarm_touch", None)
+            if not callable(touch):
+                return
+            try:
+                ok = await touch(
+                    size=maintenance.keepwarm_matrix_size,
+                    reason="engine-pool keepwarm",
+                )
+            except Exception as e:
+                logger.debug("keepwarm touch failed for '%s': %s", model_id, e)
+                return
+            event: dict = {
+                "ok": bool(ok),
+                "at": round(time.time(), 3),
+                "elapsed_ms": round((time.time() - started) * 1000, 3),
+            }
+        else:
+            core = self._resolve_engine_core_from_engine(engine)
+            executor = getattr(core, "_mlx_executor", None)
+            if executor is None:
+                return
+            loop = asyncio.get_running_loop()
+            event = await loop.run_in_executor(
+                executor,
+                lambda: metal_keepwarm_touch(
+                    mx,
+                    size=maintenance.keepwarm_matrix_size,
+                    repeats=1,
+                    reason="engine-pool keepwarm",
+                ),
+            )
+        if entry.engine is not engine:
+            # CAS owner check: the engine changed while the touch was in
+            # flight; the event belongs to the old engine, not its
+            # replacement.
+            return
+        if not isinstance(event, dict):
+            return
+        tracker.note_touch(event)
+        self._log_slow_background_op(
+            "keepwarm", started, maintenance.background_op_slow_seconds, model_id
+        )
+        if event.get("ok"):
+            logger.debug(
+                "keepwarm touch on '%s' (%d touches, %.1fms)",
+                model_id,
+                tracker.touches,
+                float(event.get("elapsed_ms") or 0.0),
+            )
+
+    @staticmethod
+    def _entry_has_large_context(
+        entry: EngineEntry, maintenance: IdleMaintenanceSettings
+    ) -> bool:
+        """Throttle discriminator for the slower keepwarm cadence.
+
+        ThunderMLX throttles on its resident RAM prompt-cache token count;
+        oMLX's paged cache is pre-allocated (the pool never shrinks), so the
+        stable stand-in is the model's declared context length — models with
+        >= ``keepwarm_large_cache_tokens`` context (prod: 8k) get the slower
+        cadence (prod: 30s vs 10s).
+        """
+
+        threshold = maintenance.keepwarm_large_cache_tokens
+        if threshold <= 0:
+            return False
+        return (entry.model_context_length or 0) >= threshold
+
+    @staticmethod
+    def _log_slow_background_op(
+        op: str, started: float, slow_seconds: float, model_id: str
+    ) -> None:
+        """Loud log for a background GPU op that held the engine too long (A3)."""
+
+        elapsed = time.time() - started
+        if elapsed >= slow_seconds:
+            logger.warning(
+                "Background op '%s' on '%s' took %.2fs (>= %.1fs slow-op "
+                "threshold) — background GPU work is meant to be sub-second; "
+                "a slow one is exactly the diagnostic a stall report needs",
+                op,
+                model_id,
+                elapsed,
+                slow_seconds,
+            )
+
+    def _record_eviction(self, mechanism: str, model_id: str, **details) -> None:
+        """Attribute one eviction/cache release to its trigger (C5).
+
+        Appends to a bounded in-memory log (surfaced via ``get_status``) and
+        emits one structured log line, so "why did my model unload" is
+        answerable after the fact: which mechanism, which model, when, and
+        on whose behalf.
+        """
+
+        event = {
+            "at": round(time.time(), 3),
+            "mechanism": mechanism,
+            "model_id": model_id,
+            **details,
+        }
+        self._eviction_attribution.append(event)
+        logger.info("Eviction attribution: %s", json.dumps(event, default=str))

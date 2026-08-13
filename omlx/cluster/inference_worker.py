@@ -558,6 +558,9 @@ def _cluster_admin_handler_class(api_handler_type: Any, controller: Any) -> Any:
             if self.path == "/admin/shutdown":
                 self._omlx_handle_shutdown()
                 return
+            if self.path == "/admin/idle-maintenance":
+                self._omlx_handle_idle_maintenance()
+                return
             super().do_POST()
 
         def _omlx_localhost_only(self) -> bool:
@@ -603,6 +606,74 @@ def _cluster_admin_handler_class(api_handler_type: Any, controller: Any) -> Any:
                 {
                     "status": "broadcast" if broadcast else "pending",
                     "sentinel_active": controller.share_channel_active,
+                },
+            )
+
+        def _omlx_handle_idle_maintenance(self) -> None:
+            """Arm one idle-maintenance op for the next idle share-channel poll.
+
+            The op (a keepwarm matmul, or an all-rank cache drop for the
+            coordinated TTL/idle-release ladder) crosses to every rank on the
+            idle request-share channel and runs at that lockstep rendezvous —
+            never mid-request, never concurrent with model collectives, and
+            never on one rank alone (a rank-local drop would diverge the
+            per-rank prompt caches). Same in-memory latch discipline as
+            cancel/shutdown: this handler never issues a collective itself.
+            """
+
+            if not self._omlx_localhost_only():
+                self._omlx_respond(
+                    403, {"error": "admin idle-maintenance is localhost-only"}
+                )
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                length = 0
+            length = max(0, min(4096, length))
+            try:
+                raw = self.rfile.read(length) if length else b"{}"
+                body = json.loads(raw or b"{}")
+            except (ValueError, UnicodeDecodeError):
+                self._omlx_respond(400, {"error": "invalid JSON body"})
+                return
+            if not isinstance(body, dict):
+                self._omlx_respond(400, {"error": "invalid idle-maintenance payload"})
+                return
+            op = body.get("op")
+            if op not in ("keepwarm", "drop_caches"):
+                self._omlx_respond(400, {"error": "unknown idle-maintenance op"})
+                return
+            if not controller.share_channel_active:
+                # Without the pinned share channel there is no lockstep
+                # rendezvous to carry the op; report rather than guess.
+                self._omlx_respond(
+                    200,
+                    {
+                        "status": "unavailable",
+                        "broadcast": False,
+                        "share_channel_active": False,
+                    },
+                )
+                return
+            controller.request_idle_op(
+                {
+                    "op": op,
+                    "reason": str(body.get("reason") or op)[:128],
+                    "clear_memory": bool(body.get("clear_memory")),
+                    "matrix_size": body.get("matrix_size"),
+                }
+            )
+            # The op crosses on the next idle share (the same 2s window the
+            # shutdown sentinel reports against). "pending" means the cluster
+            # is busy; the op stays queued and fires when the batch drains.
+            broadcast = controller.wait_idle_op_broadcast(2.0)
+            self._omlx_respond(
+                200,
+                {
+                    "status": "broadcast" if broadcast else "pending",
+                    "broadcast": bool(broadcast),
+                    "share_channel_active": True,
                 },
             )
 
