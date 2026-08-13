@@ -224,6 +224,71 @@ decode latency of a pipeline still includes every stage and inter-stage send.
 The live view therefore shows both predicted stage time and observed
 end-to-end measurements so a poor cut, cache miss, or slow link is visible.
 
+## Host tuning (opt-in)
+
+Two host-level helpers exist for dedicated inference Macs. Neither runs at
+startup, at launch, or on any timer — each executes only when the operator
+runs the command, and neither is part of the default configuration.
+
+### Raising the GPU wired ceiling
+
+macOS refuses `mx.set_wired_limit` above Apple's default (~75% of RAM)
+unless the kernel `iogpu.wired_limit_mb` ceiling is raised first, so on a
+large-memory Mac this one sysctl decides whether a big model — sharded or
+single-node — can wire its weights at all. oMLX normally only reads the
+knob and suggests a value (server logs, the admin banner's red warning, the
+Mac app). To actually apply the suggestion:
+
+```bash
+omlx cluster apply-wired-limit            # plan, confirm, then sudo sysctl
+omlx cluster apply-wired-limit --dry-run  # show the plan and command only
+omlx cluster apply-wired-limit --mb 260096 --force
+```
+
+The default target is the same value the runtime suggests: physical RAM
+minus 5%, the field-stable margin from #2184. The clamp exists because
+wiring a Mac to effective unified-memory saturation is the documented path
+to the 90 s `watchdogd` check-in panic — the machine stalls with almost no
+free pages while macOS reports no memory pressure, then panics; it is not
+an OOM. Values above the ceiling need `--force`, and anything above
+physical RAM is refused outright. The write needs `sudo` (passwordless or
+an interactive prompt; oMLX never stores a password), is verified by
+read-back, and resets at reboot — nothing touches nvram, `defaults write`,
+or launchd. Run it on every Mac that needs it; cluster ranks do not apply
+it for each other.
+
+### Quieting a dedicated Mac
+
+Spotlight indexing bursts and the photo/Siri analysis daemons steal
+GPU/Neural-Engine time and memory bandwidth, which perturbs decode cadence
+and watchdog heartbeats on a dedicated node:
+
+```bash
+omlx cluster reduce-noise                    # unprivileged daemons only
+omlx cluster reduce-noise --include-spotlight  # + mdutil/mds tier (sudo)
+omlx cluster reduce-noise --quit-safari        # + quit Safari
+```
+
+The default tier only stops launchd daemons that restart on demand and own
+no user data (`assistantd`, the Siri/knowledge/intelligence services,
+`photoanalysisd`, `mediaanalysisd`, `photolibraryd`). `--include-spotlight`
+adds `mdutil -a -i off` and the root-owned Spotlight daemons — re-enable
+later with `sudo mdutil -a -i on`. Everything is best-effort; a daemon that
+is not running is reported as such, not as a failure. On a Mac you work on
+every day this command is the wrong tool, which is why it is a command and
+not a startup step.
+
+### Single-node command-buffer caps
+
+The server process seeds `MLX_MAX_OPS_PER_BUFFER=16` and
+`MLX_MAX_MB_PER_BUFFER=512` at startup when they are not already set — the
+same values the distributed hostfile injects for every rank. One Metal
+command buffer executing for more than ~10 s is killed by the GPU driver
+(`kIOGPUCommandBufferCallbackErrorTimeout`, SIGABRT); capping work per
+buffer keeps large prefill buffers inside that timeout with `async_eval`
+still enabled. Exported values always win, and
+`OMLX_METAL_COMMAND_BUFFER_CAPS=0` disables the seeding entirely.
+
 ## Diagnostics
 
 ```bash

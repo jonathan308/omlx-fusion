@@ -7001,6 +7001,13 @@ async def init_mcp(config_path: str):
 
 def main():
     """Run the server (use omlx CLI instead)."""
+    # Match the cli.py launcher: seed MLX command-buffer caps before MLX is
+    # imported below (kIOGPUCommandBufferCallbackErrorTimeout insurance;
+    # operator-exported values always win).
+    from .settings import apply_metal_command_buffer_defaults
+
+    apply_metal_command_buffer_defaults(os.environ)
+
     parser = argparse.ArgumentParser(
         description="oMLX multi-model serving for Apple Silicon",
         formatter_class=argparse.RawDescriptionHelpFormatter,

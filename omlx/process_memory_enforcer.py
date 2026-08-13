@@ -211,6 +211,16 @@ def _wired_limit_suggestion_bytes(desired_bytes: int) -> int:
     return max(0, min(desired_bytes, total - total // 20))
 
 
+def wired_limit_suggestion_bytes(desired_bytes: int) -> int:
+    """Public spelling of ``_wired_limit_suggestion_bytes``.
+
+    ``omlx cluster apply-wired-limit`` (cluster/host_tune.py) proposes the
+    sysctl value through this so the CLI suggestion can never drift from the
+    one the enforcer logs and the admin banner shows.
+    """
+    return _wired_limit_suggestion_bytes(desired_bytes)
+
+
 def _apply_metal_wired_limit(desired_bytes: int) -> tuple[int, int | None]:
     """Try to raise Metal wired limit for this process to `desired_bytes`.
 
