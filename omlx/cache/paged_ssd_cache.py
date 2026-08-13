@@ -148,6 +148,24 @@ _MAX_PENDING_WRITES = _compute_max_pending_writes()
 # cost of taking multiple saves to fully reconverge.
 _MAX_INLINE_UNLINKS_PER_SAVE = 32
 
+# Clamp rails for live SSD-cap tuning (the /api/ssd-cache/max-size admin
+# route). ThunderMLX's storage tuning used the same 50-400 GiB band: below
+# the floor an operator typo would effectively disable the SSD tier, above
+# the ceiling the cap stops being a budget at all. Values outside the rails
+# are clamped, never rejected — a disk-budget response must not 400 because
+# the operator asked for "10GB".
+SSD_CACHE_LIVE_MAX_SIZE_MIN_BYTES = 50 * 1024**3
+SSD_CACHE_LIVE_MAX_SIZE_MAX_BYTES = 400 * 1024**3
+
+
+def clamp_live_ssd_cache_max_size(size_bytes: int) -> int:
+    """Clamp a live-tuned SSD cache cap into the supported rails."""
+
+    return max(
+        SSD_CACHE_LIVE_MAX_SIZE_MIN_BYTES,
+        min(SSD_CACHE_LIVE_MAX_SIZE_MAX_BYTES, int(size_bytes)),
+    )
+
 
 # Cache format version. Bump when on-disk layout or RotatingKVCache meta_state
 # semantics change in a way that older blocks become unsafe to load.
@@ -4704,3 +4722,30 @@ class PagedSSDCacheManager(CacheManager):
             Configured maximum cache size in bytes.
         """
         return self._max_size
+
+    def set_max_size(self, max_size_bytes: int) -> int:
+        """Live-retune the SSD cache cap; returns the effective value.
+
+        The new value is clamped into the live-tuning rails
+        (``SSD_CACHE_LIVE_MAX_SIZE_MIN_BYTES`` ..
+        ``SSD_CACHE_LIVE_MAX_SIZE_MAX_BYTES``) — the same clamp the admin
+        route applies, so direct callers and the route cannot drift apart.
+        Every enforcement site already re-reads ``self._max_size`` through
+        ``_get_effective_max_size`` (which still wins from below when disk
+        free space shrinks), so the retune takes effect on the next save with
+        no model reload. A shrink below the currently tracked size is
+        enforced immediately via the standard LRU eviction path.
+        """
+
+        clamped = clamp_live_ssd_cache_max_size(max_size_bytes)
+        with self._lock:
+            old = self._max_size
+            self._max_size = clamped
+        if clamped != old:
+            logger.info(
+                f"SSD cache max size retuned: {format_bytes(old)} -> "
+                f"{format_bytes(clamped)}"
+            )
+        if clamped < old:
+            self.enforce_size_limit()
+        return clamped
