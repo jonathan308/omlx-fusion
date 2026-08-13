@@ -13,6 +13,7 @@ import pytest
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
 from omlx.cluster.launch import run_cluster_performance_probe
 from omlx.cluster.performance import (
+    ExecutionSettings,
     NodePerformanceProfile,
     execution_profile,
     performance_profiles_from_records,
@@ -148,6 +149,83 @@ def test_prompt_cache_is_synchronized_even_when_auto_tuning_is_disabled():
     assert tuned.prompt_cache_size == 1
     assert tuned.prompt_cache_bytes is None
     assert "synchronized single-prefix cache" in tuned.tuning_reason
+
+
+# --- Plan-agreed multi-slot cache + the durable rank-local KV tier -----------
+
+
+def test_prompt_cache_size_override_lifts_the_pin_through_the_plan(monkeypatch):
+    monkeypatch.setenv("OMLX_CLUSTER_PROMPT_CACHE_SIZE", "6")
+    assignments = [
+        SimpleNamespace(headroom_bytes=40 * 1024**3),
+        SimpleNamespace(headroom_bytes=60 * 1024**3),
+    ]
+
+    tuned = tune_execution_settings(
+        execution_profile("balanced"), assignments, backend="jaccl"
+    )
+
+    assert tuned.prompt_cache_size == 6
+    assert tuned.prompt_cache_bytes is None  # byte eviction stays banned
+    assert "synchronized 6-slot prefix cache" in tuned.tuning_reason
+
+
+def test_prompt_cache_size_override_is_bounded_by_the_weakest_stage(monkeypatch):
+    monkeypatch.setenv("OMLX_CLUSTER_PROMPT_CACHE_SIZE", "6")
+    assignments = [
+        SimpleNamespace(headroom_bytes=3 * 1024**3),
+        SimpleNamespace(headroom_bytes=60 * 1024**3),
+    ]
+
+    tuned = tune_execution_settings(
+        execution_profile("balanced"), assignments, backend="jaccl"
+    )
+
+    # Critical headroom caps the agreed count at 2: every resident prefix is
+    # wired memory on every Mac, and the smallest stage sets the bound.
+    assert tuned.prompt_cache_size == 2
+    assert "critical headroom" in tuned.tuning_reason
+
+    untuned = tune_execution_settings(
+        execution_profile("balanced", auto_tune=False), assignments, backend="jaccl"
+    )
+    assert untuned.prompt_cache_size == 6
+
+
+@pytest.mark.parametrize("bad", ["0", "-2", "65", "a lot"])
+def test_prompt_cache_size_override_garbage_refuses_the_plan(monkeypatch, bad):
+    monkeypatch.setenv("OMLX_CLUSTER_PROMPT_CACHE_SIZE", bad)
+    with pytest.raises(ValueError, match="OMLX_CLUSTER_PROMPT_CACHE_SIZE"):
+        tune_execution_settings(
+            execution_profile("balanced"),
+            [SimpleNamespace(headroom_bytes=40 * 1024**3)],
+            backend="jaccl",
+        )
+
+
+def test_kv_tier_is_a_plan_field_and_rejects_byte_budget_eviction(monkeypatch):
+    monkeypatch.delenv("OMLX_CLUSTER_KV_TIER", raising=False)
+    tuned = tune_execution_settings(
+        execution_profile("balanced"),
+        [SimpleNamespace(headroom_bytes=40 * 1024**3)],
+        backend="jaccl",
+    )
+    assert tuned.kv_tier is False  # default preserves today's behavior
+
+    monkeypatch.setenv("OMLX_CLUSTER_KV_TIER", "1")
+    tuned = tune_execution_settings(
+        execution_profile("balanced"),
+        [SimpleNamespace(headroom_bytes=40 * 1024**3)],
+        backend="jaccl",
+    )
+    assert tuned.kv_tier is True
+    assert "rank-local KV tier" in tuned.tuning_reason
+    assert ExecutionSettings.from_dict(tuned.to_dict()).kv_tier is True
+
+    # The plan-refusal discipline: byte-budget eviction diverges pipeline
+    # ranks, so a plan combining it with the tier is invalid on its face.
+    with pytest.raises(ValueError, match="prompt_cache_bytes diverges"):
+        replace(tuned, prompt_cache_bytes=8 * 1024**3)
 
 
 def test_performance_profiles_reject_nonfinite_measurements():

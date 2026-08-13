@@ -846,7 +846,7 @@ def _run_rank(
     monkeypatch.setattr(
         inference_worker,
         "decode_worker_contract",
-        lambda _plan: ("a" * 64, assignments, (), 1),
+        lambda _plan: ("a" * 64, assignments, (), 1, None),
     )
 
     def fake_guard_rank_load(item, *, rank, **kwargs):

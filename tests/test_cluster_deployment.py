@@ -3,6 +3,7 @@
 import base64
 import json
 import zlib
+from dataclasses import replace
 
 import pytest
 
@@ -10,7 +11,9 @@ from omlx.cluster.deployment import (
     ClusterDeployment,
     ClusterHost,
     _assignment_from_dict,
+    decode_worker_contract,
     decode_worker_plan,
+    validate_worker_cache_contract,
 )
 from omlx.cluster.performance import NodePerformanceProfile, execution_profile
 from omlx.cluster.planner import PipelineAssignment
@@ -92,6 +95,67 @@ def test_deployment_round_trip_and_worker_plan_are_json_only():
         "MLX_MAX_MB_PER_BUFFER=512",
     ]
     assert deployment.distributed_init_backend == "jaccl"
+
+
+# --- The rank-agreed cache capacity rides the signed plan --------------------
+
+
+def _decode_payload(deployment: ClusterDeployment) -> dict:
+    encoded = deployment.encode_worker_plan()
+    return json.loads(zlib.decompress(base64.b64decode(encoded, altchars=b"-_")))
+
+
+def test_worker_contract_carries_the_agreed_cache_capacity():
+    deployment = _deployment()
+    deployment = replace(
+        deployment,
+        execution=replace(
+            execution_profile("balanced"), prompt_cache_size=6, kv_tier=True
+        ),
+    )
+
+    contract = decode_worker_contract(deployment.encode_worker_plan())[4]
+
+    assert contract == {"prompt_cache_size": 6, "kv_tier": True}
+    # The flags and the plan agree here, and only here is a worker allowed
+    # to configure its cache tier.
+    validate_worker_cache_contract(contract, prompt_cache_size=6, kv_tier=True)
+    with pytest.raises(ValueError, match="prompt cache size"):
+        validate_worker_cache_contract(contract, prompt_cache_size=1, kv_tier=True)
+    with pytest.raises(ValueError, match="KV tier"):
+        validate_worker_cache_contract(contract, prompt_cache_size=6, kv_tier=False)
+    # A plan written before the contract carried cache fields leaves the
+    # launch flags authoritative.
+    validate_worker_cache_contract(None, prompt_cache_size=1, kv_tier=False)
+
+
+def test_worker_contract_accepts_plans_without_a_cache_contract():
+    payload = _decode_payload(_deployment())
+    del payload["execution_cache"]
+    encoded = base64.urlsafe_b64encode(
+        zlib.compress(json.dumps(payload).encode())
+    ).decode()
+    assert decode_worker_contract(encoded)[4] is None
+
+
+@pytest.mark.parametrize(
+    "contract",
+    [
+        "yes",
+        {"prompt_cache_size": 0, "kv_tier": True},
+        {"prompt_cache_size": 65, "kv_tier": False},
+        {"prompt_cache_size": True, "kv_tier": False},
+        {"prompt_cache_size": 4, "kv_tier": "on"},
+    ],
+)
+def test_worker_contract_refuses_a_malformed_cache_contract(contract):
+    payload = _decode_payload(_deployment())
+    payload["execution_cache"] = contract
+    encoded = base64.urlsafe_b64encode(
+        zlib.compress(json.dumps(payload).encode())
+    ).decode()
+    with pytest.raises(ValueError, match="cache contract"):
+        decode_worker_contract(encoded)
 
 
 def test_deployment_round_trip_preserves_the_selected_context():

@@ -620,7 +620,7 @@ def _as_the_rank_sees_it(assignments):
         assignments=assignments,
         plan_hash="d" * 64,
     )
-    _plan_hash, decoded, _profiles, _tp = decode_worker_contract(
+    _plan_hash, decoded, _profiles, _tp, _cache_contract = decode_worker_contract(
         deployment.encode_worker_plan()
     )
     return decoded

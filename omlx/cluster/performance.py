@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -15,6 +16,56 @@ _MAX_RATE = 1e18
 _MAX_LATENCY_SECONDS = 60.0
 _MAX_CONNECTIONS_PER_IP = 32
 _GIB = 1024**3
+
+# Plan-time opt-ins, read from the coordinating engine's environment when a
+# deployment is planned. The agreed values land in the signed plan and the one
+# launch argv every rank shares, so an env read here cannot desync the group —
+# a rank whose argv disagrees with the plan fails validation instead of
+# drifting (see deployment.decode_worker_contract). The rank-local half of the
+# KV tier (disk budget, directory, append reserve) deliberately stays OUT of
+# the plan: omlx/cluster/kv_tier.py resolves those per rank, mirroring
+# ThunderMLX's rank-aware storage keys. Keep the env names in sync with
+# omlx/cluster/kv_tier.py and omlx/cluster/inference_worker.py.
+PROMPT_CACHE_SIZE_ENV = "OMLX_CLUSTER_PROMPT_CACHE_SIZE"
+KV_TIER_ENV = "OMLX_CLUSTER_KV_TIER"
+
+# The prompt-cache slot count is the cluster's only cache-capacity bound (byte
+# budgets diverge unequal ranks — see tune_execution_settings), so an override
+# must stay bounded itself for the plan to remain a memory promise.
+MAX_PLAN_PROMPT_CACHE_SIZE = 64
+
+
+def _plan_prompt_cache_size() -> int | None:
+    """The operator's agreed prompt-cache slot count, or None for the pin.
+
+    Read once at plan time. Garbage is a hard error — an unparseable capacity
+    must refuse the plan, never silently widen or shrink a signed bound.
+    """
+
+    raw = os.environ.get(PROMPT_CACHE_SIZE_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{PROMPT_CACHE_SIZE_ENV} must be an integer") from exc
+    if not 1 <= value <= MAX_PLAN_PROMPT_CACHE_SIZE:
+        raise ValueError(
+            f"{PROMPT_CACHE_SIZE_ENV} must be between 1 and "
+            f"{MAX_PLAN_PROMPT_CACHE_SIZE}"
+        )
+    return value
+
+
+def _plan_kv_tier_enabled() -> bool:
+    """Whether the plan opts into the durable rank-local KV tier."""
+
+    return os.environ.get(KV_TIER_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _finite_rate(value: Any, label: str) -> float:
@@ -165,6 +216,7 @@ class ExecutionSettings:
     sampling_rank_only: bool = True
     async_overlap: bool = True
     ring_connections_per_ip: int = 2
+    kv_tier: bool = False
     tuning_reason: str = "balanced profile defaults"
 
     def __post_init__(self) -> None:
@@ -197,6 +249,18 @@ class ExecutionSettings:
                 not isinstance(value, int) or isinstance(value, bool) or value <= 0
             ):
                 raise ValueError(f"{name} must be a positive integer when set")
+        if not isinstance(self.kv_tier, bool):
+            raise ValueError("kv_tier must be a boolean")
+        if self.kv_tier and self.prompt_cache_bytes is not None:
+            # Byte-budget eviction runs on each rank's own resident bytes, and
+            # the same prefix occupies different bytes per pipeline stage —
+            # ranks would retain different entries and hang on the next
+            # unmatched collective. A plan combining the two is refused here,
+            # same as any other invalid plan field.
+            raise ValueError(
+                "kv_tier requires count-based prompt-cache eviction; "
+                "prompt_cache_bytes diverges pipeline ranks"
+            )
         if not isinstance(self.tuning_reason, str) or not self.tuning_reason:
             raise ValueError("tuning_reason is required")
 
@@ -215,6 +279,7 @@ class ExecutionSettings:
             "sampling_rank_only": self.sampling_rank_only,
             "async_overlap": self.async_overlap,
             "ring_connections_per_ip": self.ring_connections_per_ip,
+            "kv_tier": self.kv_tier,
             "tuning_reason": self.tuning_reason,
         }
 
@@ -297,24 +362,44 @@ def tune_execution_settings(
     therefore unsafe for unequal pipeline stages: the same prompt occupies
     different bytes on each Mac, so one rank can retain a prefix another rank
     evicts. The next request then starts at different token offsets and blocks
-    forever in the first unmatched collective.
+    forever in the first unmatched collective. Byte-based eviction stays
+    pinned off on every plan this function produces.
 
-    Keep exactly one shared conversation prefix and disable byte-based
-    eviction. The sequence-count policy is deterministic across ranks and one
-    slot still accelerates the common follow-up-chat path. This correctness
-    invariant applies even when the user disables the other automatic tuning.
+    Count-based eviction carries no such divergence: every rank serves the
+    same requests in the same order from one lockstep serving loop, so equal
+    slot counts keep identical tries on every rank. The default stays pinned
+    to one slot (the common follow-up-chat path). An operator lifts the pin
+    with ``OMLX_CLUSTER_PROMPT_CACHE_SIZE``, read once at plan time so the
+    agreed capacity is a signed plan field: every rank configures the same
+    bounded count, the headroom tiers below can only shrink it, and a plan
+    whose ranks would disagree fails validation instead of drifting.
+
+    ``OMLX_CLUSTER_KV_TIER`` additionally opts the plan into the durable
+    rank-local SSD tier (omlx/cluster/kv_tier.py): prompt-cache artifacts
+    persist per rank so a repeated prompt survives cluster restarts. Restore
+    and eviction there stay rank-local and collective-free, reconciled by a
+    min-prefix vote between requests — never inside the decode/pipeline
+    collectives.
     """
 
-    synchronized_cache = {
-        "prompt_cache_size": 1,
-        "prompt_cache_bytes": None,
-    }
+    cache_size_override = _plan_prompt_cache_size()
+    kv_tier = _plan_kv_tier_enabled()
+
+    def cache_reason(size: int) -> str:
+        if size <= 1:
+            return "synchronized single-prefix cache"
+        return f"synchronized {size}-slot prefix cache"
+
     if not settings.auto_tune or not assignments:
+        cache_size = cache_size_override or 1
         return replace(
             settings,
-            **synchronized_cache,
+            prompt_cache_size=cache_size,
+            prompt_cache_bytes=None,
+            kv_tier=kv_tier,
             tuning_reason=(
-                f"{settings.tuning_reason}; synchronized single-prefix cache"
+                f"{settings.tuning_reason}; {cache_reason(cache_size)}"
+                + ("; rank-local KV tier" if kv_tier else "")
             ),
         )
     minimum_headroom = min(
@@ -334,7 +419,7 @@ def tune_execution_settings(
             settings.decode_concurrency,
             settings.prompt_concurrency,
             settings.prefill_step_size,
-            settings.prompt_cache_size,
+            cache_size_override or settings.prompt_cache_size,
             settings.pipeline_microbatch_size,
         )
         tier = "ample headroom"
@@ -342,6 +427,10 @@ def tune_execution_settings(
     decode = min(settings.decode_concurrency, caps[0])
     prompt = min(settings.prompt_concurrency, caps[1], decode)
     prefill = min(settings.prefill_step_size, caps[2])
+    # The agreed slot count is bounded by the weakest stage's headroom tier:
+    # every extra resident prefix is wired memory on every Mac, and the
+    # smallest rank sets what the cluster may hold.
+    cache_size = min(cache_size_override or 1, caps[3])
     microbatch = min(settings.pipeline_microbatch_size, caps[4], decode)
     connections = settings.ring_connections_per_ip if backend == "ring" else 1
     return replace(
@@ -349,13 +438,16 @@ def tune_execution_settings(
         decode_concurrency=decode,
         prompt_concurrency=prompt,
         prefill_step_size=prefill,
-        **synchronized_cache,
+        prompt_cache_size=cache_size,
+        prompt_cache_bytes=None,
+        kv_tier=kv_tier,
         pipeline_microbatch_size=microbatch,
         ring_connections_per_ip=connections,
         tuning_reason=(
             f"{settings.profile} profile auto-tuned for {tier}; "
             f"minimum stage headroom {minimum_headroom / _GIB:.2f} GiB; "
-            "synchronized single-prefix cache"
+            f"{cache_reason(cache_size)}"
+            + ("; rank-local KV tier" if kv_tier else "")
         ),
     )
 

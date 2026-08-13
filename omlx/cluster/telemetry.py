@@ -648,6 +648,7 @@ def install_server_telemetry(
     assignment: PipelineAssignment | None = None,
     prefill_guard: Any | None = None,
     stall_watchdog: Any | None = None,
+    kv_tier: Any | None = None,
     heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
 ) -> Iterator[RuntimeTelemetry]:
     """Patch the pinned worker's generator at its rank-local queue boundary.
@@ -661,6 +662,13 @@ def install_server_telemetry(
     from each request's prompt, one activity tick per batch step, and one
     channel-share observation per request broadcast (which the watchdog's
     rank-0 idle heartbeat counts).
+
+    ``kv_tier`` is the plan-enabled durable prompt-cache tier
+    (omlx/cluster/kv_tier.py). When present, a full RAM miss in the request
+    preflight consults this rank's SSD artifacts and reconciles the restore
+    length with its peers through the tier's min-prefix vote — between
+    requests, never inside a model collective — and completed conversations
+    autosave through it.
     """
 
     import mlx.core as mx
@@ -750,6 +758,16 @@ def install_server_telemetry(
             """Look up once during caught preflight, then hand it to MLX-LM."""
 
             result = self._fetch_observed(model, tokens)
+            if result[0] is None and kv_tier is not None:
+                # The durable rung of the reuse ladder: the live holder and
+                # the resident slots both missed. A full RAM miss is identical
+                # on every rank (same inserts, same count-based eviction), so
+                # the tier's restore vote fires at the same requests
+                # everywhere. A RAM hit — even a short one — wins over SSD,
+                # and nothing here runs inside a model collective.
+                restored = kv_tier.restore_prompt_cache(tokens, mx_module=mx)
+                if restored is not None:
+                    result = restored
             self._omlx_prefetched: Any = ((model, tuple(tokens)), result)
             return result
 
@@ -767,6 +785,20 @@ def install_server_telemetry(
         def insert_cache(self, *args: Any, **kwargs: Any) -> Any:
             result = super().insert_cache(*args, **kwargs)
             telemetry.observe_cache_state(entries=len(self), nbytes=self.nbytes)
+            if kv_tier is not None:
+                # Autosave the finished conversation to this rank's SSD tier.
+                # The write rides a daemon thread — the serving loop must
+                # never stall on disk — and any failure is only a future
+                # cache miss. Rank-local; no collectives.
+                try:
+                    tokens = kwargs.get("tokens", args[1] if len(args) > 1 else None)
+                    caches = kwargs.get(
+                        "prompt_cache", args[2] if len(args) > 2 else None
+                    )
+                    if isinstance(tokens, list) and isinstance(caches, list):
+                        kv_tier.save_async(tokens, caches)
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug("KV tier autosave handoff failed: %s", exc)
             return result
 
     class CoordinatedGenerationContext(original_generation_context):
@@ -811,7 +843,7 @@ def install_server_telemetry(
 
         def _tokenize(self, tokenizer: Any, request: Any, args: Any) -> Any:
             tokenized = super()._tokenize(tokenizer, request, args)
-            if prefill_guard is None:
+            if prefill_guard is None and kv_tier is None:
                 return tokenized
 
             prompt = tokenized[0]
@@ -819,6 +851,8 @@ def install_server_telemetry(
                 self.model_provider.model_key,
                 prompt,
             )
+            if prefill_guard is None:
+                return tokenized
             try:
                 # MLX-LM catches tokenization failures for batched requests.
                 # Keeping the rank vote inside that boundary rejects just this

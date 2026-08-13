@@ -454,7 +454,9 @@ def test_the_role_and_the_cap_reach_the_rank_through_the_launch_argv(cluster):
         collective_port=9090,
     )
     encoded = argv[argv.index("--plan") + 1]
-    _hash, assignments, _profiles, _tp = decode_worker_contract(encoded)
+    _hash, assignments, _profiles, _tp, _cache_contract = decode_worker_contract(
+        encoded
+    )
     by_rank = {item.rank: item for item in assignments}
 
     assert by_rank[0].node_id == "mbp"
