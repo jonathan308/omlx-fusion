@@ -238,6 +238,34 @@ omlx cluster pipeline-smoke
 small, real, unequal two-rank hybrid Nemotron-H graph and verifies both ranks
 produce the same result. Neither proves the physical Thunderbolt path.
 
+Validation assets live in `scripts/` and authenticate with the API key
+(`OMLX_API_KEY`, falling back to `~/.omlx/settings.json`); each supports
+`--dry-run`:
+
+```bash
+# GPU-vs-CPU kernel known-answer gate — run on every node after a wheel swap
+python -m omlx.custom_kernels.known_answer
+
+# Agent-regime wedge test: short/tool/rapid turns on growing context
+python scripts/agent_traffic_test.py --model <served-model-id> --cycles 10
+
+# Pre-handover certification battery (P0-P9, phases documented in the file)
+python scripts/stress_battery.py --cache-dir ~/.omlx/cache
+
+# Gold restore points: snapshot and roll back certified configuration
+python scripts/gold_restore.py create --name gold-$(date +%Y%m%d)
+python scripts/gold_restore.py list
+python scripts/gold_restore.py restore --name gold-20260813 --dry-run
+```
+
+`agent_traffic_test.py` exits 75 on the first wedge and writes one JSONL
+record per turn. `stress_battery.py` exits 90 when the API is down at start,
+otherwise the number of failed hard phases. `gold_restore.py` snapshots only
+configuration (`settings.json`, `model_settings.json`, the cluster registry)
+with SHA-256 verification, records the certified oMLX version in the manifest,
+and never touches caches, models, or logs; a restore prints the matching
+`pip install "omlx==<version>"` line when the installed package differs.
+
 Plan a model before activating it:
 
 ```bash
@@ -416,6 +444,11 @@ POST   /admin/api/cluster/guidance
 POST   /admin/api/cluster/worker-smoke
 POST   /admin/api/cluster/collective-smoke
 POST   /admin/api/cluster/pipeline-smoke
+POST   /admin/api/cluster/known-answer
+
+Live deployment operations:
+POST   /admin/api/cluster/warmup
+POST   /admin/api/cluster/stop-generation
 
 Staging and deployments:
 POST   /admin/api/cluster/stage
@@ -424,6 +457,19 @@ GET    /admin/api/cluster/deployments
 POST   /admin/api/cluster/deployments
 DELETE /admin/api/cluster/deployments/{deployment_id}
 ```
+
+`/peer-health?include_telemetry=true` additionally attaches each rank's
+marker-published serving digest (weights and memory in use, active requests,
+decode throughput, prompt-cache hit rate) — the per-host cards on the
+dashboard's cluster tab are rendered from it.
+
+`/warmup` drives the same sacrificial first generation supervision runs on
+every boot, on demand against the live deployment endpoint (409 when no
+deployment is ready, 502 when the generation itself fails).
+`/stop-generation` aborts every in-flight request through the engine's own
+`abort_all_requests` — the lockstep cancel on capable workers — and leaves
+the deployment running. `/known-answer` runs the GPU-vs-CPU kernel gate
+in-process on the Mac serving the request.
 
 `/diagnostics` returns a local-only support bundle (status, runtime, registry,
 peer health, staging jobs) with credentials and remote stderr redacted.
