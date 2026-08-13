@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import shutil
+from collections.abc import MutableMapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -159,6 +160,47 @@ def burst_decode_env(mode: str) -> dict[str, str]:
         "OMLX_DECODE_BURST_MAX_STEPS": str(max_steps),
         "OMLX_DECODE_BURST_BUDGET_SINGLE_S": str(single_s),
     }
+
+
+# Single-node insurance against kIOGPUCommandBufferCallbackErrorTimeout: one
+# Metal command buffer executing for >~10 s is killed by the GPU driver
+# (SIGABRT), and a large prefill buffer past ~512 MB trips exactly that —
+# the failure ThunderMLX documented as the real root cause hiding behind its
+# apparent watchdog crashes. Capping work per buffer keeps every buffer
+# inside the driver timeout with async_eval still enabled. The distributed
+# hostfile already injects these same values for every rank (see
+# omlx/cluster/deployment.py); the MLX C++ scheduler reads both variables,
+# so the single-node server process seeds them too.
+METAL_COMMAND_BUFFER_DEFAULTS = {
+    "MLX_MAX_OPS_PER_BUFFER": "16",
+    "MLX_MAX_MB_PER_BUFFER": "512",
+}
+
+# Set to 0/false/off to keep stock MLX scheduling (no caps seeded at all).
+METAL_COMMAND_BUFFER_CAPS_ENV = "OMLX_METAL_COMMAND_BUFFER_CAPS"
+
+
+def apply_metal_command_buffer_defaults(
+    environ: MutableMapping[str, str],
+) -> dict[str, str]:
+    """Seed MLX command-buffer caps for the server process. Opt-out.
+
+    setdefault semantics: an operator who already exported either variable
+    keeps their value untouched (env passthrough), and
+    ``OMLX_METAL_COMMAND_BUFFER_CAPS=0`` restores the previous behavior
+    exactly. Returns the variables this call actually set so the caller can
+    log them.
+    """
+
+    raw = environ.get(METAL_COMMAND_BUFFER_CAPS_ENV, "").strip().lower()
+    if raw and raw not in {"1", "true", "yes", "on"}:
+        return {}
+    applied: dict[str, str] = {}
+    for key, value in METAL_COMMAND_BUFFER_DEFAULTS.items():
+        if not environ.get(key):
+            environ[key] = value
+            applied[key] = value
+    return applied
 
 
 @dataclass

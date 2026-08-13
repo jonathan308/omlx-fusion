@@ -86,8 +86,18 @@ def serve_command(args):
 
     from ._version import __version__
     from . import process_title
-    from .settings import burst_decode_env, init_settings
+    from .settings import (
+        apply_metal_command_buffer_defaults,
+        burst_decode_env,
+        init_settings,
+    )
     from .logging_config import configure_file_logging, AdminStatsAccessFilter
+
+    # Seed MLX command-buffer caps before MLX is first imported below.
+    # Without them a single oversized Metal command buffer can trip the
+    # driver's kIOGPUCommandBufferCallbackErrorTimeout kill; setdefault
+    # semantics keep operator-exported values authoritative.
+    apply_metal_command_buffer_defaults(os.environ)
 
     process_title.set_process_title()
 
@@ -1028,9 +1038,162 @@ def cluster_command(args) -> int:
             return 2 if result["error"] in usage_errors else 1
         return 0
 
+    if action == "apply-wired-limit":
+        from .cluster import host_tune
+
+        plan = host_tune.plan_wired_limit(requested_mb=args.mb, force=args.force)
+        command = (
+            ["sudo", *host_tune.wired_limit_sysctl_command(plan.target_mb)]
+            if plan.action == "apply"
+            else []
+        )
+
+        def _print_wired_plan() -> None:
+            if args.json:
+                print(
+                    json.dumps(
+                        {"plan": plan.to_dict(), "command": command},
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+            else:
+                print(f"Plan:    {plan.detail}")
+                if command:
+                    print(f"Command: {' '.join(command)}")
+
+        if args.dry_run:
+            _print_wired_plan()
+            if command and not args.json:
+                print(
+                    "Nothing was changed. Re-run without --dry-run to apply "
+                    "(sudo required; the sysctl resets at reboot)."
+                )
+            return 0 if plan.action in {"apply", "already_sufficient"} else 2
+
+        if plan.action in {"refused", "needs_force"}:
+            _print_wired_plan()
+            return 2
+
+        if plan.action == "already_sufficient":
+            if args.json:
+                _print_wired_plan()
+            else:
+                print(f"No change: {plan.detail}")
+            return 0
+
+        # action == "apply" — a privileged, system-wide write, so never
+        # silent: an interactive confirmation or an explicit --yes.
+        if not args.yes:
+            if not sys.stdin.isatty():
+                _print_wired_plan()
+                print(
+                    "Refusing to apply without confirmation in a "
+                    "non-interactive shell; re-run with --yes to apply.",
+                    file=sys.stderr,
+                )
+                return 2
+            _print_wired_plan()
+            answer = input("Apply now? This uses sudo and resets at reboot. [y/N] ")
+            if answer.strip().lower() not in {"y", "yes"}:
+                print("Aborted; nothing was changed.")
+                return 1
+
+        sudo_prefix = host_tune.resolve_sudo_prefix()
+        if sudo_prefix is None:
+            print(
+                "sudo is required to write iogpu.wired_limit_mb but is not "
+                "usable here (non-interactive shell, no passwordless rule).",
+                file=sys.stderr,
+            )
+            print(
+                "Re-run from an interactive terminal, or configure a "
+                "passwordless sudo rule for /usr/sbin/sysctl.",
+                file=sys.stderr,
+            )
+            return 1
+
+        result = host_tune.apply_wired_limit(plan, sudo_prefix=sudo_prefix)
+        if args.json:
+            print(
+                json.dumps(
+                    {"plan": plan.to_dict(), "result": result.to_dict()},
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(result.detail)
+        return 0 if result.ok else 1
+
+    if action == "reduce-noise":
+        from .cluster import host_tune
+
+        steps = host_tune.noise_reduction_steps(
+            include_spotlight=args.include_spotlight,
+            quit_safari=args.quit_safari,
+        )
+        if args.dry_run:
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "dry_run": True,
+                            "steps": [
+                                {
+                                    "argv": list(step.argv),
+                                    "needs_sudo": step.needs_sudo,
+                                    "summary": step.summary,
+                                }
+                                for step in steps
+                            ],
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+            else:
+                for step in steps:
+                    prefix = "sudo " if step.needs_sudo else ""
+                    print(f"  {prefix}{' '.join(step.argv)}")
+                print("Nothing was changed. Re-run without --dry-run to apply.")
+            return 0
+
+        sudo_prefix = None
+        if any(step.needs_sudo for step in steps):
+            sudo_prefix = host_tune.resolve_sudo_prefix()
+        results = host_tune.apply_noise_reduction(steps, sudo_prefix=sudo_prefix)
+        failures = [r for r in results if r.outcome == "failed"]
+        skipped = [r for r in results if r.outcome == "skipped_no_sudo"]
+        if args.json:
+            print(
+                json.dumps(
+                    {"results": [r.to_dict() for r in results]},
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            for result in results:
+                print(f"  {result.step.summary}: {result.outcome}")
+            stopped = sum(1 for r in results if r.outcome == "ok")
+            print(
+                f"Noise reduction done: {stopped} stopped, "
+                f"{sum(1 for r in results if r.outcome == 'not_running')} "
+                f"not running, {len(failures)} failed, {len(skipped)} skipped."
+            )
+        if skipped:
+            print(
+                "The Spotlight tier needs sudo; re-run from an interactive "
+                "terminal or configure passwordless sudo.",
+                file=sys.stderr,
+            )
+        return 1 if failures or skipped else 0
+
     print(
         "Unknown cluster action. Available: status, worker-smoke, "
-        "collective-smoke, pipeline-smoke, deepseek-tp-smoke, plan, join",
+        "collective-smoke, pipeline-smoke, deepseek-tp-smoke, plan, join, "
+        "apply-wired-limit, reduce-noise",
         file=sys.stderr,
     )
     return 2
@@ -1528,6 +1691,86 @@ Example directory structure:
         help="Coordinator request deadline in seconds (default: 10)",
     )
     cluster_join_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON",
+    )
+    cluster_wired_parser = cluster_subparsers.add_parser(
+        "apply-wired-limit",
+        help="Apply the suggested iogpu.wired_limit_mb via sudo (opt-in)",
+        description=(
+            "Raise the kernel Metal wired ceiling so a large model can "
+            "wire its weights above Apple's default (~75% of RAM). The "
+            "default target is the same suggestion oMLX logs and shows in "
+            "the admin banner: physical RAM minus 5% (the field-stable "
+            "margin from #2184 — wiring to effective unified-memory "
+            "saturation is the documented path to the 90s watchdogd "
+            "check-in panic). This is NOT automatic: it runs only when "
+            "invoked, needs sudo, asks before applying, and resets at "
+            "reboot."
+        ),
+    )
+    cluster_wired_parser.add_argument(
+        "--mb",
+        type=int,
+        default=None,
+        metavar="MB",
+        help=(
+            "Explicit value instead of the suggestion; 0 restores Apple's "
+            "default"
+        ),
+    )
+    cluster_wired_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow a value above the safe ceiling (physical RAM - 5%%)",
+    )
+    cluster_wired_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Apply without the interactive confirmation prompt",
+    )
+    cluster_wired_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the plan and command without changing anything",
+    )
+    cluster_wired_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON",
+    )
+    cluster_noise_parser = cluster_subparsers.add_parser(
+        "reduce-noise",
+        help="Stop background indexers/analyzers on a dedicated inference Mac",
+        description=(
+            "Best-effort suppression of background CPU/IO/GPU consumers on a "
+            "dedicated inference Mac, so decode cadence and watchdog "
+            "heartbeats are not perturbed. The default tier is unprivileged "
+            "and only stops launchd daemons that restart on demand "
+            "(Siri/knowledge/photo analysis). Nothing here is automatic and "
+            "nothing persists; on a Mac you work on this is the wrong tool."
+        ),
+    )
+    cluster_noise_parser.add_argument(
+        "--include-spotlight",
+        action="store_true",
+        help=(
+            "Also disable Spotlight indexing (mdutil -a -i off) and stop "
+            "mds/mds_stores/corespotlightd; needs sudo"
+        ),
+    )
+    cluster_noise_parser.add_argument(
+        "--quit-safari",
+        action="store_true",
+        help="Also ask Safari to quit via AppleScript",
+    )
+    cluster_noise_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the steps without running them",
+    )
+    cluster_noise_parser.add_argument(
         "--json",
         action="store_true",
         help="Emit machine-readable JSON",
