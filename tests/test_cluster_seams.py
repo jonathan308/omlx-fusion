@@ -363,6 +363,11 @@ def test_post_routes_reject_a_bad_body_rather_than_crashing():
         "/admin/api/cluster/verify-pairing-token",
         # Minting records a pending token in the enrollment store.
         "/admin/api/cluster/join-token",
+        # Operator controls: abort in-flight requests, drive a warmup
+        # generation, and run GPU ops respectively — none take a body.
+        "/admin/api/cluster/stop-generation",
+        "/admin/api/cluster/warmup",
+        "/admin/api/cluster/known-answer",
     }
 
     permissive = {"/admin/api/cluster/guidance"}

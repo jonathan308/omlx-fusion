@@ -1828,11 +1828,19 @@ async def cluster_transports(hosts: str = Query(...)):
 
 
 @router.get("/peer-health")
-async def cluster_peer_health(hosts: str = Query(...), deployment_id: str = ""):
+async def cluster_peer_health(
+    hosts: str = Query(...),
+    deployment_id: str = "",
+    include_telemetry: bool = Query(False),
+):
     """Is every rank still answering?
 
     A collective cannot proceed without all of them, so a peer that has gone
     away should be visible as a stated failure rather than a hung request.
+
+    ``include_telemetry`` additionally attaches the serving digest each rank
+    already publishes in its runtime marker (memory, throughput, cache), so
+    the dashboard can render per-host state from this one channel.
     """
 
     # Validate the complete optional ``user@host`` item before extracting the
@@ -1847,12 +1855,133 @@ async def cluster_peer_health(hosts: str = Query(...), deployment_id: str = ""):
         hosts_by_rank,
         deployment_id=deployment_id,
         require_heartbeat=bool(deployment_id),
+        include_telemetry=include_telemetry,
     )
     return {
         "peers": [item.to_dict() for item in health],
         "healthy": all(item.healthy for item in health),
         "summary": describe_failure(health),
     }
+
+
+def _loaded_distributed_engines(pool: Any) -> list[tuple[str, Any]]:
+    """Loaded engines backing a distributed deployment, as (model_id, engine)."""
+
+    engines: list[tuple[str, Any]] = []
+    for model_id in pool.get_loaded_model_ids():
+        entry = pool.get_entry(model_id)
+        engine = getattr(entry, "engine", None)
+        if callable(getattr(engine, "cluster_status", None)):
+            engines.append((model_id, engine))
+    return engines
+
+
+@router.post("/stop-generation")
+async def cluster_stop_generation():
+    """Abort every in-flight request on the active distributed deployment.
+
+    This is the operator's stop button for a running cluster. It rides the
+    engine's own ``abort_all_requests`` — the lockstep cancel on capable
+    workers plus the client disconnect that cancels the rank-zero handlers —
+    rather than a parallel cancel path, so every rank stops at the same token
+    boundary.
+    """
+
+    engines = _loaded_distributed_engines(_engine_pool())
+    if not engines:
+        raise HTTPException(
+            status_code=409,
+            detail="no distributed deployment is currently loaded",
+        )
+    aborted = 0
+    deployment_ids: list[str] = []
+    for _model_id, engine in engines:
+        abort = getattr(engine, "abort_all_requests", None)
+        if not callable(abort):
+            continue
+        aborted += max(0, int(await abort()))
+        status = engine.cluster_status()
+        deployment_id = status.get("deployment_id")
+        if isinstance(deployment_id, str) and deployment_id:
+            deployment_ids.append(deployment_id)
+    return {
+        "aborted": aborted,
+        "engines": len(engines),
+        "deployment_ids": deployment_ids,
+    }
+
+
+@router.post("/warmup")
+async def cluster_warmup(
+    max_tokens: int = Query(8, ge=1, le=64),
+    timeout: float = Query(300.0, ge=1.0, le=900.0),
+):
+    """Drive one tiny generation through the active deployment's endpoint.
+
+    This is the same sacrificial-warmup path supervision runs on every boot:
+    it pays JIT compilation, cache allocation, and the first cross-rank
+    collectives inside a bounded call, doubling as a live "is the cluster
+    actually servable" check from the dashboard.
+    """
+
+    from .supervision import WarmupFailedError, run_startup_warmup
+
+    engines = _loaded_distributed_engines(_engine_pool())
+    if not engines:
+        raise HTTPException(
+            status_code=409,
+            detail="no distributed deployment is currently loaded",
+        )
+    model_id, engine = engines[0]
+    status = engine.cluster_status()
+    endpoint = status.get("endpoint")
+    phase = status.get("phase")
+    if not isinstance(endpoint, str) or not endpoint:
+        raise HTTPException(
+            status_code=409,
+            detail="the distributed deployment has no serving endpoint yet",
+        )
+    if phase != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail=f"the distributed deployment is not ready (phase: {phase})",
+        )
+    try:
+        result = await asyncio.to_thread(
+            run_startup_warmup,
+            endpoint,
+            max_tokens=max_tokens,
+            timeout_s=timeout,
+        )
+    except WarmupFailedError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {
+        **result,
+        "model_id": model_id,
+        "deployment_id": status.get("deployment_id"),
+    }
+
+
+@router.post("/known-answer")
+async def cluster_known_answer():
+    """Run the GPU-vs-CPU kernel known-answer gate on this Mac.
+
+    A corrupt Metal kernel produces token salad at normal speed, so a
+    deployment should only be trusted after the ops the hot paths exercise
+    agree between the GPU and CPU streams. This runs the gate in-process; the
+    same check is scriptable on every node with
+    ``python -m omlx.custom_kernels.known_answer``.
+    """
+
+    from ..custom_kernels.known_answer import run_checks
+
+    try:
+        return await asyncio.to_thread(run_checks)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"known-answer gate could not run: {type(exc).__name__}: {exc}",
+        ) from exc
 
 
 @router.get("/link-status")

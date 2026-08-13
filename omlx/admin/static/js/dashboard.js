@@ -307,6 +307,12 @@
             clusterPlanTensorParallelSize: 1,
             clusterPeerHealth: null,
             clusterPeerHealthLoading: false,
+            clusterWarmupLoading: false,
+            clusterWarmupResult: null,
+            clusterStopGenerationLoading: false,
+            clusterStopGenerationResult: null,
+            clusterKnownAnswerLoading: false,
+            clusterKnownAnswerResult: null,
             clusterStagingResult: null,
             clusterStagingLoading: false,
             clusterGuidance: null,
@@ -1212,11 +1218,15 @@
             // Runtime stays live every two seconds. Discovery repeats every ten
             // seconds even after the first worker appears, so three- and
             // four-node clusters grow automatically when another Mac starts.
+            // Peer health (and with it the per-host telemetry the node cards
+            // render) rides the slower tick: it costs an SSH round trip per
+            // peer and must not run at the render rate.
             async refreshClusterExperience() {
                 await this.loadClusterRuntime();
                 this._clusterDiscoveryRefreshCounter += 1;
                 if (this._clusterDiscoveryRefreshCounter < 5) return;
                 this._clusterDiscoveryRefreshCounter = 0;
+                this.loadClusterPeerHealth();
                 await this.discoverClusterPeers();
                 await this.initializeClusterSetup();
             },
@@ -2047,7 +2057,9 @@
 
             // Is every rank still answering? A collective cannot proceed
             // without all of them, so a peer that has gone away should show as a
-            // stated failure rather than a request that never returns.
+            // stated failure rather than a request that never returns. The same
+            // channel carries each rank's marker telemetry, which is what the
+            // per-host cards render — no second probe is needed.
             async loadClusterPeerHealth() {
                 if (this.clusterPeerHealthLoading) return;
                 const peers = [
@@ -2060,6 +2072,7 @@
                     const query = new URLSearchParams({
                         hosts: peers.join(','),
                         deployment_id: (this.clusterDeployments[0] || {}).deployment_id || '',
+                        include_telemetry: 'true',
                     });
                     const response = await fetch(
                         `/admin/api/cluster/peer-health?${query}`
@@ -2070,6 +2083,109 @@
                     this.clusterPeerHealth = null;
                 } finally {
                     this.clusterPeerHealthLoading = false;
+                }
+            },
+
+            // The per-host serving digest one rank published in its marker,
+            // or null before the deployment's first heartbeat arrives.
+            clusterPeerTelemetry(rank) {
+                const peers = this.clusterPeerHealth?.peers || [];
+                const peer = peers.find(item => Number(item.rank) === Number(rank));
+                return peer?.telemetry || null;
+            },
+
+            // Abort every in-flight request on the running deployment. This
+            // rides the engine's own abort path (lockstep cancel on capable
+            // workers); the cluster itself keeps running.
+            async stopClusterGeneration() {
+                if (this.clusterStopGenerationLoading) return;
+                this.clusterStopGenerationLoading = true;
+                this.clusterStopGenerationResult = null;
+                this.clusterError = '';
+                try {
+                    const response = await fetch('/admin/api/cluster/stop-generation', {
+                        method: 'POST',
+                    });
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) {
+                        throw new Error(await this.clusterResponseError(
+                            response,
+                            'Could not stop generation',
+                        ));
+                    }
+                    const result = await response.json();
+                    this.clusterStopGenerationResult = `${result.aborted} request` +
+                        (result.aborted === 1 ? '' : 's') + ' stopped';
+                    setTimeout(() => { this.clusterStopGenerationResult = null; }, 6000);
+                } catch (error) {
+                    this.clusterError = error?.message || 'Could not stop generation';
+                } finally {
+                    this.clusterStopGenerationLoading = false;
+                }
+            },
+
+            // The same sacrificial first generation supervision runs on every
+            // boot, on demand: pays JIT and first-collective cost now, and
+            // doubles as a live "is the cluster servable" check.
+            async runClusterWarmup() {
+                if (this.clusterWarmupLoading) return;
+                this.clusterWarmupLoading = true;
+                this.clusterWarmupResult = null;
+                this.clusterError = '';
+                try {
+                    const response = await fetch('/admin/api/cluster/warmup', {
+                        method: 'POST',
+                    });
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) {
+                        throw new Error(await this.clusterResponseError(
+                            response,
+                            'Warmup failed',
+                        ));
+                    }
+                    const result = await response.json();
+                    this.clusterWarmupResult = `Warmed up · ${result.completion_tokens} tokens`;
+                    setTimeout(() => { this.clusterWarmupResult = null; }, 8000);
+                } catch (error) {
+                    this.clusterError = error?.message || 'Warmup failed';
+                } finally {
+                    this.clusterWarmupLoading = false;
+                }
+            },
+
+            // GPU-vs-CPU known-answer gate on this Mac's MLX build. A corrupt
+            // Metal kernel makes token salad at normal speed; run it after any
+            // wheel swap, before trusting a deployment.
+            async runClusterKnownAnswer() {
+                if (this.clusterKnownAnswerLoading) return;
+                this.clusterKnownAnswerLoading = true;
+                this.clusterKnownAnswerResult = null;
+                this.clusterError = '';
+                try {
+                    const response = await fetch('/admin/api/cluster/known-answer', {
+                        method: 'POST',
+                    });
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) {
+                        throw new Error(await this.clusterResponseError(
+                            response,
+                            'Known-answer gate failed to run',
+                        ));
+                    }
+                    this.clusterKnownAnswerResult = await response.json();
+                } catch (error) {
+                    this.clusterError = error?.message || 'Known-answer gate failed to run';
+                } finally {
+                    this.clusterKnownAnswerLoading = false;
                 }
             },
 
