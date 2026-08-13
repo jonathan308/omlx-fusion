@@ -84,7 +84,15 @@ def _cache_dependency(cache_entry: Any, value: Any, mx: Any) -> None:
 def _install_nemotron_h_pipeline(
     assignments: Sequence[PipelineAssignment],
 ) -> Iterator[bool]:
-    """Teach the pinned MLX-LM Nemotron-H model the standard pipeline contract."""
+    """Teach the pinned MLX-LM Nemotron-H model the standard pipeline contract.
+
+    Composition with the native-MTP patch (patches/mlx_lm_mtp/nemotron_h_model):
+    either side may install last. This hook's ``pipeline_call`` accepts and
+    threads ``n_confirmed`` to M blocks, and the MTP patch's own backbone
+    ``__call__`` carries these same collectives — so whichever ``__call__``
+    wins the ordering, the active implementation satisfies both contracts
+    instead of one clobbering the other.
+    """
 
     try:
         import mlx.core as mx
@@ -139,6 +147,7 @@ def _install_nemotron_h_pipeline(
         pipeline_model: Any,
         inputs: Any,
         cache: Any | None = None,
+        n_confirmed: int = 0,
     ) -> Any:
         hidden_states = pipeline_model.embeddings(inputs)
         pipeline_rank = pipeline_model.pipeline_rank
@@ -174,7 +183,21 @@ def _install_nemotron_h_pipeline(
             else:
                 layer_cache = None
             mask = attention_mask if layer.block_type == "*" else ssm_mask
-            hidden_states = layer(hidden_states, mask=mask, cache=layer_cache)
+            if layer.block_type == "M" and n_confirmed:
+                # Composed with the native-MTP patch: its NemotronHBlock /
+                # Mamba mixer accept ``n_confirmed`` for draft-verify windows,
+                # and its Model.__call__ always passes the kwarg through.
+                # Stock blocks never see a nonzero value, so the kwarg is
+                # only forwarded when it actually splits the sequence — this
+                # hook may install over either block implementation.
+                hidden_states = layer(
+                    hidden_states,
+                    mask=mask,
+                    cache=layer_cache,
+                    n_confirmed=n_confirmed,
+                )
+            else:
+                hidden_states = layer(hidden_states, mask=mask, cache=layer_cache)
 
         if pipeline_rank != 0:
             hidden_states = mx.distributed.send(

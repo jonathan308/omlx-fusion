@@ -196,14 +196,64 @@ def _patch_backbone(nh):
     create_attention_mask = nh.create_attention_mask
     create_ssm_mask = nh.create_ssm_mask
 
+    try:
+        # Same helper the cluster worker's own pipeline hook uses; keeps the
+        # send edge alive in the lazy graph for either MLX cache family.
+        from omlx.cluster.pipeline_compat import _cache_dependency
+    except Exception:  # standalone use outside the omlx package
+
+        def _cache_dependency(cache_entry, value, mx_mod):
+            if hasattr(cache_entry, "keys"):
+                keys = cache_entry.keys
+                if keys is not None:
+                    cache_entry.keys = mx_mod.depends(keys, value)
+                return
+            try:
+                first = cache_entry[0]
+            except (IndexError, KeyError, TypeError):
+                return
+            if first is not None:
+                cache_entry[0] = mx_mod.depends(first, value)
+
     def __call__(self, inputs, cache=None, n_confirmed=0):
         h = self.embeddings(inputs)
+
+        # Pipeline-parallel (omlx/cluster worker): the worker's pipeline
+        # compat hook sets ``pipeline_rank`` / ``pipeline_size`` /
+        # ``start_idx`` / ``end_idx`` via ``apply_pipeline_assignment`` and
+        # blanks non-owned layers with None sentinels. This body carries the
+        # same recv -> stage-local layers -> send -> all_gather contract as
+        # the hook's ``pipeline_call``, so whichever of the two installs
+        # last, the active ``__call__`` satisfies both the pipeline
+        # collectives and the MTP kwargs. Single-node none of those attrs
+        # exist: rank 0 / size 1 / the full layer list — byte-identical to
+        # the pre-pipeline body.
+        pipeline_rank = getattr(self, "pipeline_rank", 0)
+        pipeline_size = getattr(self, "pipeline_size", 1)
+        layers = self.layers[getattr(self, "start_idx", 0):getattr(self, "end_idx", None)]
+
         if cache is None:
-            cache = [None] * len(self.layers)
-        attn_mask = create_attention_mask(h, cache[self.fa_idx])
-        ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
+            cache = [None] * len(layers)
+        # fa_idx/ssm_idx index the cache list (M/* blocks only). The pipeline
+        # hook recomputes them stage-locally, and a stage may hold no
+        # attention or no mamba block at all.
+        attn_mask = (
+            create_attention_mask(h, cache[self.fa_idx])
+            if self.fa_idx is not None
+            else None
+        )
+        ssm_mask = (
+            create_ssm_mask(h, cache[self.ssm_idx])
+            if self.ssm_idx is not None
+            else None
+        )
+
+        # Receive from the previous process in the pipeline
+        if pipeline_rank < pipeline_size - 1:
+            h = mx.distributed.recv_like(h, pipeline_rank + 1)
+
         cc = 0
-        for layer in self.layers:
+        for layer in layers:
             if layer.block_type in ("M", "*"):
                 c = cache[cc]
                 cc += 1
@@ -214,6 +264,16 @@ def _patch_backbone(nh):
                 h = layer(h, mask=mask, cache=c, n_confirmed=n_confirmed)
             else:
                 h = layer(h, mask=mask, cache=c)
+
+        # Send to the next process in the pipeline
+        if pipeline_rank != 0:
+            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
+            if cache:
+                _cache_dependency(cache[-1], h, mx)
+
+        # Broadcast h while keeping it in the graph
+        if pipeline_size > 1:
+            h = mx.distributed.all_gather(h)[: h.shape[0]]
         return self.norm_f(h)
 
     __call__._omlx_nh_mtp = True
