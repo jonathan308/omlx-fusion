@@ -95,9 +95,10 @@ def filler_prompt(records: int) -> str:
 class HttpxTransport:
     """The battery's server access: chat (stream or not), abandon, GET."""
 
-    def __init__(self, base_url: str, key: str) -> None:
+    def __init__(self, base_url: str, key: str, model: str) -> None:
         self.base_url = base_url.rstrip("/")
         self.key = key
+        self.model = model
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.key}"} if self.key else {}
@@ -120,7 +121,7 @@ class HttpxTransport:
     ) -> dict[str, Any]:
         started = time.monotonic()
         body: dict[str, Any] = {
-            "model": "default",
+            "model": self.model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
@@ -166,7 +167,7 @@ class HttpxTransport:
             "POST",
             self.base_url + "/v1/chat/completions",
             json={
-                "model": "default",
+                "model": self.model,
                 "messages": messages,
                 "max_tokens": max_tokens,
                 "temperature": temperature,
@@ -534,6 +535,7 @@ class Battery:
 def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
+    parser.add_argument("--model", required=True, help="served model id to drive")
     parser.add_argument(
         "--settings",
         type=Path,
@@ -588,12 +590,12 @@ def main(argv: list[str] | None = None, *, transport: Any = None, sleep: Any = t
             ("P7", f"idle survival: /health for {args.idle_seconds}s"),
             ("P9", "scorecard from /health and /api/status"),
         ]
-        print(f"STRESS BATTERY plan against {args.base_url}:")
+        print(f"STRESS BATTERY plan against {args.base_url} (model={args.model}):")
         for name, description in phases:
             print(f"  {name}: {description}")
         return 0
     if transport is None:
-        transport = HttpxTransport(args.base_url, api_key(args.settings))
+        transport = HttpxTransport(args.base_url, api_key(args.settings), args.model)
     return Battery(transport, args, sleep=sleep).run()
 
 

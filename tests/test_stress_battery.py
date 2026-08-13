@@ -73,6 +73,7 @@ class FakeTransport:
 def _fast_args(extra=()):
     return stress_battery._arguments(
         [
+            "--model", "m",
             "--hammer-cycles", "2",
             "--decode-tokens", "100",
             "--min-decode-tps", "5",
@@ -95,7 +96,7 @@ def _results(battery_results):
 
 
 def test_dry_run_lists_every_phase(capsys):
-    rc = stress_battery.main(["--dry-run"], transport=FakeTransport())
+    rc = stress_battery.main(["--model", "m", "--dry-run"], transport=FakeTransport())
 
     assert rc == 0
     out = capsys.readouterr().out
@@ -225,6 +226,7 @@ def test_p6_reports_each_unanswered_request():
 def test_main_uses_the_injected_transport(capsys):
     rc = stress_battery.main(
         [
+            "--model", "m",
             "--hammer-cycles", "1",
             "--decode-tokens", "50",
             "--min-decode-tps", "5",

@@ -250,7 +250,7 @@ python -m omlx.custom_kernels.known_answer
 python scripts/agent_traffic_test.py --model <served-model-id> --cycles 10
 
 # Pre-handover certification battery (P0-P9, phases documented in the file)
-python scripts/stress_battery.py --cache-dir ~/.omlx/cache
+python scripts/stress_battery.py --model <served-model-id> --cache-dir ~/.omlx/cache
 
 # Gold restore points: snapshot and roll back certified configuration
 python scripts/gold_restore.py create --name gold-$(date +%Y%m%d)
