@@ -454,6 +454,261 @@ class TestQwen35MtpNormShift:
         assert plan["mtp.norm.weight"]["transform"] == "add"
 
 
+class TestQwen35PipelineAwareness:
+    """The patched ``Qwen3_5TextModel.__call__`` must carry the stock pipeline
+    contract: recv from the previous stage, iterate only stage-owned layers,
+    send on, and join the final all_gather.
+
+    The MTP patch replaces the whole forward and is applied for sanitize
+    correctness on ANY head-declaring checkpoint — even with mtp_enabled=False
+    (utils/model_loading.py) — so when the body iterated ``self.layers`` with
+    no collectives, a Qwen3.6-MTP checkpoint failed cluster activation
+    regardless of the MTP gate: ``pipeline()`` blanks non-owned layers with
+    None sentinels (mlx_lm/models/pipeline.py) and the first forward raised
+    TypeError on any rank with start_idx > 0.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _apply(self):
+        try:
+            from omlx.patches.mlx_lm_mtp import (
+                is_mtp_active,
+                qwen35_model,
+                set_mtp_active,
+            )
+        except ImportError:
+            pytest.skip("omlx.patches.mlx_lm_mtp not importable")
+        if not qwen35_model.apply():
+            pytest.skip("qwen35_model patch refused to apply")
+        prev = is_mtp_active()
+        # The pipeline bug bit even with the MTP gate off, so build these
+        # models the way cluster activation of an MTP checkpoint does.
+        set_mtp_active(False)
+        yield
+        set_mtp_active(prev)
+
+    class _Group:
+        def __init__(self, rank, size):
+            self._rank, self._size = rank, size
+
+        def rank(self):
+            return self._rank
+
+        def size(self):
+            return self._size
+
+    @staticmethod
+    def _stub_collectives(monkeypatch, calls=None):
+        """Let a single process run one rank's forward without a peer.
+
+        Only the transport is faked; every line of the forward under test runs.
+        """
+
+        import mlx.core as mx
+
+        def record(name):
+            def stub(x, *_a, **_k):
+                if calls is not None:
+                    calls.append(name)
+                return x
+
+            return stub
+
+        monkeypatch.setattr(mx.distributed, "send", record("send"))
+        monkeypatch.setattr(mx.distributed, "recv_like", record("recv"))
+        monkeypatch.setattr(mx.distributed, "all_gather", record("all_gather"))
+
+    @staticmethod
+    def _tiny_model(full_attention_interval=2):
+        import mlx.core as mx
+        from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+
+        mx.random.seed(0)
+        args = TextModelArgs.from_dict(
+            {
+                "model_type": "qwen3_5",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "vocab_size": 256,
+                "linear_num_value_heads": 2,
+                "linear_num_key_heads": 2,
+                "linear_key_head_dim": 16,
+                "linear_value_head_dim": 16,
+                "linear_conv_kernel_dim": 3,
+                "full_attention_interval": full_attention_interval,
+                "tie_word_embeddings": True,
+                "rms_norm_eps": 1e-5,
+                "head_dim": 32,
+                "rope_theta": 1000.0,
+                "partial_rotary_factor": 0.5,
+                "max_position_embeddings": 128,
+                "mtp_num_hidden_layers": 1,
+            }
+        )
+        model = TextModel(args)
+        mx.eval(model.parameters())
+        return model
+
+    def test_installed_body_carries_the_pipeline_primitives(self):
+        """Source contract: the active forward must not be a single-node body."""
+        import inspect
+
+        from mlx_lm.models.qwen3_5 import Qwen3_5TextModel
+
+        src = inspect.getsource(Qwen3_5TextModel.__call__)
+        assert "recv_like" in src
+        assert "all_gather" in src
+        assert "pipeline_layers" in src
+
+    def test_stage_forwards_run_collectives_and_stage_layers_only(
+        self, monkeypatch
+    ):
+        """Each rank must issue exactly its stage's collectives and compute
+        only its own layers. mlx-lm's protocol: the FIRST layers live on the
+        highest rank, which sends downstream; rank 0 holds the LAST layers
+        (start_idx > 0), receives, and produces the output — the old body
+        died on its first None sentinel and never issued a collective."""
+        import mlx.core as mx
+
+        tokens = mx.array([[1, 2, 3]], dtype=mx.uint32)
+        # (rank, expected collectives, expected start_idx)
+        for rank, expected_calls, expected_start in (
+            (1, ["send", "all_gather"], 0),
+            (0, ["recv", "all_gather"], 2),
+        ):
+            model = self._tiny_model()
+            inner = model.model
+            inner.pipeline(self._Group(rank, 2))
+            assert inner.start_idx == expected_start
+
+            calls = []
+            self._stub_collectives(monkeypatch, calls)
+            cache = model.make_cache()  # stage-local: [ArraysCache, KVCache]
+            assert len(cache) == 2
+
+            hidden = inner(tokens, cache=cache)
+            mx.eval(hidden)
+
+            assert calls == expected_calls, f"rank {rank}"
+            # Pre-norm hidden, all positions — the PR 990 contract the
+            # wrapping TextModel.__call__ applies ``norm`` on top of.
+            assert hidden.shape == (1, 3, 64)
+            assert not mx.allclose(hidden, inner.norm(hidden))
+
+    def test_rank_zero_recomputes_mask_indices_stage_locally(self):
+        """The stock pipeline() rewrites fa_idx/ssm_idx against the stage-local
+        layer view; the patched forward must consume those, not the global
+        defaults — a stage can hold no attention or no linear layer at all."""
+        model = self._tiny_model(full_attention_interval=4)
+        inner = model.model
+        # Global view over [L, L, L, A]: first linear at 0, first attention at 3.
+        assert (inner.ssm_idx, inner.fa_idx) == (0, 3)
+        inner.pipeline(self._Group(0, 2))  # stage: [linear(2), attention(3)]
+        assert any(layer is None for layer in inner.layers)
+        # Stage-local view over [L, A]: attention moves from global 3 to local 1.
+        assert (inner.ssm_idx, inner.fa_idx) == (0, 1)
+
+    def test_single_node_forward_attempts_no_collectives(self, monkeypatch):
+        """One node has no peer: send/recv/all_gather must never fire, and
+        the forward must be sane with the MTP head unattached."""
+        import mlx.core as mx
+
+        model = self._tiny_model()
+        assert model.model.pipeline_size == 1
+        assert model.model.start_idx == 0
+        assert not hasattr(model, "mtp")  # gate off — patch still active
+
+        calls = []
+        self._stub_collectives(monkeypatch, calls)
+        logits = model(mx.array([[1, 2, 3, 4]], dtype=mx.uint32), cache=model.make_cache())
+        mx.eval(logits)
+
+        assert calls == [], f"single node attempted {calls}"
+        assert logits.shape == (1, 4, 256)
+        assert bool(mx.all(mx.isfinite(logits)))
+
+    def test_partial_rollback_pairs_caches_with_stage_local_layers(
+        self, monkeypatch
+    ):
+        """On a rank with start_idx > 0 the old rollback zipped the FULL
+        None-prefixed layer list against the stage-local cache list, shifting
+        every pairing — GDN caches were handled as if they were KV caches."""
+        import mlx.core as mx
+
+        model = self._tiny_model()
+        model.model.pipeline(self._Group(0, 2))  # stage: [linear(2), attn(3)]
+        self._stub_collectives(monkeypatch)
+
+        prefill = mx.array([[5, 6, 7, 8]], dtype=mx.uint32)
+        window = mx.array([[9, 10, 11]], dtype=mx.uint32)  # confirmed + 2 drafts
+
+        # Cache A: prefill, then a verify window that snapshots GDN state.
+        cache_a = model.make_cache()
+        model(prefill, cache=cache_a)
+        model(window, cache=cache_a, n_confirmed=1)
+        gdn_a, kv_a = cache_a  # stage-local order: linear first, then attention
+        assert kv_a.offset == 4 + 3
+        assert gdn_a.rollback_state is not None
+
+        # Cache B: prefill + only the kept prefix (the confirmed token).
+        cache_b = model.make_cache()
+        model(prefill, cache=cache_b)
+        model(window[:, :1], cache=cache_b)
+
+        assert model.mtp_partial_rollback(cache_a, accepted=0, num_drafts=2) is True
+
+        # The KV cache trims the two rejected drafts; the GDN cache replays
+        # the kept prefix from its own stash — identical to cache B.
+        assert kv_a.offset == cache_b[1].offset == 4 + 1
+        mx.eval(gdn_a[0], gdn_a[1], cache_b[0][0], cache_b[0][1])
+        assert mx.allclose(gdn_a[0], cache_b[0][0], atol=1e-5)
+        assert mx.allclose(gdn_a[1], cache_b[0][1], atol=1e-4, rtol=1e-3)
+        assert gdn_a.rollback_state is None
+        assert gdn_a._mtp_draft_stash is None
+
+    def test_single_node_output_matches_pre_pipeline_body(self):
+        """Parity: the pipeline-aware body must be byte-identical single-node
+        to the body it replaced (commit e2c05d80, no pipeline handling)."""
+        import mlx.core as mx
+        from mlx_lm.models import qwen3_5 as q35
+
+        model = self._tiny_model()
+        tokens = mx.array([[3, 1, 4, 1, 5]], dtype=mx.uint32)
+
+        def pre_pipeline_call(
+            self, inputs, cache=None, input_embeddings=None, n_confirmed=0
+        ):
+            # Verbatim pre-fix body, reinstalled as the reference below.
+            if input_embeddings is not None:
+                hidden_states = input_embeddings
+            else:
+                hidden_states = self.embed_tokens(inputs)
+            if cache is None:
+                cache = [None] * len(self.layers)
+            fa_mask = q35.create_attention_mask(hidden_states, cache[self.fa_idx])
+            ssm_mask = q35.create_ssm_mask(hidden_states, cache[self.ssm_idx])
+            for layer, c in zip(self.layers, cache):
+                mask = ssm_mask if layer.is_linear else fa_mask
+                hidden_states = layer(
+                    hidden_states, mask=mask, cache=c, n_confirmed=n_confirmed
+                )
+            return hidden_states
+
+        cls = q35.Qwen3_5TextModel
+        patched_call = cls.__call__
+        cls.__call__ = pre_pipeline_call
+        try:
+            reference = model.model(tokens, cache=model.make_cache())
+        finally:
+            cls.__call__ = patched_call
+        current = model.model(tokens, cache=model.make_cache())
+        mx.eval(reference, current)
+        assert mx.array_equal(reference, current)
+
+
 class TestQwen35MoeSanitize:
     """Regression tests for the MoE MTP sanitize patch (qwen3_5_moe.Model)."""
 

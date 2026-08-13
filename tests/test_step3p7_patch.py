@@ -341,3 +341,39 @@ def test_step3p7_mtp_sanitize_tracks_streaming_norm_transforms(
     assert (
         converted["language_model.mtp.enorm.weight"].transform == "add_if_mean_lt_0_5"
     )
+
+
+def test_step3p7_is_not_pipeline_loadable_so_mtp_needs_no_collectives():
+    """Guard: mlx-lm fail-closes pipeline loading for step3p5/step3p7.
+
+    mlx-lm's distributed loader gates on
+    ``hasattr(model, "model") and hasattr(model.model, "pipeline")`` and
+    raises "The model does not support pipelining" otherwise. Neither
+    ``step3p5.Model.model`` (``Step3p5Model``) nor the step3p7 wrapper
+    (no ``.model`` at all) passes that gate, and oMLX's cluster layer has no
+    compat hook for this architecture — so the Step-3.7 MTP patch's delegate
+    forward can never be reached under pipeline serving, and intentionally
+    carries no recv/send/all_gather handling. If upstream step3p5 ever grows
+    pipeline support, this test must fail loudly: the MTP wrapper
+    (patches/mlx_lm_mtp/step3p7_model.py) then needs the same pipeline-aware
+    treatment as qwen35/nemotron_h.
+    """
+    from omlx.patches.step3p7 import apply_step3p7_patch
+
+    apply_step3p7_patch()
+
+    from mlx_lm.models import step3p5, step3p7
+
+    lm = step3p5.Model(step3p5.ModelArgs.from_dict(_text_config()))
+    has_pipelining = hasattr(lm, "model") and hasattr(lm.model, "pipeline")
+    assert not has_pipelining, (
+        "step3p5 gained a pipeline entrypoint — the Step-3.7 MTP patch's "
+        "forward must now carry the pipeline contract (recv/send/all_gather, "
+        "stage-local layer view) before cluster serving is safe"
+    )
+
+    wrapper = step3p7.Model(
+        step3p7.ModelArgs(model_type="step3p7", text_config=_text_config())
+    )
+    has_pipelining = hasattr(wrapper, "model") and hasattr(wrapper.model, "pipeline")
+    assert not has_pipelining

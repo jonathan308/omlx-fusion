@@ -286,7 +286,15 @@ def _patch_partial_rollback(nh):
         return
 
     def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
-        layers = self.backbone.layers
+        # Stage-local view: under pipeline-parallel serving ``backbone.layers``
+        # carries None sentinels before ``start_idx`` while ``cache`` holds
+        # only this rank's M/* entries, so the full list would shift every
+        # layer/cache pairing (and AttributeError on the first None). The
+        # slice is the full layer list single-node — unchanged from before.
+        backbone = self.backbone
+        layers = backbone.layers[
+            getattr(backbone, "start_idx", 0):getattr(backbone, "end_idx", None)
+        ]
         trim_n = num_drafts - accepted
         keep = 1 + accepted  # confirmed token + accepted drafts
 

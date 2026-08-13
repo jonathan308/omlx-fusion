@@ -400,6 +400,8 @@ def _patch_qwen3_5_text_model(q35: Any) -> None:
     if _is_our_method(cls, "__call__", "_omlx_mtp_call_marker"):
         return
 
+    import mlx.core as mx
+
     create_attention_mask = q35.create_attention_mask
     create_ssm_mask = q35.create_ssm_mask
 
@@ -415,17 +417,58 @@ def _patch_qwen3_5_text_model(q35: Any) -> None:
         else:
             hidden_states = self.embed_tokens(inputs)
 
+        # Pipeline-parallel (omlx/cluster worker): the body below mirrors the
+        # stock ``Qwen3_5TextModel.__call__`` exactly — stage-local layer view
+        # (``pipeline()`` blanks non-owned layers with None sentinels), recv
+        # from the previous stage, send to the next, final all_gather — plus
+        # the PR 990 deltas (``n_confirmed`` threading, pre-norm return).
+        # Single-node ``pipeline_rank``/``pipeline_size`` are the PipelineMixin
+        # defaults 0/1 and ``pipeline_layers`` is the full layer list, so the
+        # non-distributed path is byte-identical to the pre-pipeline body.
+        pipeline_rank = self.pipeline_rank
+        pipeline_size = self.pipeline_size
+
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(self.pipeline_layers)
 
-        fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
-        ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
+        # fa_idx/ssm_idx are stage-local once ``pipeline()`` has run (the
+        # stock override recomputes them against ``pipeline_layers``) and a
+        # stage may hold no full-attention or no linear layer at all.
+        fa_mask = None
+        ssm_mask = None
+        if self.fa_idx is not None:
+            fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
+        if self.ssm_idx is not None:
+            ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
 
-        for layer, c in zip(self.layers, cache):
+        # Receive from the previous process in the pipeline
+        if pipeline_rank < pipeline_size - 1:
+            hidden_states = mx.distributed.recv_like(
+                hidden_states, (pipeline_rank + 1)
+            )
+
+        for layer, c in zip(self.pipeline_layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(
                 hidden_states, mask=mask, cache=c, n_confirmed=n_confirmed
             )
+
+        # Send to the next process in the pipeline
+        if pipeline_rank != 0:
+            hidden_states = mx.distributed.send(
+                hidden_states, (pipeline_rank - 1) % pipeline_size
+            )
+            if cache[-1] is not None:
+                if hasattr(cache[-1], "keys"):
+                    cache[-1].keys = mx.depends(cache[-1].keys, hidden_states)
+                else:
+                    cache[-1][0] = mx.depends(cache[-1][0], hidden_states)
+
+        # Broadcast h while keeping it in the graph
+        if pipeline_size > 1:
+            hidden_states = mx.distributed.all_gather(hidden_states)[
+                : hidden_states.shape[0]
+            ]
 
         # PR 990: return pre-norm hidden so the MTP head can fuse it. The
         # wrapping ``TextModel.__call__`` applies ``self.model.norm`` on top
@@ -561,7 +604,12 @@ def _patch_text_model(q35: Any) -> None:
         unsplit. Returns False if any layer lacks the state needed (caller
         falls back to the standard step).
         """
-        layers = self.model.layers
+        # Stage-local view: under pipeline-parallel serving ``model.layers``
+        # carries None sentinels before ``start_idx`` while ``cache`` holds
+        # only this rank's entries, so the full list would pair every cache
+        # with the wrong (shifted) layer. Single-node ``pipeline_layers`` is
+        # the full layer list, unchanged from before.
+        layers = self.model.pipeline_layers
         if len(cache) != len(layers):
             return False
         trim_n = num_drafts - accepted
