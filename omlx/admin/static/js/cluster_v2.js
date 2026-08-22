@@ -8,12 +8,17 @@
 //     GET    /api/cluster/devices               — {paired, discovered, self}, polled at 1 Hz
 //     POST   /api/cluster/pair/approve          — {node_id, code}
 //     POST   /api/cluster/pair/deny             — {node_id}
+//     POST   /api/cluster/pair/join             — {coordinator_addr} — joiner: mint + show the code
+//     GET    /api/cluster/pair/join             — local join snapshot, polled at 1 Hz (drives approval)
+//     POST   /api/cluster/pair/join/cancel      — abandon the join in progress
+//     POST   /api/cluster/devices/manual        — {ip, port} seed + probe a peer by address
 //     DELETE /api/cluster/devices/{node_id}     — unpair
-//   STUB (defined by Module C, to be implemented in Module A's probe path):
 //     GET    /api/cluster/discovery/health      — {multicast_rx_within_5s: bool,
 //           last_multicast_rx_at: float|null, mdns_active: bool, transport: str}
-//           Powers the "Local network / multicast" self-test check row.
-//           Handled gracefully when absent (404 → row reports "unknown").
+//           Powers the "Local network permission" self-test check row.
+//           Implemented at discovery_routes.py; a 404 from an older build
+//           degrades the row to "skipped", never a red failure (beacon loss
+//           only affects discovery, not pairing via Add by IP).
 //   Existing planner/activate API (omlx/cluster/routes.py, unchanged):
 //     POST   /admin/api/cluster/models          — per-node model inventory
 //     POST   /admin/api/cluster/catalogue       — model fit across nodes
@@ -38,6 +43,9 @@ function clusterV2Wizard() {
         discoveryHealth: '/api/cluster/discovery/health',
         pairApprove: '/api/cluster/pair/approve',
         pairDeny: '/api/cluster/pair/deny',
+        pairJoin: '/api/cluster/pair/join',
+        pairJoinCancel: '/api/cluster/pair/join/cancel',
+        manualDevice: '/api/cluster/devices/manual',
         unpair: (nodeId) =>
             `/api/cluster/devices/${encodeURIComponent(nodeId)}`,
         models: '/admin/api/cluster/models',
@@ -45,6 +53,7 @@ function clusterV2Wizard() {
         peerProbe: '/admin/api/cluster/peer-probe',
         autoconfigure: '/admin/api/cluster/autoconfigure',
         plan: '/admin/api/cluster/plan',
+        nodeRoles: '/admin/api/cluster/node-roles',
         deployments: '/admin/api/cluster/deployments',
         deployment: (id) =>
             `/admin/api/cluster/deployments/${encodeURIComponent(id)}`,
@@ -66,6 +75,64 @@ function clusterV2Wizard() {
         unknown: { label: 'Network', icon: 'help-circle' },
     };
 
+    // Offline mirror of omlx/cluster/node_role.py (NodeRole.reserve_for):
+    // a workstation keeps max(32 GiB, 50%) of its Mac, a headless node keeps
+    // 10%. The wizard prefers GET /admin/api/cluster/node-roles, which exposes
+    // these same numbers from the server; this mirror exists only so the
+    // usable-budget labels still render when that endpoint is unreachable.
+    // If node_role.py changes, this mirror must change with it.
+    const CLUSTER_V2_ROLE_FALLBACK = {
+        workstation: {
+            key: 'workstation',
+            label: 'Workstation',
+            reserve_bytes: 32 * 1024 ** 3,
+            reserve_fraction: 0.5,
+        },
+        headless: {
+            key: 'headless',
+            label: 'Headless',
+            reserve_bytes: 0,
+            reserve_fraction: 0.1,
+        },
+    };
+
+    // English fallbacks for the cluster.v2.* strings the wizard adds. The
+    // dashboard resolves window.t against en.json-filled locale_json, so these
+    // only matter when window.t is unavailable (offline component tests).
+    // Keep in sync with omlx/admin/i18n/en.json.
+    const CLUSTER_V2_STRINGS = {
+        'cluster.v2.strategy.title': 'How the model is split',
+        'cluster.v2.strategy.auto': 'Auto',
+        'cluster.v2.strategy.tensor': 'Tensor',
+        'cluster.v2.strategy.pipeline': 'Pipeline',
+        'cluster.v2.strategy.recommended': 'Recommended',
+        'cluster.v2.strategy.hint.auto':
+            'oMLX picks the split that fits this model and your link',
+        'cluster.v2.strategy.hint.tensor':
+            'Every Mac works on every token — needs a fast link',
+        'cluster.v2.strategy.hint.pipeline':
+            'Each Mac holds a different slice of the layers',
+        'cluster.v2.strategy.tensor_needs_two':
+            'Tensor parallelism needs 2+ Macs',
+        'cluster.v2.strategy.tensor_unsupported':
+            "This model's attention heads cannot be split across Macs",
+        'cluster.v2.strategy.pipeline_unsupported':
+            'This model does not support pipeline stages — use Tensor instead',
+        'cluster.v2.split.tensor_caption':
+            'Tensor split — each Mac holds 1/{count} of every layer',
+        'cluster.v2.split.tensor_share': '1/{count} of every layer',
+        'cluster.v2.models.on_every_mac': 'on every Mac',
+        'cluster.v2.models.partial':
+            'on {have} of {total} Macs — copied at activation',
+        'cluster.v2.checks.beacon_label':
+            'Local network permission (discovery only)',
+        'cluster.v2.steps.plan_hint_tensor': 'Every layer, on every Mac',
+    };
+    const t = (key) =>
+        typeof window !== 'undefined' && typeof window.t === 'function'
+            ? window.t(key)
+            : CLUSTER_V2_STRINGS[key] || key;
+
     return {
         // ---- snapshot state -------------------------------------------------
         devicesPayload: null,
@@ -82,6 +149,28 @@ function clusterV2Wizard() {
         // Null = derive from the snapshot. Explicit values: 'checks', 'plan'.
         stage: null,
         pairing: { target: null, code: '', busy: false, error: '' },
+
+        // ---- joiner side (this Mac shows the code, the other Mac approves) ---
+        // Server-driven snapshot from GET /api/cluster/pair/join; polled in
+        // tick() so the panel survives reloads and approval completes by
+        // itself. target_name is client-local context for friendly toasts.
+        join: {
+            state: 'idle',
+            code: null,
+            expires_at: null,
+            coordinator_addr: null,
+            seconds_remaining: 0,
+            error: null,
+            busy: false,
+            target_name: '',
+        },
+        joinApprovedNotified: false,
+        joinDeniedNotified: false,
+
+        // ---- add by IP (when multicast discovery is unavailable) -------------
+        manualAddr: '',
+        manualBusy: false,
+        manualError: '',
         checks: {
             started: false,
             running: false,
@@ -97,9 +186,26 @@ function clusterV2Wizard() {
         modelsError: '',
         selectedModelPath: '',
         modelSearch: '',
+        // Execution strategy for the split: 'auto' | 'tensor' | 'pipeline'.
+        // 'tensor' threads tensor_parallel_size = planNodes().length into both
+        // /plan and /deployments; anything else plans pipeline-only (TP=1).
+        planStrategy: 'auto',
+        // Per-model strategy advice from POST /admin/api/cluster/catalogue
+        // (null = not attempted yet). catalogueFailed switches the
+        // recommendation badge to the fast-transport heuristic.
+        catalogueModels: null,
+        catalogueLoading: false,
+        catalogueFailed: false,
         plan: null,
         planLoading: false,
         planError: '',
+        // Explicit per-node role picks (node_id → 'workstation' | 'headless').
+        // Nodes without an entry keep the long-standing default: this Mac is
+        // a workstation, every peer is headless.
+        nodeRoles: {},
+        roleOptions: [],
+        // Parsed from a /plan 400: { shortfallBytes, canFixWithHeadless }.
+        planFitFailure: null,
         activateBusy: false,
         confirmUnpairFor: '',
         confirmDeactivateFor: '',
@@ -133,6 +239,7 @@ function clusterV2Wizard() {
         async tick() {
             if (!this.wizardVisible()) return;
             await this.refreshDevices();
+            await this.refreshJoinState();
             this.tickCount += 1;
             if (
                 !this.deploymentsLoaded ||
@@ -222,12 +329,59 @@ function clusterV2Wizard() {
                 this.discoveryHealthUnsupported = false;
             } catch (error) {
                 if (error?.status === 404) {
-                    // STUB endpoint not implemented yet — the check row shows
-                    // "unknown" instead of a misleading red failure.
+                    // Older builds predate the endpoint (implemented at
+                    // discovery_routes.py); the check row degrades to
+                    // "skipped" instead of a misleading red failure.
                     this.discoveryHealthUnsupported = true;
                     this.discoveryHealth = null;
                 } else {
                     this.discoveryHealth = null;
+                }
+            }
+        },
+
+        // The joiner snapshot is server-owned, so a page reload mid-join
+        // restores the panel and the coordinator's approval completes on the
+        // next tick without any user action.
+        async refreshJoinState() {
+            try {
+                const snapshot = await this.apiFetch(CLUSTER_V2_API.pairJoin);
+                if (!snapshot) return;
+                const previous = this.join.state;
+                this.join = { ...this.join, ...snapshot, busy: false };
+                if (
+                    snapshot.state === 'approved' &&
+                    !this.joinApprovedNotified
+                ) {
+                    this.joinApprovedNotified = true;
+                    this.notify(
+                        'success',
+                        `This Mac joined ${this.joinTargetName()}'s cluster.`,
+                    );
+                    await this.refreshDevices();
+                    this.startChecks();
+                } else if (
+                    snapshot.state === 'denied' &&
+                    previous !== 'denied' &&
+                    !this.joinDeniedNotified
+                ) {
+                    this.joinDeniedNotified = true;
+                    this.notify(
+                        'error',
+                        `${this.joinTargetName()} denied the join request.`,
+                    );
+                    // Denied is terminal server-side; reset locally so the
+                    // panel clears instead of sticking on the refusal.
+                    await this.cancelJoin({ silent: true });
+                }
+            } catch (error) {
+                // A 404 means this backend predates the joiner endpoints —
+                // stay idle rather than tearing down the rest of the wizard.
+                if (error?.status !== 404) {
+                    this.join = {
+                        ...this.join,
+                        error: error?.message || 'Join status unavailable',
+                    };
                 }
             }
         },
@@ -291,7 +445,11 @@ function clusterV2Wizard() {
             if (this.stage === 'checks' && this.pairedDevices().length) {
                 return 'checks';
             }
-            if (this.pairing.target || this.pendingApprovals().length) {
+            if (
+                this.pairing.target ||
+                this.pendingApprovals().length ||
+                this.joinActive()
+            ) {
                 return 'pairing';
             }
             if (
@@ -311,7 +469,7 @@ function clusterV2Wizard() {
                 { key: 'discover', title: 'Find devices', hint: 'Automatic on your network' },
                 { key: 'pair', title: 'Pair', hint: 'One code, both Macs' },
                 { key: 'checks', title: 'Check', hint: 'SSH · model · RDMA' },
-                { key: 'plan', title: 'Split the model', hint: 'Layers per Mac' },
+                { key: 'plan', title: 'Split the model', hint: this.planStepHint() },
                 { key: 'active', title: 'Activate', hint: 'Run across the pool' },
             ];
             // Map the 8 UI states onto the 5 step slots.
@@ -337,6 +495,14 @@ function clusterV2Wizard() {
                         ? 'active'
                         : 'todo',
             }));
+        },
+
+        // Step-4 hint is strategy-aware: a tensor split gives every Mac every
+        // layer, so "Layers per Mac" would describe the wrong thing.
+        planStepHint() {
+            return this.planStrategy === 'tensor'
+                ? t('cluster.v2.steps.plan_hint_tensor')
+                : 'Layers per Mac';
         },
 
         // =====================================================================
@@ -519,6 +685,175 @@ function clusterV2Wizard() {
         },
 
         // =====================================================================
+        // Joiner side — THIS Mac shows the code; the other Mac approves it.
+        // =====================================================================
+        joinActive() {
+            // Anything but idle keeps the joiner panel up; approved/denied
+            // clear themselves through refreshJoinState().
+            return !!this.join.state && this.join.state !== 'idle';
+        },
+
+        joinTargetName() {
+            return (
+                this.join.target_name ||
+                this.join.coordinator_name ||
+                this.join.coordinator_addr ||
+                'the other Mac'
+            );
+        },
+
+        joinCountdownLabel() {
+            const total = Math.max(0, Math.round(this.join.seconds_remaining || 0));
+            const minutes = Math.floor(total / 60);
+            const seconds = String(total % 60).padStart(2, '0');
+            return `${minutes}:${seconds}`;
+        },
+
+        // exo-style address choice: prefer a routable IPv4 on a direct or
+        // known interface; a bare link-local fe80:: (no scope zone) can never
+        // be dialed, so it ranks below everything.
+        bestDeviceAddr(device) {
+            const addrs = Array.isArray(device?.addrs) ? device.addrs : [];
+            const preferred = ['manual', 'tb', 'thunderbolt', 'ethernet', 'tailscale'];
+            const scored = addrs
+                .filter((addr) => addr && addr.ip)
+                .map((addr) => {
+                    const ip = String(addr.ip);
+                    let score = 0;
+                    const rank = preferred.indexOf(String(addr.if_type || ''));
+                    if (rank >= 0) score += 100 - rank;
+                    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) score += 50;
+                    if (ip.toLowerCase().startsWith('fe80:')) score -= 1000;
+                    return { addr, score };
+                })
+                .sort((a, b) => b.score - a.score);
+            return scored.length ? scored[0].addr : null;
+        },
+
+        coordinatorAddrFor(device) {
+            const addr = this.bestDeviceAddr(device);
+            if (!addr) return null;
+            return `${addr.ip}:${device.http_port || 8000}`;
+        },
+
+        async beginJoinAsJoiner(device) {
+            const target = this.coordinatorAddrFor(device);
+            if (!target) {
+                this.notify(
+                    'error',
+                    `No usable address for ${this.deviceName(device)} yet — try Add by IP.`,
+                );
+                return;
+            }
+            await this.beginJoinAddr(target, this.deviceName(device));
+        },
+
+        async beginJoinAddr(coordinatorAddr, targetName) {
+            if (this.join.busy) return;
+            this.join.busy = true;
+            try {
+                const snapshot = await this.apiFetch(CLUSTER_V2_API.pairJoin, {
+                    method: 'POST',
+                    body: JSON.stringify({ coordinator_addr: coordinatorAddr }),
+                });
+                this.join = {
+                    ...this.join,
+                    ...snapshot,
+                    busy: false,
+                    target_name: targetName || coordinatorAddr,
+                };
+                this.joinApprovedNotified = false;
+                this.joinDeniedNotified = false;
+                this.cancelPairing();
+            } catch (error) {
+                this.join.busy = false;
+                this.notify(
+                    'error',
+                    error?.message || 'Could not reach that Mac',
+                );
+            }
+        },
+
+        async restartJoin() {
+            // "Code expired — start again": same coordinator, fresh code.
+            const addr = this.join.coordinator_addr;
+            if (!addr) return;
+            await this.beginJoinAddr(addr, this.join.target_name);
+        },
+
+        async cancelJoin(options = {}) {
+            try {
+                const snapshot = await this.apiFetch(
+                    CLUSTER_V2_API.pairJoinCancel,
+                    { method: 'POST' },
+                );
+                this.join = {
+                    ...this.join,
+                    ...(snapshot || { state: 'idle' }),
+                    busy: false,
+                    target_name: '',
+                };
+                if (!options.silent) {
+                    this.notify('info', 'Join cancelled.');
+                }
+            } catch (error) {
+                if (!options.silent) {
+                    this.notify(
+                        'error',
+                        error?.message || 'Could not cancel the join',
+                    );
+                }
+            }
+        },
+
+        // =====================================================================
+        // Add by IP — the deterministic path when multicast can't reach the
+        // other Mac (Thunderbolt pairs, filtered routers, Local Network off).
+        // =====================================================================
+        async submitManualPeer() {
+            if (this.manualBusy) return;
+            const raw = (this.manualAddr || '').trim();
+            const match = raw.match(/^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?$/);
+            if (!match) {
+                this.manualError = 'Enter an IPv4 address like 192.168.1.50 or 192.168.1.50:8000.';
+                return;
+            }
+            const ip = match[1];
+            const port = match[2] ? parseInt(match[2], 10) : 8000;
+            const octetsOk = ip.split('.').every((part) => Number(part) <= 255);
+            if (!octetsOk || !(port >= 1 && port <= 65535)) {
+                this.manualError = 'That address or port is out of range.';
+                return;
+            }
+            this.manualBusy = true;
+            this.manualError = '';
+            try {
+                const result = await this.apiFetch(CLUSTER_V2_API.manualDevice, {
+                    method: 'POST',
+                    body: JSON.stringify({ ip, port }),
+                });
+                await this.refreshDevices();
+                if (result && result.verified) {
+                    const name = result.peer?.friendly_name || ip;
+                    this.notify('success', `Found ${name} at ${ip}.`);
+                    // One click: this Mac shows the code, the other approves.
+                    await this.beginJoinAddr(`${ip}:${port}`, name);
+                } else {
+                    this.notify(
+                        'warning',
+                        'No oMLX node answered at that address yet — it stays on the list while we keep trying.',
+                    );
+                }
+                this.manualAddr = '';
+            } catch (error) {
+                this.manualError =
+                    error?.message || 'Could not add that address';
+            } finally {
+                this.manualBusy = false;
+            }
+        },
+
+        // =====================================================================
         // Automatic checks — SSH, model presence, version parity, rdma_ctl,
         // benchmark, multicast self-test. Each is a row: spinner / pass / fail
         // with a fix.
@@ -543,10 +878,17 @@ function clusterV2Wizard() {
         },
 
         sshTargetFor(device) {
+            // Pairing enrollment records the SSH target; the devices payload
+            // surfaces it as ssh_target on paired rows. Fall back to the
+            // first verified probe address when no enrollment exists yet.
+            if (device?.ssh_target) return String(device.ssh_target);
             const addrs = Array.isArray(device?.addrs) ? device.addrs : [];
-            const first = addrs.find((addr) => addr && addr.ip);
-            // Pairing enrollment records the SSH target; until the registry
-            // surfaces it, the first verified probe address is the target.
+            // A bare fe80:: link-local address has no scope id here, so SSH
+            // to it has no route — prefer any routable address first.
+            const usable = addrs.filter(
+                (addr) => addr && addr.ip && !String(addr.ip).startsWith('fe80::'),
+            );
+            const first = usable[0] || addrs.find((addr) => addr && addr.ip);
             return first ? String(first.ip) : this.deviceName(device);
         },
 
@@ -584,6 +926,13 @@ function clusterV2Wizard() {
                         body: JSON.stringify({
                             nodes: this.planNodes(),
                             hosts: this.deploymentHosts(),
+                            // The autoconfigure contract demands exactly one
+                            // of model_path / model_size_bytes. The wizard has
+                            // no model picked at benchmark time, so a 16 GiB
+                            // placeholder satisfies the contract — the probe
+                            // measurements (compute + link speeds) are what
+                            // actually matter here.
+                            model_size_bytes: 16 * 1024 ** 3,
                             measure_performance: true,
                             preflight: false,
                             detect_transports: true,
@@ -756,33 +1105,37 @@ function clusterV2Wizard() {
                 });
             }
 
-            // 6. Multicast / Local Network self-test (STUB endpoint).
+            // 6. Multicast / Local Network self-test (implemented at
+            //    discovery_routes.py). Beacon loss is a warning, never a red
+            //    failure: discovery degrades to Add by IP while pairing and
+            //    the model split keep working — the footer only gates on
+            //    SSH + versions, so a red row would contradict "All clear".
             {
                 const health = this.discoveryHealth;
                 let status = 'pending';
                 let detail = 'Checks whether discovery beacons are arriving.';
                 let fix =
-                    'macOS is blocking local-network beacons. System Settings → Privacy & Security → Local Network → allow oMLX, then restart oMLX. The check clears itself.';
-                if (this.discoveryHealthUnsupported) {
-                    status = 'unknown';
-                    detail =
-                        'This build does not report discovery health yet (endpoint pending). Discovery itself may still work.';
-                    fix = '';
-                } else if (health) {
+                    'macOS is blocking local-network beacons. System Settings → Privacy & Security → Local Network → allow oMLX, then restart oMLX. Pairing still works via Add by IP while this is amber.';
+                if (health) {
                     if (health.multicast_rx_within_5s) {
                         status = 'pass';
                         detail = 'Discovery beacons are flowing on this network.';
                     } else {
-                        status = 'fail';
+                        status = 'warn';
                         detail =
                             'No discovery beacons received in the last 5 seconds.';
                     }
+                } else if (this.discoveryHealthUnsupported) {
+                    status = 'skipped';
+                    detail =
+                        'This build does not report discovery health. Discovery itself may still work.';
+                    fix = '';
                 } else if (this.checks.running) {
                     status = 'running';
                 }
                 rows.push({
                     key: 'multicast',
-                    label: 'Local network permission',
+                    label: t('cluster.v2.checks.beacon_label'),
                     status,
                     detail,
                     fix,
@@ -806,9 +1159,133 @@ function clusterV2Wizard() {
         // =====================================================================
         enterPlan() {
             this.stage = 'plan';
+            this.loadNodeRoles();
             if (!this.modelOptions.length && !this.modelsLoading) {
                 this.loadModels();
+            } else {
+                // Models already cached — the recommendation badge still
+                // needs its one catalogue call for this plan session.
+                this.loadCatalogue();
             }
+        },
+
+        // =====================================================================
+        // Per-node roles — how much of each Mac the cluster may take
+        // =====================================================================
+        async loadNodeRoles() {
+            if (this.roleOptions.length) return;
+            try {
+                const payload = await this.apiFetch(CLUSTER_V2_API.nodeRoles);
+                this.roleOptions = payload?.roles || [];
+            } catch (error) {
+                // The mirrored fallback constants keep the budget labels
+                // rendering; planning itself re-derives roles server-side.
+            }
+        },
+
+        roleSpecFor(key) {
+            return (
+                this.roleOptions.find((role) => role.key === key) ||
+                CLUSTER_V2_ROLE_FALLBACK[key] ||
+                CLUSTER_V2_ROLE_FALLBACK.headless
+            );
+        },
+
+        roleLabel(key) {
+            return this.roleSpecFor(key).label || key;
+        },
+
+        nodeRole(nodeId, isSelf) {
+            // The default is unchanged: the Mac whose display is in front of
+            // the user keeps a workstation reserve; everything else is
+            // headless (also the server default).
+            return this.nodeRoles[nodeId] || (isSelf ? 'workstation' : 'headless');
+        },
+
+        setNodeRole(device, role) {
+            if (!device || this.planLoading) return;
+            if (this.nodeRole(device.node_id, !!device.is_self) === role) return;
+            this.nodeRoles = { ...this.nodeRoles, [device.node_id]: role };
+            this.planFitFailure = null;
+            if (this.selectedModelPath) this.runPlan();
+        },
+
+        // The paired Macs that will receive layers (this Mac included).
+        planRoleDevices() {
+            return this.allDevices().filter(
+                (device) => device.paired && this.deviceRamGb(device),
+            );
+        },
+
+        reserveBytesFor(roleKey, capacityBytes) {
+            // Mirrors NodeRole.reserve_for in omlx/cluster/node_role.py using
+            // the server-provided reserve_bytes/reserve_fraction pair (or the
+            // synced fallback mirror above): max(absolute floor, fractional
+            // headroom), always leaving the model at least 1 GiB.
+            const spec = this.roleSpecFor(roleKey);
+            const gib = 1024 ** 3;
+            const reserve = Math.max(
+                Number(spec.reserve_bytes || 0),
+                Math.floor(capacityBytes * Number(spec.reserve_fraction || 0)),
+            );
+            return Math.min(reserve, Math.max(0, capacityBytes - gib));
+        },
+
+        usableGbLabel(device) {
+            const capacity = (this.deviceRamGb(device) || 0) * 1024 ** 3;
+            if (!capacity) return '';
+            const role = this.nodeRole(device.node_id, !!device.is_self);
+            const usable = Math.max(
+                0,
+                capacity - this.reserveBytesFor(role, capacity),
+            );
+            return `${Math.round(usable / 1024 ** 3)} GB usable as ${this.roleLabel(role)}`;
+        },
+
+        // What flipping every workstation node to headless would free up.
+        headlessGainBytes() {
+            return this.planRoleDevices().reduce((gain, device) => {
+                const capacity = (this.deviceRamGb(device) || 0) * 1024 ** 3;
+                const role = this.nodeRole(device.node_id, !!device.is_self);
+                if (role !== 'workstation') return gain;
+                return (
+                    gain +
+                    this.reserveBytesFor('workstation', capacity) -
+                    this.reserveBytesFor('headless', capacity)
+                );
+            }, 0);
+        },
+
+        // /plan 400s with "model does not fit the supplied per-node budgets
+        // (at least N additional bytes required)" — turn the number into
+        // guidance instead of a dead end.
+        parseFitFailure(message) {
+            if (!/per-node budgets/.test(message || '')) return null;
+            const match = /at least (\d+) additional bytes/.exec(message || '');
+            if (!match) return null;
+            const shortfallBytes = Number(match[1]);
+            return {
+                shortfallBytes,
+                canFixWithHeadless:
+                    shortfallBytes > 0 &&
+                    this.headlessGainBytes() >= shortfallBytes,
+            };
+        },
+
+        fitShortfallLabel() {
+            const bytes = this.planFitFailure?.shortfallBytes;
+            return bytes ? `${(bytes / 1024 ** 3).toFixed(1)} GiB` : '';
+        },
+
+        // One explicit click: roles never flip on their own.
+        async switchAllToHeadless() {
+            const flipped = { ...this.nodeRoles };
+            for (const device of this.planRoleDevices()) {
+                flipped[device.node_id] = 'headless';
+            }
+            this.nodeRoles = flipped;
+            this.planFitFailure = null;
+            await this.runPlan();
         },
 
         inventoryHosts() {
@@ -845,13 +1322,18 @@ function clusterV2Wizard() {
             } finally {
                 this.modelsLoading = false;
             }
+            // Catalogue advice (recommended strategy pill) rides on the model
+            // list — fetched once per plan session, silently.
+            this.loadCatalogue();
         },
 
         filteredModels() {
             const query = (this.modelSearch || '').trim().toLowerCase();
             if (!query) return this.modelOptions;
             return this.modelOptions.filter((model) =>
-                `${model.id || ''} ${model.model_path || ''}`
+                `${model.id || ''} ${model.model_path || ''} ${
+                    model.display_name || ''
+                }`
                     .toLowerCase()
                     .includes(query),
             );
@@ -865,23 +1347,235 @@ function clusterV2Wizard() {
             );
         },
 
-        shortModelName(model) {
-            const path = model?.model_path || '';
-            return path.split('/').filter(Boolean).pop() || 'this model';
+        // A name a person recognizes: the inventory's display_name when the
+        // server provides one; otherwise a model_path cleaned of Hugging Face
+        // cache internals — snapshot-hash tail segments (40–64 hex chars) and
+        // the models--org--name directory encoding.
+        displayModelName(model) {
+            const display = String(model?.display_name || '').trim();
+            if (display) return display;
+            const raw = String(model?.model_path || model?.id || '');
+            const segments = raw.split('/').filter(Boolean);
+            while (
+                segments.length &&
+                /^[0-9a-f]{40,64}$/i.test(segments[segments.length - 1])
+            ) {
+                segments.pop();
+            }
+            if (segments[segments.length - 1] === 'snapshots') segments.pop();
+            let name = segments.pop() || raw || 'this model';
+            const hub = /^models--([^/]+?)--(.+)$/.exec(name);
+            if (hub) name = `${hub[1]}/${hub[2]}`;
+            return name;
         },
 
+        shortModelName(model) {
+            return this.displayModelName(model);
+        },
+
+        // Denominator is the Macs that will actually run the split (this Mac
+        // + paired peers) — discovered-but-unpaired devices never receive
+        // layers, so counting them misreported "on 1 of 3 Macs".
         modelPresenceLabel(model) {
             const holders = new Set(
                 (model?.locations || []).map((loc) => loc.node_id),
             );
-            const total = this.allDevices().length || 1;
-            return `on ${Math.min(holders.size, total)} of ${total} Macs`;
+            const total =
+                (this.selfDevice() ? 1 : 0) + this.pairedDevices().length;
+            if (!total) return '';
+            const have = Math.min(holders.size, total);
+            if (have >= total) return t('cluster.v2.models.on_every_mac');
+            return t('cluster.v2.models.partial')
+                .replace('{have}', String(have))
+                .replace('{total}', String(total));
         },
 
         async selectModel(model) {
             if (!model || this.planLoading) return;
             this.selectedModelPath = model.model_path;
+            this.normalizePlanStrategy();
             await this.runPlan();
+        },
+
+        // =====================================================================
+        // Execution strategy — auto / tensor / pipeline, server-recommended
+        // =====================================================================
+        // Tensor parallelism must span every node (routes.py rejects TP !=
+        // len(nodes)), so the size is always the full pool.
+        planTensorParallelSize() {
+            return this.planStrategy === 'tensor'
+                ? this.planNodes().length
+                : 1;
+        },
+
+        catalogueEntryForModel() {
+            if (!Array.isArray(this.catalogueModels)) return null;
+            const model = this.selectedModel();
+            if (!model) return null;
+            return (
+                this.catalogueModels.find(
+                    (entry) => entry.model_path === model.model_path,
+                ) || null
+            );
+        },
+
+        // One 'Recommended' pill, on exactly one option: the strategy the
+        // catalogue names for the picked model, or — when the catalogue could
+        // not advise — tensor iff every member sits on a fast (jaccl /
+        // Thunderbolt) transport, mirroring resolvedBackend().
+        recommendedStrategy() {
+            const entry = this.catalogueEntryForModel();
+            if (entry) {
+                if (entry.strategy === 'tensor') return 'tensor';
+                if (entry.strategy === 'pipeline') return 'pipeline';
+                // 'hybrid' / 'single node' cannot be expressed by the picker.
+                return 'auto';
+            }
+            if (
+                this.catalogueFailed ||
+                Array.isArray(this.catalogueModels)
+            ) {
+                // Fallback heuristic: tensor only pays off when every member
+                // sits on a fast (jaccl / Thunderbolt) transport — the same
+                // rule resolvedBackend() applies; anything else, auto.
+                return this.resolvedBackend() === 'jaccl' ? 'tensor' : 'auto';
+            }
+            return '';
+        },
+
+        strategyOptions() {
+            const entry = this.catalogueEntryForModel();
+            const nodeCount = this.planNodes().length;
+            const tensorUnsupported =
+                !!entry && entry.supports_tensor_parallel === false;
+            const pipelineUnsupported =
+                !!entry && entry.supports_pipeline === false;
+            const tensorDisabled = nodeCount < 2 || tensorUnsupported;
+            return [
+                {
+                    key: 'auto',
+                    label: t('cluster.v2.strategy.auto'),
+                    disabled: false,
+                    disabledReason: '',
+                },
+                {
+                    key: 'tensor',
+                    label: t('cluster.v2.strategy.tensor'),
+                    disabled: tensorDisabled,
+                    disabledReason: !tensorDisabled
+                        ? ''
+                        : nodeCount < 2
+                        ? t('cluster.v2.strategy.tensor_needs_two')
+                        : t('cluster.v2.strategy.tensor_unsupported'),
+                },
+                {
+                    key: 'pipeline',
+                    label: t('cluster.v2.strategy.pipeline'),
+                    disabled: pipelineUnsupported,
+                    disabledReason: pipelineUnsupported
+                        ? t('cluster.v2.strategy.pipeline_unsupported')
+                        : '',
+                },
+            ];
+        },
+
+        selectedStrategyOption() {
+            return (
+                this.strategyOptions().find(
+                    (option) => option.key === this.planStrategy,
+                ) || { key: 'auto', disabledReason: '' }
+            );
+        },
+
+        strategyHint() {
+            return t(`cluster.v2.strategy.hint.${this.planStrategy}`);
+        },
+
+        setPlanStrategy(key) {
+            const option = this.strategyOptions().find(
+                (item) => item.key === key,
+            );
+            if (!option || option.disabled) return;
+            if (this.planStrategy === key) return;
+            this.planStrategy = key;
+            if (this.selectedModelPath) this.runPlan();
+        },
+
+        // A model change (or catalogue arrival) can invalidate the current
+        // pick — e.g. pipeline selected for a pipeline-incapable model.
+        normalizePlanStrategy() {
+            const option = this.strategyOptions().find(
+                (item) => item.key === this.planStrategy,
+            );
+            if (option?.disabled) this.planStrategy = 'auto';
+        },
+
+        // Advisory only: on failure the badge falls back to the transport
+        // heuristic. No toasts — a missing recommendation is not an error.
+        async loadCatalogue() {
+            if (
+                this.catalogueLoading ||
+                this.catalogueModels !== null ||
+                this.catalogueFailed
+            ) {
+                return;
+            }
+            const candidates = this.modelOptions
+                .filter((model) => model?.model_path)
+                .map((model) => {
+                    const sourceLocation =
+                        (model.locations || []).find(
+                            (loc) => loc.ssh === model.model_source,
+                        ) || {};
+                    return {
+                        id: String(model.id || model.model_path),
+                        model_path: model.model_path,
+                        model_source: model.model_source || '127.0.0.1',
+                        model_source_python:
+                            sourceLocation.python_executable || undefined,
+                        source_node_id: model.source_node_id || '',
+                        model_context_length:
+                            model.model_context_length || undefined,
+                    };
+                });
+            if (!candidates.length) return;
+            this.catalogueLoading = true;
+            try {
+                const payload = await this.apiFetch(CLUSTER_V2_API.catalogue, {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        nodes: this.planNodes(),
+                        models: candidates,
+                        execution_profile: 'balanced',
+                    }),
+                });
+                this.catalogueModels = payload?.models || [];
+                this.normalizePlanStrategy();
+            } catch (error) {
+                this.catalogueFailed = true;
+            } finally {
+                this.catalogueLoading = false;
+            }
+        },
+
+        // Tensor plans give every node ALL layers with a tensor_parallel_rank;
+        // the contiguous-range split bar would lie about them.
+        planIsTensor() {
+            return (this.plan?.tensor_parallel_size || 1) > 1;
+        },
+
+        tensorShareLabel() {
+            return t('cluster.v2.split.tensor_share').replace(
+                '{count}',
+                String(this.plan?.tensor_parallel_size || 1),
+            );
+        },
+
+        tensorCaptionLabel() {
+            return t('cluster.v2.split.tensor_caption').replace(
+                '{count}',
+                String(this.plan?.tensor_parallel_size || 1),
+            );
         },
 
         planNodes() {
@@ -893,8 +1587,8 @@ function clusterV2Wizard() {
                     capacity_bytes:
                         (this.deviceRamGb(self) || 0) * 1024 ** 3,
                     // The Mac whose display is in front of the user keeps a
-                    // workstation reserve; everything else is headless.
-                    role: 'workstation',
+                    // workstation reserve unless the plan step says otherwise.
+                    role: this.nodeRole(self.node_id, true),
                     memory_guard_tier: 'balanced',
                     accelerator: 'metal',
                 });
@@ -904,7 +1598,7 @@ function clusterV2Wizard() {
                     node_id: peer.node_id,
                     capacity_bytes:
                         (this.deviceRamGb(peer) || 0) * 1024 ** 3,
-                    role: 'headless',
+                    role: this.nodeRole(peer.node_id, false),
                     memory_guard_tier: 'balanced',
                     accelerator: 'metal',
                 });
@@ -916,6 +1610,7 @@ function clusterV2Wizard() {
             if (!this.selectedModelPath) return;
             this.planLoading = true;
             this.planError = '';
+            this.planFitFailure = null;
             this.plan = null;
             try {
                 const model = this.selectedModel();
@@ -923,6 +1618,9 @@ function clusterV2Wizard() {
                     model_path: this.selectedModelPath,
                     nodes: this.planNodes(),
                     execution_profile: 'balanced',
+                    // 'tensor' spans every node (routes.py requires TP ==
+                    // len(nodes)); 'auto'/'pipeline' plan pipeline-only.
+                    tensor_parallel_size: this.planTensorParallelSize(),
                 };
                 if (
                     model?.model_source &&
@@ -937,6 +1635,7 @@ function clusterV2Wizard() {
             } catch (error) {
                 this.planError =
                     error?.message || 'Could not build the layer split';
+                this.planFitFailure = this.parseFitFailure(this.planError);
             } finally {
                 this.planLoading = false;
             }
@@ -1020,6 +1719,9 @@ function clusterV2Wizard() {
                     hosts: this.deploymentHosts(),
                     approved_placement: this.plan.placement_signature,
                     execution_profile: 'balanced',
+                    // Must match what was planned — the signed placement
+                    // covers tensor_parallel_size, so a mismatch 409s.
+                    tensor_parallel_size: this.planTensorParallelSize(),
                 };
                 if (
                     model?.model_source &&
