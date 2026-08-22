@@ -25,6 +25,15 @@
 //     POST   /admin/api/cluster/peer-probe      — SSH reachability / versions / RDMA
 //     POST   /admin/api/cluster/autoconfigure   — benchmark probe (measure_performance)
 //     POST   /admin/api/cluster/plan            — signed shard plan
+//     POST   /admin/api/cluster/stage           — start a resumable job copying
+//           the model to plan members that lack it (auto-staging: the wizard
+//           runs this as phase 1 of activation when /models shows the model is
+//           not on every Mac; the body is {activation, parallel} where
+//           activation is byte-identical to the /deployments body)
+//     GET    /admin/api/cluster/stage/{job_id}  — per-node copy progress,
+//           polled at 1 Hz by a dedicated timer (not tick(): activation must
+//           survive a tab switch). 404 mid-poll = coordinator restarted, the
+//           job is lost; re-POSTing /stage is safe (verified files skip).
 //     GET    /admin/api/cluster/deployments     — active deployments
 //     POST   /admin/api/cluster/deployments     — activate an approved plan
 //     DELETE /admin/api/cluster/deployments/{id}— deactivate
@@ -53,6 +62,9 @@ function clusterV2Wizard() {
         peerProbe: '/admin/api/cluster/peer-probe',
         autoconfigure: '/admin/api/cluster/autoconfigure',
         plan: '/admin/api/cluster/plan',
+        stage: '/admin/api/cluster/stage',
+        stageJob: (id) =>
+            `/admin/api/cluster/stage/${encodeURIComponent(id)}`,
         nodeRoles: '/admin/api/cluster/node-roles',
         deployments: '/admin/api/cluster/deployments',
         deployment: (id) =>
@@ -124,6 +136,20 @@ function clusterV2Wizard() {
         'cluster.v2.models.on_every_mac': 'on every Mac',
         'cluster.v2.models.partial':
             'on {have} of {total} Macs — copied at activation',
+        'cluster.v2.staging.title':
+            'Copying the model to your Macs — {done} of {total} ready',
+        'cluster.v2.staging.waiting': 'waiting',
+        'cluster.v2.staging.checking': 'checking what is already there…',
+        'cluster.v2.staging.copying': 'copying {done} of {total} files',
+        'cluster.v2.staging.already_there': 'already has it',
+        'cluster.v2.staging.ready': 'ready',
+        'cluster.v2.staging.failed': 'copy failed',
+        'cluster.v2.staging.lost':
+            'The coordinator restarted mid-copy — press Activate to resume.',
+        'cluster.v2.staging.unsupported':
+            'This build cannot copy models automatically — trying to activate directly.',
+        'cluster.v2.staging.button_copying_one': 'Copying model to 1 Mac…',
+        'cluster.v2.staging.button_copying': 'Copying model to {count} Macs…',
         'cluster.v2.checks.beacon_label':
             'Local network permission (discovery only)',
         'cluster.v2.steps.plan_hint_tensor': 'Every layer, on every Mac',
@@ -207,6 +233,15 @@ function clusterV2Wizard() {
         // Parsed from a /plan 400: { shortfallBytes, canFixWithHeadless }.
         planFitFailure: null,
         activateBusy: false,
+        // ---- auto-staging (phase 1 of activation) ----------------------------
+        // When /models shows the selected model is not on every plan Mac,
+        // activatePlan first POSTs /stage and polls the job at 1 Hz; on
+        // completion the same request body goes to /deployments.
+        stagingJob: null, // last /stage snapshot; null = idle
+        stagingError: '', // job-level or POST-level failure, shown inline
+        // Dedicated 1 Hz poller — NOT tick(), which early-returns when the
+        // tab is hidden; activation must survive a tab switch.
+        stagingTimer: null,
         confirmUnpairFor: '',
         confirmDeactivateFor: '',
 
@@ -1707,31 +1742,238 @@ function clusterV2Wizard() {
             return hosts.filter((host) => host.ips.length || host.ssh);
         },
 
+        // The single source of the activation payload. POST /stage takes
+        // {activation, parallel} where activation is this exact object, and
+        // POST /deployments takes it verbatim — one builder, so the signed
+        // placement check can never drift between stage and activate.
+        activationRequestBody() {
+            const model = this.selectedModel();
+            const body = {
+                model_path: this.selectedModelPath,
+                backend: this.resolvedBackend(),
+                nodes: this.planNodes(),
+                hosts: this.deploymentHosts(),
+                approved_placement: this.plan.placement_signature,
+                execution_profile: 'balanced',
+                // Must match what was planned — the signed placement
+                // covers tensor_parallel_size, so a mismatch 409s.
+                tensor_parallel_size: this.planTensorParallelSize(),
+            };
+            if (
+                model?.model_source &&
+                model.model_source !== '127.0.0.1'
+            ) {
+                body.model_source = model.model_source;
+            }
+            return body;
+        },
+
+        // =====================================================================
+        // Auto-staging — "copied at activation", literally (phase 1 of 2)
+        // =====================================================================
+        // Plan members that do not hold a complete copy of the selected
+        // model. Heuristic only — the server re-verifies file-by-file and
+        // size-skips whatever is already there. A location counts as complete
+        // when its estimated_size matches the largest location (the same
+        // proxy merge_model_inventories uses to pick the source).
+        nodesMissingModel() {
+            const model = this.selectedModel();
+            if (!model) return [];
+            const locations = model.locations || [];
+            // No inventory locations means we cannot tell who holds what —
+            // fall back to the pre-staging direct activation.
+            if (!locations.length) return [];
+            const full = Math.max(
+                0,
+                ...locations.map((loc) => loc.estimated_size || 0),
+            );
+            const holders = new Set(
+                locations
+                    .filter((loc) => (loc.estimated_size || 0) >= full)
+                    .map((loc) => loc.node_id),
+            );
+            return this.planNodes().filter(
+                (node) => !holders.has(node.node_id),
+            );
+        },
+
+        needsStaging() {
+            return this.nodesMissingModel().length > 0;
+        },
+
         async activatePlan() {
             if (!this.plan || this.activateBusy) return;
             this.activateBusy = true;
+            if (this.needsStaging()) {
+                // Phase 1 returns after the POST; the 1 Hz poller owns the
+                // flow from here and chains into phase 2 on completion.
+                await this.stageModelToPeers();
+                return;
+            }
+            // Every plan Mac already has the model — today's direct path.
+            await this.postActivation();
+        },
+
+        async stageModelToPeers() {
+            this.stagingError = '';
+            let job;
             try {
-                const model = this.selectedModel();
-                const body = {
-                    model_path: this.selectedModelPath,
-                    backend: this.resolvedBackend(),
-                    nodes: this.planNodes(),
-                    hosts: this.deploymentHosts(),
-                    approved_placement: this.plan.placement_signature,
-                    execution_profile: 'balanced',
-                    // Must match what was planned — the signed placement
-                    // covers tensor_parallel_size, so a mismatch 409s.
-                    tensor_parallel_size: this.planTensorParallelSize(),
-                };
-                if (
-                    model?.model_source &&
-                    model.model_source !== '127.0.0.1'
-                ) {
-                    body.model_source = model.model_source;
+                job = await this.apiFetch(CLUSTER_V2_API.stage, {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        activation: this.activationRequestBody(),
+                        parallel: 4,
+                    }),
+                });
+            } catch (error) {
+                this.stopStagingPoll();
+                if (error?.status === 409) {
+                    // Signature drift between plan and stage — identical
+                    // handling to activation's 409 below.
+                    this.notify(
+                        'warning',
+                        'The plan changed since you reviewed it — rebuilding it now.',
+                    );
+                    this.activateBusy = false;
+                    await this.runPlan();
+                } else if (error?.status === 404) {
+                    // A server older than /stage: degrade to the pre-staging
+                    // behavior instead of bricking activation — the
+                    // activation preflight reports whatever is still missing.
+                    this.notify('warning', t('cluster.v2.staging.unsupported'));
+                    await this.postActivation();
+                } else {
+                    this.failStaging(
+                        error?.message || t('cluster.v2.staging.failed'),
+                    );
+                    this.activateBusy = false;
                 }
+                return;
+            }
+            this.stagingJob = job;
+            this.stagingTimer = setInterval(
+                () => this.pollStagingJob(),
+                CLUSTER_V2_POLL_MS,
+            );
+        },
+
+        async pollStagingJob() {
+            const jobId = this.stagingJob?.job_id;
+            if (!jobId) {
+                this.stopStagingPoll();
+                return;
+            }
+            let snapshot;
+            try {
+                snapshot = await this.apiFetch(
+                    CLUSTER_V2_API.stageJob(jobId),
+                );
+            } catch (error) {
+                // 404 = the coordinator restarted and the in-memory job is
+                // gone. Re-POSTing /stage is safe (verified files skip), so
+                // pressing Activate again is the resume.
+                this.stopStagingPoll();
+                this.failStaging(
+                    error?.status === 404
+                        ? t('cluster.v2.staging.lost')
+                        : error?.message || t('cluster.v2.staging.failed'),
+                );
+                this.activateBusy = false;
+                return;
+            }
+            this.stagingJob = snapshot;
+            if (snapshot.status === 'completed') {
+                this.stopStagingPoll();
+                await this.postActivation(); // phase 2
+            } else if (snapshot.status === 'failed') {
+                // Other nodes may still have completed; per-node errors stay
+                // visible in stagingJob.nodes next to the banner. Pressing
+                // Activate retries — only missing files move again.
+                this.stopStagingPoll();
+                this.failStaging(
+                    snapshot.error || t('cluster.v2.staging.failed'),
+                );
+                this.activateBusy = false;
+            }
+        },
+
+        stopStagingPoll() {
+            if (this.stagingTimer) {
+                clearInterval(this.stagingTimer);
+                this.stagingTimer = null;
+            }
+        },
+
+        failStaging(message) {
+            this.stagingError = message || t('cluster.v2.staging.failed');
+            this.notify('error', this.stagingError);
+        },
+
+        // Client-side dismiss only — there is no cancel endpoint. The copy
+        // finishes server-side regardless, harmlessly: the next attempt
+        // size-verifies and skips whatever already landed.
+        dismissStaging() {
+            this.stopStagingPoll();
+            this.stagingJob = null;
+            this.stagingError = '';
+            this.activateBusy = false;
+        },
+
+        stagingNodes() {
+            return Object.values(this.stagingJob?.nodes || {});
+        },
+
+        // Per-node rows with file counts are the honest display: later nodes
+        // report bytes_total 0 until their turn starts and bytes jump per
+        // completed file, so a single overall byte % would lie.
+        stagingNodeLabel(node) {
+            const status = node?.status || 'queued';
+            if (status === 'ready') {
+                // ready with nothing copied = the node already held the
+                // complete model (the copying blip is sub-second).
+                return (node.bytes_total || 0) > 0
+                    ? t('cluster.v2.staging.ready')
+                    : t('cluster.v2.staging.already_there');
+            }
+            if (status === 'failed') {
+                return node.error || t('cluster.v2.staging.failed');
+            }
+            if (status === 'copying') {
+                if (!(node.files_total > 0)) {
+                    return t('cluster.v2.staging.checking');
+                }
+                return t('cluster.v2.staging.copying')
+                    .replace('{done}', String(node.files_completed || 0))
+                    .replace('{total}', String(node.files_total || 0));
+            }
+            return t('cluster.v2.staging.waiting');
+        },
+
+        stagingOverallLabel() {
+            const nodes = this.stagingNodes();
+            const done = nodes.filter(
+                (node) => node.status === 'ready',
+            ).length;
+            return t('cluster.v2.staging.title')
+                .replace('{done}', String(done))
+                .replace('{total}', String(nodes.length));
+        },
+
+        stagingButtonLabel() {
+            const missing = this.nodesMissingModel().length;
+            return t(
+                missing === 1
+                    ? 'cluster.v2.staging.button_copying_one'
+                    : 'cluster.v2.staging.button_copying',
+            ).replace('{count}', String(missing));
+        },
+
+        // Phase 2 — the pre-staging activation path, unchanged.
+        async postActivation() {
+            try {
                 await this.apiFetch(CLUSTER_V2_API.deployments, {
                     method: 'POST',
-                    body: JSON.stringify(body),
+                    body: JSON.stringify(this.activationRequestBody()),
                 });
                 this.notify(
                     'success',
@@ -1739,6 +1981,7 @@ function clusterV2Wizard() {
                 );
                 this.stage = null;
                 this.plan = null;
+                this.stagingJob = null;
                 await this.refreshDeployments();
             } catch (error) {
                 if (error?.status === 409) {
@@ -1754,6 +1997,7 @@ function clusterV2Wizard() {
                     );
                 }
             } finally {
+                this.stopStagingPoll();
                 this.activateBusy = false;
             }
         },

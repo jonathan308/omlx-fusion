@@ -758,7 +758,41 @@
                                 </div>
                             </template>
                         </div>
-                        <div class="mt-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3">
+                        <div class="mt-4 flex flex-col sm:flex-row sm:flex-wrap sm:items-center sm:justify-between gap-3 rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3">
+                            <!-- Auto-staging: live per-node copy progress while
+                                 phase 1 of activation stages the model onto the
+                                 Macs that lack it. Per-node file counts, not a
+                                 global byte % — later nodes report totals of 0
+                                 until their turn, so one bar would lie. -->
+                            <div x-show="stagingJob" x-cloak class="w-full" data-cluster-v2-staging>
+                                <div class="flex items-center justify-between gap-3 mb-1.5">
+                                    <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-400"
+                                         x-text="stagingOverallLabel()"></div>
+                                    <button type="button" @click="dismissStaging()"
+                                            class="text-[10px] font-semibold text-neutral-400 hover:text-neutral-600"
+                                            data-cluster-v2-staging-dismiss>Dismiss</button>
+                                </div>
+                                <template x-for="node in stagingNodes()" :key="node.node_id">
+                                    <div class="py-1" data-cluster-v2-staging-node>
+                                        <div class="flex items-center justify-between gap-3">
+                                            <span class="text-xs text-neutral-700 truncate"
+                                                  x-text="planNodeName(node)"></span>
+                                            <span class="text-[10px] whitespace-nowrap"
+                                                  :class="node.status === 'failed' ? 'text-red-600' : 'text-neutral-500'"
+                                                  x-text="stagingNodeLabel(node)"></span>
+                                        </div>
+                                        <div x-show="(node.files_total || 0) > 0"
+                                             class="mt-1 h-1 rounded-full bg-neutral-200 overflow-hidden">
+                                            <div class="h-full rounded-full bg-neutral-900 transition-[width] duration-500"
+                                                 :style="'width: ' + Math.round(100 * (node.files_completed || 0) / Math.max(node.files_total || 0, 1)) + '%'"></div>
+                                        </div>
+                                    </div>
+                                </template>
+                                <div x-show="stagingError" x-cloak
+                                     class="mt-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700"
+                                     data-cluster-v2-staging-error
+                                     x-text="stagingError"></div>
+                            </div>
                             <div class="min-w-0">
                                 <div class="text-xs font-semibold text-neutral-900">Exactly this split will launch</div>
                                 <div class="text-[10px] text-neutral-500 mt-0.5">
@@ -771,7 +805,7 @@
                                     class="inline-flex items-center justify-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40 whitespace-nowrap"
                                     data-cluster-v2-activate>
                                 <svg x-show="activateBusy" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
-                                <span x-text="activateBusy ? 'Activating…' : 'Activate cluster'"></span>
+                                <span x-text="activateBusy ? (stagingJob && !stagingJob.ready ? stagingButtonLabel() : 'Activating…') : 'Activate cluster'"></span>
                             </button>
                         </div>
                     </div>

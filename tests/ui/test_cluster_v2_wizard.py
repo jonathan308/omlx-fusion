@@ -73,6 +73,7 @@ ALLOWED_ENDPOINTS = {
     "/admin/api/cluster/autoconfigure",
     "/admin/api/cluster/plan",
     "/admin/api/cluster/node-roles",
+    "/admin/api/cluster/stage",
     "/admin/api/cluster/deployments",
 }
 
@@ -182,6 +183,8 @@ def test_wizard_consumes_only_contract_endpoints():
 
     # DELETE /api/cluster/devices/{node_id} (unpair).
     assert re.search(r"`/api/cluster/devices/\$\{encodeURIComponent\(nodeId\)\}`", javascript)
+    # GET /admin/api/cluster/stage/{job_id} (auto-staging progress poll).
+    assert re.search(r"`/admin/api/cluster/stage/\$\{encodeURIComponent\(id\)\}`", javascript)
 
 
 def test_polling_is_one_hertz_and_visibility_gated():
@@ -941,3 +944,443 @@ def test_split_bar_has_a_tensor_variant_and_width_transitions():
     # planIsTensor keys off the plan payload, not the picker.
     body = javascript.split("planIsTensor() {", 1)[1].split("},", 1)[0]
     assert "tensor_parallel_size" in body
+
+
+# --- Auto-staging: /stage as phase 1 of activation -----------------------------
+#
+# The model picker's "copied at activation" promise is literal: when /models
+# shows the selected model is not on every plan Mac, activatePlan POSTs
+# /admin/api/cluster/stage with {activation, parallel}, polls the job at 1 Hz
+# on a dedicated timer (tick() is visibility-gated; activation is not), and
+# the identical activation body goes to /deployments when the job completes.
+
+# Timer stubs: the real setInterval would keep the Node event loop alive
+# forever and the real setTimeout would slow every notify() by 6 s. Polling
+# is driven by calling pollStagingJob() directly.
+_WIZARD_TIMER_STUBS = """
+global.setInterval = () => 1;
+global.clearInterval = () => {};
+global.setTimeout = () => 0;
+"""
+
+# Two Macs, model complete on node-a only (estimated_size proxy: a holder is
+# a location whose size matches the largest location).
+_WIZARD_PARTIAL_MODEL = """
+component.modelOptions = [{
+  model_path: '/models/m', id: 'm', model_source: '127.0.0.1',
+  locations: [
+    { node_id: 'node-a', ssh: '127.0.0.1', model_path: '/models/m', estimated_size: 1000 },
+  ],
+}];
+component.selectedModelPath = '/models/m';
+component.plan = { assignments: [], placement_signature: 'b'.repeat(16) };
+"""
+
+
+def _stage_node(node_id, rank, status, files_total=0, files_completed=0,
+                bytes_total=0, bytes_completed=0, error=""):
+    return {
+        "node_id": node_id,
+        "rank": rank,
+        "status": status,
+        "files_total": files_total,
+        "files_completed": files_completed,
+        "bytes_total": bytes_total,
+        "bytes_completed": bytes_completed,
+        "files": {},
+        "error": error,
+    }
+
+
+def test_staging_runs_before_activation_with_identical_bodies():
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + _WIZARD_TIMER_STUBS
+        + _WIZARD_PARTIAL_MODEL
+        + """
+const calls = [];
+const jobId = 'a'.repeat(24);
+component.apiFetch = async (url, options) => {
+  const body = options && options.body ? JSON.parse(options.body) : null;
+  calls.push({ url, body });
+  if (url.endsWith('/stage')) {
+    return { job_id: jobId, status: 'running', ready: false, error: '', nodes: {
+      'node-a': %s,
+      'node-b': %s,
+    } };
+  }
+  if (url.endsWith('/stage/' + jobId)) {
+    return { job_id: jobId, status: 'completed', ready: true, error: '', nodes: {
+      'node-a': %s,
+      'node-b': %s,
+    } };
+  }
+  return { deployments: [] };
+};
+
+(async () => {
+  const missing = component.nodesMissingModel().map((node) => node.node_id);
+  await component.activatePlan();
+  const midFlight = {
+    label: component.stagingButtonLabel(),
+    timer: component.stagingTimer !== null,
+    busy: component.activateBusy,
+    overall: component.stagingOverallLabel(),
+  };
+  await component.pollStagingJob();
+  process.stdout.write(JSON.stringify({
+    missing,
+    midFlight,
+    urls: calls.map((entry) => entry.url),
+    stageBody: (calls.find((entry) => entry.url.endsWith('/stage')) || {}).body,
+    deployBody: (calls.find(
+      (entry) => entry.url.endsWith('/deployments') && entry.body,
+    ) || {}).body,
+    after: {
+      stage: component.stage,
+      plan: component.plan,
+      stagingJob: component.stagingJob,
+      timer: component.stagingTimer,
+      busy: component.activateBusy,
+    },
+  }));
+})();
+"""
+        % (
+            json.dumps(_stage_node("node-a", 0, "ready")),
+            json.dumps(_stage_node("node-b", 1, "copying", 10, 3, 100, 30)),
+            json.dumps(_stage_node("node-a", 0, "ready")),
+            json.dumps(
+                _stage_node("node-b", 1, "ready", 10, 10, 100, 100)
+            ),
+        ),
+    )
+
+    assert result["missing"] == ["node-b"]
+    assert result["midFlight"]["label"] == "Copying model to 1 Mac…"
+    assert result["midFlight"]["timer"] is True
+    assert result["midFlight"]["busy"] is True
+    assert result["midFlight"]["overall"] == (
+        "Copying the model to your Macs — 1 of 2 ready"
+    )
+    job_id = "a" * 24
+    assert result["urls"] == [
+        "/admin/api/cluster/stage",
+        f"/admin/api/cluster/stage/{job_id}",
+        "/admin/api/cluster/deployments",
+        "/admin/api/cluster/deployments",  # refreshDeployments() GET
+    ]
+    # The staging activation payload is byte-identical to the activation body
+    # (one shared builder), plus parallel as an int.
+    assert result["stageBody"]["activation"] == result["deployBody"]
+    assert result["stageBody"]["parallel"] == 4
+    assert result["deployBody"]["approved_placement"] == "b" * 16
+    # Phase 2 finished: wizard back to its post-activation state.
+    assert result["after"] == {
+        "stage": None,
+        "plan": None,
+        "stagingJob": None,
+        "timer": None,
+        "busy": False,
+    }
+
+
+def test_staging_is_skipped_when_every_mac_has_the_model():
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + _WIZARD_TIMER_STUBS
+        + """
+component.modelOptions = [{
+  model_path: '/models/m', id: 'm', model_source: '127.0.0.1',
+  locations: [
+    { node_id: 'node-a', ssh: '127.0.0.1', model_path: '/models/m', estimated_size: 1000 },
+    { node_id: 'node-b', ssh: 'b.local', model_path: '/models/m', estimated_size: 1000 },
+  ],
+}];
+component.selectedModelPath = '/models/m';
+component.plan = { assignments: [], placement_signature: 'b'.repeat(16) };
+const calls = [];
+component.apiFetch = async (url, options) => {
+  calls.push({
+    url,
+    body: options && options.body ? JSON.parse(options.body) : null,
+  });
+  return { deployments: [] };
+};
+
+(async () => {
+  await component.activatePlan();
+  process.stdout.write(JSON.stringify({
+    needsStaging: component.needsStaging(),
+    calls,
+  }));
+})();
+""",
+    )
+
+    assert result["needsStaging"] is False
+    posts = [c for c in result["calls"] if c["body"] is not None]
+    assert [c["url"] for c in posts] == ["/admin/api/cluster/deployments"]
+    assert all("/stage" not in c["url"] for c in result["calls"])
+
+
+def test_stage_409_replans_like_activation_409():
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + _WIZARD_TIMER_STUBS
+        + _WIZARD_PARTIAL_MODEL
+        + """
+const calls = [];
+component.apiFetch = async (url, options) => {
+  calls.push(url);
+  if (url.endsWith('/stage')) {
+    const error = new Error(
+      'The staging request no longer matches the approved plan.',
+    );
+    error.status = 409;
+    throw error;
+  }
+  if (url.endsWith('/plan')) {
+    return { assignments: [], placement_signature: 'c'.repeat(16) };
+  }
+  return {};
+};
+
+(async () => {
+  await component.activatePlan();
+  process.stdout.write(JSON.stringify({
+    calls,
+    signature: component.plan && component.plan.placement_signature,
+    stagingError: component.stagingError,
+    stagingJob: component.stagingJob,
+    busy: component.activateBusy,
+    toasts: component.toasts.map((toast) => toast.type + ':' + toast.message),
+  }));
+})();
+""",
+    )
+
+    # Signature drift on /stage takes activation's 409 path verbatim: one
+    # warning toast, then a fresh signed plan.
+    assert result["calls"] == [
+        "/admin/api/cluster/stage",
+        "/admin/api/cluster/plan",
+    ]
+    assert result["signature"] == "c" * 16
+    assert result["stagingError"] == ""
+    assert result["stagingJob"] is None
+    assert result["busy"] is False
+    assert result["toasts"] == [
+        "warning:The plan changed since you reviewed it — rebuilding it now."
+    ]
+
+
+def test_stage_poll_404_is_a_retryable_lost_job():
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + _WIZARD_TIMER_STUBS
+        + _WIZARD_PARTIAL_MODEL
+        + """
+const jobId = 'a'.repeat(24);
+let stagePosts = 0;
+component.apiFetch = async (url, options) => {
+  if (url.endsWith('/stage')) {
+    stagePosts += 1;
+    return { job_id: jobId, status: 'running', ready: false, error: '', nodes: {} };
+  }
+  if (url.includes('/stage/')) {
+    // Coordinator restarted mid-copy: the in-memory job is gone.
+    const error = new Error('staging job not found');
+    error.status = 404;
+    throw error;
+  }
+  return { deployments: [] };
+};
+
+(async () => {
+  await component.activatePlan();
+  await component.pollStagingJob();
+  const lost = {
+    error: component.stagingError,
+    busy: component.activateBusy,
+    timer: component.stagingTimer,
+  };
+  // Retry = press Activate again; a fresh job is POSTed and the server's
+  // size-verified skip turns it into a resume.
+  await component.activatePlan();
+  process.stdout.write(JSON.stringify({ lost, stagePosts }));
+})();
+""",
+    )
+
+    assert result["lost"] == {
+        "error": "The coordinator restarted mid-copy — press Activate to resume.",
+        "busy": False,
+        "timer": None,
+    }
+    assert result["stagePosts"] == 2
+
+
+def test_stage_job_failure_keeps_per_node_errors_and_retries():
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + _WIZARD_TIMER_STUBS
+        + _WIZARD_PARTIAL_MODEL
+        + """
+const jobId = 'a'.repeat(24);
+let stagePosts = 0;
+component.apiFetch = async (url, options) => {
+  if (url.endsWith('/stage')) {
+    stagePosts += 1;
+    return { job_id: jobId, status: 'running', ready: false, error: '', nodes: {} };
+  }
+  if (url.includes('/stage/')) {
+    return { job_id: jobId, status: 'failed', ready: false,
+      error: 'Model staging failed on node-b',
+      nodes: {
+        'node-a': %s,
+        'node-b': %s,
+      } };
+  }
+  return { deployments: [] };
+};
+
+(async () => {
+  await component.activatePlan();
+  await component.pollStagingJob();
+  const failed = {
+    error: component.stagingError,
+    nodeError: component.stagingJob.nodes['node-b'].error,
+    busy: component.activateBusy,
+    timer: component.stagingTimer,
+    toasts: component.toasts.map((toast) => toast.type),
+  };
+  await component.activatePlan();
+  process.stdout.write(JSON.stringify({ failed, stagePosts }));
+})();
+"""
+        % (
+            json.dumps(_stage_node("node-a", 0, "ready")),
+            json.dumps(
+                _stage_node(
+                    "node-b", 1, "failed", 10, 4,
+                    error="Failed to copy: model-00002-of-00076.safetensors",
+                )
+            ),
+        ),
+    )
+
+    assert result["failed"]["error"] == "Model staging failed on node-b"
+    # The per-node error stays in the snapshot so the row can show it inline.
+    assert (
+        result["failed"]["nodeError"]
+        == "Failed to copy: model-00002-of-00076.safetensors"
+    )
+    assert result["failed"]["busy"] is False
+    assert result["failed"]["timer"] is None
+    assert result["failed"]["toasts"] == ["error"]
+    assert result["stagePosts"] == 2
+
+
+def test_staging_progress_rows_render_per_node_file_counts():
+    template = _read(TEMPLATE)
+
+    assert "data-cluster-v2-staging" in template
+    assert "data-cluster-v2-staging-node" in template
+    assert "data-cluster-v2-staging-error" in template
+    assert "data-cluster-v2-staging-dismiss" in template
+    # Per-node thin bar over file counts — never a global byte %.
+    assert "node.files_completed || 0" in template
+    assert "Math.max(node.files_total || 0, 1)" in template
+    # The bar is hidden for already-staged nodes (files_total === 0).
+    assert 'x-show="(node.files_total || 0) > 0"' in template
+    # The activate button narrates the phase.
+    assert "stagingButtonLabel()" in template
+
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + """
+component.stagingJob = { job_id: 'a'.repeat(24), status: 'running', nodes: {
+  'node-a': %s,
+  'node-b': %s,
+  'node-c': %s,
+  'node-d': %s,
+  'node-e': %s,
+} };
+process.stdout.write(JSON.stringify({
+  labels: component.stagingNodes().map((node) => [
+    node.node_id, component.stagingNodeLabel(node),
+  ]),
+  overall: component.stagingOverallLabel(),
+}));
+"""
+        % (
+            # Complete model already local: ready with nothing copied.
+            json.dumps(_stage_node("node-a", 0, "ready")),
+            json.dumps(_stage_node("node-b", 1, "copying", 10, 3, 100, 30)),
+            json.dumps(_stage_node("node-c", 2, "queued")),
+            json.dumps(
+                _stage_node(
+                    "node-d", 3, "failed", 4, 1,
+                    error="Failed to copy: model-00002-of-00076.safetensors",
+                )
+            ),
+            # The sub-second blip: copying with no files tallied yet.
+            json.dumps(_stage_node("node-e", 4, "copying")),
+        ),
+    )
+
+    assert result["labels"] == [
+        ["node-a", "already has it"],
+        ["node-b", "copying 3 of 10 files"],
+        ["node-c", "waiting"],
+        ["node-d", "Failed to copy: model-00002-of-00076.safetensors"],
+        ["node-e", "checking what is already there…"],
+    ]
+    assert result["overall"] == "Copying the model to your Macs — 1 of 5 ready"
+
+
+def test_old_server_without_stage_degrades_to_direct_activation():
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + _WIZARD_TIMER_STUBS
+        + _WIZARD_PARTIAL_MODEL
+        + """
+const calls = [];
+component.apiFetch = async (url, options) => {
+  const body = options && options.body ? JSON.parse(options.body) : null;
+  calls.push({ url, body });
+  if (url.endsWith('/stage')) {
+    const error = new Error('Not Found');
+    error.status = 404;
+    throw error;
+  }
+  return { deployments: [] };
+};
+
+(async () => {
+  await component.activatePlan();
+  process.stdout.write(JSON.stringify({
+    urls: calls.map((entry) => entry.url),
+    deployed: calls.some(
+      (entry) => entry.url.endsWith('/deployments') && entry.body,
+    ),
+    stagingError: component.stagingError,
+    busy: component.activateBusy,
+    toasts: component.toasts.map((toast) => toast.type),
+  }));
+})();
+""",
+    )
+
+    # A 404 on the /stage POST means the server predates staging: warn once,
+    # then run the pre-staging direct activation rather than bricking.
+    assert result["deployed"] is True
+    assert result["urls"] == [
+        "/admin/api/cluster/stage",
+        "/admin/api/cluster/deployments",
+        "/admin/api/cluster/deployments",  # refreshDeployments() GET
+    ]
+    assert result["stagingError"] == ""
+    assert result["busy"] is False
+    assert result["toasts"] == ["warning", "success"]
