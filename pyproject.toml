@@ -87,7 +87,7 @@ dependencies = [
     # (and drags in hf-xet>=1.5.1). Declare the floor directly instead of
     # leaning on transformers' transitive hub requirement.
     "huggingface-hub>=1.19.0",
-    "numpy>=1.24.0,<2.4",
+    "numpy>=1.24.0,<2.5",
     "tqdm>=4.66.0",
     "pyyaml>=6.0",
     "itsdangerous>=2.0",
