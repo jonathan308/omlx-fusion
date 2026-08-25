@@ -974,16 +974,16 @@
                                 <span x-text="confirmUnloadFor === deployment.deployment_id ? 'Confirm unload weights' : 'Unload weights'"></span>
                             </button>
                             <button type="button"
-                                    x-show="deploymentRuntimeState(deployment) === 'configured'"
+                                    x-show="['configured', 'failed'].includes(deploymentRuntimeState(deployment))"
                                     @click="loadDeploymentWeights(deployment)"
                                     :disabled="clusterLifecycleBusy"
                                     class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40"
                                     data-cluster-v2-load-weights>
                                 <i data-lucide="play" class="w-3.5 h-3.5"></i>
-                                Load model
+                                <span x-text="deploymentRuntimeState(deployment) === 'failed' ? 'Retry load' : 'Load model'"></span>
                             </button>
                             <button type="button"
-                                    x-show="deploymentRuntimeState(deployment) === 'configured'"
+                                    x-show="['configured', 'failed'].includes(deploymentRuntimeState(deployment))"
                                     @click="beginModelChange(deployment)"
                                     :disabled="clusterLifecycleBusy"
                                     class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-neutral-700 border border-neutral-200 rounded-lg hover:bg-neutral-50 disabled:opacity-40"
