@@ -23,8 +23,7 @@
 //     POST   /admin/api/cluster/models          — per-node model inventory
 //     POST   /admin/api/cluster/catalogue       — model fit across nodes
 //     POST   /admin/api/cluster/peer-probe      — SSH reachability / versions / RDMA
-//     POST   /admin/api/cluster/autoconfigure   — benchmark probe (measure_performance)
-//     POST   /admin/api/cluster/plan            — signed shard plan
+//     POST   /admin/api/cluster/autoconfigure   — signed, launch-ready proposal
 //     POST   /admin/api/cluster/stage           — start a resumable job copying
 //           the model to plan members that lack it (auto-staging: the wizard
 //           runs this as phase 1 of activation when /models shows the model is
@@ -37,6 +36,9 @@
 //     GET    /admin/api/cluster/deployments     — active deployments
 //     POST   /admin/api/cluster/deployments     — activate an approved plan
 //     DELETE /admin/api/cluster/deployments/{id}— deactivate
+//     POST   /admin/api/cluster/replan           — signed preview/apply reload
+//     GET    /admin/api/cluster/tp-layout-qualifications — exact heterogeneous
+//           TP evidence and store health
 //
 // State machine (wizardState()): empty → discovering → device_card → pairing →
 // checks → plan → active, with error as an overlay state (banner + toasts,
@@ -61,12 +63,14 @@ function clusterV2Wizard() {
         catalogue: '/admin/api/cluster/catalogue',
         peerProbe: '/admin/api/cluster/peer-probe',
         autoconfigure: '/admin/api/cluster/autoconfigure',
-        plan: '/admin/api/cluster/plan',
         stage: '/admin/api/cluster/stage',
         stageJob: (id) =>
             `/admin/api/cluster/stage/${encodeURIComponent(id)}`,
         nodeRoles: '/admin/api/cluster/node-roles',
+        runtime: '/admin/api/cluster/runtime',
         deployments: '/admin/api/cluster/deployments',
+        replan: '/admin/api/cluster/replan',
+        tpQualifications: '/admin/api/cluster/tp-layout-qualifications',
         deployment: (id) =>
             `/admin/api/cluster/deployments/${encodeURIComponent(id)}`,
         deploymentLoad: (id) =>
@@ -87,7 +91,9 @@ function clusterV2Wizard() {
         tb: { label: 'Thunderbolt', icon: 'zap' },
         ethernet: { label: 'Ethernet', icon: 'cable' },
         wifi: { label: 'Wi-Fi', icon: 'wifi' },
-        tailscale: { label: 'Tailscale', icon: 'globe' },
+        // This is the address used to find/control the peer. It is not the
+        // collective fabric selected by the signed deployment.
+        tailscale: { label: 'Tailscale control', icon: 'globe' },
         unknown: { label: 'Network', icon: 'help-circle' },
     };
 
@@ -172,6 +178,13 @@ function clusterV2Wizard() {
         devicesUnreachable: false,
         deploymentsPayload: [],
         deploymentsLoaded: false,
+        // Deployments are durable configuration. Runtime is the separate,
+        // observed proof that their rank processes are loading or resident.
+        // Keeping these snapshots separate prevents a registry record from
+        // resurrecting an unloaded model after an unload or reboot.
+        runtimePayload: null,
+        runtimeLoaded: false,
+        runtimeError: '',
         discoveryHealth: null,
         discoveryHealthUnsupported: false,
 
@@ -217,8 +230,8 @@ function clusterV2Wizard() {
         selectedModelPath: '',
         modelSearch: '',
         // Execution strategy for the split: 'auto' | 'tensor' | 'pipeline'.
-        // 'tensor' threads tensor_parallel_size = planNodes().length into both
-        // /plan and /deployments; anything else plans pipeline-only (TP=1).
+        // The server resolves its TP degree, host order and backend together;
+        // the client never reconstructs those decisions after preview.
         planStrategy: 'auto',
         // Scheduler limits are selected as one of the server-owned execution
         // profiles. The worker may safely reduce these values for available
@@ -239,6 +252,10 @@ function clusterV2Wizard() {
         catalogueLoading: false,
         catalogueFailed: false,
         plan: null,
+        // Complete /autoconfigure response. Its activation object is the only
+        // payload allowed through staging and deployment.
+        planProposal: null,
+        planRequestRevision: 0,
         planLoading: false,
         planError: '',
         // Explicit per-node role picks (node_id → 'workstation' | 'headless').
@@ -254,6 +271,7 @@ function clusterV2Wizard() {
         // activatePlan first POSTs /stage and polls the job at 1 Hz; on
         // completion the same request body goes to /deployments.
         stagingJob: null, // last /stage snapshot; null = idle
+        stagingActivation: null, // exact server proposal frozen for this job
         stagingError: '', // job-level or POST-level failure, shown inline
         // Dedicated 1 Hz poller — NOT tick(), which early-returns when the
         // tab is hidden; activation must survive a tab switch.
@@ -281,6 +299,7 @@ function clusterV2Wizard() {
         // =====================================================================
         init() {
             this.tick();
+            this.refreshTpQualifications();
             this.pollTimer = setInterval(() => this.tick(), CLUSTER_V2_POLL_MS);
         },
 
@@ -298,6 +317,7 @@ function clusterV2Wizard() {
             if (!this.wizardVisible()) return;
             await this.refreshDevices();
             await this.refreshJoinState();
+            await this.refreshRuntime();
             this.tickCount += 1;
             if (
                 !this.deploymentsLoaded ||
@@ -376,6 +396,35 @@ function clusterV2Wizard() {
                         error?.message || 'Could not refresh deployments',
                     );
                 }
+            }
+        },
+
+        async refreshRuntime() {
+            try {
+                const payload = await this.apiFetch(CLUSTER_V2_API.runtime);
+                this.runtimePayload = payload || { jobs: [], launchers: [] };
+                this.runtimeLoaded = true;
+                this.runtimeError = '';
+            } catch (error) {
+                // Fail closed. A previous ready snapshot must never remain green
+                // when the ownership endpoint can no longer prove residency.
+                this.runtimePayload = null;
+                this.runtimeLoaded = false;
+                this.runtimeError =
+                    error?.message || 'Cluster runtime status is unavailable';
+            }
+        },
+
+        async refreshTpQualifications() {
+            try {
+                this.tpQualifications = await this.apiFetch(
+                    CLUSTER_V2_API.tpQualifications,
+                );
+                this.tpQualificationsError = '';
+            } catch (error) {
+                this.tpQualifications = null;
+                this.tpQualificationsError =
+                    error?.message || 'TP qualification evidence is unavailable';
             }
         },
 
@@ -484,10 +533,407 @@ function clusterV2Wizard() {
             return devices;
         },
 
-        activeDeployment() {
+        configuredDeployment() {
             return this.deploymentsPayload.length
                 ? this.deploymentsPayload[0]
                 : null;
+        },
+
+        deploymentRuntimeJobs(deployment = this.configuredDeployment()) {
+            const id = deployment?.deployment_id;
+            const jobs = this.runtimePayload?.jobs;
+            if (!id || !Array.isArray(jobs)) return [];
+            return jobs.filter((job) => job?.deployment_id === id);
+        },
+
+        deploymentRuntimeJob(deployment = this.configuredDeployment()) {
+            const jobs = this.deploymentRuntimeJobs(deployment);
+            return (
+                jobs.find(
+                    (job) => Number(job.rank) === 0 && job.live === true,
+                ) ||
+                jobs.find((job) => job.live === true) ||
+                jobs.find((job) => Number(job.rank) === 0) ||
+                jobs[0] ||
+                null
+            );
+        },
+
+        deploymentMetricsJob(deployment = this.configuredDeployment()) {
+            const jobs = this.deploymentRuntimeJobs(deployment).filter(
+                (job) => job?.metrics && typeof job.metrics === 'object',
+            );
+            return (
+                jobs.find(
+                    (job) => Number(job.rank) === 0 && job.live === true,
+                ) ||
+                jobs.find((job) => job.live === true) ||
+                jobs.find((job) => Number(job.rank) === 0) ||
+                jobs[0] ||
+                null
+            );
+        },
+
+        deploymentExecution(deployment = this.configuredDeployment()) {
+            const job =
+                this.deploymentMetricsJob(deployment) ||
+                this.deploymentRuntimeJob(deployment);
+            const metricsExecution = job?.metrics?.execution;
+            if (metricsExecution && typeof metricsExecution === 'object') {
+                return metricsExecution;
+            }
+            if (job?.execution && typeof job.execution === 'object') {
+                return job.execution;
+            }
+            const configured = deployment?.execution;
+            return configured && typeof configured === 'object'
+                ? configured
+                : null;
+        },
+
+        deploymentExecutionProfileLabel(
+            deployment = this.configuredDeployment(),
+        ) {
+            const profile = String(
+                this.deploymentExecution(deployment)?.profile || 'balanced',
+            );
+            return profile.charAt(0).toUpperCase() + profile.slice(1);
+        },
+
+        deploymentBatchStatus(deployment = this.configuredDeployment()) {
+            const job = this.deploymentRuntimeJob(deployment);
+            const metrics = job?.metrics || {};
+            const pipeline = metrics.pipeline || {};
+            const execution = this.deploymentExecution(deployment) || {};
+            const capability = job?.optimizations?.coalesced_batching;
+            const target = Math.max(
+                1,
+                Number(
+                    pipeline.microbatch_target ||
+                        execution.pipeline_microbatch_size ||
+                        1,
+                ),
+            );
+            const lastSize = Math.max(
+                0,
+                Number(pipeline.last_batch?.coalesced_batch_size || 0),
+            );
+            if (capability?.active === false) {
+                return {
+                    label: 'Unavailable',
+                    detail:
+                        capability.reason ||
+                        'This model cannot merge its request caches.',
+                    tone: 'bg-amber-50 border-amber-200 text-amber-700',
+                    target,
+                };
+            }
+            if (target <= 1 || capability?.enabled === false) {
+                return {
+                    label: 'Sequential',
+                    detail: 'The resolved batch target is one request.',
+                    tone: 'bg-neutral-50 border-neutral-200 text-neutral-600',
+                    target,
+                };
+            }
+            if (lastSize > 1) {
+                return {
+                    label: `Batched ${lastSize}`,
+                    detail: `Last scheduler step coalesced ${lastSize} of ${target} possible requests.`,
+                    tone: 'bg-green-50 border-green-200 text-green-700',
+                    target,
+                };
+            }
+            return {
+                label: 'Automatic',
+                detail: `Enabled for overlapping compatible requests, up to ${target} per scheduler step.`,
+                tone: 'bg-green-50 border-green-200 text-green-700',
+                target,
+            };
+        },
+
+        deploymentRequestMetrics(deployment = this.configuredDeployment()) {
+            const metrics = this.deploymentMetricsJob(deployment)?.metrics;
+            if (!metrics) return [];
+            const active = Array.isArray(metrics.active_request_metrics)
+                ? metrics.active_request_metrics.filter(
+                    (request) => request && request.status === 'running',
+                )
+                : [];
+            if (active.length) {
+                return active.map((request) => ({ ...request, _history: false }));
+            }
+            const last = metrics.last_request;
+            if (!last || typeof last !== 'object') return [];
+            return [{
+                ...last,
+                // Old rank markers expose only last_request.  While one is
+                // active it is still live; otherwise keep the completed row
+                // visible so a fast request is not missed between 1 Hz polls.
+                _history: Number(metrics.active_requests || 0) === 0,
+            }];
+        },
+
+        deploymentRequestCountLabel(deployment = this.configuredDeployment()) {
+            const metrics = this.deploymentMetricsJob(deployment)?.metrics;
+            const active = Math.max(0, Number(metrics?.active_requests || 0));
+            const hidden = Math.max(
+                0,
+                Number(metrics?.active_request_metrics_truncated || 0),
+            );
+            if (active > 0) {
+                return `${active} active${hidden ? ` · ${hidden} not shown` : ''}`;
+            }
+            return metrics?.last_request ? 'Last completed request' : 'Waiting';
+        },
+
+        requestPhaseLabel(request) {
+            if (request?._history) {
+                return request?.status === 'failed' ? 'Failed' : 'Complete';
+            }
+            if (request?.prefill_progress?.active) return 'Prefill';
+            if (Number(request?.completion_tokens || 0) > 0) return 'Decode';
+            return 'Queued';
+        },
+
+        requestPhaseTone(request) {
+            const phase = this.requestPhaseLabel(request);
+            if (phase === 'Prefill') return 'bg-blue-50 border-blue-200 text-blue-700';
+            if (phase === 'Decode') return 'bg-green-50 border-green-200 text-green-700';
+            if (phase === 'Failed') return 'bg-red-50 border-red-200 text-red-700';
+            return 'bg-neutral-50 border-neutral-200 text-neutral-600';
+        },
+
+        formatRequestRate(rate) {
+            const value = Number(rate);
+            if (!Number.isFinite(value) || value <= 0) return '—';
+            return `${value.toFixed(value >= 100 ? 0 : 1)} tok/s`;
+        },
+
+        requestPrefillRate(request) {
+            const progress = request?.prefill_progress;
+            const prompt = Math.max(0, Number(request?.prompt_tokens || 0));
+            const cached = Math.min(
+                prompt,
+                Math.max(0, Number(request?.cached_tokens || 0)),
+            );
+            const uncached = Math.max(0, prompt - cached);
+            if (
+                !progress?.active &&
+                cached > 0 &&
+                uncached <= Math.max(16, Math.floor(prompt * 0.01))
+            ) {
+                return 'Cache hit';
+            }
+            const rate = progress?.active
+                ? Number(progress.average_speed || request?.prefill_tps || 0)
+                : Number(request?.prefill_tps || 0);
+            return this.formatRequestRate(rate);
+        },
+
+        requestPrefillDetail(request) {
+            if (request?.prefill_progress?.active) return 'live average';
+            const prompt = Math.max(0, Number(request?.prompt_tokens || 0));
+            const cached = Math.min(
+                prompt,
+                Math.max(0, Number(request?.cached_tokens || 0)),
+            );
+            if (cached > 0) {
+                return `${cached.toLocaleString()} reused · ${Math.max(
+                    0,
+                    prompt - cached,
+                ).toLocaleString()} new`;
+            }
+            return 'prompt average';
+        },
+
+        requestDecodeRate(request) {
+            const tokens = Math.max(0, Number(request?.completion_tokens || 0));
+            if (!request?._history && tokens === 1) return 'Measuring…';
+            return this.formatRequestRate(request?.decode_tps);
+        },
+
+        requestPromptDetail(request) {
+            const prompt = Math.max(0, Number(request?.prompt_tokens || 0));
+            const cached = Math.min(
+                prompt,
+                Math.max(0, Number(request?.cached_tokens || 0)),
+            );
+            const progress = request?.prefill_progress;
+            if (progress?.active) {
+                const processed = Math.max(0, Number(progress.processed || 0));
+                const total = Math.max(0, Number(progress.total || 0));
+                return `${processed.toLocaleString()} / ${total.toLocaleString()} new`;
+            }
+            const uncached = Math.max(0, prompt - cached);
+            return `${uncached.toLocaleString()} new${cached ? ` · ${cached.toLocaleString()} cached` : ''}`;
+        },
+
+        requestDecodeDetail(request) {
+            const tokens = Math.max(0, Number(request?.completion_tokens || 0));
+            return `${tokens.toLocaleString()} generated`;
+        },
+
+        deploymentRuntimeLauncher(deployment = this.configuredDeployment()) {
+            const id = deployment?.deployment_id;
+            const launchers = this.runtimePayload?.launchers;
+            if (!id || !Array.isArray(launchers)) return null;
+            return (
+                launchers.find((launcher) => launcher?.deployment_id === id) ||
+                null
+            );
+        },
+
+        deploymentRuntimeState(deployment = this.configuredDeployment()) {
+            if (!deployment) return 'none';
+            if (!this.runtimeLoaded) return 'unknown';
+
+            const jobs = this.deploymentRuntimeJobs(deployment);
+            const launcher = this.deploymentRuntimeLauncher(deployment);
+            const terminalPhases = new Set([
+                'failed',
+                'peer_lost',
+                'launcher_lost',
+            ]);
+            if (
+                jobs.some(
+                    (job) =>
+                        terminalPhases.has(job?.phase) ||
+                        (typeof job?.error === 'string' && !!job.error.trim()),
+                ) ||
+                terminalPhases.has(launcher?.phase) ||
+                launcher?.returncode != null ||
+                (typeof launcher?.failure_reason === 'string' &&
+                    !!launcher.failure_reason.trim())
+            ) {
+                return 'failed';
+            }
+
+            // Runtime ownership is reconciled server-side against the engine
+            // pool. Both ownership and a fresh live heartbeat are required;
+            // an old marker with phase=ready is explicitly detached there.
+            if (
+                jobs.some(
+                    (job) =>
+                        job?.ownership === 'loaded' &&
+                        job?.live === true &&
+                        job?.phase === 'ready',
+                )
+            ) {
+                return 'ready';
+            }
+            if (
+                jobs.some(
+                    (job) =>
+                        job?.ownership === 'loading' &&
+                        job?.live === true &&
+                        job?.phase === 'loading',
+                ) ||
+                ['preflight', 'loading'].includes(launcher?.phase)
+            ) {
+                return 'loading';
+            }
+            if (jobs.some((job) => job?.ownership === 'loaded')) {
+                // The pool still claims ownership but there is no fresh ready
+                // marker. Present this as a failure, never as a loaded model.
+                return 'failed';
+            }
+            return 'configured';
+        },
+
+        activeDeployment() {
+            const deployment = this.configuredDeployment();
+            return this.deploymentRuntimeState(deployment) === 'ready'
+                ? deployment
+                : null;
+        },
+
+        deploymentFailureReason(deployment = this.configuredDeployment()) {
+            const job = this.deploymentRuntimeJobs(deployment).find(
+                (item) =>
+                    ['failed', 'peer_lost', 'launcher_lost'].includes(
+                        item?.phase,
+                    ) || item?.error,
+            );
+            if (job?.error) return String(job.error);
+            const launcher = this.deploymentRuntimeLauncher(deployment);
+            if (launcher?.failure_reason) {
+                return String(launcher.failure_reason);
+            }
+            const tail = Array.isArray(launcher?.stderr_tail)
+                ? launcher.stderr_tail.filter(Boolean).slice(-1)[0]
+                : '';
+            return tail
+                ? String(tail)
+                : 'The worker stopped reporting a live ready state.';
+        },
+
+        deploymentStatus(deployment = this.configuredDeployment()) {
+            const state = this.deploymentRuntimeState(deployment);
+            if (state === 'ready') {
+                return {
+                    state,
+                    eyebrow: 'Cluster running',
+                    label: 'Ready',
+                    detail:
+                        'The distributed weights are resident and available through oMLX.',
+                    tone: 'bg-green-50 border-green-200 text-green-700',
+                    pulse: true,
+                };
+            }
+            if (state === 'loading') {
+                return {
+                    state,
+                    eyebrow: 'Starting cluster',
+                    label: 'Loading',
+                    detail:
+                        'oMLX is loading and validating the model across your Macs.',
+                    tone: 'bg-blue-50 border-blue-200 text-blue-700',
+                    pulse: true,
+                };
+            }
+            if (state === 'failed') {
+                return {
+                    state,
+                    eyebrow: 'Cluster needs attention',
+                    label: 'Failed',
+                    detail: this.deploymentFailureReason(deployment),
+                    tone: 'bg-red-50 border-red-200 text-red-700',
+                    pulse: false,
+                };
+            }
+            if (state === 'unknown') {
+                return {
+                    state,
+                    eyebrow: 'Cluster configured',
+                    label: 'Checking',
+                    detail: this.runtimeError
+                        ? `Runtime status unavailable: ${this.runtimeError}`
+                        : 'Checking whether the distributed weights are resident.',
+                    tone: 'bg-neutral-50 border-neutral-200 text-neutral-600',
+                    pulse: true,
+                };
+            }
+            return {
+                state: 'configured',
+                eyebrow: 'Cluster configured',
+                label: 'Not loaded',
+                detail:
+                    'The placement is saved, but no model weights are resident. This is expected after an unload or reboot.',
+                tone: 'bg-amber-50 border-amber-200 text-amber-700',
+                pulse: false,
+            };
+        },
+
+        deploymentCacheLabel(deployment = this.configuredDeployment()) {
+            const enabled = Boolean(
+                deployment?.execution?.prompt_cache_ssd ??
+                    deployment?.prompt_cache_ssd,
+            );
+            return enabled
+                ? 'Prompt reuse · memory + persistent SSD snapshots · ' +
+                    `${Math.round(Number(deployment?.execution?.prompt_cache_ssd_max_bytes || 20 * (1024 ** 3)) / (1024 ** 3))} GiB per rank`
+                : 'Prompt reuse · memory only (SSD snapshots off)';
         },
 
         // =====================================================================
@@ -496,7 +942,9 @@ function clusterV2Wizard() {
         // =====================================================================
         wizardState() {
             if (this.devicesUnreachable) return 'error';
-            if (this.activeDeployment()) return 'active';
+            // A durable deployment keeps its management panel mounted, but its
+            // badge is driven by deploymentRuntimeState(), not by persistence.
+            if (this.configuredDeployment()) return 'active';
             if (this.stage === 'plan' && this.pairedDevices().length) {
                 return 'plan';
             }
@@ -975,29 +1423,26 @@ function clusterV2Wizard() {
 
         async runBenchmark() {
             if (this.checks.benchmarkRunning) return;
+            if (!this.selectedModelPath) {
+                this.checks.benchmark = {
+                    ok: false,
+                    error:
+                        'Choose a downloaded model first. Calibration measures that real model on this exact cluster.',
+                };
+                return;
+            }
             this.checks.benchmarkRunning = true;
             try {
-                const result = await this.apiFetch(
-                    CLUSTER_V2_API.autoconfigure,
-                    {
-                        method: 'POST',
-                        body: JSON.stringify({
-                            nodes: this.planNodes(),
-                            hosts: this.deploymentHosts(),
-                            // The autoconfigure contract demands exactly one
-                            // of model_path / model_size_bytes. The wizard has
-                            // no model picked at benchmark time, so a 16 GiB
-                            // placeholder satisfies the contract — the probe
-                            // measurements (compute + link speeds) are what
-                            // actually matter here.
-                            model_size_bytes: 16 * 1024 ** 3,
-                            measure_performance: true,
-                            preflight: false,
-                            detect_transports: true,
-                        }),
-                    },
-                );
-                this.checks.benchmark = { ok: true, result };
+                // "Run again" means a fresh probe: do not feed the previous
+                // activation's profiles back into autoconfigure.
+                this.planProposal = null;
+                const proposal = await this.runPlan();
+                if (!proposal) {
+                    this.checks.benchmark = {
+                        ok: false,
+                        error: this.planError || 'Calibration failed',
+                    };
+                }
             } catch (error) {
                 this.checks.benchmark = {
                     ok: false,
@@ -1136,7 +1581,7 @@ function clusterV2Wizard() {
                                   .map((peer) => this.deviceName(peer))
                                   .join(', ')}.`
                             : 'rdma_ctl reports devices on every Thunderbolt Mac.',
-                        fix: 'On the failing Mac, connect the Thunderbolt cable and verify with `rdma_ctl status` in Terminal, then Re-run checks. Without it the cluster falls back to the slower TCP ring.',
+                        fix: 'Connect the Thunderbolt cable and run `rdma_ctl status` on every Mac. If you are not on macOS 27 and it reports disabled: shut down, hold the power button to enter Recovery, open Utilities → Terminal, run `rdma_ctl enable`, then restart and Re-run checks. Without RDMA the cluster falls back to the slower TCP ring.',
                     });
                 }
             }
@@ -1153,13 +1598,17 @@ function clusterV2Wizard() {
                         ? bench.ok
                             ? 'pass'
                             : 'fail'
+                        : !this.selectedModelPath
+                        ? 'skipped'
                         : 'pending',
                     detail: bench
                         ? bench.ok
                             ? 'Measured compute and link speeds shape the layer split.'
                             : bench.error
-                        : 'Optional but recommended — run it once so the split matches real speeds.',
-                    fix: 'Benchmark failures are usually a sleeping peer. Wake the other Mac and press Run benchmark again.',
+                        : !this.selectedModelPath
+                        ? 'Runs automatically after you choose a model.'
+                        : 'Measuring the selected model so the split matches real speeds.',
+                    fix: 'Calibration requires a selected model and awake peers. Choose the model, wake every Mac, then run it again.',
                 });
             }
 
@@ -1412,7 +1861,9 @@ function clusterV2Wizard() {
         displayModelName(model) {
             const display = String(model?.display_name || '').trim();
             if (display) return display;
-            const raw = String(model?.model_path || model?.id || '');
+            const raw = String(
+                model?.model_path || model?.model || model?.id || '',
+            );
             const segments = raw.split('/').filter(Boolean);
             while (
                 segments.length &&
@@ -1622,7 +2073,7 @@ function clusterV2Wizard() {
             const option = this.strategyOptions().find(
                 (item) => item.key === key,
             );
-            if (!option || option.disabled) return;
+            if (!option || option.disabled || this.planLoading) return;
             if (this.planStrategy === key) return;
             this.planStrategy = key;
             if (this.selectedModelPath) this.runPlan();
@@ -1673,7 +2124,7 @@ function clusterV2Wizard() {
                     body: JSON.stringify({
                         nodes: this.planNodes(),
                         models: candidates,
-                        execution_profile: 'balanced',
+                        execution_profile: this.executionProfile,
                     }),
                 });
                 this.catalogueModels = payload?.models || [];
@@ -1685,20 +2136,124 @@ function clusterV2Wizard() {
             }
         },
 
-        // Tensor plans give every node ALL layers with a tensor_parallel_rank;
-        // the contiguous-range split bar would lie about them.
+        // Pure tensor plans give every node all layers. Hybrid plans give each
+        // TP group one contiguous stage, then split every layer in that stage.
         planIsTensor() {
             return (this.plan?.tensor_parallel_size || 1) > 1;
         },
 
-        tensorShareLabel() {
-            return t('cluster.v2.split.tensor_share').replace(
-                '{count}',
-                String(this.plan?.tensor_parallel_size || 1),
+        planPipelineStages() {
+            return Math.max(1, Number(this.plan?.pipeline_stages || 1));
+        },
+
+        planIsHybrid() {
+            return this.planIsTensor() && this.planPipelineStages() > 1;
+        },
+
+        tensorGroupRows(assignment = null) {
+            if (!assignment) return this.planAssignments();
+            return this.planAssignments().filter(
+                (row) =>
+                    Number(row.start_layer) === Number(assignment.start_layer) &&
+                    Number(row.end_layer) === Number(assignment.end_layer),
             );
         },
 
+        tensorShareLabel(assignment = null) {
+            const rows = this.tensorGroupRows(assignment);
+            const weights = rows.map((row) =>
+                Number(row.tensor_parallel_shard_weight || 1),
+            );
+            const total = weights.reduce((sum, value) => sum + value, 0);
+            const weight = Number(
+                assignment?.tensor_parallel_shard_weight || 0,
+            );
+            if (assignment && total > 0 && new Set(weights).size > 1) {
+                return `${weight}/${total} tensor rows · layers [${assignment.start_layer}, ${assignment.end_layer})`;
+            }
+            const share = t('cluster.v2.split.tensor_share').replace(
+                '{count}',
+                String(this.plan?.tensor_parallel_size || 1),
+            );
+            return this.planIsHybrid() && assignment
+                ? `${share} · layers [${assignment.start_layer}, ${assignment.end_layer})`
+                : share;
+        },
+
+        tensorSharePercent(assignment) {
+            const rows = this.tensorGroupRows(assignment);
+            const total = rows.reduce(
+                (sum, row) =>
+                    sum + Number(row.tensor_parallel_shard_weight || 1),
+                0,
+            );
+            if (total <= 0) return 0;
+            const tensorFraction =
+                Number(assignment?.tensor_parallel_shard_weight || 1) / total;
+            if (!this.planIsHybrid()) return 100 * tensorFraction;
+            const stageFraction =
+                Number(assignment?.layer_count || 0) /
+                Math.max(this.planTotalLayers(), 1);
+            return 100 * stageFraction * tensorFraction;
+        },
+
+        tensorQualification() {
+            const value = this.plan?.tensor_parallel_qualification;
+            return value && typeof value === 'object' ? value : null;
+        },
+
+        tensorQualificationIsPersistent() {
+            return this.tensorQualification()?.source === 'persistent';
+        },
+
+        tensorRecommendation() {
+            const value = this.planProposal?.tp_layout_recommendation;
+            return value && typeof value === 'object' ? value : null;
+        },
+
+        tensorRecommendationNeedsCalibration() {
+            return this.tensorRecommendation()?.state === 'calibration_required';
+        },
+
+        tensorRecommendationIsRejected() {
+            return this.tensorRecommendation()?.state === 'rejected';
+        },
+
+        tensorQualificationLabel() {
+            if (this.planIsHybrid()) {
+                return `Hybrid TP×pipeline · equal safe tensor split in each of ${this.planPipelineStages()} stages`;
+            }
+            const qualification = this.tensorQualification();
+            const weights = this.planAssignments().map((assignment) =>
+                Number(assignment.tensor_parallel_shard_weight || 1),
+            );
+            const vector = weights.join(':');
+            if (qualification?.source === 'persistent') {
+                return `Performance-qualified ${vector} split`;
+            }
+            if (qualification?.source === 'environment_override') {
+                return `Experimental ${vector} override`;
+            }
+            const recommendation = this.tensorRecommendation();
+            if (recommendation?.state === 'calibration_required') {
+                const candidate = (
+                    recommendation.recommended_weights || []
+                ).join(':');
+                return `Recommended ${candidate} · calibration required`;
+            }
+            if (recommendation?.state === 'rejected') {
+                const candidate = (
+                    recommendation.recommended_weights || []
+                ).join(':');
+                return `Rejected ${candidate} · parity or performance failed`;
+            }
+            return `Equal ${vector} safe fallback`;
+        },
+
         tensorCaptionLabel() {
+            if (this.planIsHybrid()) {
+                return `${this.plan?.tensor_parallel_size || 1}-way tensor × ${this.planPipelineStages()} pipeline stages`;
+            }
             return t('cluster.v2.split.tensor_caption').replace(
                 '{count}',
                 String(this.plan?.tensor_parallel_size || 1),
@@ -1734,13 +2289,27 @@ function clusterV2Wizard() {
         },
 
         async runPlan() {
-            if (!this.selectedModelPath) return;
+            if (!this.selectedModelPath || this.planLoading) return null;
+            const revision = ++this.planRequestRevision;
+            const previousActivation = this.planProposal?.activation;
             this.planLoading = true;
             this.planError = '';
             this.planFitFailure = null;
             this.plan = null;
+            this.planProposal = null;
             try {
                 const model = this.selectedModel();
+                const priorPerformance = new Map(
+                    (previousActivation?.nodes || [])
+                        .filter((node) => node?.node_id && node?.performance)
+                        .map((node) => [node.node_id, node.performance]),
+                );
+                const nodes = this.planNodes().map((node) => ({
+                    ...node,
+                    ...(priorPerformance.has(node.node_id)
+                        ? { performance: priorPerformance.get(node.node_id) }
+                        : {}),
+                }));
                 const body = {
                     model_path: this.selectedModelPath,
                     nodes,
@@ -1766,16 +2335,67 @@ function clusterV2Wizard() {
                 ) {
                     body.model_source = model.model_source;
                 }
-                this.plan = await this.apiFetch(CLUSTER_V2_API.plan, {
-                    method: 'POST',
-                    body: JSON.stringify(body),
-                });
+                const sourceLocation = (model?.locations || []).find(
+                    (location) => location?.ssh === model?.model_source,
+                );
+                const sourcePython =
+                    sourceLocation?.python_executable ||
+                    model?.python_executable;
+                if (sourcePython) body.model_source_python = sourcePython;
+
+                const proposal = await this.apiFetch(
+                    CLUSTER_V2_API.autoconfigure,
+                    {
+                        method: 'POST',
+                        body: JSON.stringify(body),
+                    },
+                );
+                if (revision !== this.planRequestRevision) return null;
+                if (
+                    !proposal?.plan ||
+                    !proposal?.activation ||
+                    typeof proposal.activation !== 'object'
+                ) {
+                    throw new Error(
+                        'Automatic setup did not return a signed activation proposal.',
+                    );
+                }
+                if (
+                    proposal.activation.approved_placement !==
+                    proposal.plan.placement_signature
+                ) {
+                    throw new Error(
+                        'Automatic setup returned a plan and activation with different signatures.',
+                    );
+                }
+                this.planProposal = proposal;
+                this.plan = proposal.plan;
+                const probe = proposal.performance_probe;
+                this.checks.benchmark =
+                    probe?.ok === true
+                        ? { ok: true, result: probe }
+                        : {
+                              ok: false,
+                              result: probe || null,
+                              error:
+                                  probe?.reason ||
+                                  'The server did not complete performance calibration.',
+                          };
+                return proposal;
             } catch (error) {
+                if (revision !== this.planRequestRevision) return null;
                 this.planError =
                     error?.message || 'Could not build the layer split';
                 this.planFitFailure = this.parseFitFailure(this.planError);
+                this.checks.benchmark = {
+                    ok: false,
+                    error: this.planError,
+                };
+                return null;
             } finally {
-                this.planLoading = false;
+                if (revision === this.planRequestRevision) {
+                    this.planLoading = false;
+                }
             }
         },
 
@@ -1801,6 +2421,12 @@ function clusterV2Wizard() {
         },
 
         resolvedBackend() {
+            const serverBackend =
+                this.planProposal?.activation?.backend ||
+                this.planProposal?.backend;
+            if (['jaccl', 'jaccl-ring', 'ring'].includes(serverBackend)) {
+                return serverBackend;
+            }
             const members = [this.selfDevice(), ...this.pairedDevices()].filter(
                 Boolean,
             );
@@ -1811,9 +2437,18 @@ function clusterV2Wizard() {
         },
 
         backendLabel() {
-            return this.resolvedBackend() === 'jaccl'
+            return this.resolvedBackend().startsWith('jaccl')
                 ? 'JACCL · Thunderbolt RDMA'
                 : 'TCP ring';
+        },
+
+        deploymentFabricLabel() {
+            const backend = String(
+                this.configuredDeployment()?.backend || this.resolvedBackend(),
+            );
+            return backend.startsWith('jaccl')
+                ? 'Inference: JACCL over Thunderbolt RDMA'
+                : 'Inference: TCP ring';
         },
 
         deploymentHosts() {
@@ -1845,30 +2480,14 @@ function clusterV2Wizard() {
             return hosts.filter((host) => host.ips.length || host.ssh);
         },
 
-        // The single source of the activation payload. POST /stage takes
-        // {activation, parallel} where activation is this exact object, and
-        // POST /deployments takes it verbatim — one builder, so the signed
-        // placement check can never drift between stage and activate.
+        // The server-produced activation is immutable client input from here
+        // onward. Rebuilding any of its nodes, host order, backend, profiles or
+        // TP degree in the browser would invalidate the signed preview.
         activationRequestBody() {
-            const model = this.selectedModel();
-            const body = {
-                model_path: this.selectedModelPath,
-                backend: this.resolvedBackend(),
-                nodes: this.planNodes(),
-                hosts: this.deploymentHosts(),
-                approved_placement: this.plan.placement_signature,
-                execution_profile: 'balanced',
-                // Must match what was planned — the signed placement
-                // covers tensor_parallel_size, so a mismatch 409s.
-                tensor_parallel_size: this.planTensorParallelSize(),
-            };
-            if (
-                model?.model_source &&
-                model.model_source !== '127.0.0.1'
-            ) {
-                body.model_source = model.model_source;
-            }
-            return body;
+            const activation = this.planProposal?.activation;
+            return activation && typeof activation === 'object'
+                ? activation
+                : null;
         },
 
         // =====================================================================
@@ -1895,7 +2514,11 @@ function clusterV2Wizard() {
                     .filter((loc) => (loc.estimated_size || 0) >= full)
                     .map((loc) => loc.node_id),
             );
-            return this.planNodes().filter(
+            const activationNodes = this.activationRequestBody()?.nodes;
+            const members = Array.isArray(activationNodes)
+                ? activationNodes
+                : [];
+            return members.filter(
                 (node) => !holders.has(node.node_id),
             );
         },
@@ -1905,26 +2528,28 @@ function clusterV2Wizard() {
         },
 
         async activatePlan() {
-            if (!this.plan || this.activateBusy) return;
+            const activation = this.activationRequestBody();
+            if (!this.plan || !activation || this.activateBusy) return;
             this.activateBusy = true;
             if (this.needsStaging()) {
                 // Phase 1 returns after the POST; the 1 Hz poller owns the
                 // flow from here and chains into phase 2 on completion.
-                await this.stageModelToPeers();
+                await this.stageModelToPeers(activation);
                 return;
             }
             // Every plan Mac already has the model — today's direct path.
-            await this.postActivation();
+            await this.postActivation(activation);
         },
 
-        async stageModelToPeers() {
+        async stageModelToPeers(activation) {
             this.stagingError = '';
+            this.stagingActivation = activation;
             let job;
             try {
                 job = await this.apiFetch(CLUSTER_V2_API.stage, {
                     method: 'POST',
                     body: JSON.stringify({
-                        activation: this.activationRequestBody(),
+                        activation,
                         parallel: 4,
                     }),
                 });
@@ -1938,14 +2563,16 @@ function clusterV2Wizard() {
                         'The plan changed since you reviewed it — rebuilding it now.',
                     );
                     this.activateBusy = false;
+                    this.stagingActivation = null;
                     await this.runPlan();
                 } else if (error?.status === 404) {
                     // A server older than /stage: degrade to the pre-staging
                     // behavior instead of bricking activation — the
                     // activation preflight reports whatever is still missing.
                     this.notify('warning', t('cluster.v2.staging.unsupported'));
-                    await this.postActivation();
+                    await this.postActivation(activation);
                 } else {
+                    this.stagingActivation = null;
                     this.failStaging(
                         error?.message || t('cluster.v2.staging.failed'),
                     );
@@ -1987,7 +2614,7 @@ function clusterV2Wizard() {
             this.stagingJob = snapshot;
             if (snapshot.status === 'completed') {
                 this.stopStagingPoll();
-                await this.postActivation(); // phase 2
+                await this.postActivation(this.stagingActivation); // phase 2
             } else if (snapshot.status === 'failed') {
                 // Other nodes may still have completed; per-node errors stay
                 // visible in stagingJob.nodes next to the banner. Pressing
@@ -2018,6 +2645,7 @@ function clusterV2Wizard() {
         dismissStaging() {
             this.stopStagingPoll();
             this.stagingJob = null;
+            this.stagingActivation = null;
             this.stagingError = '';
             this.activateBusy = false;
         },
@@ -2072,26 +2700,35 @@ function clusterV2Wizard() {
         },
 
         // Phase 2 — the pre-staging activation path, unchanged.
-        async postActivation() {
+        async postActivation(activation = this.activationRequestBody()) {
+            if (!activation) {
+                this.activateBusy = false;
+                this.notify('error', 'The signed activation proposal is missing.');
+                return;
+            }
             try {
                 await this.apiFetch(CLUSTER_V2_API.deployments, {
                     method: 'POST',
-                    body: JSON.stringify(this.activationRequestBody()),
+                    body: JSON.stringify(activation),
                 });
                 this.notify(
                     'success',
-                    'Cluster activated. The model starts across your Macs on next load.',
+                    'Cluster activated. The distributed readiness check passed.',
                 );
                 this.stage = null;
                 this.plan = null;
+                this.planProposal = null;
                 this.stagingJob = null;
+                this.stagingActivation = null;
                 await this.refreshDeployments();
+                await this.refreshRuntime();
             } catch (error) {
                 if (error?.status === 409) {
                     this.notify(
                         'warning',
                         'The plan changed since you reviewed it — rebuilding it now.',
                     );
+                    this.stagingActivation = null;
                     await this.runPlan();
                 } else {
                     this.notify(
@@ -2371,6 +3008,7 @@ function clusterV2Wizard() {
                 });
                 this.notify('info', 'Cluster deactivated.');
                 await this.refreshDeployments();
+                await this.refreshRuntime();
             } catch (error) {
                 this.notify(
                     'error',

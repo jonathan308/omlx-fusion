@@ -1069,7 +1069,7 @@
                                     <div class="text-sm font-semibold text-neutral-900 mt-0.5 tabular-nums"
                                          x-text="requestPrefillRate(request)"></div>
                                     <div class="text-[10px] text-neutral-600 mt-0.5"
-                                         x-text="request.prefill_progress?.active ? 'live average' : 'prompt average'"></div>
+                                         x-text="requestPrefillDetail(request)"></div>
                                 </div>
                                 <div data-cluster-v2-request-decode-rate>
                                     <div class="text-[9px] uppercase tracking-wider text-green-700">Decode</div>
