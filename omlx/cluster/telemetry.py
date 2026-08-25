@@ -3,10 +3,9 @@
 
 from __future__ import annotations
 
-import json
+import copy
 import logging
 import math
-import os
 import shutil
 import struct
 import threading
@@ -17,13 +16,40 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from .performance import ExecutionSettings
+import json
+import os
+
+from .performance import (
+    DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES,
+    ExecutionSettings,
+)
 from .planner import PipelineAssignment
 
 logger = logging.getLogger(__name__)
 
 # Bounded read for the coordinator's cancel-request file.
 _MAX_CANCEL_FILE_BYTES = 64 * 1024
+
+# A shared request contains HTTP arguments and may include multimodal payloads,
+# but it must never be able to turn one corrupt transport word into an
+# unbounded worker allocation.
+_MAX_SHARED_REQUEST_BYTES = 256 * 1024 * 1024
+_SHARED_OBJECT_MAGIC = 0x4F4D4C58  # ASCII "OMLX"
+_SHARED_OBJECT_HEADER_BYTES = 64
+
+# Runtime markers are capped at 64 KiB.  A normal deployment admits eight
+# concurrent requests, but keep enough bounded detail for deliberately wider
+# serving configurations without letting telemetry grow with an unbounded
+# queue.  ``active_requests`` remains the authoritative total when truncated.
+_MAX_ACTIVE_REQUEST_METRICS = 64
+_MAX_TARGETED_CANCEL_REQUESTS = 256
+
+# Rank-zero cancellation decisions travel in the reliable control stream as an
+# explicit epoch rather than an untyped UID list. The epoch is process-local:
+# the control-plane sequence resets with the rank lifetime too, while a newer
+# coordinator marker epoch is folded in when one exists.
+_CANCEL_VOTE_KIND = "omlx.cancel_vote"
+_CANCEL_VOTE_SCHEMA_VERSION = 1
 
 # How often a rank refreshes its marker with nothing to report.
 #
@@ -38,9 +64,45 @@ _MAX_CANCEL_FILE_BYTES = 64 * 1024
 # it never competes with generation for the lock.
 _DEFAULT_HEARTBEAT_INTERVAL = 10.0
 _MAX_TRANSPORT_REQUEST_ID_BYTES = 128
-_MAX_TARGETED_CANCEL_REQUESTS = 256
-_CANCEL_VOTE_KIND = "omlx.cancel_vote"
-_CANCEL_VOTE_SCHEMA_VERSION = 1
+_INTERNAL_REQUEST_PREFIX = "omlx-internal-"
+
+
+def _agreed_snapshot_capacity_charge(
+    local_charge: int | None,
+    *,
+    world_size: int,
+    rank: int,
+    control_plane: Any | None,
+) -> int | None:
+    """Largest rank charge, or None when safe agreement is unavailable.
+
+    The reliable control plane is intentional. Tiny int32 collectives are a
+    known-bad fit for JACCL control traffic (lost completion can poison the
+    following model collective), so an unmanaged multi-rank worker skips the
+    snapshot rather than reintroducing that fallback.
+    """
+
+    valid = local_charge is not None and int(local_charge) > 0
+    local = int(local_charge or 0)
+    if world_size <= 1:
+        return local if valid else None
+    if control_plane is None:
+        return None
+    sizes: list[int] = []
+    for source in range(world_size):
+        payload = (
+            struct.pack("!BQ", int(valid), local) if rank == source else None
+        )
+        packet = control_plane.broadcast_owned_bytes(
+            payload,
+            source_rank=source,
+            expected_size=9,
+        )
+        ok, size = struct.unpack("!BQ", packet)
+        if ok != 1 or size <= 0:
+            return None
+        sizes.append(int(size))
+    return max(sizes) if sizes else None
 
 
 def _transport_request_id(value: Any) -> str | None:
@@ -88,6 +150,47 @@ def _python_token_id(value: Any) -> int:
     return token
 
 
+def _capture_prompt_boundary_cache(
+    prompt_cache: Any,
+    model_key: Any,
+    batch_generator: Any,
+    uid: Any,
+) -> int:
+    """Store an immutable prompt-side cache before its seed token is consumed.
+
+    DS4 has sliding-window layers whose post-decode state cannot be trimmed
+    backward. Capturing at the prompt-batch→generation boundary yields the
+    ``prompt[:-1]`` state MLX-LM needs for its next request.
+    """
+
+    if uid is None or prompt_cache is None or model_key is None:
+        return 0
+    try:
+        extracted = batch_generator.extract_cache([uid]).get(uid)
+    except Exception:
+        return 0
+    if (
+        not isinstance(extracted, tuple)
+        or len(extracted) != 2
+        or not isinstance(extracted[1], list)
+        or not extracted[1]
+    ):
+        return 0
+    cache, cache_key = extracted
+    prompt_cache.insert_cache(
+        model_key,
+        cache_key[:],
+        # ``extract_cache`` returns rank-local views. Generation mutates those
+        # same cache objects after the prompt boundary, which otherwise turns
+        # a correctly keyed prefix into a post-assistant cache by the next
+        # request. MLX-LM already uses deepcopy on fetch; freeze the stored
+        # boundary with the matching operation.
+        copy.deepcopy(cache),
+        cache_type="user",
+    )
+    return len(cache_key)
+
+
 class MarkerWriter(Protocol):
     """Small RuntimeMarker surface used by the telemetry observer."""
 
@@ -99,6 +202,7 @@ class _RequestSample:
     request_id: int
     started_at: float
     updated_at: float
+    internal: bool = False
     prompt_tokens: int = 0
     cached_tokens: int = 0
     completion_tokens: int = 0
@@ -128,6 +232,10 @@ class RuntimeTelemetry:
         heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
         cancel_path: Path | None = None,
         cancel_deployment_id: str = "",
+        cancel_plan_hash: str = "",
+        cancel_epoch_floor: int = 0,
+        prompt_cache_ssd_enabled: bool = False,
+        prompt_cache_ssd_max_bytes: int = 0,
     ) -> None:
         if publish_interval < 0:
             raise ValueError("publish_interval must be non-negative")
@@ -164,6 +272,13 @@ class RuntimeTelemetry:
         self._prompt_tokens_total = 0
         self._completion_tokens_total = 0
         self._cached_tokens_total = 0
+        # Sum of per-request decode windows (first-token -> finish) for
+        # finished requests. This produces the average per-request rate. True
+        # aggregate throughput uses generation rows / batch-step wall time;
+        # summing overlapping request windows would divide concurrency away.
+        self._decode_seconds_total = 0.0
+        self._decode_step_tokens_total = 0
+        self._decode_step_seconds_total = 0.0
         self._batch_steps = 0
         self._busy_seconds = 0.0
         self._idle_seconds = 0.0
@@ -173,6 +288,20 @@ class RuntimeTelemetry:
         self._cache_tokens_reused = 0
         self._cache_entries = 0
         self._cache_bytes = 0
+        self._cache_memory_entries = 0
+        self._cache_memory_bytes = 0
+        self._cache_memory_hits = 0
+        self._cache_ssd_entries = 0
+        self._cache_ssd_bytes = 0
+        self._cache_ssd_hits = 0
+        self._cache_ssd_enabled = bool(prompt_cache_ssd_enabled)
+        self._cache_ssd_max_bytes = max(0, int(prompt_cache_ssd_max_bytes))
+        self._cache_ssd_capacity_bytes = 0
+        self._cache_ssd_evictions = 0
+        self._cache_ssd_capacity_drops = 0
+        self._cache_ssd_pending_bytes = 0
+        self._cache_ssd_pending_max_bytes = 0
+        self._cache_ssd_write_failures = 0
         # Rank-side force-cancel surface. The coordinator drops a cancel file
         # next to the runtime markers; the heartbeat picks it up and removes
         # every active uid through BatchGenerator.remove — MLX-LM's own
@@ -182,8 +311,20 @@ class RuntimeTelemetry:
         self._batch_generator: Any | None = None
         self._cancel_path = cancel_path
         self._cancel_deployment_id = cancel_deployment_id
-        self._last_cancel_epoch = 0
+        self._cancel_plan_hash = cancel_plan_hash
+        self._cancel_epoch_floor = max(0, int(cancel_epoch_floor))
+        self._last_cancel_epoch = max(0, self._cancel_epoch_floor - 1)
+        self._accepted_cancel_vote_epoch = 0
         self._last_cancel_poll_at = float("-inf")
+        # Cancellation is an edge-triggered control event, not durable desired
+        # state. A file left by a previous rank lifetime must be the startup
+        # watermark, never work applied to the first request of this process.
+        existing_cancel = self._read_cancel_request()
+        if existing_cancel is not None:
+            self._last_cancel_epoch = max(
+                self._last_cancel_epoch,
+                int(existing_cancel["epoch"]),
+            )
 
     def heartbeat(self) -> None:
         """Refresh the marker with nothing new to say.
@@ -241,6 +382,7 @@ class RuntimeTelemetry:
 
     def begin_request(self, transport_request_id: str | None = None) -> int:
         now = float(self._clock())
+        transport_request_id = _transport_request_id(transport_request_id)
         with self._lock:
             self._next_request_id += 1
             request_id = self._next_request_id
@@ -248,8 +390,11 @@ class RuntimeTelemetry:
                 request_id=request_id,
                 started_at=now,
                 updated_at=now,
+                internal=bool(
+                    transport_request_id
+                    and transport_request_id.startswith(_INTERNAL_REQUEST_PREFIX)
+                ),
             )
-            transport_request_id = _transport_request_id(transport_request_id)
             if transport_request_id is not None:
                 self._transport_to_request[transport_request_id] = request_id
                 self._request_to_transport[request_id] = transport_request_id
@@ -318,15 +463,17 @@ class RuntimeTelemetry:
                 and now > previous_at
                 and processed > previous_processed
             ):
-                sample.prefill_speed = (processed - previous_processed) / (
-                    now - previous_at
-                )
+                sample.prefill_speed = (
+                    processed - previous_processed
+                ) / (now - previous_at)
             elif (
                 processed > 0
                 and now > sample.prefill_started_at
                 and sample.prefill_speed <= 0
             ):
-                sample.prefill_speed = processed / (now - sample.prefill_started_at)
+                sample.prefill_speed = processed / (
+                    now - sample.prefill_started_at
+                )
             prefill_elapsed = now - sample.prefill_started_at
             if processed > 0 and prefill_elapsed > 0:
                 sample.prefill_average_speed = processed / prefill_elapsed
@@ -482,6 +629,8 @@ class RuntimeTelemetry:
                     logger.warning("Rank-side pending context cancel failed: %s", exc)
 
     def register_response_queue(self, request_id: int, queue: Any) -> None:
+        """Retain the raw rank-local queue so shared removal can terminate it."""
+
         with self._lock:
             if request_id in self._requests:
                 self._request_queues[request_id] = queue
@@ -515,6 +664,7 @@ class RuntimeTelemetry:
             return
         now = float(self._clock())
         changed = False
+        queues_to_close: list[Any] = []
         with self._lock:
             for uid in uid_values:
                 request_id = self._uid_to_request.pop(uid, None)
@@ -522,19 +672,28 @@ class RuntimeTelemetry:
                     continue
                 self._cancel_requested_requests.discard(request_id)
                 self._request_to_uid.pop(request_id, None)
-                changed = (
-                    self._finish_locked(
-                        request_id,
-                        now=now,
-                        status="cancelled",
-                    )
-                    or changed
+                queue = self._request_queues.get(request_id)
+                finished = self._finish_locked(
+                    request_id,
+                    now=now,
+                    status="cancelled",
                 )
+                if finished and queue is not None:
+                    queues_to_close.append(queue)
+                changed = finished or changed
             if changed:
                 self._publish_locked(now, force=True)
+        # Wake the rank-zero HTTP collector only after releasing telemetry's
+        # lock. Worker dummy queues receive the same terminal sentinel, which
+        # is harmless and keeps queue semantics symmetric.
+        for queue in queues_to_close:
+            try:
+                queue.put(None)
+            except Exception as exc:
+                logger.debug("Could not terminate cancelled response queue: %s", exc)
 
     def register_batch_generator(self, generator: Any) -> None:
-        """Remember the live BatchGenerator so force-cancel can reach it."""
+        """Remember the live generator for telemetry, never rank-local removal."""
 
         with self._lock:
             self._batch_generator = generator
@@ -557,7 +716,8 @@ class RuntimeTelemetry:
             requested = [
                 self._request_to_uid[request_id]
                 for request_id in self._cancel_requested_requests
-                if request_id in self._request_to_uid and request_id in self._requests
+                if request_id in self._request_to_uid
+                and request_id in self._requests
             ]
         for uid in requested:
             if uid not in merged:
@@ -565,37 +725,45 @@ class RuntimeTelemetry:
         return merged
 
     def force_cancel_all(self, *, reason: str = "coordinator cancel") -> int:
-        """Remove every active uid through MLX-LM's own cancel path.
+        """Request cancellation through MLX-LM's shared server-loop path.
 
-        ``BatchGenerator.remove`` is the same call MLX-LM handlers make on
-        client disconnect: it is processed by the batch loop at a step
-        boundary and shared with peer ranks, so both sides of the pipeline
-        abandon the request together and no collective is severed
-        mid-request. Returns the number of uids handed to the batch loop.
+        Directly calling ``BatchGenerator.remove`` here is rank-local and may
+        run on the heartbeat thread.  Rank zero would discard its UID while
+        peers kept decoding, producing mismatched tensor collectives. Setting
+        the real ``GenerationContext`` stop flag lets the pinned server append
+        the UID at its next prompt/token boundary, broadcast that list, and
+        remove it on every rank together. Process teardown remains the backstop
+        for a rank genuinely wedged inside a collective.
         """
 
         with self._lock:
-            generator = self._batch_generator
-            uids = [
-                uid
-                for request_id, uid in self._request_to_uid.items()
+            self._cancel_requested_requests.update(self._requests)
+            contexts = [
+                context
+                for request_id, context in self._request_contexts.items()
                 if request_id in self._requests
             ]
-        if generator is None or not uids:
+        if not contexts:
             return 0
-        try:
-            generator.remove(list(uids))
-        except Exception as exc:
-            # A cancel that failed must be loud but must not kill the rank;
-            # the coordinator falls back to process teardown.
-            logger.warning("Rank-side force-cancel failed: %s", exc)
+        requested = 0
+        for context in contexts:
+            stop = getattr(context, "stop", None)
+            if not callable(stop):
+                continue
+            try:
+                stop()
+            except Exception as exc:
+                logger.warning("Rank-side context cancel failed: %s", exc)
+                continue
+            requested += 1
+        if not requested:
             return 0
         logger.warning(
-            "Force-cancelled %d active rank-side request(s): %s",
-            len(uids),
+            "Requested synchronized cancellation for %d active request(s): %s",
+            requested,
             reason,
         )
-        return len(uids)
+        return requested
 
     def force_cancel_request(
         self,
@@ -655,8 +823,12 @@ class RuntimeTelemetry:
             and payload.get("deployment_id") != self._cancel_deployment_id
         ):
             return None
+        if self._cancel_plan_hash and payload.get("plan_hash") != self._cancel_plan_hash:
+            return None
         epoch = payload.get("epoch")
         if not isinstance(epoch, int) or isinstance(epoch, bool):
+            return None
+        if epoch < self._cancel_epoch_floor:
             return None
         return payload
 
@@ -668,6 +840,7 @@ class RuntimeTelemetry:
         payload = {
             "schema_version": 1,
             "deployment_id": self._cancel_deployment_id,
+            "plan_hash": self._cancel_plan_hash,
             "epoch": epoch,
             "cancelled": cancelled,
             "at": time.time(),
@@ -750,11 +923,21 @@ class RuntimeTelemetry:
             self._busy_seconds += elapsed
             self._last_step_finished_at = now
             self._batch_steps += 1
-            coalesced = max(prompt_responses, generation_responses)
+            generation_rows = max(0, int(generation_responses))
+            prompt_rows = max(0, int(prompt_responses))
+            internal_only = bool(self._requests) and all(
+                sample.internal for sample in self._requests.values()
+            )
+            visible_generation_rows = 0 if internal_only else generation_rows
+            visible_prompt_rows = 0 if internal_only else prompt_rows
+            if visible_generation_rows > 0 and elapsed > 0.0:
+                self._decode_step_tokens_total += visible_generation_rows
+                self._decode_step_seconds_total += elapsed
+            coalesced = max(visible_prompt_rows, visible_generation_rows)
             self._last_batch = {
                 "step_seconds": elapsed,
-                "prompt_responses": max(0, int(prompt_responses)),
-                "generation_responses": max(0, int(generation_responses)),
+                "prompt_responses": visible_prompt_rows,
+                "generation_responses": visible_generation_rows,
                 "coalesced_batch_size": max(0, int(coalesced)),
             }
             self._publish_locked(now, force=False)
@@ -766,6 +949,18 @@ class RuntimeTelemetry:
         remaining_tokens: int,
         entries: int,
         nbytes: int,
+        memory_entries: int | None = None,
+        memory_bytes: int | None = None,
+        ssd_entries: int | None = None,
+        ssd_bytes: int | None = None,
+        ssd_max_bytes: int | None = None,
+        ssd_capacity_bytes: int | None = None,
+        ssd_evictions: int | None = None,
+        ssd_capacity_drops: int | None = None,
+        ssd_pending_bytes: int | None = None,
+        ssd_pending_max_bytes: int | None = None,
+        ssd_write_failures: int | None = None,
+        hit_tier: str | None = None,
     ) -> None:
         now = float(self._clock())
         prompt = max(0, int(prompt_tokens))
@@ -776,16 +971,103 @@ class RuntimeTelemetry:
             if reused > 0:
                 self._cache_hits += 1
                 self._cache_tokens_reused += reused
+                if hit_tier == "ssd":
+                    self._cache_ssd_hits += 1
+                else:
+                    # The optional argument preserves the old in-memory-only
+                    # caller contract while making durable restores explicit.
+                    self._cache_memory_hits += 1
             self._cache_entries = max(0, int(entries))
             self._cache_bytes = max(0, int(nbytes))
+            if memory_entries is None and ssd_entries is None:
+                # Backward-compatible callers report the volatile tier only.
+                memory_entries = entries
+                memory_bytes = nbytes
+            if memory_entries is not None:
+                self._cache_memory_entries = max(0, int(memory_entries))
+            if memory_bytes is not None:
+                self._cache_memory_bytes = max(0, int(memory_bytes))
+            if ssd_entries is not None:
+                self._cache_ssd_entries = max(0, int(ssd_entries))
+            if ssd_bytes is not None:
+                self._cache_ssd_bytes = max(0, int(ssd_bytes))
+            self._observe_ssd_capacity_locked(
+                max_bytes=ssd_max_bytes,
+                capacity_bytes=ssd_capacity_bytes,
+                evictions=ssd_evictions,
+                capacity_drops=ssd_capacity_drops,
+                pending_bytes=ssd_pending_bytes,
+                pending_max_bytes=ssd_pending_max_bytes,
+                write_failures=ssd_write_failures,
+            )
             self._publish_locked(now, force=False)
 
-    def observe_cache_state(self, *, entries: int, nbytes: int) -> None:
+    def observe_cache_state(
+        self,
+        *,
+        entries: int,
+        nbytes: int,
+        memory_entries: int | None = None,
+        memory_bytes: int | None = None,
+        ssd_entries: int | None = None,
+        ssd_bytes: int | None = None,
+        ssd_max_bytes: int | None = None,
+        ssd_capacity_bytes: int | None = None,
+        ssd_evictions: int | None = None,
+        ssd_capacity_drops: int | None = None,
+        ssd_pending_bytes: int | None = None,
+        ssd_pending_max_bytes: int | None = None,
+        ssd_write_failures: int | None = None,
+    ) -> None:
         now = float(self._clock())
         with self._lock:
             self._cache_entries = max(0, int(entries))
             self._cache_bytes = max(0, int(nbytes))
+            if memory_entries is None and ssd_entries is None:
+                memory_entries = entries
+                memory_bytes = nbytes
+            if memory_entries is not None:
+                self._cache_memory_entries = max(0, int(memory_entries))
+            if memory_bytes is not None:
+                self._cache_memory_bytes = max(0, int(memory_bytes))
+            if ssd_entries is not None:
+                self._cache_ssd_entries = max(0, int(ssd_entries))
+            if ssd_bytes is not None:
+                self._cache_ssd_bytes = max(0, int(ssd_bytes))
+            self._observe_ssd_capacity_locked(
+                max_bytes=ssd_max_bytes,
+                capacity_bytes=ssd_capacity_bytes,
+                evictions=ssd_evictions,
+                capacity_drops=ssd_capacity_drops,
+                pending_bytes=ssd_pending_bytes,
+                pending_max_bytes=ssd_pending_max_bytes,
+                write_failures=ssd_write_failures,
+            )
             self._publish_locked(now, force=False)
+
+    def _observe_ssd_capacity_locked(
+        self,
+        *,
+        max_bytes: int | None,
+        capacity_bytes: int | None,
+        evictions: int | None,
+        capacity_drops: int | None,
+        pending_bytes: int | None,
+        pending_max_bytes: int | None,
+        write_failures: int | None,
+    ) -> None:
+        values = {
+            "_cache_ssd_max_bytes": max_bytes,
+            "_cache_ssd_capacity_bytes": capacity_bytes,
+            "_cache_ssd_evictions": evictions,
+            "_cache_ssd_capacity_drops": capacity_drops,
+            "_cache_ssd_pending_bytes": pending_bytes,
+            "_cache_ssd_pending_max_bytes": pending_max_bytes,
+            "_cache_ssd_write_failures": write_failures,
+        }
+        for name, value in values.items():
+            if value is not None:
+                setattr(self, name, max(0, int(value)))
 
     def _finish_locked(
         self,
@@ -810,6 +1092,11 @@ class RuntimeTelemetry:
         if uid is not None:
             self._uid_to_request.pop(uid, None)
         sample.updated_at = now
+        if sample.internal:
+            # Readiness canaries prove the ranks but are not user inference.
+            # Do not turn a four-token load probe into Request #1, poison the
+            # displayed prefill rate, or dilute lifetime aggregate throughput.
+            return True
         if status == "failed":
             self._requests_failed += 1
         elif status == "cancelled":
@@ -819,6 +1106,8 @@ class RuntimeTelemetry:
         self._prompt_tokens_total += sample.prompt_tokens
         self._completion_tokens_total += sample.completion_tokens
         self._cached_tokens_total += sample.cached_tokens
+        if sample.first_token_at is not None and sample.completion_tokens > 0:
+            self._decode_seconds_total += max(0.0, now - sample.first_token_at)
         self._last_completed = self._sample_snapshot(
             sample,
             now=now,
@@ -853,7 +1142,26 @@ class RuntimeTelemetry:
             max(0, sample.prefill_processed_tokens),
         )
         prefill_started_at = sample.prefill_started_at or sample.started_at
-        prefill_elapsed = max(0.0, now - prefill_started_at)
+        prefill_active = status == "running" and first is None
+        # Freeze the prefill clock when prefill is done. ``now`` is the
+        # snapshot/finish instant, so an unfrozen elapsed keeps growing through
+        # the whole decode phase (observed: elapsed 25.3 s with ttft 2.49 s)
+        # and average_speed collapses to a few tok/s on every long decode.
+        # The last progress callback lands with the final chunk; when no
+        # callback ever arrived, the first token is the honest upper bound.
+        if prefill_active:
+            prefill_end = now
+        elif (
+            prefill_total > 0
+            and prefill_processed >= prefill_total
+            and sample.prefill_updated_at is not None
+        ):
+            prefill_end = sample.prefill_updated_at
+        elif first is not None:
+            prefill_end = first
+        else:
+            prefill_end = now
+        prefill_elapsed = max(0.0, prefill_end - prefill_started_at)
         prefill_average_speed = (
             prefill_processed / prefill_elapsed
             if prefill_processed > 0 and prefill_elapsed > 0
@@ -864,7 +1172,6 @@ class RuntimeTelemetry:
             # processed prompt tokens divided by total time so far. The recent
             # chunk remains separate below for ETA and diagnostics.
             prefill_tps = prefill_average_speed or sample.prefill_speed
-        prefill_active = status == "running" and first is None
         prefill_remaining = max(0, prefill_total - prefill_processed)
         prefill_eta = (
             prefill_remaining / sample.prefill_speed
@@ -880,6 +1187,7 @@ class RuntimeTelemetry:
         )
         end_to_end_tps = sample.completion_tokens / elapsed if elapsed > 0 else 0.0
         return {
+            "request_id": sample.request_id,
             "status": status,
             "prompt_tokens": sample.prompt_tokens,
             "cached_tokens": sample.cached_tokens,
@@ -901,9 +1209,17 @@ class RuntimeTelemetry:
         }
 
     def _snapshot_locked(self, now: float) -> dict[str, Any]:
+        active_samples = sorted(
+            (
+                sample
+                for sample in self._requests.values()
+                if not sample.internal
+            ),
+            key=lambda item: item.request_id,
+        )
         active_sample = (
-            max(self._requests.values(), key=lambda item: item.updated_at)
-            if self._requests
+            max(active_samples, key=lambda item: item.updated_at)
+            if active_samples
             else None
         )
         current = (
@@ -912,10 +1228,16 @@ class RuntimeTelemetry:
             else self._last_completed
         )
         active_completion_tokens = sum(
-            sample.completion_tokens for sample in self._requests.values()
+            sample.completion_tokens for sample in active_samples
         )
         uptime = max(0.0, now - self._started_at)
         total_generated = self._completion_tokens_total + active_completion_tokens
+        active_decode_seconds = sum(
+            now - sample.first_token_at
+            for sample in active_samples
+            if sample.first_token_at is not None
+        )
+        decode_seconds = self._decode_seconds_total + active_decode_seconds
         utilization_denominator = self._busy_seconds + self._idle_seconds
         pipeline_utilization = (
             self._busy_seconds / utilization_denominator
@@ -927,14 +1249,36 @@ class RuntimeTelemetry:
         )
         result = {
             "scope": "end_to_end_pipeline",
-            "active_requests": len(self._requests),
+            "active_requests": len(active_samples),
             "requests_completed": self._requests_completed,
             "requests_failed": self._requests_failed,
             "requests_cancelled": self._requests_cancelled,
             "prompt_tokens_total": self._prompt_tokens_total,
             "completion_tokens_total": self._completion_tokens_total,
             "cached_tokens_total": self._cached_tokens_total,
-            "aggregate_decode_tps": (total_generated / uptime if uptime > 0 else 0.0),
+            # ``last_request`` is retained for older dashboards.  New clients
+            # use this stable request-id ordered collection so concurrent
+            # prompt/decode rates never overwrite one another before the API
+            # boundary.
+            "active_request_metrics": [
+                self._sample_snapshot(sample, now=now, status="running")
+                for sample in active_samples[:_MAX_ACTIVE_REQUEST_METRICS]
+            ],
+            "active_request_metrics_truncated": max(
+                0,
+                len(active_samples) - _MAX_ACTIVE_REQUEST_METRICS,
+            ),
+            "aggregate_decode_tps": (
+                self._decode_step_tokens_total / self._decode_step_seconds_total
+                if self._decode_step_seconds_total > 0
+                else 0.0
+            ),
+            "average_request_decode_tps": (
+                total_generated / decode_seconds if decode_seconds > 0 else 0.0
+            ),
+            # The pre-fix semantic (tokens / process uptime, idle included),
+            # kept under an honest name for capacity planning views.
+            "aggregate_wall_tps": (total_generated / uptime if uptime > 0 else 0.0),
             "cache": {
                 "affinity": (
                     "deployment"
@@ -948,6 +1292,24 @@ class RuntimeTelemetry:
                 "tokens_reused": self._cache_tokens_reused,
                 "entries": self._cache_entries,
                 "bytes": self._cache_bytes,
+                "ssd_enabled": self._cache_ssd_enabled,
+                "memory": {
+                    "entries": self._cache_memory_entries,
+                    "bytes": self._cache_memory_bytes,
+                    "hits": self._cache_memory_hits,
+                },
+                "ssd": {
+                    "entries": self._cache_ssd_entries,
+                    "bytes": self._cache_ssd_bytes,
+                    "hits": self._cache_ssd_hits,
+                    "max_bytes": self._cache_ssd_max_bytes,
+                    "capacity_bytes": self._cache_ssd_capacity_bytes,
+                    "evictions": self._cache_ssd_evictions,
+                    "capacity_drops": self._cache_ssd_capacity_drops,
+                    "pending_bytes": self._cache_ssd_pending_bytes,
+                    "pending_max_bytes": self._cache_ssd_pending_max_bytes,
+                    "write_failures": self._cache_ssd_write_failures,
+                },
             },
             "pipeline": {
                 "batch_steps": self._batch_steps,
@@ -968,6 +1330,16 @@ class RuntimeTelemetry:
             },
             "last_request": current,
         }
+        try:
+            from omlx.patches.mlx_lm_mtp.batch_generator import (
+                mtp_runtime_stats_snapshot,
+            )
+
+            mtp_stats = mtp_runtime_stats_snapshot()
+        except Exception:
+            mtp_stats = None
+        if mtp_stats is not None:
+            result["mtp"] = mtp_stats
         if self._execution is not None:
             result["execution"] = self._execution.to_dict()
         if self._assignment is not None:
@@ -1059,7 +1431,9 @@ def install_server_telemetry(
     heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
     ssd_cache_dir: str | None = None,
     ssd_max_entries: int = 512,
+    ssd_max_bytes: int | None = None,
     ssd_cache_persistent: bool = False,
+    ssd_write_behind: bool = False,
     prefill_step_size: int = 2048,
     control_plane: Any | None = None,
 ) -> Iterator[RuntimeTelemetry]:
@@ -1103,6 +1477,7 @@ def install_server_telemetry(
         if isinstance(marker_payload, dict)
         else ""
     )
+    worker_cancel_epoch_floor = int(time.time() * 1000)
     telemetry = RuntimeTelemetry(
         marker,
         execution=execution,
@@ -1114,7 +1489,42 @@ def install_server_telemetry(
             else None
         ),
         cancel_deployment_id=marker_deployment_id,
+        cancel_plan_hash=marker_plan_hash,
+        cancel_epoch_floor=worker_cancel_epoch_floor,
+        prompt_cache_ssd_enabled=bool(ssd_cache_dir),
+        prompt_cache_ssd_max_bytes=(
+            int(ssd_max_bytes)
+            if ssd_max_bytes is not None
+            else execution.prompt_cache_ssd_max_bytes
+            if execution is not None
+            else DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
+        )
+        if ssd_cache_dir
+        else 0,
     )
+
+    try:
+        group = mx.distributed.init()
+        world_size = int(group.size())
+        rank = int(group.rank())
+    except Exception:
+        world_size = 1
+        rank = 0
+
+    def agree_snapshot_capacity_charge(local_charge: int | None) -> int | None:
+        """Largest rank file charge, or None if any rank cannot snapshot.
+
+        All ranks account the same largest charge even though their layer
+        slices have different physical sizes. The common charge plus the
+        operation-ordered LRU makes byte eviction rank-symmetric.
+        """
+
+        return _agreed_snapshot_capacity_charge(
+            local_charge,
+            world_size=world_size,
+            rank=rank,
+            control_plane=control_plane,
+        )
 
     snapshot_ctx = threading.local()
     prompt_cache_instances: list[Any] = []
@@ -1127,19 +1537,36 @@ def install_server_telemetry(
             candidate_boundaries,
         )
 
+        resolved_ssd_max_bytes = int(
+            ssd_max_bytes
+            or (
+                execution.prompt_cache_ssd_max_bytes
+                if execution is not None
+                else DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
+            )
+        )
         ssd_store = SSDPromptSnapshotStore(
             ssd_cache_dir,
             step=snapshot_step,
             max_entries=ssd_max_entries,
+            max_bytes=resolved_ssd_max_bytes,
             persistent=ssd_cache_persistent,
+            write_behind=ssd_write_behind,
+            capacity_agreement=agree_snapshot_capacity_charge,
         )
-    try:
-        group = mx.distributed.init()
-        world_size = int(group.size())
-        rank = int(group.rank())
-    except Exception:
-        world_size = 1
-        rank = 0
+
+    def ssd_store_observability() -> dict[str, int]:
+        if ssd_store is None:
+            return {}
+        return {
+            "ssd_max_bytes": ssd_store.max_bytes,
+            "ssd_capacity_bytes": ssd_store.capacity_bytes,
+            "ssd_evictions": ssd_store.evictions,
+            "ssd_capacity_drops": ssd_store.capacity_drops,
+            "ssd_pending_bytes": ssd_store.pending_bytes,
+            "ssd_pending_max_bytes": ssd_store.pending_max_bytes,
+            "ssd_write_failures": ssd_store.write_failures,
+        }
 
     def prompt_cache_positions(cache: Any) -> tuple[int, ...]:
         """Best-effort logical token positions for a rank-local cache copy."""
@@ -1162,6 +1589,22 @@ def install_server_telemetry(
                 if isinstance(offset, int):
                     positions.append(offset)
         return tuple(positions)
+
+    def prompt_cache_position_trace(cache: Any) -> tuple[dict[str, Any], ...]:
+        """Describe cached offsets for an operator-only DS4 reuse diagnosis."""
+
+        rows: list[dict[str, Any]] = []
+        for item in cache or ():
+            nested = getattr(item, "caches", None)
+            entries = nested if isinstance(nested, (list, tuple)) else (item,)
+            for entry in entries:
+                row: dict[str, Any] = {"type": type(entry).__name__}
+                for name in ("ratio", "remainder", "_pool_len", "offset", "max_size"):
+                    value = getattr(entry, name, None)
+                    if isinstance(value, int):
+                        row[name] = value
+                rows.append(row)
+        return tuple(rows)
 
     def agree_prompt_cache_plan(
         cache: Any,
@@ -1191,11 +1634,24 @@ def install_server_telemetry(
         suffix = len(rest) if cache is not None else len(tokens)
         positions = prompt_cache_positions(cache)
         incoherent = int(any(position != reused for position in positions))
+        if (
+            incoherent
+            and os.environ.get("OMLX_CLUSTER_CACHE_TRACE", "0") == "1"
+        ):
+            logger.warning(
+                "Prompt-cache position diagnostic rank=%s reused=%s positions=%s details=%s",
+                rank,
+                reused,
+                positions,
+                prompt_cache_position_trace(cache),
+            )
         local = (reused, suffix, incoherent)
         plans: list[tuple[int, int, int]] = []
         if control_plane is not None:
             for source in range(world_size):
-                payload = struct.pack("!QQQ", *local) if rank == source else None
+                payload = (
+                    struct.pack("!QQQ", *local) if rank == source else None
+                )
                 packet = control_plane.broadcast_owned_bytes(
                     payload,
                     source_rank=source,
@@ -1205,7 +1661,9 @@ def install_server_telemetry(
         else:
             fields = [0] * (3 * world_size)
             fields[3 * rank : 3 * rank + 3] = local
-            agreed = mx.distributed.all_sum(mx.array(fields, dtype=mx.int32))
+            agreed = mx.distributed.all_sum(
+                mx.array(fields, dtype=mx.int32)
+            )
             mx.eval(agreed)
             values = [int(value) for value in agreed.tolist()]
             plans = [
@@ -1272,28 +1730,112 @@ def install_server_telemetry(
             # Full token sequence per in-flight uid, so a boundary snapshot can
             # be keyed while the batched prefill is still running.
             self._omlx_tokens: dict[Any, list[int]] = {}
+            self._omlx_batch_trace_steps = 0
+            self._omlx_prepared_cancel_vote: tuple[int, tuple[int, ...]] | None = None
             telemetry.register_batch_generator(self)
+
+        @staticmethod
+        def _at_generation_boundary(sequence: Any) -> bool:
+            """Whether one staged sequence has only its decode seed token."""
+
+            return bool(
+                isinstance(sequence, (tuple, list))
+                and len(sequence) == 1
+                and isinstance(sequence[0], (tuple, list))
+                and len(sequence[0]) == 1
+            )
+
+        def _about_to_enter_generation(self) -> bool:
+            current = getattr(self, "_currently_processing", ())
+            if any(
+                self._at_generation_boundary(item[0])
+                for item in current
+                if isinstance(item, (tuple, list)) and item
+            ):
+                return True
+            pending = getattr(self, "_unprocessed_sequences", ())
+            return any(
+                self._at_generation_boundary(item[1])
+                for item in pending
+                if isinstance(item, (tuple, list)) and len(item) > 1
+            )
+
+        def _generation_boundary_uids(self) -> tuple[Any, ...]:
+            """Prompt-batch UIDs whose final token moves to generation next."""
+
+            current = getattr(self, "_currently_processing", ())
+            prompt_batch = getattr(self, "_prompt_batch", None)
+            uids = tuple(getattr(prompt_batch, "uids", ()) or ())
+            return tuple(
+                uids[index]
+                for index, item in enumerate(current)
+                if index < len(uids)
+                and isinstance(item, (tuple, list))
+                and item
+                and self._at_generation_boundary(item[0])
+            )
+
+        def _omlx_drain_cancel_boundary(self, epoch: int, uids: Any) -> None:
+            """Finish all scheduled tensor work before a cancel rendezvous."""
+
+            if self._omlx_prepared_cancel_vote is not None:
+                raise RuntimeError("a distributed cancel vote is already armed")
+            # ``BatchGenerator.next`` normally materializes cache state, but a
+            # discarded final-layer/indexer graph can otherwise outlive the
+            # outer prompt call. Removing/filtering its cache while that graph
+            # is live can let the peer issue the next differently shaped
+            # collective first. Synchronizing the generation stream is paid
+            # only for a real cancellation, never on the decode hot path.
+            stream = getattr(self, "stream", None)
+            if stream is None:
+                mx.synchronize()
+            else:
+                mx.synchronize(stream)
+
+        def _omlx_arm_cancel_boundary(self, epoch: int, uids: Any) -> None:
+            normalized = tuple(int(uid) for uid in uids)
+            if self._omlx_prepared_cancel_vote is not None:
+                raise RuntimeError("a distributed cancel vote is already armed")
+            self._omlx_prepared_cancel_vote = (int(epoch), normalized)
 
         def insert_segments(self, *args: Any, **kwargs: Any) -> Any:
             uids = super().insert_segments(*args, **kwargs)
             telemetry.bind_pending_uid(uids)
-            if ssd_store is not None:
-                segments = kwargs.get("segments")
-                all_tokens = kwargs.get("all_tokens")
-                if isinstance(segments, list):
-                    for index, uid in enumerate(uids):
-                        prefix = (
-                            list(all_tokens[index])
-                            if isinstance(all_tokens, list)
-                            and index < len(all_tokens)
-                            and all_tokens[index]
-                            else []
-                        )
-                        body = [
-                            token for segment in segments[index] for token in segment
-                        ]
-                        self._omlx_tokens[uid] = prefix + body
+            segments = kwargs.get("segments")
+            all_tokens = kwargs.get("all_tokens")
+            if isinstance(segments, list):
+                for index, uid in enumerate(uids):
+                    prefix = (
+                        list(all_tokens[index])
+                        if isinstance(all_tokens, list)
+                        and index < len(all_tokens)
+                        and all_tokens[index]
+                        else []
+                    )
+                    body = [
+                        token for segment in segments[index] for token in segment
+                    ]
+                    self._omlx_tokens[uid] = prefix + body
             return uids
+
+        def _make_batch(self, n: int) -> Any:
+            batch = super()._make_batch(n)
+            totals = {
+                uid: len(self._omlx_tokens[uid])
+                for uid in batch.uids
+                if uid in self._omlx_tokens
+            }
+            if totals:
+                existing = dict(
+                    getattr(
+                        self._prompt_batch,
+                        "_omlx_total_prompt_lengths",
+                        {},
+                    )
+                )
+                existing.update(totals)
+                self._prompt_batch._omlx_total_prompt_lengths = existing
+            return batch
 
         def remove(self, uids: Any) -> Any:
             uid_values = list(uids)
@@ -1333,19 +1875,100 @@ def install_server_telemetry(
                 return
             processed, total = int(progress[0]), int(progress[1])
             absolute = len(full) - total + processed
-            if absolute > 0 and absolute % snapshot_step == 0:
+            if (
+                ssd_store is not None
+                and absolute > 0
+                and absolute % snapshot_step == 0
+            ):
                 model = getattr(snapshot_ctx, "model", None)
                 if model is not None:
                     try:
                         extracted = self.extract_cache([uid]).get(uid)
                     except Exception:
                         extracted = None
-                    if extracted is not None:
-                        ssd_store.put(model, full[:absolute], extracted[0])
+                    # Every rank must enter capacity agreement for every
+                    # aligned boundary. A rank-local extraction failure is
+                    # represented as an invalid payload so all peers reject
+                    # the checkpoint together instead of one blocking in the
+                    # tiny size exchange.
+                    cache_payload = extracted[0] if extracted is not None else None
+                    ssd_store.put(model, full[:absolute], cache_payload)
             if getattr(response, "end_of_prompt", False):
                 self._omlx_tokens.pop(uid, None)
 
         def next(self) -> Any:
+            at_boundary = self._about_to_enter_generation()
+            captured_boundaries: tuple[tuple[Any, int], ...] = ()
+            if at_boundary:
+                prompt_cache = getattr(snapshot_ctx, "prompt_cache", None)
+                model_key = getattr(snapshot_ctx, "model_key", None)
+                captured_boundaries = tuple(
+                    (uid, captured)
+                    for uid in self._generation_boundary_uids()
+                    if (
+                        captured := _capture_prompt_boundary_cache(
+                            prompt_cache,
+                            model_key,
+                            self,
+                            uid,
+                        )
+                    )
+                )
+                if (
+                    captured_boundaries
+                    and os.environ.get("OMLX_CLUSTER_CACHE_TRACE", "0") == "1"
+                ):
+                    logger.warning(
+                        "Captured predecode prompt cache rank=%s boundaries=%s",
+                        rank,
+                        captured_boundaries,
+                    )
+            if (
+                os.environ.get("OMLX_CLUSTER_TRACE_COLLECTIVES", "0")
+                .strip()
+                .lower()
+                in {"1", "true", "on", "yes"}
+                and self._omlx_batch_trace_steps < 10
+            ):
+                self._omlx_batch_trace_steps += 1
+                current = getattr(self, "_currently_processing", ())
+                pending = getattr(self, "_unprocessed_sequences", ())
+                print(
+                    "OMLX_BATCH_TRACE:"
+                    + json.dumps(
+                        {
+                            "rank": int(mx.distributed.init().rank()),
+                            "step": self._omlx_batch_trace_steps,
+                            "at_generation_boundary": at_boundary,
+                            "prompt_uids": list(
+                                getattr(
+                                    getattr(self, "_prompt_batch", None),
+                                    "uids",
+                                    (),
+                                )
+                            ),
+                            "generation_uids": list(
+                                getattr(
+                                    getattr(self, "_generation_batch", None),
+                                    "uids",
+                                    (),
+                                )
+                            ),
+                            "current_segments": [
+                                [len(segment) for segment in item[0]]
+                                for item in current
+                                if isinstance(item, (tuple, list)) and item
+                            ],
+                            "pending_segments": [
+                                [len(segment) for segment in item[1]]
+                                for item in pending
+                                if isinstance(item, (tuple, list)) and len(item) > 1
+                            ],
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
             started = time.perf_counter()
             prompt_responses, generation_responses = super().next()
             elapsed = time.perf_counter() - started
@@ -1365,8 +1988,9 @@ def install_server_telemetry(
                     processed_tokens=progress[0],
                     total_tokens=progress[1],
                 )
-                if ssd_store is not None:
-                    self._omlx_snapshot_boundary(response)
+                # This routine also retires the per-UID token bookkeeping at
+                # end_of_prompt; it is not only an SSD-cache operation.
+                self._omlx_snapshot_boundary(response)
             telemetry.observe_batch_step(
                 prompt_responses=len(prompt_responses),
                 generation_responses=len(generation_responses),
@@ -1375,18 +1999,59 @@ def install_server_telemetry(
             return prompt_responses, generation_responses
 
     class TelemetryPromptCache(original_prompt_cache):
-        def _omlx_cache_inventory(self) -> tuple[int, int]:
-            """Combined volatile LRU and durable rank-local snapshot tiers."""
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            prompt_cache_instances.append(self)
 
+        def _omlx_entry_trace(self, model: Any) -> dict[str, tuple[tuple[int, bool], ...]]:
+            """Bounded LRU shape trace for operator cache-reuse diagnosis."""
+
+            lru = getattr(self, "_lru", None)
+            rows = getattr(lru, "_lrus", {})
+            if not isinstance(rows, dict):
+                return {}
+            result: dict[str, tuple[tuple[int, bool], ...]] = {}
+            for cache_type, entries in rows.items():
+                result[str(cache_type)] = tuple(
+                    (len(tokens), stored_model == model)
+                    for stored_model, tokens in entries
+                    if isinstance(tokens, list)
+                )[:8]
+            return result
+
+        def _omlx_cache_inventory(
+            self,
+        ) -> tuple[int, int, int, int, int, int]:
+            """Combined totals plus observable memory and SSD tier splits."""
+
+            memory_entries = len(self)
+            memory_bytes = self.nbytes
             disk_entries = len(ssd_store) if ssd_store is not None else 0
             disk_bytes = ssd_store.nbytes if ssd_store is not None else 0
-            return len(self) + disk_entries, self.nbytes + disk_bytes
+            return (
+                memory_entries + disk_entries,
+                memory_bytes + disk_bytes,
+                memory_entries,
+                memory_bytes,
+                disk_entries,
+                disk_bytes,
+            )
 
         def _fetch_observed(self, model: Any, tokens: list[int]) -> Any:
             return super().fetch_nearest_cache(model, tokens)
 
         def _lookup(self, model: Any, tokens: list[int]) -> Any:
             cache, rest = self._fetch_observed(model, tokens)
+            if os.environ.get("OMLX_CLUSTER_CACHE_TRACE", "0") == "1":
+                logger.warning(
+                    "Prompt-cache lookup rank=%s tokens=%s found=%s rest=%s lru=%s",
+                    rank,
+                    len(tokens),
+                    cache is not None,
+                    len(rest),
+                    self._omlx_entry_trace(model),
+                )
+            hit_tier = "memory" if cache is not None else None
             if cache is not None and not rest and tokens:
                 # MLX-LM's exact-hit branch returns an empty rest, unlike its
                 # shorter/longer branches which cap the prefix at len - 1. The
@@ -1405,6 +2070,7 @@ def install_server_telemetry(
                     rest = list(tokens[-1:])
                 else:
                     cache, rest = None, list(tokens)
+                    hit_tier = None
             # Record the full prompt so the boundary-snapshot callback can key
             # its writes; it runs later on this same generation thread.
             snapshot_ctx.model = model
@@ -1413,19 +2079,41 @@ def install_server_telemetry(
                 # The collective is taken on every request, hit or miss, so all
                 # ranks reach it the same number of times regardless of their
                 # in-memory state; the agreed boundary is only used when the
-                # in-memory tier missed. This is what lets SSD serve the batched
-                # path, whose byte-based eviction can diverge across ranks.
+                # in-memory tier missed. It also protects restore if a transient
+                # write failure leaves one rank without an otherwise symmetric
+                # byte-budget entry.
                 boundary = agree_ssd_boundary(model, tokens)
                 if cache is None and boundary > 0:
                     loaded = ssd_store.load(model, tokens, boundary)
                     if loaded is not None:
                         cache, rest = loaded, list(tokens[boundary:])
-            entries, nbytes = self._omlx_cache_inventory()
+                        hit_tier = "ssd"
+            cache, rest = agree_prompt_cache_plan(cache, tokens, rest)
+            if cache is None:
+                hit_tier = None
+            (
+                entries,
+                nbytes,
+                memory_entries,
+                memory_bytes,
+                ssd_entries,
+                ssd_bytes,
+            ) = self._omlx_cache_inventory()
+            # Observe the final agreed tier. Recording the volatile lookup
+            # before SSD restore made a real durable hit appear as a miss on
+            # the cluster dashboard even while per-request cached_tokens was
+            # correct.
             telemetry.observe_cache_lookup(
                 prompt_tokens=len(tokens),
-                remaining_tokens=len(rest) if cache is not None else len(tokens),
+                remaining_tokens=len(rest),
                 entries=entries,
                 nbytes=nbytes,
+                memory_entries=memory_entries,
+                memory_bytes=memory_bytes,
+                ssd_entries=ssd_entries,
+                ssd_bytes=ssd_bytes,
+                hit_tier=hit_tier,
+                **ssd_store_observability(),
             )
             return cache, rest
 
@@ -1454,8 +2142,23 @@ def install_server_telemetry(
 
         def insert_cache(self, *args: Any, **kwargs: Any) -> Any:
             result = super().insert_cache(*args, **kwargs)
-            entries, nbytes = self._omlx_cache_inventory()
-            telemetry.observe_cache_state(entries=entries, nbytes=nbytes)
+            (
+                entries,
+                nbytes,
+                memory_entries,
+                memory_bytes,
+                ssd_entries,
+                ssd_bytes,
+            ) = self._omlx_cache_inventory()
+            telemetry.observe_cache_state(
+                entries=entries,
+                nbytes=nbytes,
+                memory_entries=memory_entries,
+                memory_bytes=memory_bytes,
+                ssd_entries=ssd_entries,
+                ssd_bytes=ssd_bytes,
+                **ssd_store_observability(),
+            )
             return result
 
     class CoordinatedGenerationContext(original_generation_context):
@@ -1503,7 +2206,8 @@ def install_server_telemetry(
         @staticmethod
         def _finish_shared_cancel_vote(shared: Any) -> Any:
             if not (
-                isinstance(shared, dict) and shared.get("kind") == _CANCEL_VOTE_KIND
+                isinstance(shared, dict)
+                and shared.get("kind") == _CANCEL_VOTE_KIND
             ):
                 return shared
             epoch, uids = telemetry.accept_cancel_vote(shared)
@@ -1531,8 +2235,85 @@ def install_server_telemetry(
                 if obj:
                     obj = telemetry.make_cancel_vote(obj)
             if control_plane is not None:
-                return control_plane.broadcast_object(obj)
-            return super()._share_object(obj)
+                shared = control_plane.broadcast_object(obj)
+                return self._finish_shared_cancel_vote(shared)
+
+            # MLX-LM implements every rank-zero object broadcast as two
+            # all-sums: the producer contributes pickle length/data and every
+            # worker contributes zeros. Tiny JACCL reductions are the wrong
+            # primitive for an owned byte stream and can corrupt either the
+            # request or later cancellation lists. Direct send/recv is also
+            # unsuitable here: MLX-LM polls and retires batches on slightly
+            # different host timelines, and a lost JACCL send completion then
+            # leaves one rank in teardown. Use identically ordered all-gathers
+            # with a fixed, checksummed control envelope instead.
+            import pickle
+            import struct
+            import zlib
+
+            group = mx.distributed.init()
+            world_size = int(group.size())
+            rank = int(getattr(self, "_rank", group.rank()))
+            if rank == 0:
+                payload = pickle.dumps(obj) if obj is not None else b""
+                if len(payload) > _MAX_SHARED_REQUEST_BYTES:
+                    raise RuntimeError(
+                        "distributed object exceeds the 256 MiB safety bound"
+                    )
+                checksum = zlib.crc32(payload)
+                header_bytes = struct.pack(
+                    ">III", _SHARED_OBJECT_MAGIC, len(payload), checksum
+                ).ljust(_SHARED_OBJECT_HEADER_BYTES, b"\0")
+                local_header = mx.array(header_bytes, dtype=mx.uint8)
+            else:
+                payload = b""
+                local_header = mx.zeros(
+                    (_SHARED_OBJECT_HEADER_BYTES,), dtype=mx.uint8
+                )
+
+            gathered_header = mx.distributed.all_gather(local_header, group=group)
+            rank_zero_header = bytes(
+                gathered_header[:_SHARED_OBJECT_HEADER_BYTES].tolist()
+            )
+            try:
+                magic, size, checksum = struct.unpack(">III", rank_zero_header[:12])
+            except struct.error as exc:
+                raise RuntimeError(
+                    "distributed object broadcast has a malformed header"
+                ) from exc
+            if magic != _SHARED_OBJECT_MAGIC:
+                raise RuntimeError(
+                    "distributed object broadcast failed its magic-header check"
+                )
+            if size > _MAX_SHARED_REQUEST_BYTES:
+                raise RuntimeError(
+                    "distributed object broadcast has an invalid byte length: "
+                    f"{size}"
+                )
+            if size == 0:
+                return self._finish_shared_cancel_vote(None)
+
+            local_data = (
+                mx.array(payload, dtype=mx.uint8)
+                if rank == 0
+                else mx.zeros((size,), dtype=mx.uint8)
+            )
+            gathered_data = mx.distributed.all_gather(local_data, group=group)
+            rank_zero_data = bytes(gathered_data[:size].tolist())
+            if zlib.crc32(rank_zero_data) != checksum:
+                raise RuntimeError(
+                    "distributed object broadcast failed its CRC32 integrity check"
+                )
+            if rank == 0:
+                shared = obj
+            else:
+                try:
+                    shared = pickle.loads(rank_zero_data)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "distributed object broadcast failed integrity decoding"
+                    ) from exc
+            return self._finish_shared_cancel_vote(shared)
 
         def _share_request(self, request: Any) -> Any:
             shared = super()._share_request(request)
@@ -1557,6 +2338,8 @@ def install_server_telemetry(
 
         def _tokenize(self, tokenizer: Any, request: Any, args: Any) -> Any:
             tokenized = super()._tokenize(tokenizer, request, args)
+            snapshot_ctx.prompt_cache = self.prompt_cache
+            snapshot_ctx.model_key = self.model_provider.model_key
             if prefill_guard is None:
                 return tokenized
 
@@ -1604,7 +2387,9 @@ def install_server_telemetry(
     ) -> Any:
         """Attach the private coordinator id before ranks share the request."""
 
-        request_id = _transport_request_id(handler.headers.get("X-oMLX-Request-ID"))
+        request_id = _transport_request_id(
+            handler.headers.get("X-oMLX-Request-ID")
+        )
         if request_id is not None:
             request._omlx_transport_request_id = request_id
         return original_handle_completion(handler, request, stop_words)
@@ -1629,6 +2414,11 @@ def install_server_telemetry(
         telemetry.observe_cache_state(
             entries=memory_entries + disk_entries,
             nbytes=memory_bytes + disk_bytes,
+            memory_entries=memory_entries,
+            memory_bytes=memory_bytes,
+            ssd_entries=disk_entries,
+            ssd_bytes=disk_bytes,
+            **ssd_store_observability(),
         )
         return {
             "status": "ok",
@@ -1792,6 +2582,18 @@ def install_server_telemetry(
     mlx_server.APIHandler.do_POST = maintenance_do_post
     if ssd_store is not None:
         mlx_server.stream_generate = snapshotting_stream_generate
+        # A persistent manifest can already contain useful snapshots before
+        # the first lookup. Publish that inventory as soon as serving begins
+        # so "enabled but idle" is distinguishable from "not wired".
+        telemetry.observe_cache_state(
+            entries=len(ssd_store),
+            nbytes=ssd_store.nbytes,
+            memory_entries=0,
+            memory_bytes=0,
+            ssd_entries=len(ssd_store),
+            ssd_bytes=ssd_store.nbytes,
+            **ssd_store_observability(),
+        )
     # Started here rather than by the caller: this block is exactly the span
     # during which a rank is alive and expected to look alive, and a heartbeat
     # a caller can forget to start is a heartbeat that will be forgotten.
@@ -1808,7 +2610,19 @@ def install_server_telemetry(
         mlx_server.APIHandler.handle_completion = original_handle_completion
         mlx_server.APIHandler.do_POST = original_do_post
         mlx_server.stream_generate = original_stream_generate
-        if ssd_store is not None and not ssd_cache_persistent:
+        snapshot_writer_closed = True
+        if ssd_store is not None:
+            snapshot_writer_closed = ssd_store.close(timeout=10.0)
+            if not snapshot_writer_closed:
+                logger.warning(
+                    "Prompt snapshot writer did not drain within 10 seconds; "
+                    "leaving its directory intact for failure-safe teardown"
+                )
+        if (
+            ssd_store is not None
+            and snapshot_writer_closed
+            and not ssd_cache_persistent
+        ):
             # Legacy process-lifetime mode: a hard crash skips this and the
             # next nonpersistent store reclaims the leftovers instead.
             shutil.rmtree(ssd_store.directory, ignore_errors=True)

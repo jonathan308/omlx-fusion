@@ -2080,9 +2080,17 @@ def init_server(
         _register_cluster_routes()
     response_state_dir = None
     if global_settings:
-        response_state_dir = (
-            global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
-            / "response-state"
+        ssd_cache_root = global_settings.cache.get_ssd_cache_dir(
+            global_settings.base_path
+        )
+        response_state_dir = ssd_cache_root / "response-state"
+        # The hostfile copies this value to every rank. Preserve an explicit
+        # operator override, otherwise colocate cluster snapshots with the
+        # configured ordinary SSD cache instead of hiding them under runtime
+        # marker state.
+        os.environ.setdefault(
+            "OMLX_CLUSTER_PROMPT_CACHE_ROOT",
+            str(ssd_cache_root / "cluster-prompt-snapshots"),
         )
     _server_state.responses_store = ResponseStore(state_dir=response_state_dir)
 

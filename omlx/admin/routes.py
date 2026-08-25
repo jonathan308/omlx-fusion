@@ -5866,6 +5866,35 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
             except Exception as exc:
                 logger.warning("Failed to clean SSD cache directory: %s", exc)
 
+        # A cold configured cluster has no rank process to answer the normal
+        # distributed clear RPC. Its persistent snapshots still belong to the
+        # same global SSD-cache action, so remove the shared local root when no
+        # loaded distributed rank handled the request. Keep the live root in
+        # place when ranks are active: their store objects continue writing
+        # after clear and own their directory lifetime.
+        if distributed_ranks == 0:
+            cluster_roots = (
+                cache_dir / "cluster-prompt-snapshots",
+                # Pre-unification location; clearing SSD cache also cleans the
+                # one-time legacy residue left by an older build.
+                Path(global_settings.base_path)
+                / "cluster/runtime/prompt-cache-ssd",
+            )
+            for cluster_root in cluster_roots:
+                if not cluster_root.exists():
+                    continue
+                try:
+                    total_deleted += sum(
+                        1 for item in cluster_root.rglob("*") if item.is_file()
+                    )
+                    shutil.rmtree(cluster_root)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to clean distributed SSD cache directory %s: %s",
+                        cluster_root,
+                        exc,
+                    )
+
     if distributed_failures:
         raise HTTPException(
             status_code=503,

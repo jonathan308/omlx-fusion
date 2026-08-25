@@ -520,13 +520,19 @@ def _execution_settings(args: argparse.Namespace) -> ExecutionSettings:
 def _prompt_cache_ssd_dir(args: argparse.Namespace, rank: int) -> str | None:
     """Per-rank SSD directory for prompt-cache snapshots, or None when off.
 
-    Kept beside the runtime markers and scoped by deployment, signed plan and
-    rank, so a changed tensor split can never restore another shard layout.
+    Kept under the normal oMLX SSD cache root and scoped by deployment, signed
+    plan and rank, so model switching preserves one clearable cache location
+    while a changed tensor split can never restore another shard layout.
     """
 
     if not args.prompt_cache_ssd:
         return None
-    root = Path(args.state_dir).expanduser() / "prompt-cache-ssd"
+    root = Path(
+        os.environ.get(
+            "OMLX_CLUSTER_PROMPT_CACHE_ROOT",
+            "~/.omlx/cache/cluster-prompt-snapshots",
+        )
+    ).expanduser()
     plan_hash = str(getattr(args, "plan_hash", "") or "unplanned")
     return str(root / args.deployment_id / plan_hash / f"rank-{rank}")
 

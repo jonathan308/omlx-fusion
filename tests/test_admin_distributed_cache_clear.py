@@ -57,3 +57,31 @@ async def test_ssd_clear_surfaces_partial_cluster_failure():
 
     assert raised.value.status_code == 503
     assert "rank 1 unreachable" in raised.value.detail
+
+
+@pytest.mark.asyncio
+async def test_ssd_clear_removes_cold_cluster_and_legacy_roots(tmp_path):
+    cache_root = tmp_path / "cache"
+    cluster_root = cache_root / "cluster-prompt-snapshots"
+    legacy_root = tmp_path / "state" / "cluster/runtime/prompt-cache-ssd"
+    for root in (cluster_root, legacy_root):
+        target = root / "deployment" / "plan" / "rank-0" / "snapshot.safetensors"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"cache")
+
+    cache = SimpleNamespace(get_ssd_cache_dir=lambda _base: cache_root)
+    settings = SimpleNamespace(cache=cache, base_path=tmp_path / "state")
+    pool = SimpleNamespace(
+        get_status=MagicMock(return_value={"models": []}),
+        _entries={},
+    )
+    with (
+        patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+        patch.object(admin_routes, "_get_global_settings", return_value=settings),
+    ):
+        result = await admin_routes.clear_ssd_cache(is_admin=True)
+
+    assert result["distributed_ranks"] == 0
+    assert result["total_deleted"] == 2
+    assert not cluster_root.exists()
+    assert not legacy_root.exists()

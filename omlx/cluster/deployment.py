@@ -25,6 +25,7 @@ from .planner import (
     normalize_memory_guard_tier,
     normalize_node_role,
 )
+from .tp_qualifications import TPQualificationProvenance
 
 DistributedBackend = Literal["ring", "jaccl", "jaccl-ring"]
 
@@ -68,6 +69,193 @@ _RANK_ENV_DEFAULTS = (
     ("MLX_MAX_MB_PER_BUFFER", "512"),
     ("JACCL_PROGRESS_TIMEOUT_MS", "30000"),
     ("JACCL_TIMEOUT_ACTION", "teardown-exit"),
+    # Live two-Mac RDMA A/B showed the experimental one-buffer two-rank path
+    # was neutral below 8 KiB and 3-6% slower at 40-512 KiB. Keep the switch
+    # visible for kernel iteration, but ship the measured generic path.
+    ("JACCL_TWO_RANK_SMALL_ALLREDUCE", "0"),
+    # Rank-local JSONL tracing identifies collective-order divergence without
+    # changing JACCL execution. It is intentionally operator-only because one
+    # line per tensor operation is too expensive for normal inference.
+    ("OMLX_CLUSTER_TRACE_COLLECTIVES", "0"),
+    # Prompt-cache structure tracing is operator-only. It must reach every
+    # rank because cache reuse is a synchronized prefill decision.
+    ("OMLX_CLUSTER_CACHE_TRACE", "0"),
+    # Keep distributed prompt snapshots under the ordinary oMLX SSD cache
+    # root. The server replaces this default from GlobalSettings before a
+    # launch, while each remote rank expands ``~`` for its own account.
+    ("OMLX_CLUSTER_PROMPT_CACHE_ROOT", "~/.omlx/cache/cluster-prompt-snapshots"),
+    # Qualification gate for rank-zero-coordinated adaptive MTP depth. The
+    # coordinator broadcasts the selected verify width and park decision, so
+    # every TP rank enters the same collective graph. Production stays on its
+    # signed fixed depth until physical parity/throughput qualification.
+    ("OMLX_MTP_DISTRIBUTED_ADAPTIVE_DEPTH", "0"),
+    # Deterministic accepted-prefix depth controller. Unlike the measured
+    # controller it uses no rank-local clock and needs no depth broadcast.
+    ("OMLX_MTP_DISTRIBUTED_LOCKSTEP_DEPTH", "0"),
+    # DS4's sparse prefill indexer is row-independent. TP ranks split prompt
+    # rows and exchange only top-k indices instead of redundantly scoring the
+    # full chunk on every GPU. Explicit env keeps live rollback one flag away.
+    ("OMLX_DSV4_INDEXER_ROW_TP", "1"),
+    # Candidate weighted-TP2 transport exchanges exact, unpadded index rows
+    # with ordered point-to-point operations. It requires both this flag and
+    # OMLX_DSV4_WEIGHTED_INDEXER_ROWS; equal/non-TP2 rows always retain the
+    # faster general collective. Keep both off pending a whole-model gate.
+    ("OMLX_DSV4_INDEXER_GATHER_P2P", "0"),
+    ("OMLX_DSV4_NATIVE_INDEXER", "1"),
+    # Bit-exact DS4F ratio-4 MMA score path, physically qualified on M2 Ultra,
+    # M3 Ultra, and M5 Max. Carry one rollback value to every TP rank.
+    ("OMLX_DSV4F_MMA_SCORE", "1"),
+    # Certified low-rank screen + exact candidate rescore. Default-off until
+    # its full TP2 100K/250K rate and cache-lifecycle gates clear.
+    ("OMLX_DSV4_HIERARCHICAL_INDEXER", "0"),
+    ("OMLX_DSV4_HIERARCHICAL_MIN_POOL", "16000"),
+    ("OMLX_DSV4_HIERARCHICAL_REFRESH_POOL", "2048"),
+    ("OMLX_DSV4_HIERARCHICAL_CANDIDATE_FRACTION", "0.30"),
+    # Native exact-bound postprocess for the opt-in hierarchy. It fuses the
+    # BF16 approximate sheet's FP32 error bound and 16-row reduction, but stays
+    # separately rollbackable until physical real-key/full-model gates pass.
+    ("OMLX_DSV4_HIERARCHICAL_NATIVE_UPPER", "0"),
+    # Weighted row shards require padding every rank to the largest shard for
+    # all_gather. The first 3:5/30K live gate was slower, so retain the exact
+    # implementation only as an operator A/B and ship equal row counts.
+    ("OMLX_DSV4_WEIGHTED_INDEXER_ROWS", "0"),
+    # Optional long-context query-row balance independent of tensor weight
+    # ownership. Empty preserves equal rows; the pool threshold prevents a
+    # heterogeneous qualification from perturbing short prompts.
+    ("OMLX_DSV4_INDEXER_ROW_WEIGHTS", ""),
+    ("OMLX_DSV4_INDEXER_ROW_WEIGHTS_MIN_POOL", "16000"),
+    # Below 2K pooled entries the fixed top-k exchange can cost more than the
+    # saved score work; the threshold turns the split on where context taper
+    # begins instead of perturbing short-prompt performance.
+    ("OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL", "2048"),
+    # DS4's 2K prefill chunk wins at medium context, while 1K avoids the 14K
+    # taper. The worker switches only after the first 4K tokens.
+    ("OMLX_DSV4_ADAPTIVE_PREFILL", "1"),
+    ("OMLX_DSV4_ADAPTIVE_PREFILL_AFTER", "4096"),
+    ("OMLX_DSV4_ADAPTIVE_PREFILL_STEP", "1024"),
+    ("OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE", "2048"),
+    # Experimental 2K outer tile with canonical 1K FP32 HC and compressed-
+    # attention/cache boundaries. Both ranks must enter the same split graph.
+    ("OMLX_DSV4_CANONICAL_WIDE_PREFILL", "0"),
+    # Exact FP32 decode HC producer compile. Shape/config gates retain the
+    # ordinary path for training, prefill and non-DS4 checkpoints.
+    ("OMLX_DSV4_COMPILED_HC_DECODE_PRODUCER", "0"),
+    # Shape warmup enters the full distributed graph, so every rank must make
+    # the same decision.  Coordinator-only overrides would cross collectives.
+    ("OMLX_CLUSTER_PREFILL_SHAPE_WARMUP", "1"),
+    # Experimental DS4 replicated-projection ownership. The physical 3:5 gate
+    # nominates rank 0/M3, but production remains off until the exact live
+    # prefill+decode promotion gate clears.
+    ("OMLX_DSV4_PROJECTION_OWNER_RANK", "off"),
+    # Exact one-dispatch DS4 B1 ratio-4 Q/KV/compressor bundle. Physical TP2
+    # gate: +9.6% short decode with unchanged 14K prefill and exact hashes.
+    ("OMLX_DSV4_QKV_BUNDLE_DECODE", "1"),
+    # Lossless M=1024 continuation over original packed MXFP8/BF16 storage.
+    # M3 uses three dispatches; M5 keeps its reduction-sensitive main BF16
+    # banks separate and uses four. Carry one rollback value to every rank;
+    # remain default-off until the full cold-prefill TP2 gate is recorded.
+    ("OMLX_DSV4_QKV_BUNDLE_PREFILL", "0"),
+    # Ratio-0/128 siblings are exact and locally faster on M5, but did not
+    # improve whole-model TP2 decode after ratio-4 moved the critical path.
+    ("OMLX_DSV4_QKV_BUNDLE_ALL_SCHEDULES", "0"),
+    # Exact 256-way B1 router top-6. Default-off until the full TP2 rate/hash
+    # gate confirms the isolated 2.6% selection win scales across 40 layers.
+    ("OMLX_DSV4_ROUTER_TOPK_DECODE", "1"),
+    # Yield long prompt work back to live decode after one bounded DS4 slice.
+    # The hostfile value keeps both TP ranks on the same scheduler decision.
+    ("OMLX_DSV4_PREFILL_YIELD", "1"),
+    # Generic schedulers retain their 512/256/128 B1/B2/B4 policy. DS4's
+    # physical TP path has its own live-qualified 1024/1024/512 schedule.
+    ("OMLX_CONTENDED_PREFILL_CHUNK", "512"),
+    ("OMLX_DSV4_MIXED_PREFILL_CHUNK", "1024"),
+    ("OMLX_MIXED_PREFILL_MIN_QUANTUM", "128"),
+    ("OMLX_DSV4_PREFILL_STEP_TRACE", "0"),
+    # Reversible depth-two graph overlap for pure TP2 prefill.  It remains off
+    # until a live lossless A/B clears the promotion gate; carrying the value
+    # in the hostfile guarantees that both ranks make the same queue decision.
+    ("OMLX_DSV4_PREFILL_ASYNC_DEPTH", "0"),
+    # The lossless windowed+sparse prefill kernel is head-count agnostic at
+    # the Metal level.  Carry its controls in the hostfile so every TP rank
+    # makes the same dispatch decision; coordinator-only environment values
+    # are otherwise not inherited by remote ranks launched over SSH.
+    ("OMLX_DSV4_WSDPA", "1"),
+    ("OMLX_DSV4_WSDPA_TP", "1"),
+    ("OMLX_DSV4_WSDPA_TOPK", "1"),
+    # BatchRotatingKVCache's B=1 host offset unlocks the exact scalar WSDPA
+    # ABI. Matched 30K gate: +52.0%, identical completion hash.
+    ("OMLX_DSV4_B1_SCALAR_OFFSET", "1"),
+    # Decode has one sparse-indexer row, so row TP cannot divide it. The
+    # measured fastest rank computes the exact top-k once and broadcasts only
+    # 512 int32 indices; ``off`` restores replicated indexer work.
+    ("OMLX_DSV4_INDEXER_DECODE_OWNER_RANK", "auto"),
+    # Full routed-MoE decode fusion is bit-exact and isolated-kernel faster
+    # through B=4 on both 3:5 slices. The live TP2 gate retained only +1.1% at
+    # B=2 and regressed aggregate B=4 decode by 3.5%, so production remains B=1.
+    # Operators may still use the existing explicit maximum for future A/Bs.
+    ("OMLX_DSV4_FULL_MOE_DECODE", "1"),
+    ("OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS", "1"),
+    # Exact M=1024 M3-family MXFP4 route-tail kernels. Keep both ranks on the
+    # same explicit A/B value; default remains off pending the TP2 model gate.
+    ("OMLX_DSV4_MOE_TAIL8", "0"),
+    # Exact equal-TP2 M3 route-tail kernels. M5 keeps NAX; unequal/single
+    # topologies retain the explicit legacy gate above.
+    ("OMLX_DSV4_MOE_TAIL8_EQUAL_TP", "1"),
+    # Combined asymmetric 3:5 routed-MoE prefill: M3 rank 0 tail8 plus
+    # separate M5 rank 1 expert-blocked NAX projections. One rollback value
+    # must reach every rank; exact local device/shape/rank gates decide use.
+    ("OMLX_DSV4_COMBINED_MOE_PREFILL", "0"),
+    # Exact M=1024 M5 TensorOps O-A projection for the 40-head 5/8 shard.
+    # Default-off until the full TP A/B clears; exporting the value prevents
+    # coordinator/worker capability decisions from diverging.
+    ("OMLX_DSV4_NAX_OA_PREFILL", "0"),
+    # Exact M=1024 BF16 Q/KV RMSNorm+RoPE finalizers for the supported
+    # H24/H32/H40 TP shapes. Keep pair selection identical across ranks while
+    # the full distributed A/B remains operator-controlled.
+    ("OMLX_DSV4_ATTN_FINALIZER_PREFILL", "0"),
+    ("OMLX_DSV4_ATTN_FINALIZER_VERIFY", "0"),
+    # Exact two-dispatch O-A→BF16→O-B prefill chain for signed 3:5 TP shapes.
+    # Both ranks receive one value; exact shape/config guards decide locally.
+    ("OMLX_DSV4_OUTPUT_CHAIN_PREFILL", "0"),
+    # Exact equal-TP2 M3 O-A->BF16->O-B chain. M5 retains NAX stock and every
+    # unequal/single topology retains its separately default-off legacy gate.
+    ("OMLX_DSV4_OUTPUT_CHAIN_EQUAL_TP", "1"),
+    # Exact DSpark verify graph simplification: prepare all M O-A rows as one
+    # grouped view instead of materializing M one-row slices + concatenate.
+    # Default-off until the physical equal-TP2 decode gate clears.
+    ("OMLX_DSV4_VERIFY_BATCHED_OA_PREPARE", "0"),
+    # Exact M=6 HC sinkhorn/collapse continuation into MLX's weighted
+    # 4096-wide RMSNorm topology. Default-off pending physical TP2 decode.
+    ("OMLX_DSV4_VERIFY_HC_PRENORM", "0"),
+    # Exact M=1024 HC sinkhorn/collapse continuation into the following
+    # weighted RMSNorm. Default-off pending physical cross-chip prefill A/B.
+    ("OMLX_DSV4_PREFILL_HC_PRENORM", "0"),
+    # Exact M=1 HC sinkhorn/collapse continuation into weighted RMSNorm.
+    # Default-off pending physical non-MTP decode qualification.
+    ("OMLX_DSV4_DECODE_HC_PRENORM", "0"),
+    # Split the exact FP32 HyperConnection residual branch so Metal can fill
+    # communication bubbles without changing collective or arithmetic order.
+    ("OMLX_DSV4_HC_RESIDUAL_OVERLAP", "0"),
+    # Exact M5 Max rank-1 5/8 expert-blocked NAX routed-MoE path. The flag is
+    # carried to both ranks, while the exact hardware/TP gate activates only
+    # on the qualified M5 rank. Default-off until full cold-prefill A/B.
+    ("OMLX_DSV4_NAX_MOE_BLOCKS", "0"),
+    # Structure-first local safetensors slicing. Default-off until a complete
+    # 60--100 GiB load clears strict sanitizer/parameter coverage, memory and
+    # first-token parity on every rank. Carry the rollback bit symmetrically.
+    ("OMLX_DSV4_SHARD_NATIVE_LOAD", "0"),
+    # Optional routed-MoE-only TP split layered over a signed unequal outer
+    # plan. Empty preserves the outer split. One hostfile value is exported to
+    # every rank so a mixed plan cannot diverge locally.
+    ("OMLX_TP_MOE_SHARD_WEIGHTS", ""),
+    # Conservative mixed-plan form: keep the signed outer plan equal for
+    # admission, then opt only non-routed tensors into a qualified unequal
+    # split. Empty preserves the signed outer assignment.
+    ("OMLX_TP_NON_MOE_SHARD_WEIGHTS", ""),
+    # Large standalone output projections are exact row shards. The default
+    # threshold avoids adding a collective to small models where it cannot
+    # repay its latency, while keeping every rank on the same decision.
+    ("OMLX_CLUSTER_VOCAB_PARALLEL", "auto"),
+    ("OMLX_CLUSTER_VOCAB_PARALLEL_MIN_BYTES", str(256 * 1024**2)),
 )
 
 
@@ -109,7 +297,7 @@ def _validate_ip(value: str) -> str:
     return value
 
 
-def _hostfile_ips(host: ClusterHost) -> list[str]:
+def _hostfile_ips(host: "ClusterHost") -> list[str]:
     """Communication IPs in the order a rank should try them.
 
     Routable addresses first: a link-local IPv6 without its (machine-local)
@@ -175,8 +363,6 @@ def validate_model_path_map(
         if (
             not path
             or "\x00" in path
-            or "\n" in path
-            or "\r" in path
             or len(path.encode()) > _MAX_MODEL_PATH_BYTES
             or not Path(path).is_absolute()
         ):
@@ -299,6 +485,9 @@ def _assignment_from_dict(payload: dict[str, Any]) -> PipelineAssignment:
             memory_guard_tier=memory_guard_tier,
             tensor_parallel_rank=int(payload.get("tensor_parallel_rank", 0)),
             tensor_parallel_size=int(payload.get("tensor_parallel_size", 1)),
+            tensor_parallel_shard_weight=int(
+                payload.get("tensor_parallel_shard_weight", 1)
+            ),
             sharded_weight_bytes=int(payload.get("sharded_weight_bytes", 0)),
             # ``to_dict`` has always emitted these three; nothing read them
             # back, so every decoded assignment claimed a 0-byte KV cache.
@@ -354,10 +543,13 @@ class ClusterDeployment:
     performance_profiles: tuple[NodePerformanceProfile, ...] = ()
     tensor_parallel_size: int = 1
     target_context_tokens: int = 8192
+    mtp_enabled: bool = False
+    mtp_num_draft_tokens: int | None = None
     # node_id → absolute model path on that node. Empty means every node uses
     # ``model`` — the pre-v2 same-absolute-path requirement. Entries override
     # only the nodes they name; the coordinator path stays the fallback.
     path_map: dict[str, str] = field(default_factory=dict)
+    tensor_parallel_qualification: TPQualificationProvenance | None = None
 
     def __post_init__(self) -> None:
         if _NODE_ID.fullmatch(self.deployment_id) is None:
@@ -385,6 +577,14 @@ class ClusterDeployment:
             or not 1 <= self.target_context_tokens <= 1_048_576
         ):
             raise ValueError("target_context_tokens must be between 1 and 1,048,576")
+        if not isinstance(self.mtp_enabled, bool):
+            raise ValueError("mtp_enabled must be a boolean")
+        if self.mtp_num_draft_tokens is not None and (
+            not isinstance(self.mtp_num_draft_tokens, int)
+            or isinstance(self.mtp_num_draft_tokens, bool)
+            or not 1 <= self.mtp_num_draft_tokens <= 8
+        ):
+            raise ValueError("mtp_num_draft_tokens must be between 1 and 8")
         if len(self.assignments) != len(self.hosts):
             raise ValueError("host count must match pipeline assignment count")
         if self.hosts[0].ssh != "127.0.0.1":
@@ -410,6 +610,30 @@ class ClusterDeployment:
         for rank, (host, assignment) in enumerate(zip(self.hosts, assignments)):
             if host.node_id != assignment.node_id or assignment.rank != rank:
                 raise ValueError("host order must match node IDs and pipeline ranks")
+            if (
+                assignment.tensor_parallel_size != self.tensor_parallel_size
+                or assignment.tensor_parallel_rank != rank % self.tensor_parallel_size
+            ):
+                raise ValueError(
+                    "assignment tensor-parallel coordinates do not match deployment"
+                )
+        for start in range(0, len(assignments), self.tensor_parallel_size):
+            tensor_group = assignments[start : start + self.tensor_parallel_size]
+            if len({(item.start_layer, item.end_layer) for item in tensor_group}) != 1:
+                raise ValueError(
+                    "tensor-parallel group members must hold the same layer range"
+                )
+        qualification = self.tensor_parallel_qualification
+        if qualification is not None:
+            if self.tensor_parallel_size != len(self.hosts):
+                raise ValueError(
+                    "tensor layout qualification currently requires pure TP"
+                )
+            weights = tuple(item.tensor_parallel_shard_weight for item in assignments)
+            if weights != qualification.shard_weights:
+                raise ValueError(
+                    "deployment TP weights do not match qualification provenance"
+                )
         if self.performance_profiles:
             if len(self.performance_profiles) != len(self.hosts):
                 raise ValueError(
@@ -481,7 +705,7 @@ class ClusterDeployment:
         }
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "schema_version": DEPLOYMENT_SCHEMA_VERSION,
             "deployment_id": self.deployment_id,
             "model": self.model,
@@ -496,8 +720,15 @@ class ClusterDeployment:
             ],
             "tensor_parallel_size": self.tensor_parallel_size,
             "target_context_tokens": self.target_context_tokens,
+            "mtp_enabled": self.mtp_enabled,
+            "mtp_num_draft_tokens": self.mtp_num_draft_tokens,
             "path_map": dict(sorted(self.path_map.items())),
         }
+        if self.tensor_parallel_qualification is not None:
+            result["tensor_parallel_qualification"] = (
+                self.tensor_parallel_qualification.to_dict()
+            )
+        return result
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> ClusterDeployment:
@@ -524,6 +755,9 @@ class ClusterDeployment:
             for value in (deployment_id, model, backend, plan_hash)
         ):
             raise ValueError("deployment identity fields must be strings")
+        mtp_enabled = payload.get("mtp_enabled", False)
+        if not isinstance(mtp_enabled, bool):
+            raise ValueError("deployment mtp_enabled must be a boolean")
         return cls(
             deployment_id=deployment_id,
             model=model,
@@ -541,27 +775,41 @@ class ClusterDeployment:
             ),
             tensor_parallel_size=int(payload.get("tensor_parallel_size", 1)),
             target_context_tokens=int(payload.get("target_context_tokens", 8192)),
+            mtp_enabled=mtp_enabled,
+            mtp_num_draft_tokens=payload.get("mtp_num_draft_tokens"),
             # Schema 1 payloads predate per-node paths; they decode to the
             # empty map, which is the shared-path behavior they ran with.
             path_map=validate_model_path_map(payload.get("path_map")),
+            tensor_parallel_qualification=(
+                TPQualificationProvenance.from_dict(
+                    payload["tensor_parallel_qualification"]
+                )
+                if payload.get("tensor_parallel_qualification") is not None
+                else None
+            ),
         )
 
     def encode_worker_plan(self) -> str:
         """Encode the small trusted plan as a bounded command-line argument."""
 
+        worker_payload = {
+            "schema_version": DEPLOYMENT_SCHEMA_VERSION,
+            "plan_hash": self.plan_hash,
+            "assignments": [assignment.to_dict() for assignment in self.assignments],
+            "performance_profiles": [
+                profile.to_dict() for profile in self.performance_profiles
+            ],
+            "tensor_parallel_size": self.tensor_parallel_size,
+            "mtp_enabled": self.mtp_enabled,
+            "mtp_num_draft_tokens": self.mtp_num_draft_tokens,
+            "path_map": dict(sorted(self.path_map.items())),
+        }
+        if self.tensor_parallel_qualification is not None:
+            worker_payload["tensor_parallel_qualification"] = (
+                self.tensor_parallel_qualification.to_dict()
+            )
         raw = json.dumps(
-            {
-                "schema_version": DEPLOYMENT_SCHEMA_VERSION,
-                "plan_hash": self.plan_hash,
-                "assignments": [
-                    assignment.to_dict() for assignment in self.assignments
-                ],
-                "performance_profiles": [
-                    profile.to_dict() for profile in self.performance_profiles
-                ],
-                "tensor_parallel_size": self.tensor_parallel_size,
-                "path_map": dict(sorted(self.path_map.items())),
-            },
+            worker_payload,
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
@@ -612,6 +860,11 @@ def _decode_worker_payload(encoded: str) -> dict[str, Any]:
         char not in "0123456789abcdef" for char in plan_hash
     ):
         raise ValueError("pipeline plan hash is invalid")
+    qualification = payload.get("tensor_parallel_qualification")
+    if qualification is not None:
+        payload["tensor_parallel_qualification"] = TPQualificationProvenance.from_dict(
+            qualification
+        ).to_dict()
     return payload
 
 
@@ -646,6 +899,16 @@ def decode_worker_contract(
         raise ValueError(
             "tensor_parallel_size must be between 1 and the assignment count"
         )
+    qualification_payload = payload.get("tensor_parallel_qualification")
+    if qualification_payload is not None:
+        qualification = TPQualificationProvenance.from_dict(qualification_payload)
+        ordered = tuple(sorted(parsed, key=lambda item: item.rank))
+        if (
+            tensor_parallel_size != len(ordered)
+            or tuple(item.tensor_parallel_shard_weight for item in ordered)
+            != qualification.shard_weights
+        ):
+            raise ValueError("worker TP weights do not match qualification provenance")
     return payload["plan_hash"], parsed, profiles, tensor_parallel_size
 
 
@@ -659,6 +922,25 @@ def decode_worker_path_map(encoded: str) -> dict[str, str]:
 
     payload = _decode_worker_payload(encoded)
     return validate_model_path_map(payload.get("path_map"))
+
+
+def decode_worker_speculation(encoded: str) -> tuple[bool, int | None]:
+    """Validated speculative-decode settings carried to every rank."""
+
+    payload = _decode_worker_payload(encoded)
+    enabled = payload.get("mtp_enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("worker mtp_enabled must be a boolean")
+    raw_depth = payload.get("mtp_num_draft_tokens")
+    if raw_depth is None:
+        return enabled, None
+    if (
+        not isinstance(raw_depth, int)
+        or isinstance(raw_depth, bool)
+        or not 1 <= raw_depth <= 8
+    ):
+        raise ValueError("worker mtp_num_draft_tokens must be between 1 and 8")
+    return enabled, raw_depth
 
 
 def decode_worker_plan(encoded: str) -> tuple[str, tuple[PipelineAssignment, ...]]:
