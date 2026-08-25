@@ -639,6 +639,102 @@
                          x-text="selectedStrategyOption().disabledReason"></div>
                 </div>
 
+                <!-- Serving limits are a profile, not three unrelated knobs:
+                     the server can safely lower all three together when a
+                     rank has less headroom. Compatible overlapping requests
+                     are continuously batched automatically. -->
+                <div class="mt-4" data-cluster-v2-serving-profile>
+                    <div class="flex items-center justify-between gap-3 mb-2">
+                        <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Serving profile</div>
+                        <span class="text-[10px] text-neutral-400">Auto-tuned down if memory requires it</span>
+                    </div>
+                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                        <template x-for="option in executionProfileOptions()" :key="option.key">
+                            <button type="button"
+                                    @click="setExecutionProfile(option.key)"
+                                    :disabled="planLoading"
+                                    :data-selected="executionProfile === option.key ? 'true' : 'false'"
+                                    :data-cluster-v2-serving-profile-option="option.key"
+                                    class="rounded-xl border px-3 py-2 text-left transition-colors disabled:opacity-40"
+                                    :class="executionProfile === option.key
+                                        ? 'bg-neutral-900 border-neutral-900 text-white'
+                                        : 'border-neutral-200 text-neutral-600 hover:bg-neutral-50'">
+                                <span class="block text-xs font-semibold" x-text="option.label"></span>
+                                <span class="block text-[10px] mt-0.5 opacity-80" x-text="option.limits"></span>
+                                <span class="block text-[9px] mt-1 opacity-60" x-text="option.detail"></span>
+                            </button>
+                        </template>
+                    </div>
+                    <p class="text-[10px] text-neutral-500 mt-1.5">
+                        There is no separate batching switch: these are admission limits, and compatible requests that overlap are coalesced continuously up to the batch target.
+                    </p>
+                </div>
+
+                <div class="mt-4 rounded-xl border border-neutral-200 px-3 py-2.5"
+                     data-cluster-v2-context-reservation>
+                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                        <span class="min-w-0">
+                            <span class="block text-xs font-semibold text-neutral-900">Context reservation</span>
+                            <span class="block text-[10px] text-neutral-500 mt-0.5">
+                                Reserve KV capacity on every rank for the largest prompt you expect. The planner refuses a value the smallest Mac cannot hold.
+                            </span>
+                        </span>
+                        <select :value="targetContextTokens"
+                                @change="setTargetContextTokens($event.target.value)"
+                                :disabled="planLoading || !selectedModelPath"
+                                class="text-xs border border-neutral-200 rounded-lg px-2.5 py-1.5 bg-white focus:ring-2 focus:ring-neutral-900 focus:border-transparent disabled:opacity-40"
+                                aria-label="Distributed context reservation">
+                            <template x-for="tokens in contextReservationOptions()" :key="tokens">
+                                <option :value="tokens" x-text="contextReservationLabel(tokens)"></option>
+                            </template>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- The rank-local memory prompt cache is always on. Durable
+                     SSD snapshots are opt-in because the first request writes
+                     one shard-local snapshot per rank at each boundary. -->
+                <label class="mt-4 flex items-start justify-between gap-4 rounded-xl border border-neutral-200 px-3 py-2.5"
+                       data-cluster-v2-prompt-cache-ssd>
+                    <span class="min-w-0">
+                        <span class="block text-xs font-semibold text-neutral-900">Persistent prompt reuse</span>
+                        <span class="block text-[10px] text-neutral-500 mt-0.5">
+                            Save aligned prompt snapshots on each Mac so prefixes survive restarts. Writes run in the background; memory reuse stays on either way, and snapshots above the safe 512 MiB pending limit are skipped.
+                        </span>
+                    </span>
+                    <span class="inline-flex items-center gap-2 flex-shrink-0 pt-0.5">
+                        <span class="text-[10px] font-semibold text-neutral-500"
+                              x-text="promptCacheSsd ? 'On' : 'Off'"></span>
+                        <input type="checkbox"
+                               x-model="promptCacheSsd"
+                               @change="runPlan()"
+                               :disabled="planLoading"
+                               class="h-4 w-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-500 disabled:opacity-40"
+                               aria-label="Persist distributed prompt snapshots to SSD"
+                               data-cluster-v2-prompt-cache-ssd-toggle>
+                    </span>
+                </label>
+                <label x-show="promptCacheSsd" x-cloak
+                       class="mt-2 block rounded-xl border border-neutral-200 px-3 py-2.5"
+                       data-cluster-v2-prompt-cache-ssd-cap>
+                    <span class="block text-xs font-semibold text-neutral-900">SSD budget per rank</span>
+                    <span class="mt-2 inline-flex items-center gap-2">
+                        <input type="number"
+                               x-model.number="promptCacheSsdMaxGiB"
+                               @change="runPlan()"
+                               min="1"
+                               max="1024"
+                               step="1"
+                               :disabled="planLoading"
+                               class="w-24 text-xs border border-neutral-200 rounded-lg px-2 py-1.5 focus:ring-2 focus:ring-neutral-900 focus:border-transparent disabled:opacity-40"
+                               aria-label="Persistent prompt snapshot SSD budget per rank">
+                        <span class="text-xs text-neutral-600">GiB</span>
+                    </span>
+                    <span class="block text-[10px] text-neutral-500 mt-1">
+                        Oldest aligned snapshots are evicted deterministically at this limit. Default: 20 GiB on each rank.
+                    </span>
+                </label>
+
                 <!-- Per-node roles: how much of each Mac the cluster may take.
                      Default is unchanged (this Mac = Workstation, peers =
                      Headless); changing one re-runs the plan. -->
@@ -852,18 +948,87 @@
                     </template>
                 </div>
 
-                <div class="mt-4 flex flex-wrap items-center gap-2">
+                <div class="mt-4 flex flex-wrap items-center gap-2"
+                     data-cluster-v2-model-lifecycle>
                     <template x-for="deployment in deploymentsPayload" :key="deployment.deployment_id">
-                        <button type="button" @click="deactivateDeployment(deployment)"
-                                class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border"
-                                :class="confirmDeactivateFor === deployment.deployment_id
-                                    ? 'text-red-700 border-red-300 bg-red-50 hover:bg-red-100'
-                                    : 'text-neutral-600 border-neutral-200 hover:bg-neutral-50'"
-                                data-cluster-v2-deactivate>
-                            <i data-lucide="octagon-x" class="w-3.5 h-3.5"></i>
-                            <span x-text="confirmDeactivateFor === deployment.deployment_id ? 'Click again to deactivate' : 'Deactivate'"></span>
-                        </button>
+                        <div class="contents">
+                            <button type="button"
+                                    x-show="deploymentRuntimeState(deployment) === 'ready'"
+                                    @click="beginModelChange(deployment)"
+                                    :disabled="clusterLifecycleBusy"
+                                    class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40"
+                                    data-cluster-v2-change-model>
+                                <i data-lucide="shuffle" class="w-3.5 h-3.5"></i>
+                                Change model
+                            </button>
+                            <button type="button"
+                                    x-show="deploymentRuntimeState(deployment) === 'ready'"
+                                    @click="unloadDeploymentWeights(deployment)"
+                                    :disabled="clusterLifecycleBusy"
+                                    class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border"
+                                    :class="confirmUnloadFor === deployment.deployment_id
+                                        ? 'text-amber-800 border-amber-300 bg-amber-50 hover:bg-amber-100'
+                                        : 'text-neutral-600 border-neutral-200 hover:bg-neutral-50'"
+                                    data-cluster-v2-unload-weights>
+                                <i data-lucide="archive" class="w-3.5 h-3.5"></i>
+                                <span x-text="confirmUnloadFor === deployment.deployment_id ? 'Confirm unload weights' : 'Unload weights'"></span>
+                            </button>
+                            <button type="button"
+                                    x-show="deploymentRuntimeState(deployment) === 'configured'"
+                                    @click="loadDeploymentWeights(deployment)"
+                                    :disabled="clusterLifecycleBusy"
+                                    class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40"
+                                    data-cluster-v2-load-weights>
+                                <i data-lucide="play" class="w-3.5 h-3.5"></i>
+                                Load model
+                            </button>
+                            <button type="button"
+                                    x-show="deploymentRuntimeState(deployment) === 'configured'"
+                                    @click="beginModelChange(deployment)"
+                                    :disabled="clusterLifecycleBusy"
+                                    class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-neutral-700 border border-neutral-200 rounded-lg hover:bg-neutral-50 disabled:opacity-40"
+                                    data-cluster-v2-change-model-cold>
+                                <i data-lucide="shuffle" class="w-3.5 h-3.5"></i>
+                                Choose another model
+                            </button>
+                            <button type="button" @click="deactivateDeployment(deployment)"
+                                    :disabled="clusterLifecycleBusy"
+                                    class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border disabled:opacity-40"
+                                    :class="confirmDeactivateFor === deployment.deployment_id
+                                        ? 'text-red-700 border-red-300 bg-red-50 hover:bg-red-100'
+                                        : 'text-neutral-500 border-neutral-200 hover:bg-neutral-50'"
+                                    data-cluster-v2-deactivate>
+                                <i data-lucide="octagon-x" class="w-3.5 h-3.5"></i>
+                                <span x-text="confirmDeactivateFor === deployment.deployment_id ? 'Confirm remove setup' : 'Remove cluster setup'"></span>
+                            </button>
+                        </div>
                     </template>
+                </div>
+
+                <div x-show="confirmChangeModelFor === configuredDeployment()?.deployment_id"
+                     x-cloak
+                     class="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3"
+                     data-cluster-v2-change-model-confirm>
+                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                        <div>
+                            <div class="text-xs font-semibold text-amber-900">Unload these shards and choose a new model?</div>
+                            <div class="text-[10px] text-amber-800 mt-0.5">
+                                oMLX waits for active requests, verifies both ranks stopped, keeps the Macs paired, then reopens the existing model picker with this profile, cache policy, memory roles and context reservation prefilled.
+                            </div>
+                        </div>
+                        <div class="flex items-center gap-2 flex-shrink-0">
+                            <button type="button" @click="cancelModelChange()"
+                                    :disabled="clusterLifecycleBusy"
+                                    class="px-3 py-1.5 text-xs font-medium text-amber-900 border border-amber-300 rounded-lg hover:bg-amber-100 disabled:opacity-40">Cancel</button>
+                            <button type="button" @click="changeClusterModel(configuredDeployment())"
+                                    :disabled="clusterLifecycleBusy"
+                                    class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-amber-800 rounded-lg hover:bg-amber-900 disabled:opacity-40"
+                                    data-cluster-v2-change-model-confirm-action>
+                                <svg x-show="clusterLifecycleBusy" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                                <span x-text="clusterLifecycleBusy ? 'Stopping ranks…' : 'Unload & choose model'"></span>
+                            </button>
+                        </div>
+                    </div>
                 </div>
             </div>
         </section>

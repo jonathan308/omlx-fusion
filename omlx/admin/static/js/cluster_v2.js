@@ -69,6 +69,10 @@ function clusterV2Wizard() {
         deployments: '/admin/api/cluster/deployments',
         deployment: (id) =>
             `/admin/api/cluster/deployments/${encodeURIComponent(id)}`,
+        deploymentLoad: (id) =>
+            `/admin/api/cluster/deployments/${encodeURIComponent(id)}/load`,
+        deploymentUnload: (id) =>
+            `/admin/api/cluster/deployments/${encodeURIComponent(id)}/unload`,
     };
 
     // exo-style data layer: one snapshot endpoint polled once per second
@@ -216,6 +220,18 @@ function clusterV2Wizard() {
         // 'tensor' threads tensor_parallel_size = planNodes().length into both
         // /plan and /deployments; anything else plans pipeline-only (TP=1).
         planStrategy: 'auto',
+        // Scheduler limits are selected as one of the server-owned execution
+        // profiles. The worker may safely reduce these values for available
+        // headroom, and the active view always renders those resolved values.
+        // Continuous batching itself is automatic for batchable models; this
+        // profile controls its target width and prompt/decode admission limits.
+        executionProfile: 'balanced',
+        // The volatile rank-local prompt LRU is always enabled. Persistent
+        // SSD boundary snapshots are explicit because their bounded detached
+        // payloads consume memory and disk even though writes run in back.
+        promptCacheSsd: false,
+        promptCacheSsdMaxGiB: 20,
+        targetContextTokens: 32768,
         // Per-model strategy advice from POST /admin/api/cluster/catalogue
         // (null = not attempted yet). catalogueFailed switches the
         // recommendation badge to the fast-transport heuristic.
@@ -244,6 +260,13 @@ function clusterV2Wizard() {
         stagingTimer: null,
         confirmUnpairFor: '',
         confirmDeactivateFor: '',
+        confirmUnloadFor: '',
+        confirmChangeModelFor: '',
+        clusterLifecycleBusy: false,
+        executionReplan: null,
+        executionReplanBusy: false,
+        tpQualifications: null,
+        tpQualificationsError: '',
 
         // ---- feedback ----------------------------------------------------------
         toasts: [],
@@ -1428,6 +1451,17 @@ function clusterV2Wizard() {
         async selectModel(model) {
             if (!model || this.planLoading) return;
             this.selectedModelPath = model.model_path;
+            const modelLimit = Math.max(
+                1,
+                Number(model.model_context_length || 1_048_576),
+            );
+            this.targetContextTokens = Math.min(
+                Math.max(1, Number(this.targetContextTokens) || 32768),
+                modelLimit,
+            );
+            this.plan = null;
+            this.planProposal = null;
+            this.checks.benchmark = null;
             this.normalizePlanStrategy();
             await this.runPlan();
         },
@@ -1435,12 +1469,70 @@ function clusterV2Wizard() {
         // =====================================================================
         // Execution strategy — auto / tensor / pipeline, server-recommended
         // =====================================================================
-        // Tensor parallelism must span every node (routes.py rejects TP !=
-        // len(nodes)), so the size is always the full pool.
-        planTensorParallelSize() {
-            return this.planStrategy === 'tensor'
-                ? this.planNodes().length
-                : 1;
+        executionProfileOptions() {
+            return [
+                {
+                    key: 'interactive',
+                    label: 'Interactive',
+                    limits: '4 decode · 2 prompt · batch 2',
+                    detail: 'Lower queueing and memory use',
+                },
+                {
+                    key: 'balanced',
+                    label: 'Balanced',
+                    limits: '8 decode · 4 prompt · batch 4',
+                    detail: 'Default mix of latency and throughput',
+                },
+                {
+                    key: 'throughput',
+                    label: 'Throughput',
+                    limits: '16 decode · 8 prompt · batch 8',
+                    detail: 'Wider automatic batches when requests overlap',
+                },
+            ];
+        },
+
+        contextReservationOptions() {
+            const selectedLimit = Math.max(
+                1,
+                Number(this.selectedModel()?.model_context_length || 1_048_576),
+            );
+            const standard = [8192, 32768, 131072, 262144, 524288, 1_048_576];
+            const values = standard.filter((value) => value <= selectedLimit);
+            if (!values.includes(selectedLimit)) values.push(selectedLimit);
+            return [...new Set(values)].sort((left, right) => left - right);
+        },
+
+        contextReservationLabel(tokens) {
+            const value = Math.max(1, Number(tokens) || 0);
+            if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2).replace(/\.00$/, '')}M tokens`;
+            return `${Math.round(value / 1024)}K tokens`;
+        },
+
+        setTargetContextTokens(value) {
+            const parsed = Math.max(1, Number(value) || 32768);
+            if (parsed === this.targetContextTokens || this.planLoading) return;
+            this.targetContextTokens = parsed;
+            if (this.selectedModelPath) this.runPlan();
+        },
+
+        setExecutionProfile(key) {
+            if (
+                this.planLoading ||
+                !this.executionProfileOptions().some(
+                    (option) => option.key === key,
+                ) ||
+                this.executionProfile === key
+            ) {
+                return;
+            }
+            this.executionProfile = key;
+            // Catalogue recommendations also use the workload profile, so do
+            // not retain a recommendation computed for the old limits.
+            this.catalogueModels = null;
+            this.catalogueFailed = false;
+            if (this.modelOptions.length) this.loadCatalogue();
+            if (this.selectedModelPath) this.runPlan();
         },
 
         catalogueEntryForModel() {
@@ -1651,11 +1743,22 @@ function clusterV2Wizard() {
                 const model = this.selectedModel();
                 const body = {
                     model_path: this.selectedModelPath,
-                    nodes: this.planNodes(),
-                    execution_profile: 'balanced',
-                    // 'tensor' spans every node (routes.py requires TP ==
-                    // len(nodes)); 'auto'/'pipeline' plan pipeline-only.
-                    tensor_parallel_size: this.planTensorParallelSize(),
+                    nodes,
+                    hosts: this.deploymentHosts(),
+                    execution_profile: this.executionProfile,
+                    prompt_cache_ssd: this.promptCacheSsd,
+                    prompt_cache_ssd_max_bytes:
+                        Math.max(1, Number(this.promptCacheSsdMaxGiB) || 20) * (1024 ** 3),
+                    prefer: 'speed',
+                    strategy: this.planStrategy,
+                    detect_transports: true,
+                    preflight: true,
+                    auto_tune: true,
+                    measure_performance: true,
+                    target_context_tokens: Math.max(
+                        1,
+                        Number(this.targetContextTokens) || 32768,
+                    ),
                 };
                 if (
                     model?.model_source &&
@@ -2002,14 +2105,266 @@ function clusterV2Wizard() {
             }
         },
 
+        executionReplanBody(profile) {
+            const deployment = this.configuredDeployment();
+            const execution = this.deploymentExecution(deployment) || {};
+            if (!deployment?.deployment_id) return null;
+            const body = {
+                deployment_id: deployment.deployment_id,
+                execution_profile: profile,
+                auto_tune: execution.auto_tune !== false,
+                sampling_rank_only: execution.sampling_rank_only !== false,
+                async_overlap: execution.async_overlap !== false,
+                cache_affinity: execution.cache_affinity !== false,
+                prompt_cache_ssd: execution.prompt_cache_ssd === true,
+                prompt_cache_ssd_max_bytes:
+                    Number(execution.prompt_cache_ssd_max_bytes) || 20 * (1024 ** 3),
+                target_context_tokens:
+                    Number(deployment.target_context_tokens) || 8192,
+            };
+            if (Number(execution.max_kv_size) > 0) {
+                body.max_kv_size = Number(execution.max_kv_size);
+            }
+            if (Number(execution.ring_connections_per_ip) > 0) {
+                body.ring_connections_per_ip = Number(
+                    execution.ring_connections_per_ip,
+                );
+            }
+            if (typeof deployment.mtp_enabled === 'boolean') {
+                body.mtp_enabled = deployment.mtp_enabled;
+            }
+            if (Number(deployment.mtp_num_draft_tokens) > 0) {
+                body.mtp_num_draft_tokens = Number(
+                    deployment.mtp_num_draft_tokens,
+                );
+            }
+            return body;
+        },
+
+        async previewExecutionProfile(profile) {
+            const current = this.deploymentExecution()?.profile || 'balanced';
+            if (profile === current) {
+                this.executionReplan = null;
+                return;
+            }
+            const body = this.executionReplanBody(profile);
+            if (!body || this.executionReplanBusy) return;
+            this.executionReplanBusy = true;
+            try {
+                const preview = await this.apiFetch(CLUSTER_V2_API.replan, {
+                    method: 'POST',
+                    body: JSON.stringify(body),
+                });
+                const signature = preview?.plan?.placement_signature;
+                if (typeof signature !== 'string' || signature.length < 16) {
+                    throw new Error('The re-plan preview was not signed.');
+                }
+                this.executionReplan = { profile, body, preview };
+            } catch (error) {
+                this.executionReplan = null;
+                this.notify(
+                    'error',
+                    error?.message || 'Could not preview the serving profile.',
+                );
+            } finally {
+                this.executionReplanBusy = false;
+            }
+        },
+
+        async applyExecutionProfileReplan() {
+            const pending = this.executionReplan;
+            const signature = pending?.preview?.plan?.placement_signature;
+            if (!pending || !signature || this.executionReplanBusy) return;
+            this.executionReplanBusy = true;
+            try {
+                await this.apiFetch(CLUSTER_V2_API.replan, {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        ...pending.body,
+                        approved_placement: signature,
+                    }),
+                });
+                this.executionProfile = pending.profile;
+                this.executionReplan = null;
+                this.notify(
+                    'success',
+                    'Serving profile applied and distributed readiness re-checked.',
+                );
+                await this.refreshDeployments();
+                await this.refreshRuntime();
+            } catch (error) {
+                this.notify(
+                    error?.status === 409 ? 'warning' : 'error',
+                    error?.message ||
+                        'Could not apply the signed serving-profile re-plan.',
+                );
+            } finally {
+                this.executionReplanBusy = false;
+            }
+        },
+
+        hydratePlannerFromDeployment(deployment) {
+            const execution = this.deploymentExecution(deployment) || {};
+            this.executionProfile = String(
+                execution.profile || deployment?.execution?.profile || 'balanced',
+            );
+            this.promptCacheSsd = Boolean(
+                execution.prompt_cache_ssd ?? deployment?.prompt_cache_ssd,
+            );
+            this.promptCacheSsdMaxGiB = Math.max(
+                1,
+                Math.round(
+                    Number(
+                        execution.prompt_cache_ssd_max_bytes ||
+                            deployment?.prompt_cache_ssd_max_bytes ||
+                            20 * 1024 ** 3,
+                    ) /
+                        1024 ** 3,
+                ),
+            );
+            this.targetContextTokens = Math.max(
+                1,
+                Number(deployment?.target_context_tokens || 32768),
+            );
+            this.nodeRoles = Object.fromEntries(
+                (deployment?.assignments || [])
+                    .filter((assignment) => assignment?.node_id && assignment?.role)
+                    .map((assignment) => [assignment.node_id, assignment.role]),
+            );
+            // A different architecture may need a different split. Automatic
+            // retains all the current serving/cache/memory choices while
+            // letting the catalogue select TP or pipeline for the new model.
+            this.planStrategy = 'auto';
+        },
+
+        resetModelPicker() {
+            this.selectedModelPath = '';
+            this.modelSearch = '';
+            this.modelOptions = [];
+            this.modelsError = '';
+            this.catalogueModels = null;
+            this.catalogueFailed = false;
+            this.plan = null;
+            this.planProposal = null;
+            this.planError = '';
+            this.planFitFailure = null;
+            this.checks.benchmark = null;
+            this.stagingJob = null;
+            this.stagingActivation = null;
+            this.stagingError = '';
+        },
+
+        async unloadDeploymentWeights(deployment) {
+            const id = deployment?.deployment_id;
+            if (!id || this.clusterLifecycleBusy) return;
+            if (this.confirmUnloadFor !== id) {
+                this.confirmUnloadFor = id;
+                this.confirmChangeModelFor = '';
+                return;
+            }
+            this.confirmUnloadFor = '';
+            this.clusterLifecycleBusy = true;
+            try {
+                await this.apiFetch(CLUSTER_V2_API.deploymentUnload(id), {
+                    method: 'POST',
+                });
+                this.notify(
+                    'success',
+                    'Cluster weights unloaded. The signed setup is still ready to load again.',
+                );
+                await this.refreshDeployments();
+                await this.refreshRuntime();
+            } catch (error) {
+                this.notify(
+                    error?.status === 409 ? 'warning' : 'error',
+                    error?.message || 'Could not unload the cluster weights.',
+                );
+            } finally {
+                this.clusterLifecycleBusy = false;
+            }
+        },
+
+        async loadDeploymentWeights(deployment) {
+            const id = deployment?.deployment_id;
+            if (!id || this.clusterLifecycleBusy) return;
+            this.clusterLifecycleBusy = true;
+            try {
+                await this.apiFetch(CLUSTER_V2_API.deploymentLoad(id), {
+                    method: 'POST',
+                });
+                this.notify(
+                    'success',
+                    'Cluster weights loaded and every rank passed readiness.',
+                );
+                await this.refreshDeployments();
+                await this.refreshRuntime();
+            } catch (error) {
+                this.notify(
+                    error?.status === 409 ? 'warning' : 'error',
+                    error?.message || 'Could not load the cluster weights.',
+                );
+            } finally {
+                this.clusterLifecycleBusy = false;
+            }
+        },
+
+        beginModelChange(deployment) {
+            const id = deployment?.deployment_id;
+            if (!id || this.clusterLifecycleBusy) return;
+            this.confirmChangeModelFor = id;
+            this.confirmUnloadFor = '';
+            this.confirmDeactivateFor = '';
+        },
+
+        cancelModelChange() {
+            this.confirmChangeModelFor = '';
+        },
+
+        async changeClusterModel(deployment) {
+            const id = deployment?.deployment_id;
+            if (
+                !id ||
+                this.confirmChangeModelFor !== id ||
+                this.clusterLifecycleBusy
+            ) {
+                return;
+            }
+            this.clusterLifecycleBusy = true;
+            this.hydratePlannerFromDeployment(deployment);
+            try {
+                await this.apiFetch(CLUSTER_V2_API.deployment(id), {
+                    method: 'DELETE',
+                });
+                this.confirmChangeModelFor = '';
+                this.resetModelPicker();
+                await this.refreshDeployments();
+                await this.refreshRuntime();
+                this.enterPlan();
+                this.notify(
+                    'info',
+                    'Previous shards unloaded. Choose the next model; current serving and memory settings are prefilled.',
+                );
+            } catch (error) {
+                this.notify(
+                    error?.status === 409 ? 'warning' : 'error',
+                    error?.message || 'Could not switch the clustered model.',
+                );
+            } finally {
+                this.clusterLifecycleBusy = false;
+            }
+        },
+
         async deactivateDeployment(deployment) {
             const id = deployment?.deployment_id;
-            if (!id) return;
+            if (!id || this.clusterLifecycleBusy) return;
             if (this.confirmDeactivateFor !== id) {
                 this.confirmDeactivateFor = id;
                 return;
             }
             this.confirmDeactivateFor = '';
+            this.confirmChangeModelFor = '';
+            this.confirmUnloadFor = '';
+            this.clusterLifecycleBusy = true;
             try {
                 await this.apiFetch(CLUSTER_V2_API.deployment(id), {
                     method: 'DELETE',
@@ -2021,6 +2376,8 @@ function clusterV2Wizard() {
                     'error',
                     error?.message || 'Could not deactivate',
                 );
+            } finally {
+                this.clusterLifecycleBusy = false;
             }
         },
 
