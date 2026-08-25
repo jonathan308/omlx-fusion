@@ -915,6 +915,12 @@ raise SystemExit(2)
             / f"{self.deployment.deployment_id}-rank-0.json"
         )
         if not isinstance(marker, dict):
+            # The phase-split server owns one broker future per private HTTP
+            # request and does not yet publish the sharded scheduler marker.
+            # Its response cannot finish before decode and cache ownership do,
+            # so the coordinator counter is valid quiescence evidence here.
+            if self.deployment.serving_mode == "disaggregated":
+                return self._active_requests
             return None
         metrics = marker.get("metrics")
         if not isinstance(metrics, dict):

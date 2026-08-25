@@ -11,6 +11,8 @@ from omlx.cluster.deployment import (
     ClusterHost,
     _assignment_from_dict,
     decode_worker_plan,
+    decode_worker_serving_mode,
+    decode_worker_speculation,
 )
 from omlx.cluster.performance import NodePerformanceProfile, execution_profile
 from omlx.cluster.planner import PipelineAssignment
@@ -93,6 +95,57 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
         "MLX_MAX_MB_PER_BUFFER",
         "JACCL_PROGRESS_TIMEOUT_MS",
         "JACCL_TIMEOUT_ACTION",
+        "JACCL_TWO_RANK_SMALL_ALLREDUCE",
+        "OMLX_CLUSTER_TRACE_COLLECTIVES",
+        "OMLX_MTP_DISTRIBUTED_ADAPTIVE_DEPTH",
+        "OMLX_MTP_DISTRIBUTED_LOCKSTEP_DEPTH",
+        "OMLX_MTP_ROWWISE_BATCH",
+        "OMLX_DSV4_MTP_DECODE_CONCURRENCY",
+        "OMLX_DSV4_INDEXER_ROW_TP",
+        "OMLX_DSV4_INDEXER_GATHER_P2P",
+        "OMLX_DSV4_NATIVE_INDEXER",
+        "OMLX_DSV4F_MMA_SCORE",
+        "OMLX_DSV4_HIERARCHICAL_INDEXER",
+        "OMLX_DSV4_HIERARCHICAL_MIN_POOL",
+        "OMLX_DSV4_HIERARCHICAL_REFRESH_POOL",
+        "OMLX_DSV4_HIERARCHICAL_CANDIDATE_FRACTION",
+        "OMLX_DSV4_HIERARCHICAL_NATIVE_UPPER",
+        "OMLX_DSV4_INDEXER_ROW_WEIGHTS",
+        "OMLX_DSV4_INDEXER_ROW_WEIGHTS_MIN_POOL",
+        "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL",
+        "OMLX_DSV4_ADAPTIVE_PREFILL",
+        "OMLX_DSV4_ADAPTIVE_PREFILL_AFTER",
+        "OMLX_DSV4_ADAPTIVE_PREFILL_STEP",
+        "OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE",
+        "OMLX_CLUSTER_PREFILL_SHAPE_WARMUP",
+        "OMLX_DSV4_PREFILL_YIELD",
+        "OMLX_CONTENDED_PREFILL_CHUNK",
+        "OMLX_DSV4_MIXED_PREFILL_CHUNK",
+        "OMLX_MIXED_PREFILL_MIN_QUANTUM",
+        "OMLX_DSV4_PREFILL_STEP_TRACE",
+        "OMLX_DSV4_PREFILL_ASYNC_DEPTH",
+        "OMLX_DSV4_WSDPA",
+        "OMLX_DSV4_WSDPA_TP",
+        "OMLX_DSV4_WSDPA_TOPK",
+        "OMLX_DSV4_B1_SCALAR_OFFSET",
+        "OMLX_DSV4_QKV_BUNDLE_PREFILL",
+        "OMLX_DSV4_FULL_MOE_DECODE",
+        "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS",
+        "OMLX_DSV4_ROUTER_TOPK_DECODE",
+        "OMLX_DSV4_NAX_OA_PREFILL",
+        "OMLX_DSV4_ATTN_FINALIZER_PREFILL",
+        "OMLX_DSV4_ATTN_FINALIZER_VERIFY",
+        "OMLX_DSV4_OUTPUT_CHAIN_PREFILL",
+        "OMLX_DSV4_OUTPUT_CHAIN_EQUAL_TP",
+        "OMLX_DSV4_VERIFY_BATCHED_OA_PREPARE",
+        "OMLX_DSV4_VERIFY_HC_PRENORM",
+        "OMLX_DSV4_HC_RESIDUAL_OVERLAP",
+        "OMLX_DSV4_NAX_MOE_BLOCKS",
+        "OMLX_DSV4_COMBINED_MOE_PREFILL",
+        "OMLX_TP_MOE_SHARD_WEIGHTS",
+        "OMLX_TP_NON_MOE_SHARD_WEIGHTS",
+        "OMLX_CLUSTER_VOCAB_PARALLEL",
+        "OMLX_CLUSTER_VOCAB_PARALLEL_MIN_BYTES",
     ):
         monkeypatch.delenv(name, raising=False)
     deployment = _deployment()
@@ -106,11 +159,96 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
     assert "MLX_MAX_MB_PER_BUFFER=512" in envs
     assert "JACCL_PROGRESS_TIMEOUT_MS=30000" in envs
     assert "JACCL_TIMEOUT_ACTION=teardown-exit" in envs
+    assert "JACCL_TWO_RANK_SMALL_ALLREDUCE=0" in envs
+    assert "OMLX_CLUSTER_TRACE_COLLECTIVES=0" in envs
+    assert "OMLX_MTP_DISTRIBUTED_ADAPTIVE_DEPTH=0" in envs
+    assert "OMLX_MTP_DISTRIBUTED_LOCKSTEP_DEPTH=0" in envs
+    assert "OMLX_MTP_ROWWISE_BATCH=0" in envs
+    assert "OMLX_DSV4_MTP_DECODE_CONCURRENCY=1" in envs
+    assert "OMLX_DSV4_INDEXER_ROW_TP=1" in envs
+    assert "OMLX_DSV4_INDEXER_GATHER_P2P=0" in envs
+    assert "OMLX_DSV4_NATIVE_INDEXER=1" in envs
+    assert "OMLX_DSV4F_MMA_SCORE=1" in envs
+    assert "OMLX_DSV4_HIERARCHICAL_INDEXER=0" in envs
+    assert "OMLX_DSV4_HIERARCHICAL_MIN_POOL=16000" in envs
+    assert "OMLX_DSV4_HIERARCHICAL_REFRESH_POOL=2048" in envs
+    assert "OMLX_DSV4_HIERARCHICAL_CANDIDATE_FRACTION=0.30" in envs
+    assert "OMLX_DSV4_HIERARCHICAL_NATIVE_UPPER=0" in envs
+    assert "OMLX_DSV4_INDEXER_ROW_WEIGHTS=" in envs
+    assert "OMLX_DSV4_INDEXER_ROW_WEIGHTS_MIN_POOL=16000" in envs
+    assert "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL=2048" in envs
+    assert "OMLX_DSV4_ADAPTIVE_PREFILL=1" in envs
+    assert "OMLX_DSV4_ADAPTIVE_PREFILL_AFTER=4096" in envs
+    assert "OMLX_DSV4_ADAPTIVE_PREFILL_STEP=1024" in envs
+    assert "OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE=2048" in envs
+    assert "OMLX_CLUSTER_PREFILL_SHAPE_WARMUP=1" in envs
+    assert "OMLX_DSV4_PREFILL_YIELD=1" in envs
+    assert "OMLX_CONTENDED_PREFILL_CHUNK=512" in envs
+    assert "OMLX_DSV4_MIXED_PREFILL_CHUNK=256" in envs
+    assert "OMLX_MIXED_PREFILL_MIN_QUANTUM=128" in envs
+    assert "OMLX_DSV4_PREFILL_STEP_TRACE=0" in envs
+    assert "OMLX_DSV4_PREFILL_ASYNC_DEPTH=0" in envs
+    assert "OMLX_DSV4_WSDPA=1" in envs
+    assert "OMLX_DSV4_WSDPA_TP=1" in envs
+    assert "OMLX_DSV4_WSDPA_TOPK=1" in envs
+    assert "OMLX_DSV4_B1_SCALAR_OFFSET=1" in envs
+    assert "OMLX_DSV4_QKV_BUNDLE_PREFILL=0" in envs
+    assert "OMLX_DSV4_FULL_MOE_DECODE=1" in envs
+    assert "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS=1" in envs
+    assert "OMLX_DSV4_ROUTER_TOPK_DECODE=1" in envs
+    assert "OMLX_DSV4_NAX_OA_PREFILL=0" in envs
+    assert "OMLX_DSV4_ATTN_FINALIZER_PREFILL=0" in envs
+    assert "OMLX_DSV4_ATTN_FINALIZER_VERIFY=0" in envs
+    assert "OMLX_DSV4_OUTPUT_CHAIN_PREFILL=0" in envs
+    assert "OMLX_DSV4_OUTPUT_CHAIN_EQUAL_TP=1" in envs
+    assert "OMLX_DSV4_VERIFY_BATCHED_OA_PREPARE=0" in envs
+    assert "OMLX_DSV4_VERIFY_HC_PRENORM=0" in envs
+    assert "OMLX_DSV4_HC_RESIDUAL_OVERLAP=0" in envs
+    assert "OMLX_DSV4_NAX_MOE_BLOCKS=0" in envs
+    assert "OMLX_DSV4_COMBINED_MOE_PREFILL=0" in envs
+    assert "OMLX_TP_MOE_SHARD_WEIGHTS=" in envs
+    assert "OMLX_TP_NON_MOE_SHARD_WEIGHTS=" in envs
+    assert "OMLX_CLUSTER_VOCAB_PARALLEL=auto" in envs
+    assert "OMLX_CLUSTER_VOCAB_PARALLEL_MIN_BYTES=268435456" in envs
 
 
 def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     monkeypatch.setenv("MLX_MAX_OPS_PER_BUFFER", "32")
     monkeypatch.setenv("JACCL_PROGRESS_TIMEOUT_MS", "60000")
+    monkeypatch.setenv("JACCL_TWO_RANK_SMALL_ALLREDUCE", "1")
+    monkeypatch.setenv("OMLX_CLUSTER_TRACE_COLLECTIVES", "1")
+    monkeypatch.setenv("OMLX_MTP_DISTRIBUTED_ADAPTIVE_DEPTH", "1")
+    monkeypatch.setenv("OMLX_MTP_DISTRIBUTED_LOCKSTEP_DEPTH", "1")
+    monkeypatch.setenv("OMLX_DSV4_INDEXER_ROW_TP", "0")
+    monkeypatch.setenv("OMLX_DSV4_INDEXER_GATHER_P2P", "1")
+    monkeypatch.setenv("OMLX_DSV4_NATIVE_INDEXER", "0")
+    monkeypatch.setenv("OMLX_DSV4_HIERARCHICAL_NATIVE_UPPER", "1")
+    monkeypatch.setenv("OMLX_DSV4_INDEXER_ROW_WEIGHTS", "9,7")
+    monkeypatch.setenv("OMLX_DSV4_INDEXER_ROW_WEIGHTS_MIN_POOL", "20000")
+    monkeypatch.setenv("OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL", "4096")
+    monkeypatch.setenv("OMLX_CLUSTER_PREFILL_SHAPE_WARMUP", "0")
+    monkeypatch.setenv("OMLX_DSV4_PREFILL_YIELD", "0")
+    monkeypatch.setenv("OMLX_CONTENDED_PREFILL_CHUNK", "640")
+    monkeypatch.setenv("OMLX_DSV4_MIXED_PREFILL_CHUNK", "1536")
+    monkeypatch.setenv("OMLX_MIXED_PREFILL_MIN_QUANTUM", "64")
+    monkeypatch.setenv("OMLX_DSV4_PREFILL_STEP_TRACE", "1")
+    monkeypatch.setenv("OMLX_DSV4_PREFILL_ASYNC_DEPTH", "2")
+    monkeypatch.setenv("OMLX_DSV4_WSDPA_TP", "0")
+    monkeypatch.setenv("OMLX_DSV4_B1_SCALAR_OFFSET", "0")
+    monkeypatch.setenv("OMLX_DSV4_QKV_BUNDLE_PREFILL", "1")
+    monkeypatch.setenv("OMLX_DSV4_FULL_MOE_DECODE", "1")
+    monkeypatch.setenv("OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS", "2")
+    monkeypatch.setenv("OMLX_DSV4_ROUTER_TOPK_DECODE", "0")
+    monkeypatch.setenv("OMLX_DSV4_NAX_OA_PREFILL", "1")
+    monkeypatch.setenv("OMLX_DSV4_ATTN_FINALIZER_PREFILL", "1")
+    monkeypatch.setenv("OMLX_DSV4_OUTPUT_CHAIN_PREFILL", "1")
+    monkeypatch.setenv("OMLX_DSV4_OUTPUT_CHAIN_EQUAL_TP", "0")
+    monkeypatch.setenv("OMLX_DSV4_VERIFY_BATCHED_OA_PREPARE", "1")
+    monkeypatch.setenv("OMLX_DSV4_VERIFY_HC_PRENORM", "1")
+    monkeypatch.setenv("OMLX_DSV4_HC_RESIDUAL_OVERLAP", "1")
+    monkeypatch.setenv("OMLX_DSV4_NAX_MOE_BLOCKS", "1")
+    monkeypatch.setenv("OMLX_DSV4_COMBINED_MOE_PREFILL", "1")
+    monkeypatch.setenv("OMLX_TP_MOE_SHARD_WEIGHTS", "4,4")
     deployment = _deployment()
 
     envs = deployment.hostfile_dict()["envs"]
@@ -118,6 +256,47 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     assert "MLX_MAX_OPS_PER_BUFFER=32" in envs
     assert "MLX_MAX_OPS_PER_BUFFER=16" not in envs
     assert "JACCL_PROGRESS_TIMEOUT_MS=60000" in envs
+    assert "JACCL_TWO_RANK_SMALL_ALLREDUCE=1" in envs
+    assert "JACCL_TWO_RANK_SMALL_ALLREDUCE=0" not in envs
+    assert "OMLX_CLUSTER_TRACE_COLLECTIVES=1" in envs
+    assert "OMLX_MTP_DISTRIBUTED_ADAPTIVE_DEPTH=1" in envs
+    assert "OMLX_MTP_DISTRIBUTED_LOCKSTEP_DEPTH=1" in envs
+    assert "OMLX_DSV4_INDEXER_ROW_TP=0" in envs
+    assert "OMLX_DSV4_INDEXER_ROW_TP=1" not in envs
+    assert "OMLX_DSV4_INDEXER_GATHER_P2P=1" in envs
+    assert "OMLX_DSV4_INDEXER_GATHER_P2P=0" not in envs
+    assert "OMLX_DSV4_NATIVE_INDEXER=0" in envs
+    assert "OMLX_DSV4_HIERARCHICAL_NATIVE_UPPER=1" in envs
+    assert "OMLX_DSV4_INDEXER_ROW_WEIGHTS=9,7" in envs
+    assert "OMLX_DSV4_INDEXER_ROW_WEIGHTS_MIN_POOL=20000" in envs
+    assert "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL=4096" in envs
+    assert "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL=2048" not in envs
+    assert "OMLX_CLUSTER_PREFILL_SHAPE_WARMUP=0" in envs
+    assert "OMLX_DSV4_PREFILL_YIELD=0" in envs
+    assert "OMLX_CONTENDED_PREFILL_CHUNK=640" in envs
+    assert "OMLX_DSV4_MIXED_PREFILL_CHUNK=1536" in envs
+    assert "OMLX_MIXED_PREFILL_MIN_QUANTUM=64" in envs
+    assert "OMLX_DSV4_PREFILL_STEP_TRACE=1" in envs
+    assert "OMLX_DSV4_PREFILL_YIELD=1" not in envs
+    assert "OMLX_DSV4_PREFILL_ASYNC_DEPTH=2" in envs
+    assert "OMLX_DSV4_PREFILL_ASYNC_DEPTH=0" not in envs
+    assert "OMLX_DSV4_WSDPA_TP=0" in envs
+    assert "OMLX_DSV4_WSDPA_TP=1" not in envs
+    assert "OMLX_DSV4_B1_SCALAR_OFFSET=0" in envs
+    assert "OMLX_DSV4_QKV_BUNDLE_PREFILL=1" in envs
+    assert "OMLX_DSV4_FULL_MOE_DECODE=1" in envs
+    assert "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS=2" in envs
+    assert "OMLX_DSV4_ROUTER_TOPK_DECODE=0" in envs
+    assert "OMLX_DSV4_NAX_OA_PREFILL=1" in envs
+    assert "OMLX_DSV4_ATTN_FINALIZER_PREFILL=1" in envs
+    assert "OMLX_DSV4_OUTPUT_CHAIN_PREFILL=1" in envs
+    assert "OMLX_DSV4_OUTPUT_CHAIN_EQUAL_TP=0" in envs
+    assert "OMLX_DSV4_VERIFY_BATCHED_OA_PREPARE=1" in envs
+    assert "OMLX_DSV4_VERIFY_HC_PRENORM=1" in envs
+    assert "OMLX_DSV4_HC_RESIDUAL_OVERLAP=1" in envs
+    assert "OMLX_DSV4_NAX_MOE_BLOCKS=1" in envs
+    assert "OMLX_DSV4_COMBINED_MOE_PREFILL=1" in envs
+    assert envs.count("OMLX_TP_MOE_SHARD_WEIGHTS=4,4") == 1
     # Untouched knobs keep their tuned defaults.
     assert "MLX_MAX_MB_PER_BUFFER=512" in envs
     assert "JACCL_TIMEOUT_ACTION=teardown-exit" in envs
@@ -141,6 +320,129 @@ def test_deployment_round_trip_preserves_the_selected_context():
     assert restored.to_dict()["target_context_tokens"] == 262144
 
 
+def test_deployment_carries_mtp_settings_to_every_rank():
+    deployment = _deployment()
+    deployment = ClusterDeployment(
+        deployment_id=deployment.deployment_id,
+        model=deployment.model,
+        backend=deployment.backend,
+        hosts=deployment.hosts,
+        assignments=deployment.assignments,
+        plan_hash=deployment.plan_hash,
+        mtp_enabled=True,
+        mtp_num_draft_tokens=5,
+    )
+
+    restored = ClusterDeployment.from_dict(deployment.to_dict())
+
+    assert restored.mtp_enabled is True
+    assert restored.mtp_num_draft_tokens == 5
+    assert decode_worker_speculation(deployment.encode_worker_plan()) == (True, 5)
+
+
+def _disaggregated_deployment(**overrides):
+    base = _deployment()
+    assignments = tuple(
+        PipelineAssignment(
+            node_id=host.node_id,
+            rank=rank,
+            start_layer=0,
+            end_layer=48,
+            layer_weight_bytes=14 * GIB,
+            fixed_weight_bytes=GIB,
+            reserve_bytes=8 * GIB,
+            capacity_bytes=(256 if rank == 0 else 128) * GIB,
+            tensor_parallel_rank=0,
+            tensor_parallel_size=1,
+            kv_cache_bytes=2 * GIB,
+            kv_bytes_per_token=65536,
+            max_context_tokens=1_000_000,
+        )
+        for rank, host in enumerate(base.hosts)
+    )
+    fields = dict(
+        deployment_id="qwen-phase-split",
+        model="mlx-community/Qwen3.8-27B-4bit",
+        backend=base.backend,
+        hosts=base.hosts,
+        assignments=assignments,
+        plan_hash="f" * 64,
+        tensor_parallel_size=1,
+        serving_mode="disaggregated",
+        prefill_rank=1,
+        decode_rank=0,
+    )
+    fields.update(overrides)
+    return ClusterDeployment(**fields)
+
+
+def test_disaggregated_deployment_round_trip_and_worker_contract():
+    deployment = _disaggregated_deployment()
+
+    restored = ClusterDeployment.from_dict(deployment.to_dict())
+    mode = decode_worker_serving_mode(deployment.encode_worker_plan())
+
+    assert restored == deployment
+    assert restored.to_dict()["serving_mode"] == "disaggregated"
+    assert mode == ("disaggregated", 1, 0)
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        (
+            {"prefill_rank": 0, "decode_rank": 0},
+            "distinct prefill/decode ranks",
+        ),
+        (
+            {"prefill_rank": 0, "decode_rank": 1},
+            "rank 0 decode and rank 1 prefill",
+        ),
+        ({"tensor_parallel_size": 2}, "tensor-parallel coordinates"),
+        ({"mtp_enabled": True}, "does not yet admit speculative"),
+    ],
+)
+def test_disaggregated_deployment_rejects_unsafe_contracts(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        _disaggregated_deployment(**overrides)
+
+
+def test_legacy_deployment_decodes_to_sharded_mode():
+    payload = _deployment().to_dict()
+    payload["schema_version"] = 2
+    payload.pop("serving_mode")
+    payload.pop("prefill_rank")
+    payload.pop("decode_rank")
+
+    restored = ClusterDeployment.from_dict(payload)
+
+    assert restored.serving_mode == "sharded"
+    assert decode_worker_serving_mode(restored.encode_worker_plan()) == (
+        "sharded",
+        None,
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    "field, value, message",
+    [
+        ("mtp_enabled", "false", "mtp_enabled must be a boolean"),
+        (
+            "mtp_num_draft_tokens",
+            "5",
+            "mtp_num_draft_tokens must be between 1 and 8",
+        ),
+    ],
+)
+def test_deployment_rejects_coerced_mtp_settings(field, value, message):
+    payload = _deployment().to_dict()
+    payload[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        ClusterDeployment.from_dict(payload)
+
+
 def test_deployment_round_trip_preserves_tensor_parallel_size():
     """Tensor parallel size must survive to_dict/from_dict and worker plan encoding."""
     from omlx.cluster.planner import PipelineAssignment
@@ -157,6 +459,7 @@ def test_deployment_round_trip_preserves_tensor_parallel_size():
             capacity_bytes=256 * GIB,
             tensor_parallel_rank=0,
             tensor_parallel_size=2,
+            tensor_parallel_shard_weight=5,
             sharded_weight_bytes=4 * GIB,
         ),
         PipelineAssignment(
@@ -170,6 +473,7 @@ def test_deployment_round_trip_preserves_tensor_parallel_size():
             capacity_bytes=256 * GIB,
             tensor_parallel_rank=1,
             tensor_parallel_size=2,
+            tensor_parallel_shard_weight=3,
             sharded_weight_bytes=4 * GIB,
         ),
     )
@@ -201,6 +505,9 @@ def test_deployment_round_trip_preserves_tensor_parallel_size():
     payload = json.loads(raw)
     assert payload["tensor_parallel_size"] == 2
     assert payload["assignments"][0]["tensor_parallel_rank"] == 0
+    assert [
+        item["tensor_parallel_shard_weight"] for item in payload["assignments"]
+    ] == [5, 3]
     assert payload["assignments"][0]["sharded_weight_bytes"] == 4 * GIB
 
 
@@ -220,6 +527,48 @@ def test_deployment_rejects_non_divisible_tensor_parallel_size():
             plan_hash="c" * 64,
             tensor_parallel_size=2,
         )
+
+
+def test_deployment_round_trip_preserves_hybrid_rank_map():
+    from omlx.cluster.planner import PipelineAssignment
+
+    assignments = tuple(
+        PipelineAssignment(
+            node_id=f"node-{rank}",
+            rank=rank,
+            start_layer=20 if rank < 2 else 0,
+            end_layer=40 if rank < 2 else 20,
+            layer_weight_bytes=20 * GIB,
+            fixed_weight_bytes=GIB,
+            reserve_bytes=2 * GIB,
+            capacity_bytes=64 * GIB,
+            tensor_parallel_rank=rank % 2,
+            tensor_parallel_size=2,
+            sharded_weight_bytes=20 * GIB,
+        )
+        for rank in range(4)
+    )
+    deployment = ClusterDeployment(
+        deployment_id="hybrid-test",
+        model="mlx-community/test",
+        backend="ring",
+        hosts=tuple(
+            ClusterHost(
+                f"node-{rank}",
+                "127.0.0.1" if rank == 0 else f"node-{rank}.local",
+                (f"10.0.0.{rank + 1}",),
+            )
+            for rank in range(4)
+        ),
+        assignments=assignments,
+        plan_hash="d" * 64,
+        tensor_parallel_size=2,
+    )
+
+    restored = ClusterDeployment.from_dict(deployment.to_dict())
+    assert restored == deployment
+    assert restored.world_size == 4
+    assert restored.tensor_parallel_size == 2
 
 
 def test_deployment_round_trip_preserves_execution_and_performance_profiles():

@@ -127,6 +127,7 @@ function clusterV2Wizard() {
         'cluster.v2.strategy.auto': 'Auto',
         'cluster.v2.strategy.tensor': 'Tensor',
         'cluster.v2.strategy.pipeline': 'Pipeline',
+        'cluster.v2.strategy.disaggregated': 'Phase split',
         'cluster.v2.strategy.recommended': 'Recommended',
         'cluster.v2.strategy.hint.auto':
             'oMLX picks the split that fits this model and your link',
@@ -134,6 +135,8 @@ function clusterV2Wizard() {
             'Every Mac works on every token — needs a fast link',
         'cluster.v2.strategy.hint.pipeline':
             'Each Mac holds a different slice of the layers',
+        'cluster.v2.strategy.hint.disaggregated':
+            'One full replica prefills while the other full replica decodes',
         'cluster.v2.strategy.tensor_needs_two':
             'Tensor parallelism needs 2+ Macs',
         'cluster.v2.strategy.tensor_unsupported':
@@ -229,10 +232,11 @@ function clusterV2Wizard() {
         modelsError: '',
         selectedModelPath: '',
         modelSearch: '',
-        // Execution strategy for the split: 'auto' | 'tensor' | 'pipeline'.
+        // Execution strategy for an ordinary split or full-replica phases.
         // The server resolves its TP degree, host order and backend together;
         // the client never reconstructs those decisions after preview.
         planStrategy: 'auto',
+        phasePrefillRank: 1,
         // Scheduler limits are selected as one of the server-owned execution
         // profiles. The worker may safely reduce these values for available
         // headroom, and the active view always renders those resolved values.
@@ -2029,6 +2033,7 @@ function clusterV2Wizard() {
             const pipelineUnsupported =
                 !!entry && entry.supports_pipeline === false;
             const tensorDisabled = nodeCount < 2 || tensorUnsupported;
+            const phaseDisabled = nodeCount !== 2;
             return [
                 {
                     key: 'auto',
@@ -2054,6 +2059,14 @@ function clusterV2Wizard() {
                         ? t('cluster.v2.strategy.pipeline_unsupported')
                         : '',
                 },
+                {
+                    key: 'disaggregated',
+                    label: t('cluster.v2.strategy.disaggregated'),
+                    disabled: phaseDisabled,
+                    disabledReason: phaseDisabled
+                        ? 'Phase split currently requires exactly two Macs.'
+                        : '',
+                },
             ];
         },
 
@@ -2076,7 +2089,33 @@ function clusterV2Wizard() {
             if (!option || option.disabled || this.planLoading) return;
             if (this.planStrategy === key) return;
             this.planStrategy = key;
+            if (key === 'disaggregated') {
+                this.phasePrefillRank = Math.min(
+                    1,
+                    Math.max(0, Number(this.phasePrefillRank) || 0),
+                );
+            }
             if (this.selectedModelPath) this.runPlan();
+        },
+
+        phaseRoleDevices() {
+            return this.planRoleDevices().filter((_device, index) => index < 2);
+        },
+
+        setPhasePrefillRank(rank) {
+            const value = Number(rank);
+            if (value !== 1 || this.planLoading) return;
+            if (this.phasePrefillRank === value) return;
+            this.phasePrefillRank = value;
+            if (this.selectedModelPath && this.planStrategy === 'disaggregated') {
+                this.runPlan();
+            }
+        },
+
+        phaseRoleForRank(rank) {
+            return Number(rank) === Number(this.phasePrefillRank)
+                ? 'Prefill'
+                : 'Decode';
         },
 
         // A model change (or catalogue arrival) can invalidate the current
@@ -2140,6 +2179,17 @@ function clusterV2Wizard() {
         // TP group one contiguous stage, then split every layer in that stage.
         planIsTensor() {
             return (this.plan?.tensor_parallel_size || 1) > 1;
+        },
+
+        planIsDisaggregated() {
+            return this.plan?.serving_mode === 'disaggregated';
+        },
+
+        phasePlanRole(assignment) {
+            if (!this.planIsDisaggregated()) return '';
+            return Number(assignment?.rank) === Number(this.plan?.prefill_rank)
+                ? 'Prefill'
+                : 'Decode';
         },
 
         planPipelineStages() {
@@ -2329,6 +2379,11 @@ function clusterV2Wizard() {
                         Number(this.targetContextTokens) || 32768,
                     ),
                 };
+                if (this.planStrategy === 'disaggregated') {
+                    body.prefill_rank = Number(this.phasePrefillRank);
+                    body.decode_rank = 1 - Number(this.phasePrefillRank);
+                    body.measure_performance = false;
+                }
                 if (
                     model?.model_source &&
                     model.model_source !== '127.0.0.1'
@@ -2372,7 +2427,8 @@ function clusterV2Wizard() {
                 this.plan = proposal.plan;
                 const probe = proposal.performance_probe;
                 this.checks.benchmark =
-                    probe?.ok === true
+                    probe?.ok === true ||
+                    probe?.status === 'phase_probe_required'
                         ? { ok: true, result: probe }
                         : {
                               ok: false,
@@ -2405,6 +2461,13 @@ function clusterV2Wizard() {
         },
 
         planTotalLayers() {
+            if (this.planIsDisaggregated()) {
+                return this.planAssignments().reduce(
+                    (largest, assignment) =>
+                        Math.max(largest, Number(assignment.layer_count || 0)),
+                    0,
+                );
+            }
             return this.planAssignments().reduce(
                 (sum, assignment) => sum + (assignment.layer_count || 0),
                 0,
@@ -2443,6 +2506,11 @@ function clusterV2Wizard() {
         },
 
         deploymentFabricLabel() {
+            if (this.configuredDeployment()?.serving_mode === 'disaggregated') {
+                return this.resolvedBackend().startsWith('jaccl')
+                    ? 'Inference: Prefill → Decode over Thunderbolt RDMA'
+                    : 'Inference: Prefill → Decode over TCP ring';
+            }
             const backend = String(
                 this.configuredDeployment()?.backend || this.resolvedBackend(),
             );

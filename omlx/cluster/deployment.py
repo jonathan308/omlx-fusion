@@ -28,13 +28,15 @@ from .planner import (
 from .tp_qualifications import TPQualificationProvenance
 
 DistributedBackend = Literal["ring", "jaccl", "jaccl-ring"]
+ServingMode = Literal["sharded", "disaggregated"]
 
+# Version 3 adds the signed serving mode and prefill/decode rank ownership.
 # Version 2 adds ``path_map``: an optional per-node absolute model path, so
 # nodes no longer need the model at the same absolute path on every Mac.
 # Version 1 payloads decode with an empty map, which reproduces the legacy
-# shared-path behavior exactly.
-DEPLOYMENT_SCHEMA_VERSION = 2
-_SUPPORTED_DEPLOYMENT_SCHEMAS = (1, DEPLOYMENT_SCHEMA_VERSION)
+# shared-path behavior exactly. Older schemas decode to ordinary sharded mode.
+DEPLOYMENT_SCHEMA_VERSION = 3
+_SUPPORTED_DEPLOYMENT_SCHEMAS = (1, 2, DEPLOYMENT_SCHEMA_VERSION)
 _MAX_PATH_MAP_ENTRIES = 64
 _MAX_MODEL_PATH_BYTES = 4096
 
@@ -92,6 +94,14 @@ _RANK_ENV_DEFAULTS = (
     # Deterministic accepted-prefix depth controller. Unlike the measured
     # controller it uses no rank-local clock and needs no depth broadcast.
     ("OMLX_MTP_DISTRIBUTED_LOCKSTEP_DEPTH", "0"),
+    # Experimental multi-sequence MTP runs independent exact singleton cycles
+    # per row. Keep it rank-identical and default-off; physical B2/B4 economics
+    # decide whether a serving profile should enable it.
+    ("OMLX_MTP_ROWWISE_BATCH", "0"),
+    # DS4's current DSpark MTP implementation is singleton-only. Until true
+    # N×M verification lands, one decode lane has higher aggregate throughput
+    # than forcing concurrent rows onto the slower standard batch path.
+    ("OMLX_DSV4_MTP_DECODE_CONCURRENCY", "1"),
     # DS4's sparse prefill indexer is row-independent. TP ranks split prompt
     # rows and exchange only top-k indices instead of redundantly scoring the
     # full chunk on every GPU. Explicit env keeps live rollback one flag away.
@@ -167,7 +177,7 @@ _RANK_ENV_DEFAULTS = (
     # Generic schedulers retain their 512/256/128 B1/B2/B4 policy. DS4's
     # physical TP path has its own live-qualified 1024/1024/512 schedule.
     ("OMLX_CONTENDED_PREFILL_CHUNK", "512"),
-    ("OMLX_DSV4_MIXED_PREFILL_CHUNK", "1024"),
+    ("OMLX_DSV4_MIXED_PREFILL_CHUNK", "256"),
     ("OMLX_MIXED_PREFILL_MIN_QUANTUM", "128"),
     ("OMLX_DSV4_PREFILL_STEP_TRACE", "0"),
     # Reversible depth-two graph overlap for pure TP2 prefill.  It remains off
@@ -545,6 +555,12 @@ class ClusterDeployment:
     target_context_tokens: int = 8192
     mtp_enabled: bool = False
     mtp_num_draft_tokens: int | None = None
+    # ``disaggregated`` loads one complete replica per rank and transfers the
+    # completed prompt cache from ``prefill_rank`` to ``decode_rank``. The
+    # default preserves every pre-v3 tensor/pipeline deployment.
+    serving_mode: ServingMode = "sharded"
+    prefill_rank: int | None = None
+    decode_rank: int | None = None
     # node_id → absolute model path on that node. Empty means every node uses
     # ``model`` — the pre-v2 same-absolute-path requirement. Entries override
     # only the nodes they name; the coordinator path stays the fallback.
@@ -585,6 +601,8 @@ class ClusterDeployment:
             or not 1 <= self.mtp_num_draft_tokens <= 8
         ):
             raise ValueError("mtp_num_draft_tokens must be between 1 and 8")
+        if self.serving_mode not in {"sharded", "disaggregated"}:
+            raise ValueError(f"unsupported serving mode: {self.serving_mode!r}")
         if len(self.assignments) != len(self.hosts):
             raise ValueError("host count must match pipeline assignment count")
         if self.hosts[0].ssh != "127.0.0.1":
@@ -622,6 +640,48 @@ class ClusterDeployment:
             if len({(item.start_layer, item.end_layer) for item in tensor_group}) != 1:
                 raise ValueError(
                     "tensor-parallel group members must hold the same layer range"
+                )
+        if self.serving_mode == "sharded":
+            if self.prefill_rank is not None or self.decode_rank is not None:
+                raise ValueError(
+                    "sharded serving cannot carry prefill/decode rank ownership"
+                )
+        else:
+            if len(self.hosts) != 2 or self.tensor_parallel_size != 1:
+                raise ValueError(
+                    "disaggregated serving currently requires two full replicas"
+                )
+            if {self.prefill_rank, self.decode_rank} != {0, 1}:
+                raise ValueError(
+                    "disaggregated serving requires distinct prefill/decode ranks"
+                )
+            if (self.prefill_rank, self.decode_rank) != (1, 0):
+                raise ValueError(
+                    "persistent phase-split serving currently requires rank 0 "
+                    "decode and rank 1 prefill"
+                )
+            if self.mtp_enabled or self.mtp_num_draft_tokens is not None:
+                raise ValueError(
+                    "disaggregated serving does not yet admit speculative decode"
+                )
+            replica_ranges = {
+                (item.start_layer, item.end_layer) for item in assignments
+            }
+            replica_weights = {
+                (item.layer_weight_bytes, item.fixed_weight_bytes)
+                for item in assignments
+            }
+            replica_kv = {
+                (item.kv_cache_bytes, item.kv_bytes_per_token)
+                for item in assignments
+            }
+            if len(replica_ranges) != 1 or len(replica_weights) != 1:
+                raise ValueError(
+                    "disaggregated ranks must hold identical complete model replicas"
+                )
+            if len(replica_kv) != 1:
+                raise ValueError(
+                    "disaggregated ranks must reserve the same full cache shape"
                 )
         qualification = self.tensor_parallel_qualification
         if qualification is not None:
@@ -722,6 +782,9 @@ class ClusterDeployment:
             "target_context_tokens": self.target_context_tokens,
             "mtp_enabled": self.mtp_enabled,
             "mtp_num_draft_tokens": self.mtp_num_draft_tokens,
+            "serving_mode": self.serving_mode,
+            "prefill_rank": self.prefill_rank,
+            "decode_rank": self.decode_rank,
             "path_map": dict(sorted(self.path_map.items())),
         }
         if self.tensor_parallel_qualification is not None:
@@ -777,6 +840,9 @@ class ClusterDeployment:
             target_context_tokens=int(payload.get("target_context_tokens", 8192)),
             mtp_enabled=mtp_enabled,
             mtp_num_draft_tokens=payload.get("mtp_num_draft_tokens"),
+            serving_mode=str(payload.get("serving_mode", "sharded")),
+            prefill_rank=payload.get("prefill_rank"),
+            decode_rank=payload.get("decode_rank"),
             # Schema 1 payloads predate per-node paths; they decode to the
             # empty map, which is the shared-path behavior they ran with.
             path_map=validate_model_path_map(payload.get("path_map")),
@@ -802,6 +868,9 @@ class ClusterDeployment:
             "tensor_parallel_size": self.tensor_parallel_size,
             "mtp_enabled": self.mtp_enabled,
             "mtp_num_draft_tokens": self.mtp_num_draft_tokens,
+            "serving_mode": self.serving_mode,
+            "prefill_rank": self.prefill_rank,
+            "decode_rank": self.decode_rank,
             "path_map": dict(sorted(self.path_map.items())),
         }
         if self.tensor_parallel_qualification is not None:
@@ -941,6 +1010,26 @@ def decode_worker_speculation(encoded: str) -> tuple[bool, int | None]:
     ):
         raise ValueError("worker mtp_num_draft_tokens must be between 1 and 8")
     return enabled, raw_depth
+
+
+def decode_worker_serving_mode(
+    encoded: str,
+) -> tuple[ServingMode, int | None, int | None]:
+    """Validated phase ownership carried to every persistent rank."""
+
+    payload = _decode_worker_payload(encoded)
+    mode = payload.get("serving_mode", "sharded")
+    if mode not in {"sharded", "disaggregated"}:
+        raise ValueError("worker serving mode is invalid")
+    prefill_rank = payload.get("prefill_rank")
+    decode_rank = payload.get("decode_rank")
+    if mode == "sharded":
+        if prefill_rank is not None or decode_rank is not None:
+            raise ValueError("sharded worker contract carries phase ownership")
+        return mode, None, None
+    if {prefill_rank, decode_rank} != {0, 1}:
+        raise ValueError("disaggregated worker phase ranks are invalid")
+    return mode, int(prefill_rank), int(decode_rank)
 
 
 def decode_worker_plan(encoded: str) -> tuple[str, tuple[PipelineAssignment, ...]]:

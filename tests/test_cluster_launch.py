@@ -75,6 +75,35 @@ def _jaccl_deployment() -> ClusterDeployment:
     )
 
 
+def _disaggregated_deployment() -> ClusterDeployment:
+    deployment = _deployment("mlx-community/Qwen3.8-27B-4bit")
+    assignments = tuple(
+        PipelineAssignment(
+            node_id=host.node_id,
+            rank=rank,
+            start_layer=0,
+            end_layer=48,
+            layer_weight_bytes=14,
+            fixed_weight_bytes=1,
+            reserve_bytes=1,
+            capacity_bytes=32,
+            tensor_parallel_rank=0,
+            tensor_parallel_size=1,
+            kv_cache_bytes=2,
+            kv_bytes_per_token=1,
+            max_context_tokens=1_000_000,
+        )
+        for rank, host in enumerate(deployment.hosts)
+    )
+    return replace(
+        deployment,
+        assignments=assignments,
+        serving_mode="disaggregated",
+        prefill_rank=1,
+        decode_rank=0,
+    )
+
+
 def test_serve_release_is_atomic_and_mirrored_to_remote(tmp_path):
     calls = []
 
@@ -139,6 +168,22 @@ def test_launcher_argv_keeps_model_as_one_argument(tmp_path):
     assert "--cache-affinity" in argv
     assert "--async-overlap" in argv
     assert argv.count(model) == 1
+
+
+def test_launcher_selects_persistent_phase_server_for_disaggregated_plan(tmp_path):
+    argv = build_mlx_launch_argv(
+        _disaggregated_deployment(),
+        hostfile=(tmp_path / "hosts.json").resolve(),
+        api_port=32100,
+        collective_port=32120,
+        python_executable="/opt/omlx/bin/python",
+        control_host="10.0.0.1",
+        control_port=32140,
+    )
+
+    worker = argv[argv.index("--") + 1 :]
+    assert "omlx.cluster.disaggregated_server_worker" in worker
+    assert "omlx.cluster.inference_worker" not in worker
 
 
 def test_launcher_rejects_overlapping_api_and_collective_ports(tmp_path):
