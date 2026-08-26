@@ -440,7 +440,7 @@ component.apiFetch = async (url, options = {}) => {
     )
 
     assert result["armed"] == "pool-a"
-    assert result["deploymentAfterUnload"] == "pool-a"
+    assert result["deploymentAfterUnload"] is None
     assert result["lifecycleBusy"] is False
     assert {
         "url": "/admin/api/cluster/deployments/pool-a/unload",
@@ -468,6 +468,7 @@ def test_runtime_residency_separates_configuration_from_observed_workers():
         f"""
 component.deploymentsPayload = {json.dumps(deployment)};
 component.deploymentsLoaded = true;
+const savedDeployment = component.deploymentsPayload[0];
 
 const snapshots = {json.dumps(snapshots)};
 const samples = {{}};
@@ -477,13 +478,14 @@ for (const [name, snapshot] of Object.entries(snapshots)) {{
   component.runtimeError = '';
   const configured = component.configuredDeployment();
   const active = component.activeDeployment();
-  const status = component.deploymentStatus();
+  const visible = configured || savedDeployment;
+  const status = component.deploymentStatus(visible);
   samples[name] = {{
-    runtimeState: component.deploymentRuntimeState(),
+    runtimeState: component.deploymentRuntimeState(visible),
     wizardState: component.wizardState(),
     configured: configured && configured.deployment_id,
     active: active && active.deployment_id,
-    modelName: component.displayModelName(configured),
+    modelName: component.displayModelName(visible),
     label: status.label,
     eyebrow: status.eyebrow,
     detail: status.detail,
@@ -496,24 +498,24 @@ for (const [name, snapshot] of Object.entries(snapshots)) {{
 component.runtimePayload = {{ jobs: [], launchers: [], warnings: [] }};
 component.runtimeLoaded = true;
 samples.empty = {{
-  runtimeState: component.deploymentRuntimeState(),
+  runtimeState: component.deploymentRuntimeState(savedDeployment),
   active: component.activeDeployment(),
-  label: component.deploymentStatus().label,
+  label: component.deploymentStatus(savedDeployment).label,
 }};
 // A launcher record is process-manager metadata, not proof that every rank is
 // alive or that the engine pool still owns the weights.
 component.runtimePayload = {{
   jobs: [],
   launchers: [{{
-    deployment_id: component.configuredDeployment().deployment_id,
+    deployment_id: savedDeployment.deployment_id,
     phase: 'ready',
     returncode: null,
   }}],
 }};
 samples.launcherOnly = {{
-  runtimeState: component.deploymentRuntimeState(),
+  runtimeState: component.deploymentRuntimeState(savedDeployment),
   active: component.activeDeployment(),
-  label: component.deploymentStatus().label,
+  label: component.deploymentStatus(savedDeployment).label,
 }};
 process.stdout.write(JSON.stringify(samples));
 """
@@ -521,8 +523,8 @@ process.stdout.write(JSON.stringify(samples));
 
     detached = result["runtime_detached.json"]
     assert detached["runtimeState"] == "configured"
-    assert detached["wizardState"] == "active", "management stays reachable"
-    assert detached["configured"] == "minimax-m3-9f2ab41cd0e1"
+    assert detached["wizardState"] != "active"
+    assert detached["configured"] is None
     assert detached["active"] is None, "a detached marker is not residency"
     assert detached["modelName"] == "minimax-m3"
     assert detached["label"] == "Not loaded"
@@ -589,6 +591,72 @@ component.apiFetch = async () => {{ throw new Error('runtime endpoint down'); }}
     assert result["payload"] is None
     assert result["label"] == "Checking"
     assert "runtime endpoint down" in result["detail"]
+
+
+def test_active_card_prefers_loaded_runtime_owner_over_stale_registry_order():
+    result = _run_wizard(
+        """
+component.deploymentsPayload = [
+  { deployment_id: 'ds4-cold', model: '/models/ds4', serving_mode: 'sharded' },
+  { deployment_id: 'qwen-phase', model: '/models/qwen',
+    serving_mode: 'disaggregated', prefill_rank: 1, decode_rank: 0 },
+];
+const fallback = component.configuredDeployment().deployment_id;
+component.runtimePayload = { jobs: [{
+  deployment_id: 'qwen-phase', rank: 0, live: true,
+  phase: 'ready', ownership: 'loaded', metrics: {},
+}], launchers: [] };
+component.runtimeLoaded = true;
+process.stdout.write(JSON.stringify({
+  fallback,
+  selected: component.configuredDeployment().deployment_id,
+  mode: component.configuredDeployment().serving_mode,
+  state: component.deploymentRuntimeState(),
+}));
+"""
+    )
+
+    assert result == {
+        "fallback": "ds4-cold",
+        "selected": "qwen-phase",
+        "mode": "disaggregated",
+        "state": "ready",
+    }
+
+
+def test_cold_saved_setups_open_one_model_picker_instead_of_a_fake_active_card():
+    result = _run_wizard(
+        """
+component.devicesPayload = {
+  self: { node_id: 'node-a', friendly_name: 'Node A', caps: {}, addrs: [] },
+  paired: [{ node_id: 'node-b', friendly_name: 'Node B', caps: {}, addrs: [], paired: true }],
+  discovered: [],
+};
+component.devicesLoaded = true;
+component.deploymentsPayload = [
+  { deployment_id: 'ds4-cold', model: '/models/ds4' },
+  { deployment_id: 'qwen-cold', model: '/models/qwen', serving_mode: 'disaggregated' },
+];
+component.deploymentsLoaded = true;
+component.runtimePayload = { jobs: [], launchers: [] };
+component.runtimeLoaded = true;
+component.apiFetch = async () => ({});
+component.ensureColdModelSelection();
+process.stdout.write(JSON.stringify({
+  configured: component.configuredDeployment(),
+  stage: component.stage,
+  wizard: component.wizardState(),
+}));
+"""
+    )
+
+    assert result == {"configured": None, "stage": "plan", "wizard": "plan"}
+
+    template = _read(TEMPLATE)
+    assert 'x-for="deployment in deploymentsPayload"' not in template
+    assert template.count("data-cluster-v2-model-lifecycle") == 1
+    assert template.count("data-cluster-v2-load-weights") == 1
+    assert template.count("data-cluster-v2-deactivate") == 1
 
 
 def test_active_panel_preserves_per_request_prefill_and_decode_rates():
