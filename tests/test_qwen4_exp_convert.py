@@ -35,6 +35,20 @@ def _fake_q8(array: np.ndarray, group_size: int, bits: int, source_dtype: str):
     )
 
 
+def _fake_q4(array: np.ndarray, group_size: int, bits: int, source_dtype: str):
+    assert bits == 4
+    assert source_dtype in {"BF16", "F32"}
+    assert array.shape[-1] % group_size == 0
+    packed_shape = (*array.shape[:-1], array.shape[-1] // 8)
+    group_shape = (*array.shape[:-1], array.shape[-1] // group_size)
+    scale_dtype = np.uint16 if source_dtype == "BF16" else np.float32
+    return (
+        np.zeros(packed_shape, dtype=np.uint32),
+        np.ones(group_shape, dtype=scale_dtype),
+        np.zeros(group_shape, dtype=scale_dtype),
+    )
+
+
 def _write_source(root: Path, *, bf16: bool = False) -> dict[str, str]:
     root.mkdir()
     config = {
@@ -110,6 +124,7 @@ def _convert(
     ple_source_dtype="F32",
     **kwargs,
 ):
+    quantizer = kwargs.pop("quantizer", _fake_q8)
     return convert_qwen38_flash_next(
         source,
         destination,
@@ -119,7 +134,7 @@ def _convert(
         ple_head_dim=32,
         ple_source_dtype=ple_source_dtype,
         ple_quantization=ple_quantization,
-        quantizer=_fake_q8,
+        quantizer=quantizer,
         source_revision="synthetic-source-sha",
         **kwargs,
     )
@@ -188,6 +203,34 @@ def test_streams_split_artifacts_without_ple_leak_and_preserves_mtp(tmp_path):
     assert result.stats.source_tensors_read == len(source_weight_map) - 2
     assert result.stats.ple_table_tensors_stream_copied == 2
     assert not list(result.root.rglob("*.tmp"))
+
+
+def test_affine_q4_compute_uses_distinct_layout_and_preserves_bf16_ple(tmp_path):
+    source = tmp_path / "source"
+    _write_source(source)
+    result = _convert(
+        source,
+        tmp_path / "output",
+        compute_bits=4,
+        quantizer=_fake_q4,
+    )
+
+    assert result.compute_dir.name == "compute-q4"
+    assert result.ple_dir.name == "ple-bf16"
+    config = json.loads((result.compute_dir / "config.json").read_text())
+    assert config["quantization"] == {
+        "bits": 4,
+        "group_size": 32,
+        "mode": "affine",
+    }
+    assert config["qwen4_exp_artifact"]["layout"] == "qwen4-exp-split-q4-v2"
+    manifest = json.loads(result.manifest_path.read_text())
+    assert manifest["layout_version"] == "qwen4-exp-split-q4-v2"
+    assert manifest["q8_bits"] == 4
+    assert not any(
+        name.startswith(f"{PLE_TABLE_PREFIX}.shard_")
+        for name in _index(result.compute_dir)["weight_map"]
+    )
 
 
 def test_output_shards_are_valid_and_indexed_atomically(tmp_path):
