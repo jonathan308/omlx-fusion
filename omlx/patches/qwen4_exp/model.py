@@ -49,6 +49,14 @@ from omlx.patches.qwen4_exp.qsa_mlx import (
 QWEN4_EXP_STRICT_QSA = True
 
 
+def expand_hyper_streams(hidden, hc_count: int):
+    """Repeat the complete hidden vector once per mHC stream."""
+
+    if hc_count <= 1:
+        raise ValueError("Qwen4-Exp requires more than one hyper stream")
+    return mx.concatenate([hidden] * hc_count, axis=-1)
+
+
 class ZeroCenteredRMSNorm(nn.Module):
     """Official Qwen4-Exp RMSNorm: multiply by ``1 + weight``."""
 
@@ -445,7 +453,7 @@ class Qwen4ExpTextModel(PipelineMixin, nn.Module):
         hidden = (
             self.embed_tokens(inputs) if input_embeddings is None else input_embeddings
         )
-        hidden = mx.repeat(hidden, self.args.hc_count, axis=-1)
+        hidden = expand_hyper_streams(hidden, self.args.hc_count)
         if cache is None:
             cache = [None] * len(self.pipeline_layers)
 
@@ -751,6 +759,7 @@ __all__ = [
     "TextModelArgs",
     "build_mtp_decoder_layer",
     "create_attention_mask",
+    "expand_hyper_streams",
     "make_qsa_cache",
 ]
 

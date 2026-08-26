@@ -118,6 +118,19 @@ def test_mtp_factory_surface_is_depth_one_qsa_without_ple():
     assert qwen4_model.QWEN4_EXP_STRICT_QSA is True
 
 
+def test_initial_hyper_streams_repeat_vectors_not_elements():
+    import mlx.core as mx
+
+    from omlx.patches.qwen4_exp.model import expand_hyper_streams
+
+    hidden = mx.array([[[1.0, 2.0, 3.0]]])
+    expanded = expand_hyper_streams(hidden, 4)
+
+    assert expanded.tolist() == [
+        [[1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0]]
+    ]
+
+
 def test_qsa_cache_is_accepted_by_mlx_lm_continuous_batching():
     from mlx_lm.generate import _make_cache
     from mlx_lm.models.cache import BatchKVCache, CacheList, KVCache
