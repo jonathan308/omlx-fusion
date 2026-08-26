@@ -9,6 +9,8 @@ micro-block sparse adapter and never falls back to dense attention or DSA.
 
 from __future__ import annotations
 
+import weakref
+
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.base import create_attention_mask, create_ssm_mask
@@ -249,6 +251,8 @@ class Qwen4ExpPLELayer(nn.Module):
             bias=False,
         )
         self._pool: Qwen4ExpPLESSDPool | None = None
+        self._pool_finalizer: weakref.finalize | None = None
+        self._residency_policy = getattr(args, "ple_residency_policy", None)
 
     def _get_pool(self) -> Qwen4ExpPLESSDPool:
         if self._pool is None:
@@ -257,8 +261,23 @@ class Qwen4ExpPLELayer(nn.Module):
             model_dir = get_model_dir()
             if model_dir is None:
                 raise RuntimeError("qwen4_exp PLE has no bound checkpoint directory")
-            self._pool = Qwen4ExpPLESSDPool(model_dir)
+            pool = Qwen4ExpPLESSDPool(
+                model_dir, residency_policy=self._residency_policy
+            )
+            self._pool = pool
+            # Model teardown is not uniformly routed through Model.close() by
+            # every mlx-lm engine. Keep the pool out of the callback's object
+            # graph and close its mappings when this layer is collected.
+            self._pool_finalizer = weakref.finalize(self, pool.close)
         return self._pool
+
+    def close(self) -> None:
+        finalizer = self._pool_finalizer
+        if finalizer is not None and finalizer.alive:
+            finalizer()
+        elif self._pool is not None:
+            self._pool.close()
+        self._pool = None
 
     def __call__(self, hidden_states, input_ids, cache=None, mask=None):
         import numpy as np
@@ -626,6 +645,14 @@ class Model(nn.Module):
         self.args = args
         self.model_type = args.model_type
         text_args = TextModelArgs.from_dict(args.text_config)
+        for key in (
+            "ple_residency_policy",
+            "qwen4_exp_ple_residency",
+            "ple_residency",
+        ):
+            if args.text_config.get(key) is not None:
+                text_args.ple_residency_policy = args.text_config[key]
+                break
         self.language_model = TextModel(text_args)
         self._quantized_checkpoint = bool(args.quantization or args.quantization_config)
 
@@ -670,6 +697,15 @@ class Model(nn.Module):
 
     def make_cache(self):
         return self.language_model.make_cache()
+
+    def close(self) -> None:
+        """Release PLE file mappings; safe to call repeatedly during unload."""
+
+        layers = getattr(getattr(self.language_model, "model", None), "layers", ())
+        if len(layers) > 1:
+            ple = getattr(layers[1], "ple", None)
+            if ple is not None:
+                ple.close()
 
     def sanitize(self, weights):
         # Validate and bind all 128 SSD-backed PLE ranges during load, before

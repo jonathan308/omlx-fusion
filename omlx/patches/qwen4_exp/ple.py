@@ -23,6 +23,7 @@ import os
 import stat
 import struct
 import threading
+import weakref
 from collections import OrderedDict, defaultdict
 from concurrent.futures import Executor, Future
 from contextlib import suppress
@@ -44,6 +45,10 @@ PLE_MLX_Q8_BITS: Final = 8
 PLE_MLX_Q8_GROUP_SIZE: Final = 32
 PLE_MLX_Q8_MODE: Final = "affine"
 PLE_MLX_Q8_FORMAT: Final = "mlx-affine-q8-v1"
+PLE_RESIDENCY_SSD_MMAP: Final = "ssd_mmap"
+PLE_RESIDENCY_MEMORY: Final = "memory"
+PLE_RESIDENCY_ENV: Final = "OMLX_QWEN4_EXP_PLE_RESIDENCY"
+PLE_RESIDENCY_METADATA_KEY: Final = "qwen4_exp_ple_residency"
 
 # These flat model.safetensors.index.json metadata fields are part of the Q8
 # artifact contract.  They make a mixed compute-Q4 / PLE-Q8 conversion
@@ -83,6 +88,9 @@ _DTYPES: Final[dict[str, tuple[np.dtype[Any], int]]] = {
     "I64": (np.dtype("<i8"), 8),
     "U32": (np.dtype("<u4"), 4),
 }
+
+_ACTIVE_POOLS: weakref.WeakSet[Qwen4ExpPLESSDPool] = weakref.WeakSet()
+_ACTIVE_POOLS_LOCK = threading.RLock()
 
 
 class PLEArtifactError(ValueError):
@@ -295,8 +303,14 @@ class _TensorDescriptor:
 class _MappedTensor:
     """A tensor-range mmap that does not fault data in until rows are read."""
 
-    def __init__(self, descriptor: _TensorDescriptor) -> None:
+    def __init__(
+        self,
+        descriptor: _TensorDescriptor,
+        *,
+        random_access: bool = True,
+    ) -> None:
         self.descriptor = descriptor
+        self._random_access = random_access
         self._mapping: mmap.mmap | None = None
         self._mapping_delta = 0
         self._lock = threading.Lock()
@@ -328,12 +342,33 @@ class _MappedTensor:
             finally:
                 os.close(file_descriptor)
 
-            if hasattr(self._mapping, "madvise") and hasattr(mmap, "MADV_RANDOM"):
+            if (
+                self._random_access
+                and hasattr(self._mapping, "madvise")
+                and hasattr(mmap, "MADV_RANDOM")
+            ):
                 # The hint is an optimization.  Some macOS/filesystem
                 # combinations expose madvise but reject MADV_RANDOM.
                 with suppress(OSError, ValueError):
                     self._mapping.madvise(mmap.MADV_RANDOM)
             return self._mapping
+
+    def advise(self, advice: int) -> int:
+        """Apply a best-effort VM hint and report logical tensor bytes hinted."""
+
+        mapping = self._ensure_open()
+        if not hasattr(mapping, "madvise"):
+            return 0
+        try:
+            mapping.madvise(advice)
+        except (OSError, ValueError):
+            return 0
+        return self.descriptor.byte_length
+
+    @property
+    def mapped_bytes(self) -> int:
+        with self._lock:
+            return self.descriptor.byte_length if self._mapping is not None else 0
 
     def read_rows(self, start: int, stop: int) -> NDArray[Any]:
         rows, columns = self.descriptor.shape
@@ -437,10 +472,13 @@ class _BoundedPageCache:
                 _, evicted = self._pages.popitem(last=False)
                 self._size -= evicted.nbytes
 
-    def clear(self) -> None:
+    def clear(self) -> tuple[int, int]:
         with self._lock:
+            pages = len(self._pages)
+            size = self._size
             self._pages.clear()
             self._size = 0
+            return pages, size
 
     @property
     def size_bytes(self) -> int:
@@ -467,6 +505,66 @@ def _checked_model_file(model_dir: Path, filename: object) -> Path:
     if not stat.S_ISREG(info.st_mode):
         raise PLEArtifactError(f"safetensors shard is not a regular file: {filename}")
     return path
+
+
+def _normalize_residency_policy(value: object, *, source: str) -> str:
+    if not isinstance(value, str):
+        raise PLEArtifactError(f"{source} must be a string")
+    normalized = value.strip().lower().replace("-", "_")
+    aliases = {
+        "ssd": PLE_RESIDENCY_SSD_MMAP,
+        "ssd_mmap": PLE_RESIDENCY_SSD_MMAP,
+        "mmap": PLE_RESIDENCY_SSD_MMAP,
+        "memory": PLE_RESIDENCY_MEMORY,
+        "file_cache_pinned": PLE_RESIDENCY_MEMORY,
+        "filecache_pinned": PLE_RESIDENCY_MEMORY,
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        raise PLEArtifactError(
+            f"unsupported {source} {value!r}; expected 'ssd_mmap' or 'memory'"
+        ) from exc
+
+
+def _artifact_residency_policy(model_dir: Path, metadata: object) -> str | None:
+    if isinstance(metadata, dict) and PLE_RESIDENCY_METADATA_KEY in metadata:
+        return _normalize_residency_policy(
+            metadata[PLE_RESIDENCY_METADATA_KEY], source=PLE_RESIDENCY_METADATA_KEY
+        )
+
+    config_path = model_dir / "config.json"
+    if not config_path.is_file():
+        return None
+    try:
+        config = json.loads(config_path.read_bytes())
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise PLEArtifactError(f"invalid Qwen4-Exp config: {config_path}") from exc
+    if not isinstance(config, dict):
+        raise PLEArtifactError(f"Qwen4-Exp config must be an object: {config_path}")
+    artifact = config.get("qwen4_exp_artifact")
+    candidates = (
+        config.get(PLE_RESIDENCY_METADATA_KEY),
+        config.get("ple_residency_policy"),
+        artifact.get("ple_residency") if isinstance(artifact, dict) else None,
+    )
+    for value in candidates:
+        if value is not None:
+            return _normalize_residency_policy(value, source="PLE residency policy")
+    return None
+
+
+def _resolve_residency_policy(
+    model_dir: Path,
+    metadata: object,
+    explicit: str | None,
+) -> str:
+    if explicit is not None:
+        return _normalize_residency_policy(explicit, source="PLE residency policy")
+    environment = os.environ.get(PLE_RESIDENCY_ENV)
+    if environment is not None:
+        return _normalize_residency_policy(environment, source=PLE_RESIDENCY_ENV)
+    return _artifact_residency_policy(model_dir, metadata) or PLE_RESIDENCY_SSD_MMAP
 
 
 def _parse_safetensors_header(
@@ -594,6 +692,7 @@ class Qwen4ExpPLESSDPool:
         index_name: str = "model.safetensors.index.json",
         rows_per_page: int = 256,
         max_cache_bytes: int = 64 * 1024 * 1024,
+        residency_policy: str | None = None,
     ) -> None:
         if rows_per_page <= 0:
             raise ValueError("rows_per_page must be positive")
@@ -617,6 +716,10 @@ class Qwen4ExpPLESSDPool:
             )
         weight_map: dict[str, Any] = index["weight_map"]
         metadata = index.get("metadata")
+        self.residency_policy = _resolve_residency_policy(
+            self.model_dir, metadata, residency_policy
+        )
+        self._prefetched_bytes = 0
         if layout is None:
             layout = _layout_from_index_metadata(metadata)
         self.layout = layout
@@ -670,6 +773,7 @@ class Qwen4ExpPLESSDPool:
                 if isinstance(key, str)
                 and key.startswith("qwen4_exp_ple_")
                 and key not in expected_metadata
+                and key != PLE_RESIDENCY_METADATA_KEY
             }
             if unexpected_metadata:
                 preview = ", ".join(sorted(unexpected_metadata)[:3])
@@ -717,21 +821,24 @@ class Qwen4ExpPLESSDPool:
                             table_names[shard],
                             "U32",
                             (layout.rows_per_shard, packed_columns),
-                        )
+                        ),
+                        random_access=self.residency_policy == PLE_RESIDENCY_SSD_MMAP,
                     ),
                     scales=_MappedTensor(
                         descriptor(
                             q8_scales_names[shard],
                             "BF16",
                             (layout.rows_per_shard, group_columns),
-                        )
+                        ),
+                        random_access=self.residency_policy == PLE_RESIDENCY_SSD_MMAP,
                     ),
                     biases=_MappedTensor(
                         descriptor(
                             q8_biases_names[shard],
                             "BF16",
                             (layout.rows_per_shard, group_columns),
-                        )
+                        ),
+                        random_access=self.residency_policy == PLE_RESIDENCY_SSD_MMAP,
                     ),
                 )
                 for shard in range(PLE_SHARD_COUNT)
@@ -739,7 +846,10 @@ class Qwen4ExpPLESSDPool:
         else:
             table_shape = (layout.rows_per_shard, layout.head_dim)
             self._shards = [
-                _MappedTensor(descriptor(name, layout.table_dtype, table_shape))
+                _MappedTensor(
+                    descriptor(name, layout.table_dtype, table_shape),
+                    random_access=self.residency_policy == PLE_RESIDENCY_SSD_MMAP,
+                )
                 for name in table_names
             ]
         aux_tensors = {
@@ -781,6 +891,35 @@ class Qwen4ExpPLESSDPool:
         if last_used_row > layout.padded_vocab_size:
             self.close()
             raise PLEArtifactError("PLE head ranges exceed the table")
+
+        if self.residency_policy == PLE_RESIDENCY_MEMORY:
+            try:
+                self._prefetched_bytes = self._prefetch_all_mappings()
+            except BaseException:
+                self.close()
+                raise
+        with _ACTIVE_POOLS_LOCK:
+            _ACTIVE_POOLS.add(self)
+
+    def _iter_mapped_tensors(self):
+        for shard in self._shards:
+            if isinstance(shard, _Q8MappedShard):
+                yield shard.weight
+                yield shard.scales
+                yield shard.biases
+            else:
+                yield shard
+
+    def _prefetch_all_mappings(self) -> int:
+        """Map every shard and ask the OS to populate its file-backed pages."""
+
+        advice = getattr(mmap, "MADV_WILLNEED", None)
+        hinted = 0
+        for tensor in self._iter_mapped_tensors():
+            tensor._ensure_open()
+            if advice is not None:
+                hinted += tensor.advise(advice)
+        return hinted
 
     def _check_open(self) -> None:
         with self._state:
@@ -1072,10 +1211,36 @@ class Qwen4ExpPLESSDPool:
             "pages": self._cache.page_count,
             "bytes": self._cache.size_bytes,
             "max_bytes": self._cache.max_bytes,
+            "mapped_bytes": sum(
+                tensor.mapped_bytes for tensor in self._iter_mapped_tensors()
+            ),
+            "prefetched_bytes": self._prefetched_bytes,
         }
 
-    def clear_cache(self) -> None:
-        self._cache.clear()
+    def clear_cache(self) -> dict[str, int]:
+        pages, size = self._cache.clear()
+        return {"pages": pages, "bytes": size}
+
+    def drop_resident_pages(self) -> dict[str, int]:
+        """Drop copied pages and best-effort file-backed resident page hints."""
+
+        self._begin_read()
+        try:
+            cleared = self.clear_cache()
+            dropped = 0
+            advice = getattr(mmap, "MADV_DONTNEED", None)
+            if advice is not None:
+                for tensor in self._iter_mapped_tensors():
+                    if tensor.mapped_bytes:
+                        dropped += tensor.advise(advice)
+            self._prefetched_bytes = max(0, self._prefetched_bytes - dropped)
+            return {
+                **cleared,
+                "resident_bytes": dropped,
+                "bytes": cleared["bytes"] + dropped,
+            }
+        finally:
+            self._end_read()
 
     def close(self) -> None:
         state = getattr(self, "_state", None)
@@ -1090,6 +1255,8 @@ class Qwen4ExpPLESSDPool:
         self._cache.clear()
         for shard in getattr(self, "_shards", ()):
             shard.close()
+        with _ACTIVE_POOLS_LOCK:
+            _ACTIVE_POOLS.discard(self)
 
     def __enter__(self) -> Qwen4ExpPLESSDPool:
         self._check_open()
@@ -1102,6 +1269,65 @@ class Qwen4ExpPLESSDPool:
         self.close()
 
 
+def _active_pool_snapshot() -> tuple[Qwen4ExpPLESSDPool, ...]:
+    with _ACTIVE_POOLS_LOCK:
+        return tuple(pool for pool in _ACTIVE_POOLS if not pool._closed)
+
+
+def active_ple_pool_info() -> dict[str, int]:
+    """Aggregate bounded-cache and mapping telemetry for all live PLE pools."""
+
+    pools = _active_pool_snapshot()
+    infos = [pool.cache_info for pool in pools]
+    return {
+        "pools": len(pools),
+        "hits": sum(info["hits"] for info in infos),
+        "misses": sum(info["misses"] for info in infos),
+        "pages": sum(info["pages"] for info in infos),
+        "bytes": sum(info["bytes"] for info in infos),
+        "max_bytes": sum(info["max_bytes"] for info in infos),
+        "mapped_bytes": sum(info["mapped_bytes"] for info in infos),
+        "prefetched_bytes": sum(info["prefetched_bytes"] for info in infos),
+        "memory_pools": sum(
+            pool.residency_policy == PLE_RESIDENCY_MEMORY for pool in pools
+        ),
+        "ssd_mmap_pools": sum(
+            pool.residency_policy == PLE_RESIDENCY_SSD_MMAP for pool in pools
+        ),
+    }
+
+
+def clear_active_ple_page_caches() -> dict[str, int]:
+    """Release only explicit copied PLE pages, retaining lazy file mappings."""
+
+    pools = _active_pool_snapshot()
+    reports = [pool.clear_cache() for pool in pools if not pool._closed]
+    return {
+        "pools": len(pools),
+        "pages": sum(report["pages"] for report in reports),
+        "bytes": sum(report["bytes"] for report in reports),
+    }
+
+
+def drop_active_ple_resident_pages() -> dict[str, int]:
+    """Release copied pages and ask the VM to evict mapped PLE file pages."""
+
+    pools = _active_pool_snapshot()
+    reports = []
+    for pool in pools:
+        try:
+            reports.append(pool.drop_resident_pages())
+        except RuntimeError:
+            # A model may finish unloading after the weak-registry snapshot.
+            continue
+    return {
+        "pools": len(reports),
+        "pages": sum(report["pages"] for report in reports),
+        "bytes": sum(report["bytes"] for report in reports),
+        "resident_bytes": sum(report["resident_bytes"] for report in reports),
+    }
+
+
 __all__ = [
     "OFFICIAL_PLE_LAYOUT",
     "OFFICIAL_PLE_Q8_LAYOUT",
@@ -1111,11 +1337,18 @@ __all__ = [
     "PLE_MLX_Q8_GROUP_SIZE",
     "PLE_MLX_Q8_METADATA",
     "PLE_MLX_Q8_MODE",
+    "PLE_RESIDENCY_ENV",
+    "PLE_RESIDENCY_MEMORY",
+    "PLE_RESIDENCY_METADATA_KEY",
+    "PLE_RESIDENCY_SSD_MMAP",
     "PLEArtifactError",
     "PLELayout",
     "PLE_PREFIX",
     "PLE_SHARD_COUNT",
     "PLE_TABLE_PREFIX",
     "Qwen4ExpPLESSDPool",
+    "active_ple_pool_info",
+    "clear_active_ple_page_caches",
+    "drop_active_ple_resident_pages",
     "mlx_q8_index_metadata",
 ]
