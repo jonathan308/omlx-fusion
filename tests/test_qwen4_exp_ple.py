@@ -298,6 +298,23 @@ def test_official_layout_and_exact_checkpoint_binding() -> None:
     assert OFFICIAL_PLE_LAYOUT.embedding_dim == 2560
     assert OFFICIAL_PLE_LAYOUT.padded_vocab_size == 320_001_536
     assert OFFICIAL_PLE_LAYOUT.table_dtype == "BF16"
+
+
+def test_artifact_format_detection_distinguishes_bf16_from_q8() -> None:
+    assert (
+        ple_module._layout_from_index_metadata(
+            {"qwen4_exp_ple_format": "bf16-ssd-mmap-v1"}
+        )
+        is OFFICIAL_PLE_LAYOUT
+    )
+    assert (
+        ple_module._layout_from_index_metadata(
+            mlx_q8_index_metadata(OFFICIAL_PLE_Q8_LAYOUT)
+        ).table_dtype
+        == PLE_MLX_Q8_DTYPE
+    )
+    with pytest.raises(PLEArtifactError, match="unsupported"):
+        ple_module._layout_from_index_metadata({"qwen4_exp_ple_format": "unknown-v9"})
     assert OFFICIAL_PLE_LAYOUT.layer_multipliers.tolist() == [
         23_703_573_157_769,
         20_109_073_645_365,

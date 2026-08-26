@@ -247,6 +247,21 @@ def _layout_from_q8_metadata(metadata: dict[str, Any]) -> PLELayout:
         raise PLEArtifactError(f"invalid MLX Q8 PLE layout metadata: {exc}") from exc
 
 
+def _layout_from_index_metadata(metadata: Any) -> PLELayout:
+    """Select dense BF16 or affine Q8 from an explicit format marker."""
+
+    if not isinstance(metadata, dict):
+        return OFFICIAL_PLE_LAYOUT
+    artifact_format = metadata.get("qwen4_exp_ple_format")
+    if artifact_format == PLE_MLX_Q8_FORMAT:
+        return _layout_from_q8_metadata(metadata)
+    if artifact_format in (None, "bf16-ssd-mmap-v1"):
+        return OFFICIAL_PLE_LAYOUT
+    raise PLEArtifactError(
+        f"unsupported Qwen4-Exp PLE artifact format: {artifact_format!r}"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _FileFingerprint:
     device: int
@@ -603,15 +618,7 @@ class Qwen4ExpPLESSDPool:
         weight_map: dict[str, Any] = index["weight_map"]
         metadata = index.get("metadata")
         if layout is None:
-            q8_metadata_present = isinstance(metadata, dict) and any(
-                isinstance(key, str) and key.startswith("qwen4_exp_ple_")
-                for key in metadata
-            )
-            layout = (
-                _layout_from_q8_metadata(metadata)
-                if q8_metadata_present
-                else OFFICIAL_PLE_LAYOUT
-            )
+            layout = _layout_from_index_metadata(metadata)
         self.layout = layout
 
         table_names = [
