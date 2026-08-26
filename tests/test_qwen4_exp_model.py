@@ -137,6 +137,8 @@ def test_qsa_cache_is_accepted_by_mlx_lm_continuous_batching():
     assert len(batched) == 1
     assert isinstance(batched[0], CacheList)
     assert all(isinstance(item, BatchKVCache) for item in batched[0].caches)
+    mask = batched[0].caches[0].make_mask(2, return_array=True, window_size=None)
+    assert mask.shape == (2, 1, 2, 2)
 
 
 def test_depth_one_reject_replays_gdn_and_ple_then_trims_qsa():

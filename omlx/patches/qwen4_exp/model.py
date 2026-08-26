@@ -173,7 +173,7 @@ class Qwen4ExpAttention(nn.Module):
             prepared_mask = (
                 mask
                 if isinstance(mask, mx.array)
-                else main_cache.make_mask(length, return_array=True)
+                else main_cache.make_mask(length, return_array=True, window_size=None)
             )
             keys, values = main_cache.update_and_fetch(keys, values)
             auxiliary_values = mx.concatenate((cos, sin), axis=-1)[:, None]
