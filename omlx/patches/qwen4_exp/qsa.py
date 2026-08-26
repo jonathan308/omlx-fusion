@@ -365,8 +365,11 @@ class Qwen4ExpQSARequest:
     position_sin: Any
     attention_mask: Any
     cache: Any = None
+    contiguous_causal: bool = False
 
     def validate(self, contract: Qwen4ExpQSAContract) -> None:
+        if not isinstance(self.contiguous_causal, bool):
+            raise Qwen4ExpQSAInputError("contiguous_causal must be a boolean")
         q_shape = _shape_of(self.queries)
         if q_shape is None or len(q_shape) != 4:
             raise Qwen4ExpQSAInputError(

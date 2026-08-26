@@ -144,6 +144,7 @@ class Qwen4ExpAttention(nn.Module):
 
     def __call__(self, x, mask=None, cache=None):
         batch, length, _ = x.shape
+        contiguous_causal = batch == 1 and mask is None
         projected = self.q_proj(x).reshape(
             batch, length, self.num_attention_heads, self.head_dim * 2
         )
@@ -201,6 +202,7 @@ class Qwen4ExpAttention(nn.Module):
                 position_cos=cos,
                 position_sin=sin,
                 attention_mask=prepared_mask,
+                contiguous_causal=contiguous_causal,
             )
         else:
             request = prepare_qsa_request(
@@ -213,6 +215,7 @@ class Qwen4ExpAttention(nn.Module):
                 position_sin=sin,
                 attention_mask=mask if isinstance(mask, mx.array) else None,
                 cache=cache,
+                contiguous_causal=contiguous_causal,
             )
         output = self.qsa(request).reshape(batch, length, -1)
         return self.o_proj(output * mx.sigmoid(gate))

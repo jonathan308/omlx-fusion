@@ -341,6 +341,38 @@ def test_vectorized_prefill_matches_row_reference_with_padding_holes_and_tail(ad
     )
 
 
+@pytest.mark.parametrize("additive", [False, True])
+def test_contiguous_causal_prefill_matches_generic_sparse_path(additive):
+    query_tokens, key_tokens = 19, 43
+    mx.random.seed(812)
+    cos, sin = _positions(1, key_tokens)
+    query_start = key_tokens - query_tokens
+    qpos = query_start + mx.arange(query_tokens)
+    kpos = mx.arange(key_tokens)
+    mask = (kpos[None, :] <= qpos[:, None])[None, None]
+    if additive:
+        mask = mx.where(mask, mx.array(0.0), mx.array(-float("inf")))
+    request = prepare_qsa_request(
+        queries=mx.random.normal((1, 4, query_tokens, 4)),
+        keys=mx.random.normal((1, 2, key_tokens, 4)),
+        values=mx.random.normal((1, 2, key_tokens, 4)),
+        index_queries=mx.random.normal((1, query_tokens, 2, 2)),
+        index_keys=mx.random.normal((1, key_tokens, 2)),
+        position_cos=cos,
+        position_sin=sin,
+        attention_mask=mask,
+        contiguous_causal=True,
+    )
+    generic = type(request)(**{**request.__dict__, "contiguous_causal": False})
+    fast = micro_block_sparse_qsa(request, geometry=SMALL, index_key_norm=_identity)
+    expected = micro_block_sparse_qsa(generic, geometry=SMALL, index_key_norm=_identity)
+    mx.eval(fast, expected)
+
+    np.testing.assert_allclose(
+        np.asarray(fast), np.asarray(expected), rtol=2e-5, atol=2e-5
+    )
+
+
 def test_production_prefill_never_enters_rowwise_visible_item_path(monkeypatch):
     import omlx.patches.qwen4_exp.qsa_mlx as module
 
