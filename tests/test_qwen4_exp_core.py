@@ -351,6 +351,45 @@ def test_moe_sanitize_splits_backbone_and_mtp_without_dropping_mtp():
         assert sanitized[f"{prefix}.switch_mlp.down_proj.weight"].marker == "down"
 
 
+@pytest.mark.parametrize("tokens", [1, 32])
+def test_fused_gate_up_switch_glu_matches_stock_q8(tokens):
+    import mlx.core as mx
+    from mlx_lm.models.switch_layers import SwitchGLU
+
+    if not mx.metal.is_available():
+        pytest.skip("Metal is required")
+    moe = importlib.import_module("omlx.patches.qwen4_exp.moe")
+    mx.random.seed(41 + tokens)
+    input_dims = 64
+    hidden_dims = 32
+    num_experts = 8
+    top_k = 2
+    stock = SwitchGLU(input_dims, hidden_dims, num_experts)
+    fused = moe._fused_switch_glu_class()(
+        input_dims, hidden_dims, num_experts
+    )
+    fused.gate_up_proj.weight = mx.concatenate(
+        [stock.gate_proj.weight, stock.up_proj.weight], axis=1
+    )
+    fused.down_proj.weight = stock.down_proj.weight
+
+    for module in (stock, fused):
+        for name in tuple(module):
+            projection = module[name]
+            if hasattr(projection, "to_quantized"):
+                module[name] = projection.to_quantized(
+                    group_size=32, bits=8, mode="affine"
+                )
+
+    x = mx.random.normal((1, tokens, input_dims)).astype(mx.bfloat16)
+    pattern = mx.arange(tokens * top_k).reshape(1, tokens, top_k)
+    indices = (pattern % num_experts).astype(mx.uint32)
+    expected = stock(x, indices)
+    actual = fused(x, indices)
+    mx.eval(expected, actual)
+    assert bool(mx.array_equal(expected, actual).item())
+
+
 def test_moe_sanitize_fails_closed_on_malformed_packed_weight():
     moe = importlib.import_module("omlx.patches.qwen4_exp.moe")
     prefix = "model.language_model.layers.0.mlp"

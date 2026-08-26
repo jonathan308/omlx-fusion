@@ -180,9 +180,14 @@ def test_streams_split_artifacts_without_ple_leak_and_preserves_mtp(tmp_path):
     assert "mtp.fc_embedding.biases" in compute_names
     assert "mtp.layers.0.mlp.experts.gate_up_proj" not in compute_names
     assert "mtp.layers.0.mlp.experts.down_proj" not in compute_names
-    for projection in ("gate_proj", "up_proj", "down_proj"):
+    for projection in ("gate_up_proj", "down_proj"):
         base = f"mtp.layers.0.mlp.switch_mlp.{projection}"
         assert {f"{base}.weight", f"{base}.scales", f"{base}.biases"} <= compute_names
+    assert not any(
+        f"switch_mlp.{projection}." in name
+        for name in compute_names
+        for projection in ("gate_proj", "up_proj")
+    )
 
     # Numerically sensitive/state tensors and both conv/norm paths remain dense.
     for name in (
@@ -223,9 +228,12 @@ def test_affine_q4_compute_uses_distinct_layout_and_preserves_bf16_ple(tmp_path)
         "group_size": 32,
         "mode": "affine",
     }
-    assert config["qwen4_exp_artifact"]["layout"] == "qwen4-exp-split-q4-v2"
+    assert (
+        config["qwen4_exp_artifact"]["layout"]
+        == "qwen4-exp-fused-gate-up-q4-v3"
+    )
     manifest = json.loads(result.manifest_path.read_text())
-    assert manifest["layout_version"] == "qwen4-exp-split-q4-v2"
+    assert manifest["layout_version"] == "qwen4-exp-fused-gate-up-q4-v3"
     assert manifest["q8_bits"] == 4
     assert not any(
         name.startswith(f"{PLE_TABLE_PREFIX}.shard_")
@@ -250,7 +258,7 @@ def test_output_shards_are_valid_and_indexed_atomically(tmp_path):
     assert manifest["complete"] is True
     assert manifest["source_revision"] == "synthetic-source-sha"
     assert len(manifest["source_index_sha256"]) == 64
-    assert manifest["layout_version"] == "qwen4-exp-split-q8-v2"
+    assert manifest["layout_version"] == "qwen4-exp-fused-gate-up-q8-v3"
     assert manifest["ple_quantization"] == "bf16"
 
 

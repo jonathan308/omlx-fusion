@@ -128,6 +128,60 @@ def sanitize_moe_weights(weights: Mapping[str, Any]) -> dict[str, Any]:
 
 
 @lru_cache(maxsize=1)
+def _fused_switch_glu_class():
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx_lm.models.activations import swiglu
+    from mlx_lm.models.switch_layers import (
+        SwitchLinear,
+        _gather_sort,
+        _scatter_unsort,
+    )
+
+    class _FusedGateUpSwitchGLU(nn.Module):
+        """Published packed gate/up MoE executed as two routed QMMs total.
+
+        The official checkpoint already stores ``[gate; up]`` contiguously.
+        Fusion v3 quantizes that tensor without splitting it, eliminating one
+        gather-QMM command buffer per MoE layer while preserving every output
+        row and the stock sort/unsort path exactly.
+        """
+
+        def __init__(self, input_dims: int, hidden_dims: int, num_experts: int):
+            super().__init__()
+            self.hidden_dims = hidden_dims
+            self.gate_up_proj = SwitchLinear(
+                input_dims, 2 * hidden_dims, num_experts, bias=False
+            )
+            self.down_proj = SwitchLinear(
+                hidden_dims, input_dims, num_experts, bias=False
+            )
+
+        def __call__(self, x, indices):
+            x = mx.expand_dims(x, (-2, -3))
+            do_sort = indices.size >= 64
+            idx = indices
+            inv_order = None
+            if do_sort:
+                x, idx, inv_order = _gather_sort(x, indices)
+            if self.training:
+                idx = mx.stop_gradient(idx)
+
+            gate_up = self.gate_up_proj(x, idx, sorted_indices=do_sort)
+            gate = gate_up[..., : self.hidden_dims]
+            up = gate_up[..., self.hidden_dims :]
+            x = self.down_proj(
+                swiglu(gate, up), idx, sorted_indices=do_sort
+            )
+
+            if do_sort:
+                x = _scatter_unsort(x, inv_order, indices.shape)
+            return x.squeeze(-2)
+
+    return _FusedGateUpSwitchGLU
+
+
+@lru_cache(maxsize=1)
 def _implementation_class():
     # Qwen's official implementation subclasses Qwen3-Next's sparse MoE.
     # The pinned mlx-lm class has the same router, precise softmax, SwitchGLU,
@@ -138,6 +192,12 @@ def _implementation_class():
         def __init__(self, config: Any):
             validate_moe_config(config)
             super().__init__(config)
+            if bool(_get(config, "fused_moe_gate_up", False)):
+                self.switch_mlp = _fused_switch_glu_class()(
+                    int(_get(config, "hidden_size")),
+                    int(_get(config, "moe_intermediate_size")),
+                    int(_get(config, "num_experts")),
+                )
 
     _Qwen4ExpSparseMoeBlock.__name__ = "Qwen4ExpSparseMoeBlock"
     _Qwen4ExpSparseMoeBlock.__qualname__ = "Qwen4ExpSparseMoeBlock"

@@ -648,6 +648,14 @@ class Model(nn.Module):
         self.args = args
         self.model_type = args.model_type
         text_args = TextModelArgs.from_dict(args.text_config)
+        artifact = getattr(args, "qwen4_exp_artifact", None) or {}
+        artifact_layout = artifact.get("layout")
+        if artifact_layout is not None and not isinstance(artifact_layout, str):
+            raise ValueError("qwen4_exp_artifact.layout must be a string")
+        text_args.fused_moe_gate_up = bool(
+            artifact_layout
+            and artifact_layout.startswith("qwen4-exp-fused-gate-up-")
+        )
         for key in (
             "ple_residency_policy",
             "qwen4_exp_ple_residency",

@@ -53,6 +53,11 @@ class TextModelArgs:
     moe_intermediate_size: int = 640
     shared_expert_intermediate_size: int = 640
     norm_topk_prob: bool = True
+    # Artifact-only execution layout.  Official BF16 checkpoints leave this
+    # false and use the published packed tensor sanitizer.  Fusion v3 compute
+    # artifacts set it after the outer artifact marker has been validated so
+    # gate+up remain one packed projection at runtime.
+    fused_moe_gate_up: bool = False
 
     hc_count: int = 4
     hc_lowrank: int = 320
@@ -192,6 +197,7 @@ class ModelArgs:
     tie_word_embeddings: bool = False
     quantization: dict[str, Any] | None = None
     quantization_config: dict[str, Any] | None = None
+    qwen4_exp_artifact: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, values: Mapping[str, Any]) -> ModelArgs:
@@ -221,6 +227,11 @@ class ModelArgs:
             quantization_config=(
                 dict(values["quantization_config"])
                 if isinstance(values.get("quantization_config"), Mapping)
+                else None
+            ),
+            qwen4_exp_artifact=(
+                dict(values["qwen4_exp_artifact"])
+                if isinstance(values.get("qwen4_exp_artifact"), Mapping)
                 else None
             ),
         )
