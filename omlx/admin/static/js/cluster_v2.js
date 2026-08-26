@@ -2268,7 +2268,8 @@ function clusterV2Wizard() {
             const pipelineUnsupported =
                 !!entry && entry.supports_pipeline === false;
             const tensorDisabled = nodeCount < 2 || tensorUnsupported;
-            const phaseDisabled = nodeCount !== 2;
+            const phaseFit = this.phaseReplicaFitEstimate();
+            const phaseDisabled = nodeCount !== 2 || phaseFit?.fits === false;
             return [
                 {
                     key: 'auto',
@@ -2299,7 +2300,9 @@ function clusterV2Wizard() {
                     label: t('cluster.v2.strategy.disaggregated'),
                     disabled: phaseDisabled,
                     disabledReason: phaseDisabled
-                        ? 'Phase split currently requires exactly two Macs.'
+                        ? nodeCount !== 2
+                            ? 'Phase split currently requires exactly two Macs.'
+                            : 'The complete model does not fit on both Macs.'
                         : '',
                 },
             ];
@@ -2337,9 +2340,93 @@ function clusterV2Wizard() {
             return this.planRoleDevices().filter((_device, index) => index < 2);
         },
 
+        phaseRecommendedPrefillRank() {
+            const profiles = Array.isArray(this.plan?.performance_profiles)
+                ? this.plan.performance_profiles
+                : [];
+            const measured = profiles
+                .map((profile) => ({
+                    rank: Number(profile?.rank),
+                    rate: Number(profile?.prefill_weight_bytes_per_second || 0),
+                }))
+                .filter(
+                    (item) =>
+                        [0, 1].includes(item.rank) &&
+                        Number.isFinite(item.rate) &&
+                        item.rate > 0,
+                )
+                .sort((left, right) => right.rate - left.rate);
+            if (measured.length) return measured[0].rank;
+            const devices = this.phaseRoleDevices();
+            const headless = devices.findIndex(
+                (device) =>
+                    this.nodeRole(device?.node_id, !!device?.is_self) === 'headless',
+            );
+            return headless >= 0 ? headless : Math.min(1, devices.length - 1);
+        },
+
+        phaseRecommendationReason() {
+            const profiles = Array.isArray(this.plan?.performance_profiles)
+                ? this.plan.performance_profiles
+                : [];
+            return profiles.length
+                ? 'Recommended from the measured prefill profile.'
+                : 'Recommended to keep the coordinator focused on decode and API work.';
+        },
+
+        phaseDeviceMeta(device) {
+            return [
+                this.deviceChipLabel(device),
+                this.deviceRamLabel(device),
+                this.usableGbLabel(device),
+            ]
+                .filter(Boolean)
+                .join(' · ');
+        },
+
+        phaseReplicaFitEstimate() {
+            const entry = this.catalogueEntryForModel();
+            const weightBytes = Number(entry?.weight_bytes || 0);
+            const devices = this.phaseRoleDevices();
+            if (!(weightBytes > 0) || devices.length !== 2) return null;
+            const usable = devices.map((device) => {
+                const capacity = (this.deviceRamGb(device) || 0) * (1024 ** 3);
+                const role = this.nodeRole(device.node_id, !!device.is_self);
+                return Math.max(
+                    0,
+                    capacity - this.reserveBytesFor(role, capacity),
+                );
+            });
+            return {
+                fits: usable.every((value) => value >= weightBytes),
+                weightBytes,
+                smallestUsableBytes: Math.min(...usable),
+            };
+        },
+
+        phaseFitSummary() {
+            if (this.planIsDisaggregated()) {
+                const context = Number(this.plan?.target_context_tokens || 0);
+                return `Signed fit verified on both Macs${
+                    context ? ` at ${context.toLocaleString()} tokens` : ''
+                }.`;
+            }
+            const estimate = this.phaseReplicaFitEstimate();
+            if (estimate && !estimate.fits) {
+                return `Unavailable: complete weights need ${(
+                    estimate.weightBytes /
+                    1024 ** 3
+                ).toFixed(1)} GiB, above the smallest Mac's usable ${(
+                    estimate.smallestUsableBytes /
+                    1024 ** 3
+                ).toFixed(1)} GiB.`;
+            }
+            return 'Final approval verifies complete weights plus the selected context reservation on both Macs.';
+        },
+
         setPhasePrefillRank(rank) {
             const value = Number(rank);
-            if (value !== 1 || this.planLoading) return;
+            if (![0, 1].includes(value) || this.planLoading) return;
             if (this.phasePrefillRank === value) return;
             this.phasePrefillRank = value;
             if (this.selectedModelPath && this.planStrategy === 'disaggregated') {

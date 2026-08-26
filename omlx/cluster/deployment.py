@@ -655,11 +655,6 @@ class ClusterDeployment:
                 raise ValueError(
                     "disaggregated serving requires distinct prefill/decode ranks"
                 )
-            if (self.prefill_rank, self.decode_rank) != (1, 0):
-                raise ValueError(
-                    "persistent phase-split serving currently requires rank 0 "
-                    "decode and rank 1 prefill"
-                )
             if self.mtp_enabled or self.mtp_num_draft_tokens is not None:
                 raise ValueError(
                     "disaggregated serving does not yet admit speculative decode"

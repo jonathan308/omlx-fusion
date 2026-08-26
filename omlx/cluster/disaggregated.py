@@ -252,11 +252,6 @@ def build_full_replica_shard_plan(
         raise PlanningError(
             "disaggregated serving requires two distinct phase ranks"
         )
-    if (prefill_rank, decode_rank) != (1, 0):
-        raise PlanningError(
-            "persistent phase-split serving currently requires rank 0 decode "
-            "and rank 1 prefill"
-        )
     layer_weights = tuple(int(value) for value in model.layer_weight_bytes)
     if not layer_weights:
         raise PlanningError("disaggregated serving requires a layered model")

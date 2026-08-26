@@ -7,6 +7,7 @@ import argparse
 import copy
 import json
 import os
+import pickle
 import struct
 import threading
 import time
@@ -27,6 +28,7 @@ from .cache_transfer import (
 
 _PROGRESS = struct.Struct("!II")
 _CANCEL = struct.Struct("!B")
+_OBJECT_LENGTH = struct.Struct("!Q")
 _PREFILL_START = struct.Struct("!IIIIQQQQ")
 _LOGITS_HEADER = struct.Struct("!III")
 _DTYPE_TO_CODE = {"float16": 1, "bfloat16": 2, "float32": 3}
@@ -52,6 +54,32 @@ def _phase_event(rank: int, stage: str, **details: Any) -> None:
     )
 
 
+def _broadcast_owned_object(control: Any, value: Any, *, source_rank: int) -> Any:
+    """Broadcast one bounded pickle owned by either phase rank."""
+
+    payload = pickle.dumps(value, protocol=5) if control.rank == source_rank else None
+    size = len(payload) if payload is not None else 0
+    if size > 256 * 1024 * 1024:
+        raise RuntimeError("phase control object exceeds 256 MiB")
+    length_packet = control.broadcast_owned_bytes(
+        _OBJECT_LENGTH.pack(size) if control.rank == source_rank else None,
+        source_rank=source_rank,
+        expected_size=_OBJECT_LENGTH.size,
+    )
+    expected = _OBJECT_LENGTH.unpack(length_packet)[0]
+    if expected > 256 * 1024 * 1024:
+        raise RuntimeError("phase control object has an invalid size")
+    encoded = control.broadcast_owned_bytes(
+        payload,
+        source_rank=source_rank,
+        expected_size=expected,
+    )
+    try:
+        return pickle.loads(encoded)
+    except Exception as exc:
+        raise RuntimeError("phase control object is invalid") from exc
+
+
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
@@ -59,6 +87,7 @@ def _arguments() -> argparse.Namespace:
         "--backend", choices=("ring", "jaccl", "jaccl-ring"), required=True
     )
     parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--server-host", required=True)
     parser.add_argument("--deployment-id", required=True)
     parser.add_argument("--plan-hash", required=True)
     parser.add_argument("--plan", required=True)
@@ -385,11 +414,8 @@ class _PhaseResponseGenerator:
         deployment_id: str,
         telemetry: Any,
     ) -> None:
-        if decode_rank != 0 or prefill_rank != 1:
-            raise RuntimeError(
-                "persistent phase-split serving currently requires rank 0 decode "
-                "and rank 1 prefill"
-            )
+        if {decode_rank, prefill_rank} != {0, 1}:
+            raise RuntimeError("phase-split serving requires distinct ranks 0 and 1")
         self.mx = mx
         self.model = model
         self.tokenizer = tokenizer
@@ -606,13 +632,19 @@ class _PhaseResponseGenerator:
             if request is None:
                 break
             try:
-                _phase_event(0, "broker_request", prompt_tokens=len(request.prompt))
-                self.control.broadcast_object(
+                _phase_event(
+                    self.decode_rank,
+                    "broker_request",
+                    prompt_tokens=len(request.prompt),
+                )
+                _broadcast_owned_object(
+                    self.control,
                     {
                         "op": "prefill",
                         "prompt": request.prompt,
                         "prefill_step_size": self.prefill_step_size,
-                    }
+                    },
+                    source_rank=self.decode_rank,
                 )
                 start_packet = self.control.broadcast_owned_bytes(
                     None,
@@ -664,7 +696,11 @@ class _PhaseResponseGenerator:
                     self.telemetry.cancel_request(request.request_id)
                     request.output.put(None)
                     continue
-                _phase_event(0, "broker_prefill_ready", logits_columns=columns)
+                _phase_event(
+                    self.decode_rank,
+                    "broker_prefill_ready",
+                    logits_columns=columns,
+                )
                 dtype_name = _CODE_TO_DTYPE.get(dtype_code)
                 if dtype_name is None or rows != 1 or columns <= 0:
                     raise RuntimeError("prefill rank returned an invalid logits header")
@@ -675,7 +711,7 @@ class _PhaseResponseGenerator:
                 if previous is not None:
                     previous.join()
                 self.control.barrier()
-                _phase_event(0, "broker_cache_recv_start")
+                _phase_event(self.decode_rank, "broker_cache_recv_start")
                 cache, _manifest, stats = recv_cache_transfer(
                     self.mx,
                     src=self.prefill_rank,
@@ -700,7 +736,7 @@ class _PhaseResponseGenerator:
                     self.telemetry.cancel_request(request.request_id)
                     request.output.put(None)
                     continue
-                _phase_event(0, "broker_cache_recv_done")
+                _phase_event(self.decode_rank, "broker_cache_recv_done")
                 previous = threading.Thread(
                     target=self._decode,
                     args=(request, cache, logits),
@@ -718,7 +754,11 @@ class _PhaseResponseGenerator:
         if previous is not None:
             previous.join()
         with suppress(Exception):
-            self.control.broadcast_object({"op": "stop"})
+            _broadcast_owned_object(
+                self.control,
+                {"op": "stop"},
+                source_rank=self.decode_rank,
+            )
 
     def stop_and_join(self) -> None:
         self._stopping.set()
@@ -737,10 +777,11 @@ def _prefill_rank_loop(
     control: Any,
     model_identity: str,
     rank: int,
+    decode_rank: int,
     prompt_cache: _PhasePromptCache,
 ) -> None:
     while True:
-        request = control.broadcast_object(None)
+        request = _broadcast_owned_object(control, None, source_rank=decode_rank)
         if not isinstance(request, dict):
             raise RuntimeError("phase broker sent an invalid request")
         if request.get("op") == "stop":
@@ -767,7 +808,7 @@ def _prefill_rank_loop(
                 cache_stats["ssd_entries"],
                 cache_stats["ssd_bytes"],
             ),
-            source_rank=1,
+            source_rank=rank,
             expected_size=_PREFILL_START.size,
         )
         _phase_event(
@@ -792,12 +833,12 @@ def _prefill_rank_loop(
             )
             control.broadcast_owned_bytes(
                 _PROGRESS.pack(processed, total),
-                source_rank=1,
+                source_rank=rank,
                 expected_size=_PROGRESS.size,
             )
             cancel_packet = control.broadcast_owned_bytes(
                 None,
-                source_rank=0,
+                source_rank=decode_rank,
                 expected_size=_CANCEL.size,
             )
             return _CANCEL.unpack(cancel_packet)[0] == 0
@@ -814,7 +855,7 @@ def _prefill_rank_loop(
         if logits is None:
             control.broadcast_owned_bytes(
                 _LOGITS_HEADER.pack(0, 0, 0),
-                source_rank=1,
+                source_rank=rank,
                 expected_size=_LOGITS_HEADER.size,
             )
             _phase_event(rank, "prefill_cancelled")
@@ -827,7 +868,7 @@ def _prefill_rank_loop(
         prompt_cache.insert(prompt, cache, logits)
         control.broadcast_owned_bytes(
             _LOGITS_HEADER.pack(dtype_code, int(logits.shape[0]), int(logits.shape[1])),
-            source_rank=1,
+            source_rank=rank,
             expected_size=_LOGITS_HEADER.size,
         )
         control.barrier()
@@ -837,8 +878,14 @@ def _prefill_rank_loop(
             model_identity=model_identity,
             prompt_tokens=len(prompt),
         )
-        send_cache_transfer(mx, prepared, dst=0, group=group)
-        mx.eval(mx.distributed.send(mx.contiguous(logits), 0, group=group))
+        send_cache_transfer(mx, prepared, dst=decode_rank, group=group)
+        mx.eval(
+            mx.distributed.send(
+                mx.contiguous(logits),
+                decode_rank,
+                group=group,
+            )
+        )
         mx.synchronize()
         prompt_cache.active.clear()
         _phase_event(rank, "prefill_cache_send_done")
@@ -1018,7 +1065,7 @@ def run_worker(args: argparse.Namespace) -> int:
                 prefill_rank=prefill_rank,
                 decode_rank=decode_rank,
             )
-            if rank == 0:
+            if rank == decode_rank:
                 cli_args = SimpleNamespace(
                     allowed_origins=["*"],
                     num_draft_tokens=0,
@@ -1068,7 +1115,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         "protocol_version": 1,
                         "deployment_id": args.deployment_id,
                         "plan_hash": plan_hash,
-                        "rank": 0,
+                        "rank": rank,
                         "world_size": 2,
                         "port": args.port,
                         "serving_mode": "disaggregated",
@@ -1101,7 +1148,7 @@ def run_worker(args: argparse.Namespace) -> int:
                             status = 200
                             payload = {
                                 "status": "ok",
-                                "rank": 0,
+                                "rank": rank,
                                 "hot_cleared": 0,
                                 "ssd_deleted": 0,
                             }
@@ -1124,7 +1171,7 @@ def run_worker(args: argparse.Namespace) -> int:
                 telemetry.start_heartbeat()
                 try:
                     _run_http_server(
-                        "127.0.0.1",
+                        args.server_host,
                         args.port,
                         generator,
                         handler_class=PhaseAPIHandler,
@@ -1144,6 +1191,7 @@ def run_worker(args: argparse.Namespace) -> int:
                     control=control,
                     model_identity=identity,
                     rank=rank,
+                    decode_rank=int(decode_rank),
                     prompt_cache=phase_prompt_cache,
                 )
         return 0

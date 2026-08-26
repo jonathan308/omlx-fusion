@@ -36,6 +36,35 @@ def _deployment() -> ClusterDeployment:
     )
 
 
+def _phase_deployment(*, prefill_rank: int) -> ClusterDeployment:
+    base = _deployment()
+    assignments = tuple(
+        PipelineAssignment(
+            host.node_id,
+            rank,
+            0,
+            4,
+            4,
+            0,
+            0,
+            8,
+            tensor_parallel_rank=0,
+            tensor_parallel_size=1,
+            kv_cache_bytes=1,
+            kv_bytes_per_token=1,
+            max_context_tokens=8,
+        )
+        for rank, host in enumerate(base.hosts)
+    )
+    return replace(
+        base,
+        assignments=assignments,
+        serving_mode="disaggregated",
+        prefill_rank=prefill_rank,
+        decode_rank=1 - prefill_rank,
+    )
+
+
 class _Tokenizer:
     @staticmethod
     def encode(text):
@@ -102,6 +131,69 @@ async def test_distributed_cache_clear_refuses_active_requests():
             await engine.clear_prompt_caches(ssd=True)
     finally:
         await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reversed_phase_clear_reaches_local_prefill_owner(tmp_path, monkeypatch):
+    deployment = _phase_deployment(prefill_rank=0)
+
+    def handler(_request):
+        return httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "rank": 1,
+                "ssd_deleted": 0,
+                "hot_cleared": 0,
+            },
+        )
+
+    engine = DistributedBatchedEngine(deployment)
+    engine._loaded = True
+    engine._client = httpx.AsyncClient(
+        base_url="http://10.0.0.2:8001",
+        transport=httpx.MockTransport(handler),
+    )
+    engine._supervisor.port = 8001
+    engine._supervisor.state_dir = str(tmp_path)
+    monkeypatch.setattr(distributed.time, "time_ns", lambda: 7)
+    (tmp_path / f"{deployment.deployment_id}-cache-clear-rank-0.json").write_text(
+        json.dumps(
+            {
+                "epoch": 7,
+                "status": "ok",
+                "rank": 0,
+                "ssd_deleted": 3,
+                "hot_cleared": 0,
+            }
+        )
+    )
+    monkeypatch.setattr(
+        distributed,
+        "_run_cluster_ssh",
+        lambda *_args, **_kwargs: pytest.fail("local prefill must not use SSH"),
+    )
+    try:
+        result = await engine.clear_prompt_caches(ssd=True)
+    finally:
+        await engine._client.aclose()
+
+    assert result["ssd_deleted"] == 3
+    assert {item["rank"] for item in result["ranks"]} == {0, 1}
+    request = json.loads(
+        (tmp_path / f"{deployment.deployment_id}-cache-clear.json").read_text()
+    )
+    assert request["ssd"] is True
+
+
+def test_text_backbone_only_contract_is_explicit_and_default_off():
+    assert DistributedBatchedEngine(_deployment()).text_backbone_only is False
+    assert (
+        DistributedBatchedEngine(
+            _deployment(), text_backbone_only=True
+        ).text_backbone_only
+        is True
+    )
 
 
 def test_backend_chat_messages_serialize_native_tool_history_once():

@@ -398,10 +398,6 @@ def test_disaggregated_deployment_round_trip_and_worker_contract():
             {"prefill_rank": 0, "decode_rank": 0},
             "distinct prefill/decode ranks",
         ),
-        (
-            {"prefill_rank": 0, "decode_rank": 1},
-            "rank 0 decode and rank 1 prefill",
-        ),
         ({"tensor_parallel_size": 2}, "tensor-parallel coordinates"),
         ({"mtp_enabled": True}, "does not yet admit speculative"),
     ],
@@ -409,6 +405,19 @@ def test_disaggregated_deployment_round_trip_and_worker_contract():
 def test_disaggregated_deployment_rejects_unsafe_contracts(overrides, message):
     with pytest.raises(ValueError, match=message):
         _disaggregated_deployment(**overrides)
+
+
+def test_disaggregated_deployment_allows_either_signed_phase_orientation():
+    deployment = _disaggregated_deployment(prefill_rank=0, decode_rank=1)
+
+    restored = ClusterDeployment.from_dict(deployment.to_dict())
+
+    assert (restored.prefill_rank, restored.decode_rank) == (0, 1)
+    assert decode_worker_serving_mode(deployment.encode_worker_plan()) == (
+        "disaggregated",
+        0,
+        1,
+    )
 
 
 def test_legacy_deployment_decodes_to_sharded_mode():

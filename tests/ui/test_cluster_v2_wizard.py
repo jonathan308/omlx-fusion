@@ -1563,11 +1563,13 @@ component.apiFetch = async (url, options) => {
   const body = options?.body ? JSON.parse(options.body) : null;
   bodies.push({ url, body });
   if (url.endsWith('/autoconfigure')) {
+    const prefill = Number(body.prefill_rank);
+    const decode = Number(body.decode_rank);
     return {
       serving_mode: 'disaggregated',
       performance_probe: { ok: false, status: 'phase_probe_required' },
       plan: {
-        serving_mode: 'disaggregated', prefill_rank: 1, decode_rank: 0,
+        serving_mode: 'disaggregated', prefill_rank: prefill, decode_rank: decode,
         assignments: [
           { rank: 0, node_id: 'node-a', start_layer: 0, end_layer: 48, layer_count: 48 },
           { rank: 1, node_id: 'node-b', start_layer: 0, end_layer: 48, layer_count: 48 },
@@ -1576,7 +1578,7 @@ component.apiFetch = async (url, options) => {
         placement_signature: 'f'.repeat(16),
       },
       activation: {
-        serving_mode: 'disaggregated', prefill_rank: 1, decode_rank: 0,
+        serving_mode: 'disaggregated', prefill_rank: prefill, decode_rank: decode,
         approved_placement: 'f'.repeat(16),
       },
     };
@@ -1589,11 +1591,16 @@ component.selectedModelPath = '/models/qwen';
 (async () => {
   component.setPlanStrategy('disaggregated');
   await new Promise((resolve) => setTimeout(resolve, 0));
+  const initial = bodies.filter((entry) => entry.url.endsWith('/autoconfigure')).at(-1).body;
+  component.setPhasePrefillRank(0);
+  await new Promise((resolve) => setTimeout(resolve, 0));
   process.stdout.write(JSON.stringify({
-    body: bodies.find((entry) => entry.url.endsWith('/autoconfigure'))?.body,
+    initial,
+    body: bodies.filter((entry) => entry.url.endsWith('/autoconfigure')).at(-1)?.body,
     isPhase: component.planIsDisaggregated(),
     totalLayers: component.planTotalLayers(),
     roles: component.planAssignments().map((row) => component.phasePlanRole(row)),
+    recommended: component.phaseRecommendedPrefillRank(),
     benchmarkOkay: component.checks.benchmark?.ok,
   }));
 })();
@@ -1601,17 +1608,53 @@ component.selectedModelPath = '/models/qwen';
     )
 
     assert result["body"]["strategy"] == "disaggregated"
-    assert result["body"]["prefill_rank"] == 1
-    assert result["body"]["decode_rank"] == 0
+    assert result["initial"]["prefill_rank"] == 1
+    assert result["initial"]["decode_rank"] == 0
+    assert result["body"]["prefill_rank"] == 0
+    assert result["body"]["decode_rank"] == 1
     assert result["body"]["measure_performance"] is False
     assert result["isPhase"] is True
     assert result["totalLayers"] == 48
-    assert result["roles"] == ["Decode", "Prefill"]
+    assert result["roles"] == ["Prefill", "Decode"]
+    assert result["recommended"] == 1
     assert result["benchmarkOkay"] is True
 
     template = _read(TEMPLATE)
     assert "data-cluster-v2-phase-role-picker" in template
     assert "data-cluster-v2-split-bar-disaggregated" in template
+    assert "Full-replica Beta" in template
+    assert "bg-neutral-900 text-white" in template
+
+
+def test_phase_split_is_disabled_when_a_full_replica_exceeds_smallest_mac():
+    result = _run_wizard(
+        """
+component.devicesPayload = {
+  self: { node_id: 'node-a', friendly_name: 'M3 Ultra',
+    caps: { ram_gb: 256, chip: 'M3 Ultra' }, addrs: [] },
+  paired: [{ node_id: 'node-b', friendly_name: 'M5 Max', paired: true,
+    caps: { ram_gb: 128, chip: 'M5 Max' }, addrs: [] }],
+  discovered: [],
+};
+component.modelOptions = [{ model_path: '/models/huge', id: 'huge' }];
+component.selectedModelPath = '/models/huge';
+component.catalogueModels = [{
+  model_path: '/models/huge', weight_bytes: 200 * (1024 ** 3),
+  fits: true, supports_pipeline: true, supports_tensor_parallel: true,
+}];
+const option = component.strategyOptions().find((item) => item.key === 'disaggregated');
+process.stdout.write(JSON.stringify({
+  disabled: option.disabled,
+  reason: option.disabledReason,
+  summary: component.phaseFitSummary(),
+}));
+"""
+    )
+
+    assert result["disabled"] is True
+    assert result["reason"] == "The complete model does not fit on both Macs."
+    assert "200.0 GiB" in result["summary"]
+    assert "smallest Mac" in result["summary"]
 
 
 def test_catalogue_drives_the_recommendation_badge_and_capability_locks():

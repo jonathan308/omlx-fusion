@@ -75,7 +75,7 @@ def _jaccl_deployment() -> ClusterDeployment:
     )
 
 
-def _disaggregated_deployment() -> ClusterDeployment:
+def _disaggregated_deployment(prefill_rank: int = 1) -> ClusterDeployment:
     deployment = _deployment("mlx-community/Qwen3.8-27B-4bit")
     assignments = tuple(
         PipelineAssignment(
@@ -99,8 +99,8 @@ def _disaggregated_deployment() -> ClusterDeployment:
         deployment,
         assignments=assignments,
         serving_mode="disaggregated",
-        prefill_rank=1,
-        decode_rank=0,
+        prefill_rank=prefill_rank,
+        decode_rank=1 - prefill_rank,
     )
 
 
@@ -184,6 +184,25 @@ def test_launcher_selects_persistent_phase_server_for_disaggregated_plan(tmp_pat
     worker = argv[argv.index("--") + 1 :]
     assert "omlx.cluster.disaggregated_server_worker" in worker
     assert "omlx.cluster.inference_worker" not in worker
+    assert argv[argv.index("--server-host") + 1] == "127.0.0.1"
+
+
+def test_reversed_phase_server_binds_and_advertises_decode_peer(tmp_path):
+    deployment = _disaggregated_deployment(prefill_rank=0)
+    argv = build_mlx_launch_argv(
+        deployment,
+        hostfile=(tmp_path / "hosts.json").resolve(),
+        api_port=32100,
+        collective_port=32120,
+        python_executable="/opt/omlx/bin/python",
+        control_host="10.0.0.1",
+        control_port=32140,
+    )
+    supervisor = launch.DistributedJobSupervisor(deployment, preflight=False)
+    supervisor.port = 32100
+
+    assert argv[argv.index("--server-host") + 1] == deployment.hosts[1].ips[0]
+    assert supervisor.endpoint == f"http://{deployment.hosts[1].ips[0]}:32100"
 
 
 def test_launcher_rejects_overlapping_api_and_collective_ports(tmp_path):
@@ -693,14 +712,14 @@ def test_listener_grace_only_covers_post_warmup_socket_bind(monkeypatch):
 
     times = iter((0.0, 20.0))
     monkeypatch.setattr(launch.time, "monotonic", lambda: next(times))
-    with pytest.raises(TimeoutError, match="rank-zero inference endpoint"):
+    with pytest.raises(TimeoutError, match="decode-rank inference endpoint"):
         supervisor._wait_for_listener()
     assert attempts == []
 
     monkeypatch.setenv("OMLX_CLUSTER_LISTENER_TIMEOUT_SECONDS", "60")
     times = iter((0.0, 20.0, 61.0))
     monkeypatch.setattr(launch.time, "monotonic", lambda: next(times))
-    with pytest.raises(TimeoutError, match="rank-zero inference endpoint"):
+    with pytest.raises(TimeoutError, match="decode-rank inference endpoint"):
         supervisor._wait_for_listener()
     assert len(attempts) == 1
 

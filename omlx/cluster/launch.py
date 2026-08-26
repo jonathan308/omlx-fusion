@@ -1373,6 +1373,14 @@ def build_mlx_launch_argv(
             deployment.execution.tuning_reason,
         ]
     )
+    if deployment.serving_mode == "disaggregated":
+        decode_rank = int(deployment.decode_rank)
+        server_host = (
+            deployment.hosts[decode_rank].ips[0]
+            if decode_rank != 0
+            else "127.0.0.1"
+        )
+        argv.extend(["--server-host", server_host])
     if launcher_lease is not None:
         argv.extend(["--launcher-lease", str(launcher_lease)])
     if control_host is not None and control_port is not None:
@@ -2915,8 +2923,22 @@ class DistributedJobSupervisor:
         self._launcher_lease_thread: threading.Thread | None = None
 
     @property
+    def endpoint_host(self) -> str:
+        if (
+            self.deployment.serving_mode == "disaggregated"
+            and self.deployment.decode_rank is not None
+            and int(self.deployment.decode_rank) != 0
+        ):
+            return self.deployment.hosts[int(self.deployment.decode_rank)].ips[0]
+        return "127.0.0.1"
+
+    @property
     def endpoint(self) -> str | None:
-        return f"http://127.0.0.1:{self.port}" if self.port is not None else None
+        return (
+            f"http://{self.endpoint_host}:{self.port}"
+            if self.port is not None
+            else None
+        )
 
     def _prepare_launcher_lease(self) -> Path:
         """Publish the lease before spawning anything that may outlive us."""
@@ -3420,11 +3442,14 @@ class DistributedJobSupervisor:
                 code = None if process is None else process.returncode
                 raise DistributedLaunchError(self._exit_detail(code))
             try:
-                with socket.create_connection(("127.0.0.1", self.port), timeout=0.25):
+                with socket.create_connection(
+                    (self.endpoint_host, self.port),
+                    timeout=0.25,
+                ):
                     return
             except OSError:
                 time.sleep(0.05)
-        raise TimeoutError("rank-zero inference endpoint did not start listening")
+        raise TimeoutError("decode-rank inference endpoint did not start listening")
 
     def stop(self) -> None:
         self._terminate()

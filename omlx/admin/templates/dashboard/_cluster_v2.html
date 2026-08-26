@@ -673,37 +673,52 @@
                      these rank choices and independently verifies that both
                      Macs fit complete weights plus the context reservation. -->
                 <div x-show="planStrategy === 'disaggregated'" x-cloak
-                     class="mt-4 rounded-xl border border-cyan-200 bg-cyan-50/60 px-3 py-3"
+                     class="mt-4 rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3.5"
                      data-cluster-v2-phase-role-picker>
                     <div class="flex items-start justify-between gap-3">
                         <span>
-                            <span class="block text-xs font-semibold text-cyan-950">Choose the prefill Mac</span>
-                            <span class="block text-[10px] text-cyan-800 mt-0.5">
-                                Both Macs load the complete model. The selected Mac processes prompts; the other owns decode and the API. Completed cache state moves over the verified fabric.
+                            <span class="block text-xs font-semibold text-neutral-900">Assign prefill and decode</span>
+                            <span class="block text-[10px] text-neutral-600 mt-1 max-w-3xl">
+                                Both Macs must fit the complete model and reserved context. Choose the prefill owner; the other Mac runs decode and the private API. The signed planner refuses Phase split if either full replica cannot fit.
                             </span>
                         </span>
-                        <span class="inline-flex rounded-full border border-cyan-200 bg-white px-2 py-0.5 text-[9px] font-semibold text-cyan-800">Experimental</span>
+                        <span class="inline-flex rounded-full border border-neutral-300 bg-white px-2 py-0.5 text-[9px] font-semibold text-neutral-600">Full-replica Beta</span>
                     </div>
                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2">
                         <template x-for="(device, rank) in phaseRoleDevices()" :key="device.node_id">
                             <button type="button"
                                     @click="setPhasePrefillRank(rank)"
-                                    :disabled="planLoading || Number(rank) === 0"
-                                    :title="Number(rank) === 0 ? 'The coordinator is the current decode/API owner.' : 'Use this Mac for prompt processing.'"
-                                    class="rounded-lg border px-3 py-2 text-left transition-colors disabled:opacity-40"
+                                    :disabled="planLoading"
+                                    title="Choose this Mac for prompt processing; the other Mac will own decode and the private API."
+                                    class="rounded-lg border px-3 py-2.5 text-left transition-colors disabled:opacity-40"
                                     :class="Number(phasePrefillRank) === Number(rank)
-                                        ? 'border-cyan-700 bg-cyan-900 text-white'
-                                        : 'border-cyan-200 bg-white text-cyan-950 hover:bg-cyan-100'"
+                                        ? 'border-neutral-900 bg-neutral-900 text-white shadow-sm'
+                                        : 'border-neutral-200 bg-white text-neutral-900 hover:border-neutral-400 hover:bg-neutral-100'"
                                     :data-cluster-v2-phase-rank="rank">
-                                <span class="block text-xs font-semibold truncate" x-text="deviceName(device)"></span>
-                                <span class="block text-[10px] mt-0.5 opacity-80"
-                                      x-text="phaseRoleForRank(rank) + ' · full model replica'"></span>
+                                <span class="flex items-center justify-between gap-2">
+                                    <span class="block text-xs font-semibold truncate" x-text="deviceName(device)"></span>
+                                    <span x-show="Number(rank) === Number(phaseRecommendedPrefillRank())"
+                                          class="inline-flex rounded-full border px-2 py-0.5 text-[9px] font-semibold"
+                                          :class="Number(phasePrefillRank) === Number(rank)
+                                              ? 'border-white/40 text-white'
+                                              : 'border-green-200 bg-green-50 text-green-700'">Recommended</span>
+                                </span>
+                                <span class="block text-[10px] mt-1 opacity-75 truncate"
+                                      x-text="phaseDeviceMeta(device)"></span>
+                                <span class="inline-flex mt-2 rounded-md border px-2 py-0.5 text-[10px] font-semibold"
+                                      :class="Number(phasePrefillRank) === Number(rank)
+                                          ? 'border-white/30 bg-white/10 text-white'
+                                          : 'border-neutral-200 bg-neutral-50 text-neutral-700'"
+                                      x-text="phaseRoleForRank(rank) + ' · complete replica'"></span>
                             </button>
                         </template>
                     </div>
-                    <p class="text-[10px] text-cyan-800 mt-2">
-                        Best for queued agent workloads. The first request pays one cache handoff; later requests overlap decode N with prefill N+1.
+                    <p class="text-[10px] text-neutral-600 mt-2"
+                       x-text="phaseRecommendationReason() + ' You can override it; changing roles rebuilds and re-signs the fit plan.'">
                     </p>
+                    <p class="text-[10px] font-medium mt-1"
+                       :class="phaseReplicaFitEstimate()?.fits === false ? 'text-red-700' : 'text-neutral-700'"
+                       x-text="phaseFitSummary()"></p>
                 </div>
 
                 <!-- Serving limits are a profile, not three unrelated knobs:
@@ -915,8 +930,8 @@
                         <template x-if="planIsDisaggregated()">
                             <div class="grid grid-cols-[1fr_auto_1fr] items-stretch gap-2"
                                  data-cluster-v2-split-bar-disaggregated>
-                                <div class="rounded-xl border border-cyan-200 bg-cyan-50 px-3 py-3">
-                                    <div class="text-[9px] uppercase tracking-wider font-bold text-cyan-700">Prefill</div>
+                                <div class="rounded-xl border border-neutral-300 bg-neutral-50 px-3 py-3">
+                                    <div class="text-[9px] uppercase tracking-wider font-bold text-neutral-600">Prefill</div>
                                     <div class="text-xs font-semibold text-neutral-900 mt-1 truncate"
                                          x-text="planNodeName(planAssignments().find((row) => phasePlanRole(row) === 'Prefill') || {})"></div>
                                     <div class="text-[10px] text-neutral-500 mt-0.5">Complete model replica</div>
@@ -924,11 +939,11 @@
                                 <div class="flex items-center text-neutral-400">
                                     <i data-lucide="arrow-right" class="w-4 h-4"></i>
                                 </div>
-                                <div class="rounded-xl border border-violet-200 bg-violet-50 px-3 py-3">
-                                    <div class="text-[9px] uppercase tracking-wider font-bold text-violet-700">Decode</div>
-                                    <div class="text-xs font-semibold text-neutral-900 mt-1 truncate"
+                                <div class="rounded-xl border border-neutral-900 bg-neutral-900 px-3 py-3 text-white">
+                                    <div class="text-[9px] uppercase tracking-wider font-bold text-neutral-300">Decode + API</div>
+                                    <div class="text-xs font-semibold text-white mt-1 truncate"
                                          x-text="planNodeName(planAssignments().find((row) => phasePlanRole(row) === 'Decode') || {})"></div>
-                                    <div class="text-[10px] text-neutral-500 mt-0.5">Complete model replica · API owner</div>
+                                    <div class="text-[10px] text-neutral-300 mt-0.5">Complete model replica · private endpoint owner</div>
                                 </div>
                             </div>
                         </template>

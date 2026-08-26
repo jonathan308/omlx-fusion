@@ -312,19 +312,59 @@ class DistributedBatchedEngine(BatchedEngine):
         headers = {"X-oMLX-Plan-Hash": self.deployment.plan_hash}
         maintenance_epoch = time.time_ns()
 
-        async def clear_rank_zero() -> dict[str, Any]:
+        async def clear_api_rank() -> dict[str, Any]:
             response = await self._client.post(path, headers=headers)
             if response.status_code >= 400:
                 raise DistributedInferenceError(
-                    "rank 0 cache clear failed: "
+                    "decode-rank cache clear failed: "
                     f"HTTP {response.status_code} {response.text[:300]}"
                 )
             payload = response.json()
             if not isinstance(payload, dict) or payload.get("status") != "ok":
                 raise DistributedInferenceError(
-                    "rank 0 returned invalid cache-clear JSON"
+                    "decode rank returned invalid cache-clear JSON"
                 )
             return payload
+
+        def clear_local(rank: int) -> dict[str, Any]:
+            state_root = Path(self._supervisor.state_dir).expanduser()
+            request_path = state_root / (
+                f"{self.deployment.deployment_id}-cache-clear.json"
+            )
+            ack_path = state_root / (
+                f"{self.deployment.deployment_id}-cache-clear-rank-{rank}.json"
+            )
+            request_payload = {
+                "epoch": maintenance_epoch,
+                "deployment_id": self.deployment.deployment_id,
+                "plan_hash": self.deployment.plan_hash,
+                "ssd": bool(ssd),
+                "hot": bool(hot),
+            }
+            request_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = request_path.with_name(request_path.name + ".tmp")
+            temporary.write_text(
+                json.dumps(request_payload, separators=(",", ":"), sort_keys=True),
+                encoding="utf-8",
+            )
+            os.replace(temporary, request_path)
+            deadline = time.monotonic() + 40.0
+            while time.monotonic() < deadline:
+                try:
+                    if ack_path.is_file() and ack_path.stat().st_size <= 65536:
+                        ack = json.loads(ack_path.read_text(encoding="utf-8"))
+                        if int(ack.get("epoch", 0)) == maintenance_epoch:
+                            if ack.get("status") != "ok":
+                                raise DistributedInferenceError(
+                                    f"rank {rank} returned an invalid cache-clear result"
+                                )
+                            return ack
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    pass
+                time.sleep(0.1)
+            raise DistributedInferenceError(
+                f"rank {rank} local cache-clear acknowledgement timed out"
+            )
 
         def clear_remote(rank: int, ssh_target: str) -> dict[str, Any]:
             state_root = str(self._supervisor.state_dir).rstrip("/") or "."
@@ -405,9 +445,19 @@ raise SystemExit(2)
                 )
             return payload
 
-        tasks = [clear_rank_zero()]
-        for rank, host in enumerate(self.deployment.hosts[1:], start=1):
-            tasks.append(asyncio.to_thread(clear_remote, rank, host.ssh))
+        tasks = [clear_api_rank()]
+        if self.deployment.serving_mode == "disaggregated":
+            prefill_rank = int(self.deployment.prefill_rank)
+            if prefill_rank == 0:
+                tasks.append(asyncio.to_thread(clear_local, prefill_rank))
+            else:
+                host = self.deployment.hosts[prefill_rank]
+                tasks.append(
+                    asyncio.to_thread(clear_remote, prefill_rank, host.ssh)
+                )
+        else:
+            for rank, host in enumerate(self.deployment.hosts[1:], start=1):
+                tasks.append(asyncio.to_thread(clear_remote, rank, host.ssh))
         reports = await asyncio.gather(*tasks)
         return {
             "status": "ok",
@@ -910,9 +960,19 @@ raise SystemExit(2)
         quiescence evidence an abort or unload should wait for (G5).
         """
 
+        telemetry_rank = (
+            int(self.deployment.decode_rank)
+            if self.deployment.serving_mode == "disaggregated"
+            else 0
+        )
+        if telemetry_rank != 0:
+            # Remote decode telemetry is not a local marker. The coordinator's
+            # request counter remains the quiescence gate; the private response
+            # cannot finish before remote decode releases its cache ownership.
+            return self._active_requests
         marker = read_marker(
             Path(self._supervisor.state_dir).expanduser()
-            / f"{self.deployment.deployment_id}-rank-0.json"
+            / f"{self.deployment.deployment_id}-rank-{telemetry_rank}.json"
         )
         if not isinstance(marker, dict):
             # The phase-split server owns one broker future per private HTTP
@@ -943,10 +1003,27 @@ raise SystemExit(2)
         rates.
         """
 
-        marker = read_marker(
-            Path(self._supervisor.state_dir).expanduser()
-            / f"{self.deployment.deployment_id}-rank-0.json"
+        telemetry_rank = (
+            int(self.deployment.decode_rank)
+            if self.deployment.serving_mode == "disaggregated"
+            else 0
         )
+        marker_path = (
+            Path(self._supervisor.state_dir).expanduser()
+            / f"{self.deployment.deployment_id}-rank-{telemetry_rank}.json"
+        )
+        if telemetry_rank == 0:
+            marker = read_marker(marker_path)
+        else:
+            from ..cluster.liveness import read_remote_marker
+
+            host = self.deployment.hosts[telemetry_rank]
+            marker, process_live, _peer_now, _error = read_remote_marker(
+                host.ssh,
+                str(marker_path),
+            )
+            if marker is not None and process_live is False:
+                marker = None
         if not isinstance(marker, dict):
             return None
         metrics = marker.get("metrics")
