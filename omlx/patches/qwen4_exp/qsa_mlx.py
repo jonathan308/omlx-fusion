@@ -369,6 +369,14 @@ _PREFILL_QUERY_CHUNK = 64
 _CONTIGUOUS_CAUSAL_QUERY_CHUNK = 32
 
 
+def _contiguous_causal_query_chunk(key_tokens: int) -> int:
+    if key_tokens <= 4096:
+        return _CONTIGUOUS_CAUSAL_QUERY_CHUNK
+    if key_tokens <= 16384:
+        return 64
+    return 128
+
+
 def _batch_gather_tokens(values: mx.array, indices: mx.array) -> mx.array:
     """Gather token rows independently for every batch without a host read."""
 
@@ -481,7 +489,7 @@ def _contiguous_causal_sparse_prefill(
     *,
     geometry: Qwen4ExpQSAGeometry,
     index_key_norm: IndexKeyNorm,
-    query_chunk: int = _CONTIGUOUS_CAUSAL_QUERY_CHUNK,
+    query_chunk: int | None = None,
 ) -> mx.array:
     """Fast exact QSA for a single contiguous causal sequence.
 
@@ -500,6 +508,8 @@ def _contiguous_causal_sparse_prefill(
             "contiguous causal QSA currently requires batch size one"
         )
     key_tokens = keys.shape[2]
+    if query_chunk is None:
+        query_chunk = _contiguous_causal_query_chunk(key_tokens)
     ratio = geometry.compress_ratio
     max_blocks = key_tokens // ratio
     block_budget = geometry.block_budget

@@ -373,6 +373,15 @@ def test_contiguous_causal_prefill_matches_generic_sparse_path(additive):
     )
 
 
+def test_contiguous_causal_query_chunk_adapts_to_context() -> None:
+    import omlx.patches.qwen4_exp.qsa_mlx as module
+
+    assert module._contiguous_causal_query_chunk(4096) == 32
+    assert module._contiguous_causal_query_chunk(4097) == 64
+    assert module._contiguous_causal_query_chunk(16384) == 64
+    assert module._contiguous_causal_query_chunk(16385) == 128
+
+
 def test_production_prefill_never_enters_rowwise_visible_item_path(monkeypatch):
     import omlx.patches.qwen4_exp.qsa_mlx as module
 
