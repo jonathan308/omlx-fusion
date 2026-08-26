@@ -824,6 +824,59 @@ component.apiFetch = async (url, options = {}) => {
     assert "data-cluster-v2-membership-preview" in template
     assert "data-cluster-v2-membership-plan" in template
     assert "data-cluster-v2-membership-apply" in template
+    assert "data-cluster-v2-plan-add-mac" in template
+    assert "data-cluster-v2-plan-add-mac-panel" in template
+
+
+def test_plan_add_mac_reopens_pairing_without_losing_model_selection():
+    result = _run_wizard(
+        """
+component.devicesPayload = {
+  self: { node_id: 'node-a', paired: true, caps: { ram_gb: 64 }, addrs: [] },
+  paired: [{ node_id: 'node-b', paired: true, caps: { ram_gb: 64 }, addrs: [] }],
+  discovered: [],
+};
+component.devicesLoaded = true;
+component.deploymentsLoaded = true;
+component.runtimeLoaded = true;
+component.runtimePayload = { jobs: [], launchers: [] };
+component.stage = 'plan';
+component.selectedModelPath = '/models/qwen';
+component.executionProfile = 'throughput';
+component.toggleMembershipPanel();
+const opened = {
+  wizard: component.wizardState(),
+  stage: component.stage,
+  model: component.selectedModelPath,
+  profile: component.executionProfile,
+  open: component.membershipPanelOpen,
+};
+component.toggleMembershipPanel();
+const closed = {
+  wizard: component.wizardState(),
+  stage: component.stage,
+  model: component.selectedModelPath,
+  profile: component.executionProfile,
+  open: component.membershipPanelOpen,
+};
+process.stdout.write(JSON.stringify({ opened, closed }));
+"""
+    )
+
+    assert result["opened"] == {
+        "wizard": "device_card",
+        "stage": None,
+        "model": "/models/qwen",
+        "profile": "throughput",
+        "open": True,
+    }
+    assert result["closed"] == {
+        "wizard": "plan",
+        "stage": "plan",
+        "model": "/models/qwen",
+        "profile": "throughput",
+        "open": False,
+    }
 
 
 def test_cold_saved_setups_open_one_model_picker_instead_of_a_fake_active_card():

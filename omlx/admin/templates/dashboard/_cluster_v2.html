@@ -260,10 +260,40 @@
                     <span class="text-neutral-300 normal-case font-medium"
                           x-text="combinedMemoryLabel()"></span>
                 </div>
-                <span class="inline-flex items-center gap-1.5 text-[10px] text-neutral-400">
-                    <span class="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
-                    Listening for new devices
-                </span>
+                <div class="flex items-center gap-2">
+                    <span class="inline-flex items-center gap-1.5 text-[10px] text-neutral-400">
+                        <span class="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
+                        Listening for new devices
+                    </span>
+                    <button type="button" @click="toggleMembershipPanel()"
+                            class="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100"
+                            data-cluster-v2-plan-add-mac>
+                        <i :data-lucide="membershipPanelOpen ? 'x' : 'plus'" class="w-3.5 h-3.5"></i>
+                        <span x-text="membershipPanelOpen ? 'Close' : 'Add Mac'"></span>
+                    </button>
+                </div>
+            </div>
+            <div x-show="membershipPanelOpen && !configuredDeployment()" x-cloak
+                 class="mb-4 rounded-xl border border-neutral-200 bg-white px-4 py-3"
+                 data-cluster-v2-plan-add-mac-panel>
+                <div class="text-xs font-semibold text-neutral-900">Add another Mac</div>
+                <p class="text-[10px] text-neutral-600 mt-1">
+                    Automatic discovery keeps listening. Or find it directly below. On the new Mac, open Cluster and join this Mac; its six-digit approval request appears here. Your selected model and serving settings stay intact.
+                </p>
+                <div class="mt-2 flex items-center gap-2">
+                    <input type="text" x-model="manualAddr"
+                           @keydown.enter="submitManualPeer({ beginJoin: false })"
+                           placeholder="192.168.1.50 or 192.168.1.50:8000"
+                           class="flex-1 px-3 py-2 text-xs font-mono border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent"
+                           data-cluster-v2-plan-add-mac-input>
+                    <button type="button" @click="submitManualPeer({ beginJoin: false })"
+                            :disabled="manualBusy"
+                            class="px-3 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40 whitespace-nowrap"
+                            data-cluster-v2-plan-add-mac-submit>
+                        <span x-text="manualBusy ? 'Checking…' : 'Find Mac'"></span>
+                    </button>
+                </div>
+                <div class="text-[10px] text-red-700 mt-1" x-show="manualError" x-text="manualError"></div>
             </div>
             <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
                 <template x-for="device in allDevices()" :key="device.node_id">

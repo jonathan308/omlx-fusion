@@ -294,6 +294,7 @@ function clusterV2Wizard() {
         membershipBusy: false,
         membershipError: '',
         membershipProposal: null,
+        membershipReturnStage: null,
         tpQualifications: null,
         tpQualificationsError: '',
 
@@ -1379,6 +1380,15 @@ function clusterV2Wizard() {
                     if (paired) await this.probePeer(paired);
                     this.membershipProposal = null;
                     this.membershipError = '';
+                    if (!this.configuredDeployment()) {
+                        this.membershipPanelOpen = false;
+                        this.stage = this.selectedModelPath ? 'plan' : 'checks';
+                        if (this.selectedModelPath) {
+                            await this.runPlan();
+                        } else {
+                            this.startChecks();
+                        }
+                    }
                 } else {
                     this.startChecks();
                 }
@@ -3282,11 +3292,24 @@ function clusterV2Wizard() {
         },
 
         toggleMembershipPanel() {
-            this.membershipPanelOpen = !this.membershipPanelOpen;
+            const opening = !this.membershipPanelOpen;
+            this.membershipPanelOpen = opening;
             this.membershipError = '';
-            if (!this.membershipPanelOpen) {
+            if (opening && !this.configuredDeployment()) {
+                this.membershipReturnStage = this.stage;
+                // Pairing must outrank the plan cursor while this panel is
+                // open; the selected model/profile remain untouched.
+                this.stage = null;
+            }
+            if (!opening) {
                 this.membershipProposal = null;
                 this.cancelPairing();
+                if (!this.configuredDeployment()) {
+                    this.stage =
+                        this.membershipReturnStage ||
+                        (this.selectedModelPath ? 'plan' : null);
+                }
+                this.membershipReturnStage = null;
             }
         },
 
