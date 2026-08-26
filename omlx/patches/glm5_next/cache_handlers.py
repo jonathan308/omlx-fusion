@@ -130,8 +130,23 @@ class Glm5NextDsaCacheHandler(CacheTypeHandler):
     def concatenate_states(self, states: list[dict[str, Any]]) -> dict[str, Any]:
         if not states:
             return {}
-        latents = [state["kv_latent"] for state in states]
-        packed = [state["indexer_states"] for state in states]
+
+        def elements(state: dict[str, Any]) -> tuple[Any, Any]:
+            if "kv_latent" in state and "indexer_states" in state:
+                return state["kv_latent"], state["indexer_states"]
+            if "states" in state:
+                values = tuple(state["states"])
+                if len(values) == 2:
+                    return values
+            # Legacy two-tensor block payloads are collected by the generic
+            # prefix-cache loop under keys/values.  Their tensors are still
+            # exact DSA latent/indexer slices; preserve them under the native
+            # cache class instead of rejecting a mixed old/new block chain.
+            return state["keys"], state["values"]
+
+        pairs = [elements(state) for state in states]
+        latents = [pair[0] for pair in pairs]
+        packed = [pair[1] for pair in pairs]
         latent = mx.concatenate(latents, axis=1)
         indexer = mx.concatenate(packed, axis=1)
         return {

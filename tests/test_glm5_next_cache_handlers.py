@@ -93,6 +93,34 @@ def test_dsa_handler_slices_axis_one_and_round_trips_cache_metadata():
     )
 
 
+def test_dsa_handler_accepts_legacy_two_tensor_block_payloads():
+    handler = Glm5NextDsaCacheHandler()
+    latent_a = mx.ones((1, 2, 3))
+    latent_b = mx.ones((1, 1, 3)) * 2
+    index_a = mx.ones((1, 2, 7)) * 3
+    index_b = mx.ones((1, 1, 7)) * 4
+
+    for legacy in (
+        [
+            {"keys": latent_a, "values": index_a},
+            {"keys": latent_b, "values": index_b},
+        ],
+        [
+            {"states": (latent_a, index_a)},
+            {"states": (latent_b, index_b)},
+        ],
+    ):
+        combined = handler.concatenate_states(legacy)
+        np.testing.assert_array_equal(
+            np.asarray(combined["kv_latent"]),
+            np.asarray(mx.concatenate([latent_a, latent_b], axis=1)),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(combined["indexer_states"]),
+            np.asarray(mx.concatenate([index_a, index_b], axis=1)),
+        )
+
+
 def test_prefix_block_extraction_uses_ntuple_for_axis_one_dsa_and_four_state_kda():
     from omlx.cache.paged_cache import PagedCacheManager
     from omlx.cache.prefix_cache import BlockAwarePrefixCache
