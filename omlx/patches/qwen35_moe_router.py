@@ -25,12 +25,14 @@ from __future__ import annotations
 import logging
 
 import mlx.core as mx
+import mlx.nn as nn
 
 logger = logging.getLogger(__name__)
 
 _KERNEL = None
 _ENGAGED_LOGGED = False
 _MAX_ROWS = 8
+_SHARED_GATE_KERNEL = None
 
 _SOURCE = """
     // One threadgroup (a single simdgroup) per row; each lane owns
@@ -91,6 +93,33 @@ _SOURCE = """
     }
 """
 
+_SHARED_GATE_SOURCE = """
+    uint lane = thread_position_in_threadgroup.x;
+    constexpr uint GROUPS = uint(K) / 32;
+    const device uchar* wb =
+        reinterpret_cast<const device uchar*>(qweight);
+    float result = 0.0f;
+    for (uint base = lane * 4; base < uint(K); base += 128) {
+        float values[4];
+        float sum = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            values[i] = float(x[base + i]);
+            sum += values[i];
+        }
+        float accum = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            accum += values[i] * float(wb[base + i]);
+        }
+        uint group = base / 32;
+        result += float(scales[group]) * accum +
+                  sum * float(biases[group]);
+    }
+    float total = simd_sum(result);
+    if (lane == 0) {
+        y[0] = T(total);
+    }
+"""
+
 
 def _kernel():
     global _KERNEL
@@ -102,6 +131,45 @@ def _kernel():
             source=_SOURCE,
         )
     return _KERNEL
+
+
+def _shared_gate_kernel():
+    global _SHARED_GATE_KERNEL
+    if _SHARED_GATE_KERNEL is None:
+        _SHARED_GATE_KERNEL = mx.fast.metal_kernel(
+            name="omlx_qwen4_shared_gate_qmv_q8",
+            input_names=["x", "qweight", "scales", "biases"],
+            output_names=["y"],
+            source=_SHARED_GATE_SOURCE,
+        )
+    return _SHARED_GATE_KERNEL
+
+
+def qwen4_fast_shared_gate(projection, x):
+    """Exact batch-one Q8 scalar gate, or ``None`` for stock fallback."""
+
+    if (
+        not mx.metal.is_available()
+        or not isinstance(projection, nn.QuantizedLinear)
+        or x.ndim != 3
+        or x.shape[:2] != (1, 1)
+        or projection.scales.shape[-1] * projection.group_size != x.shape[-1]
+        or projection.weight.shape[-2] != 1
+        or projection.group_size != 32
+        or projection.bits != 8
+        or projection.mode != "affine"
+        or projection.get("biases") is None
+        or "bias" in projection
+    ):
+        return None
+    return _shared_gate_kernel()(
+        inputs=[x, projection.weight, projection.scales, projection.biases],
+        template=[("T", x.dtype), ("K", x.shape[-1])],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(*x.shape[:-1], 1)],
+        output_dtypes=[x.dtype],
+    )[0]
 
 
 def fused_router_topk(probs, top_k: int):
@@ -177,12 +245,15 @@ def apply_qwen35_moe_router_patch() -> bool:
             y = (y * scores[..., None]).sum(axis=-2)
 
             shared_y = self.shared_expert(x)
-            shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
+            shared_gate = None
+            if "qwen4_exp" in (type(self).__module__ or ""):
+                shared_gate = qwen4_fast_shared_gate(self.shared_expert_gate, x)
+            if shared_gate is None:
+                shared_gate = self.shared_expert_gate(x)
+            shared_y = mx.sigmoid(shared_gate) * shared_y
             return y + shared_y
         except Exception:
-            logger.warning(
-                "fused MoE router failed; composed fallback", exc_info=True
-            )
+            logger.warning("fused MoE router failed; composed fallback", exc_info=True)
             return orig_call(self, x)
 
     cls.__call__ = patched_call
@@ -200,9 +271,7 @@ def apply_qwen35_moe_router_patch() -> bool:
             if not router_eligible(x, self.num_experts):
                 return vlm_orig(self, x, target_verify=target_verify)
             try:
-                gates = vlm_moe._target_verify_linear(
-                    self.gate, x, target_verify
-                )
+                gates = vlm_moe._target_verify_linear(self.gate, x, target_verify)
                 gates = mx.softmax(gates, axis=-1, precise=True)
                 inds, scores = fused_router_topk(gates, self.top_k)
 

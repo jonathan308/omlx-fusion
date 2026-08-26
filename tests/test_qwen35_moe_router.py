@@ -10,10 +10,15 @@ Scores may differ from the composed sum/divide by reduction-order ulp.
 from __future__ import annotations
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 import pytest
 
-from omlx.patches.qwen35_moe_router import fused_router_topk, router_eligible
+from omlx.patches.qwen35_moe_router import (
+    fused_router_topk,
+    qwen4_fast_shared_gate,
+    router_eligible,
+)
 
 K = 8
 NE = 256
@@ -73,3 +78,30 @@ def test_eligibility_gates():
     assert not router_eligible(x1, 250)  # NE % 32 != 0
     xf = mx.zeros((1, 1, 2048), dtype=mx.float32)
     assert not router_eligible(xf, NE)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_qwen4_q8_shared_gate_is_bit_exact_and_shape_gated():
+    projection = nn.QuantizedLinear(
+        2560,
+        1,
+        bias=False,
+        group_size=32,
+        bits=8,
+        mode="affine",
+    )
+    projection.scales = projection.scales.astype(mx.bfloat16)
+    projection.biases = projection.biases.astype(mx.bfloat16)
+    mx.eval(projection.parameters())
+    for seed in range(8):
+        mx.random.seed(seed)
+        x = mx.random.normal((1, 1, 2560)).astype(mx.bfloat16)
+        expected = projection(x)
+        actual = qwen4_fast_shared_gate(projection, x)
+        assert actual is not None
+        mx.eval(expected, actual)
+        assert bool(mx.array_equal(expected, actual).item())
+    assert (
+        qwen4_fast_shared_gate(projection, mx.zeros((1, 2, 2560), dtype=mx.bfloat16))
+        is None
+    )
