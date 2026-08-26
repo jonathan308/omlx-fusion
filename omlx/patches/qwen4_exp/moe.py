@@ -133,6 +133,7 @@ def _fused_switch_glu_class():
     import mlx.nn as nn
     from mlx_lm.models.activations import swiglu
     from mlx_lm.models.switch_layers import (
+        QuantizedSwitchLinear,
         SwitchLinear,
         _gather_sort,
         _scatter_unsort,
@@ -157,6 +158,39 @@ def _fused_switch_glu_class():
                 hidden_dims, input_dims, num_experts, bias=False
             )
 
+        def _project_slice(self, x, idx, start: int, stop: int, *, sorted_indices):
+            """Project one zero-copy output slice of the packed gate/up bank."""
+
+            projection = self.gate_up_proj
+            if isinstance(projection, QuantizedSwitchLinear):
+                biases = projection.get("biases")
+                if biases is not None:
+                    biases = biases[:, start:stop]
+                output = mx.gather_qmm(
+                    x,
+                    projection["weight"][:, start:stop],
+                    projection["scales"][:, start:stop],
+                    biases,
+                    rhs_indices=idx,
+                    transpose=True,
+                    group_size=projection.group_size,
+                    bits=projection.bits,
+                    mode=projection.mode,
+                    sorted_indices=sorted_indices,
+                )
+            else:
+                output = mx.gather_mm(
+                    x,
+                    projection["weight"][:, start:stop].swapaxes(-1, -2),
+                    rhs_indices=idx,
+                    sorted_indices=sorted_indices,
+                )
+            if "bias" in projection:
+                output = output + mx.expand_dims(
+                    projection["bias"][idx][..., start:stop], -2
+                )
+            return output
+
         def __call__(self, x, indices):
             x = mx.expand_dims(x, (-2, -3))
             do_sort = indices.size >= 64
@@ -167,9 +201,25 @@ def _fused_switch_glu_class():
             if self.training:
                 idx = mx.stop_gradient(idx)
 
-            gate_up = self.gate_up_proj(x, idx, sorted_indices=do_sort)
-            gate = gate_up[..., : self.hidden_dims]
-            up = gate_up[..., self.hidden_dims :]
+            if do_sort:
+                # Wide gathered QMM wins at decode but regresses prompt-sized
+                # rows.  Slicing the packed buffers is zero-copy and restores
+                # the stock two-640-row prefill geometry without maintaining
+                # duplicate gate/up weights.
+                gate = self._project_slice(
+                    x, idx, 0, self.hidden_dims, sorted_indices=True
+                )
+                up = self._project_slice(
+                    x,
+                    idx,
+                    self.hidden_dims,
+                    2 * self.hidden_dims,
+                    sorted_indices=True,
+                )
+            else:
+                gate_up = self.gate_up_proj(x, idx, sorted_indices=False)
+                gate = gate_up[..., : self.hidden_dims]
+                up = gate_up[..., self.hidden_dims :]
             x = self.down_proj(
                 swiglu(gate, up), idx, sorted_indices=do_sort
             )
