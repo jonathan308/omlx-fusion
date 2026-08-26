@@ -79,6 +79,29 @@ class TestCacheRollback:
         assert pool._undo is None
         assert pool._undo_chain is False
 
+    def test_legacy_reject_uses_model_partial_rollback_contract(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _rollback_after_reject,
+        )
+
+        calls = []
+
+        class Model:
+            @staticmethod
+            def mtp_partial_rollback(cache, accepted, num_drafts):
+                calls.append((cache, accepted, num_drafts))
+                return True
+
+        prompt_cache = [object()]
+        assert _rollback_after_reject(
+            Model(),
+            prompt_cache,
+            gdn_states=None,
+            accepted=0,
+            block_size=2,
+        ) is True
+        assert calls == [(prompt_cache, 0, 1)]
+
 
 def test_mtp_runtime_stats_accumulate_structured_cycle_economics():
     from omlx.patches.mlx_lm_mtp import batch_generator as bg

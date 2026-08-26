@@ -1607,10 +1607,15 @@ def _rollback_after_reject(
        run with both confirmed and draft tokens; the rollback replays only
        the accepted prefix through the original pre-update state.
 
-    2. **mlx-lm path** (PR 990) — per-layer ``cache.rollback_state`` snapshot
-       written by the patched ``GatedDeltaNet.__call__`` during the
-       confirmed/draft split. We restore the snapshot for SSM layers and
-       trim KV layers by 1. ``gdn_states`` is None in this path.
+    2. **mlx-lm model contract** — Qwen and other depth-k-capable patches
+       expose ``mtp_partial_rollback`` so linear-attention state can replay
+       the confirmed prefix after a rejection. This is required even for the
+       synchronous depth-one protocol because those caches carry projected
+       draft inputs that generic trimming cannot safely interpret.
+
+    3. **generic mlx-lm path** — per-layer ``cache.rollback_state`` snapshot
+       written during the confirmed/draft split. We restore the snapshot for
+       SSM layers and trim KV layers by 1. ``gdn_states`` is None here.
 
     Returns True on success. False means a cache layer in the list supports
     neither mechanism, in which case the caller falls back to the standard
@@ -1619,6 +1624,19 @@ def _rollback_after_reject(
     if gdn_states is not None and hasattr(model, "rollback_speculative_cache"):
         model.rollback_speculative_cache(prompt_cache, gdn_states, accepted, block_size)
         return True
+    partial_rollback = getattr(model, "mtp_partial_rollback", None)
+    if callable(partial_rollback):
+        try:
+            return bool(
+                partial_rollback(
+                    prompt_cache,
+                    accepted,
+                    max(0, int(block_size) - 1),
+                )
+            )
+        except Exception as exc:
+            logger.debug("mtp_partial_rollback failed: %s", exc)
+            return False
     return _restore_or_trim_caches(prompt_cache)
 
 
