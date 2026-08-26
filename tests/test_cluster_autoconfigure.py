@@ -194,6 +194,7 @@ def test_autoconfigure_returns_an_activatable_proposal():
     payload = _autoconfigure_payload()
     payload.update(
         {
+            "deployment_id": "existing-pool",
             "auto_tune": False,
             "sampling_rank_only": True,
             "async_overlap": False,
@@ -220,6 +221,7 @@ def test_autoconfigure_returns_an_activatable_proposal():
         body["tensor_parallel_size"] * body["pipeline_stages"]
         == len(body["activation"]["nodes"])
     )
+    assert body["activation"]["deployment_id"] == "existing-pool"
 
     # The activation block must be shaped for POST /deployments as-is.
     activation = body["activation"]

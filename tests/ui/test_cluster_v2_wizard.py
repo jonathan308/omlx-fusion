@@ -72,6 +72,7 @@ ALLOWED_ENDPOINTS = {
     "/admin/api/cluster/peer-probe",
     "/admin/api/cluster/autoconfigure",
     "/admin/api/cluster/node-roles",
+    "/admin/api/cluster/node-budgets",
     "/admin/api/cluster/stage",
     "/admin/api/cluster/runtime",
     "/admin/api/cluster/deployments",
@@ -658,7 +659,7 @@ process.stdout.write(JSON.stringify({ loading, ready }));
         "visible": True,
         "percent": 60,
         "label": "Materializing model layers",
-        "detail": "0 of 1 ranks ready · readiness canary runs last",
+        "detail": "0 of 2 ranks ready · readiness canary runs last",
         "steps": ["done", "done", "done", "done", "active"],
     }
     assert result["ready"] == {
@@ -670,6 +671,159 @@ process.stdout.write(JSON.stringify({ loading, ready }));
     assert "data-cluster-v2-activation-progress" in template
     assert "data-cluster-v2-activation-progress-bar" in template
     assert '<i data-lucide="check" class="w-3 h-3"></i>' not in template
+
+
+def test_retry_loading_ownership_supersedes_retained_failure_marker():
+    result = _run_wizard(
+        """
+component.deploymentsPayload = [{ deployment_id: 'pool-a', model: '/models/qwen' }];
+component.deploymentsLoaded = true;
+component.runtimeLoaded = true;
+component.runtimePayload = { jobs: [{
+  deployment_id: 'pool-a', rank: 0, world_size: 2,
+  phase: 'failed', load_stage: 'loading_weights',
+  live: false, ownership: 'loading', error: 'failure from the previous attempt',
+}], launchers: [] };
+const retry = {
+  state: component.deploymentRuntimeState(),
+  label: component.deploymentStatus().label,
+  progress: component.activationProgressVisible(),
+  progressLabel: component.activationProgressLabel(),
+  steps: component.wizardSteps().map((step) => step.state),
+};
+component.runtimePayload.jobs.push({
+  deployment_id: 'pool-a', rank: 0, world_size: 2,
+  phase: 'ready', load_stage: 'ready',
+  live: true, ownership: 'loaded',
+});
+// Reconciliation assigns deployment ownership to every retained marker. A
+// current live ready rank must likewise outrank the old diagnostic failure.
+component.runtimePayload.jobs[0].ownership = 'loaded';
+const ready = {
+  state: component.deploymentRuntimeState(),
+  label: component.deploymentStatus().label,
+  progress: component.activationProgressVisible(),
+};
+process.stdout.write(JSON.stringify({ retry, ready }));
+"""
+    )
+
+    assert result["retry"] == {
+        "state": "loading",
+        "label": "Loading",
+        "progress": True,
+        "progressLabel": "Loading model weights",
+        "steps": ["done", "done", "done", "done", "active"],
+    }
+    assert result["ready"] == {
+        "state": "ready",
+        "label": "Ready",
+        "progress": False,
+    }
+
+
+def test_active_cluster_can_preview_a_signed_three_mac_membership_plan():
+    result = _run_wizard(
+        """
+component.devicesPayload = {
+  self: { node_id: 'node-a', friendly_name: 'Studio', paired: true,
+    caps: { ram_gb: 256, chip: 'M3 Ultra', jaccl: true },
+    addrs: [{ ip: '10.0.0.1', if_type: 'thunderbolt' }] },
+  paired: [
+    { node_id: 'node-b', friendly_name: 'MacBook', paired: true,
+      ssh_target: '10.0.0.2', caps: { ram_gb: 128, chip: 'M5 Max', jaccl: true },
+      addrs: [{ ip: '10.0.0.2', if_type: 'thunderbolt' }] },
+    { node_id: 'node-c', friendly_name: 'Mini', paired: true,
+      ssh_target: '10.0.0.3', caps: { ram_gb: 64, chip: 'M4 Pro', jaccl: true },
+      addrs: [{ ip: '10.0.0.3', if_type: 'thunderbolt' }] },
+  ],
+  discovered: [],
+};
+component.devicesLoaded = true;
+component.deploymentsPayload = [{
+  deployment_id: 'pool-a', model: '/models/qwen', backend: 'jaccl',
+  serving_mode: 'sharded', tensor_parallel_size: 2,
+  target_context_tokens: 32768, mtp_enabled: false,
+  execution: { profile: 'balanced', auto_tune: true,
+    sampling_rank_only: true, async_overlap: true, cache_affinity: true,
+    prompt_cache_ssd: true, prompt_cache_ssd_max_bytes: 21474836480,
+    max_kv_size: 32768, ring_connections_per_ip: 1 },
+  assignments: [
+    { node_id: 'node-a', rank: 0, role: 'workstation' },
+    { node_id: 'node-b', rank: 1, role: 'headless' },
+  ],
+  hosts: [], performance_profiles: [],
+}];
+component.deploymentsLoaded = true;
+component.runtimeLoaded = true;
+component.runtimePayload = { jobs: [{ deployment_id: 'pool-a', rank: 0,
+  phase: 'ready', live: true, ownership: 'loaded', metrics: {} }], launchers: [] };
+const calls = [];
+component.apiFetch = async (url, options = {}) => {
+  const body = options.body ? JSON.parse(options.body) : null;
+  calls.push({ url, body });
+  if (url.includes('peer-probe')) {
+    return { status: { runtime: { python_executable: '/opt/omlx/python' } } };
+  }
+  if (url.includes('node-budgets')) {
+    return { nodes: [
+      { node_id: 'node-a', capacity_bytes: 250000, reserve_bytes: 10000 },
+      { node_id: 'node-b', capacity_bytes: 120000, reserve_bytes: 10000 },
+      { node_id: 'node-c', capacity_bytes: 60000, reserve_bytes: 10000 },
+    ] };
+  }
+  if (url.includes('autoconfigure')) {
+    return {
+      ready_to_activate: true, backend: 'jaccl', summary: 'TP3 over RDMA',
+      plan: { assignments: body.nodes.map((node, rank) => ({
+        node_id: node.node_id, rank, start_layer: 0, end_layer: 64,
+        planned_weight_bytes: 1000, tensor_parallel_size: 3,
+        tensor_parallel_rank: rank,
+      })) },
+      activation: { deployment_id: body.deployment_id, model_path: body.model_path,
+        nodes: body.nodes, hosts: body.hosts, approved_placement: 'signed-plan' },
+    };
+  }
+  return {};
+};
+(async () => {
+  component.membershipPanelOpen = true;
+  await component.previewMembershipExpansion();
+  const request = calls.find((call) => call.url.includes('autoconfigure')).body;
+  process.stdout.write(JSON.stringify({
+    candidates: component.membershipCandidates().map((device) => device.node_id),
+    request,
+    rows: component.membershipPlanAssignments().map((row) => row.node_id),
+    ready: component.membershipProposal.ready_to_activate,
+    error: component.membershipError,
+  }));
+})();
+"""
+    )
+
+    assert result["candidates"] == ["node-c"]
+    assert result["request"]["deployment_id"] == "pool-a"
+    assert result["request"]["model_path"] == "/models/qwen"
+    assert result["request"]["strategy"] == "auto"
+    assert [node["node_id"] for node in result["request"]["nodes"]] == [
+        "node-a",
+        "node-b",
+        "node-c",
+    ]
+    assert [host["node_id"] for host in result["request"]["hosts"]] == [
+        "node-a",
+        "node-b",
+        "node-c",
+    ]
+    assert result["rows"] == ["node-a", "node-b", "node-c"]
+    assert result["ready"] is True
+    assert result["error"] == ""
+
+    template = _read(TEMPLATE)
+    assert "data-cluster-v2-add-mac" in template
+    assert "data-cluster-v2-membership-preview" in template
+    assert "data-cluster-v2-membership-plan" in template
+    assert "data-cluster-v2-membership-apply" in template
 
 
 def test_cold_saved_setups_open_one_model_picker_instead_of_a_fake_active_card():

@@ -1202,6 +1202,150 @@
                     </div>
                 </div>
 
+                <!-- Active membership is independent of the resident model.
+                     Pair first; only a separately signed preview can change
+                     rank membership and trigger drain/reshard/reload. -->
+                <div class="mt-4 rounded-xl border border-neutral-200 overflow-hidden"
+                     data-cluster-v2-membership>
+                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 py-3 bg-neutral-50">
+                        <div>
+                            <div class="text-xs font-semibold text-neutral-900">Cluster Macs</div>
+                            <div class="text-[10px] text-neutral-600 mt-0.5"
+                                 x-text="membershipActiveCount() + ' active in this model' + (membershipCandidates().length ? ' · ' + membershipCandidates().length + ' paired and ready to add' : '')"></div>
+                        </div>
+                        <button type="button" @click="toggleMembershipPanel()"
+                                :disabled="clusterLifecycleBusy || activateBusy"
+                                class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold border border-neutral-200 bg-white text-neutral-700 rounded-lg hover:bg-neutral-100 disabled:opacity-40 self-start sm:self-auto"
+                                data-cluster-v2-add-mac>
+                            <i :data-lucide="membershipPanelOpen ? 'x' : 'laptop-minimal-check'" class="w-3.5 h-3.5"></i>
+                            <span x-text="membershipPanelOpen ? 'Close' : 'Add Mac'"></span>
+                        </button>
+                    </div>
+
+                    <div x-show="membershipPanelOpen" x-cloak
+                         class="border-t border-neutral-200 px-4 py-4 space-y-4"
+                         data-cluster-v2-membership-panel>
+                        <div class="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2.5 text-xs text-blue-900">
+                            <span class="font-semibold">On the new Mac:</span>
+                            open oMLX → Cluster, choose Add by IP, and enter
+                            <code class="font-mono" x-text="coordinatorAddrFor(selfDevice()) || 'this Mac’s address'"></code>.
+                            It shows a six-digit code; approve that request below. Pairing does not interrupt the running model.
+                        </div>
+
+                        <div>
+                            <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">Find a Mac by IP</div>
+                            <div class="mt-2 flex items-center gap-2">
+                                <input type="text" x-model="manualAddr"
+                                       @keydown.enter="submitManualPeer({ beginJoin: false })"
+                                       placeholder="192.168.1.50 or 192.168.1.50:8000"
+                                       class="flex-1 px-3 py-2 text-xs font-mono border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent"
+                                       data-cluster-v2-membership-manual-input>
+                                <button type="button"
+                                        @click="submitManualPeer({ beginJoin: false })"
+                                        :disabled="manualBusy"
+                                        class="px-3 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40 whitespace-nowrap"
+                                        data-cluster-v2-membership-manual-submit>
+                                    <span x-text="manualBusy ? 'Checking…' : 'Find Mac'"></span>
+                                </button>
+                            </div>
+                            <div class="text-[10px] text-red-700 mt-1" x-show="manualError" x-text="manualError"></div>
+                        </div>
+
+                        <template x-for="device in pendingApprovals()" :key="'membership-pending-' + device.node_id">
+                            <div class="rounded-lg border border-amber-200 bg-amber-50 px-3 py-3"
+                                 data-cluster-v2-membership-pending>
+                                <div class="flex items-center justify-between gap-3">
+                                    <div>
+                                        <div class="text-xs font-semibold text-amber-900" x-text="deviceName(device) + ' wants to join'"></div>
+                                        <div class="text-[10px] text-amber-800 mt-0.5">Enter the six digits shown on that Mac.</div>
+                                    </div>
+                                    <button type="button" @click="beginPairing(device)"
+                                            x-show="pairing.target?.node_id !== device.node_id"
+                                            class="px-3 py-1.5 text-xs font-semibold text-amber-900 border border-amber-300 rounded-lg hover:bg-amber-100">Approve</button>
+                                </div>
+                                <div x-show="pairing.target?.node_id === device.node_id" class="mt-2 flex items-center gap-2">
+                                    <input type="text" inputmode="numeric" maxlength="6"
+                                           x-model="pairing.code"
+                                           @keydown.enter="submitPairApproval(device)"
+                                           placeholder="000000"
+                                           class="w-28 px-3 py-2 text-sm tracking-[0.3em] font-mono border border-amber-300 rounded-lg bg-white"
+                                           aria-label="Pairing code">
+                                    <button type="button" @click="submitPairApproval(device)"
+                                            :disabled="pairing.busy"
+                                            class="px-3 py-2 text-xs font-semibold text-white bg-amber-800 rounded-lg hover:bg-amber-900 disabled:opacity-40">Pair Mac</button>
+                                    <button type="button" @click="cancelPairing()"
+                                            class="px-2 py-2 text-xs text-amber-900">Cancel</button>
+                                </div>
+                                <div x-show="pairing.target?.node_id === device.node_id && pairing.error"
+                                     class="text-[10px] text-red-700 mt-1" x-text="pairing.error"></div>
+                            </div>
+                        </template>
+
+                        <template x-for="device in discoveredDevices()" :key="'membership-found-' + device.node_id">
+                            <div class="rounded-lg border border-neutral-200 px-3 py-2.5 flex items-center justify-between gap-3">
+                                <div>
+                                    <div class="text-xs font-semibold text-neutral-900" x-text="deviceName(device)"></div>
+                                    <div class="text-[10px] text-neutral-600">Found · start Join on that Mac to display its approval code here.</div>
+                                </div>
+                                <span class="text-[10px] font-semibold text-neutral-500">Not paired</span>
+                            </div>
+                        </template>
+
+                        <template x-if="membershipCandidates().length">
+                            <div class="space-y-2" data-cluster-v2-membership-candidates>
+                                <template x-for="device in membershipCandidates()" :key="'membership-candidate-' + device.node_id">
+                                    <div class="rounded-lg border border-green-200 bg-green-50 px-3 py-2.5 flex items-center justify-between gap-3">
+                                        <div>
+                                            <div class="text-xs font-semibold text-green-900" x-text="deviceName(device)"></div>
+                                            <div class="text-[10px] text-green-800" x-text="deviceChipLabel(device) + ' · ' + deviceRamLabel(device)"></div>
+                                        </div>
+                                        <span class="text-[10px] font-semibold text-green-800">Paired · ready to plan</span>
+                                    </div>
+                                </template>
+                                <button type="button" @click="previewMembershipExpansion()"
+                                        :disabled="membershipBusy"
+                                        class="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40"
+                                        data-cluster-v2-membership-preview>
+                                    <svg x-show="membershipBusy" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                                    <span x-text="membershipBusy ? 'Measuring expanded pool…' : 'Preview re-shard across ' + (membershipActiveCount() + membershipCandidates().length) + ' Macs'"></span>
+                                </button>
+                            </div>
+                        </template>
+
+                        <div x-show="membershipError" x-cloak
+                             class="rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-xs text-red-800"
+                             x-text="membershipError"></div>
+
+                        <div x-show="membershipProposal" x-cloak
+                             class="rounded-xl border border-neutral-200 overflow-hidden"
+                             data-cluster-v2-membership-plan>
+                            <div class="px-3 py-2.5 bg-neutral-50 border-b border-neutral-200">
+                                <div class="text-xs font-semibold text-neutral-900"
+                                     x-text="'Signed ' + membershipPlanAssignments().length + '-Mac plan'"></div>
+                                <div class="text-[10px] text-neutral-600 mt-0.5"
+                                     x-text="(membershipProposal?.backend || 'ring').toUpperCase() + ' · ' + (membershipProposal?.summary || 'automatic placement')"></div>
+                            </div>
+                            <div class="divide-y divide-neutral-100">
+                                <template x-for="assignment in membershipPlanAssignments()" :key="'membership-plan-' + assignment.node_id">
+                                    <div class="px-3 py-2.5 flex items-center justify-between gap-3">
+                                        <span class="text-xs font-semibold text-neutral-900" x-text="membershipPlanNodeName(assignment)"></span>
+                                        <span class="text-[10px] text-neutral-600 text-right" x-text="membershipPlanDetail(assignment)"></span>
+                                    </div>
+                                </template>
+                            </div>
+                            <div class="px-3 py-3 border-t border-neutral-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                                <div class="text-[10px] text-neutral-600">Applying waits for active requests, syncs missing model files, replaces the signed rank map, reloads, and runs readiness again.</div>
+                                <button type="button" @click="applyMembershipExpansion()"
+                                        :disabled="membershipBusy || activateBusy || !membershipProposal?.ready_to_activate"
+                                        class="px-3 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40 whitespace-nowrap"
+                                        data-cluster-v2-membership-apply>
+                                    Add Mac &amp; re-shard
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Device list + health -->
                 <div class="mt-4 divide-y divide-neutral-100 border border-neutral-200 rounded-xl overflow-hidden">
                     <template x-for="device in allDevices()" :key="device.node_id">

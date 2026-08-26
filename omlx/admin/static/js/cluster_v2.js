@@ -67,6 +67,7 @@ function clusterV2Wizard() {
         stageJob: (id) =>
             `/admin/api/cluster/stage/${encodeURIComponent(id)}`,
         nodeRoles: '/admin/api/cluster/node-roles',
+        nodeBudgets: '/admin/api/cluster/node-budgets',
         runtime: '/admin/api/cluster/runtime',
         deployments: '/admin/api/cluster/deployments',
         replan: '/admin/api/cluster/replan',
@@ -287,6 +288,12 @@ function clusterV2Wizard() {
         clusterLifecycleBusy: false,
         executionReplan: null,
         executionReplanBusy: false,
+        // Pairing is durable and model-independent. Adding a paired Mac to
+        // resident ranks is a separate signed activation preview.
+        membershipPanelOpen: false,
+        membershipBusy: false,
+        membershipError: '',
+        membershipProposal: null,
         tpQualifications: null,
         tpQualificationsError: '',
 
@@ -1364,7 +1371,17 @@ function clusterV2Wizard() {
                     `${this.deviceName(device)} joined the cluster.`,
                 );
                 this.cancelPairing();
-                this.startChecks();
+                if (this.membershipPanelOpen) {
+                    await this.refreshDevices();
+                    const paired = this.pairedDevices().find(
+                        (item) => item.node_id === device.node_id,
+                    );
+                    if (paired) await this.probePeer(paired);
+                    this.membershipProposal = null;
+                    this.membershipError = '';
+                } else {
+                    this.startChecks();
+                }
             } catch (error) {
                 if (error?.status === 404 || error?.status === 409) {
                     this.pairing.error =
@@ -1555,7 +1572,7 @@ function clusterV2Wizard() {
         // Add by IP — the deterministic path when multicast can't reach the
         // other Mac (Thunderbolt pairs, filtered routers, Local Network off).
         // =====================================================================
-        async submitManualPeer() {
+        async submitManualPeer(options = {}) {
             if (this.manualBusy) return;
             const raw = (this.manualAddr || '').trim();
             const match = raw.match(/^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?$/);
@@ -1581,8 +1598,12 @@ function clusterV2Wizard() {
                 if (result && result.verified) {
                     const name = result.peer?.friendly_name || ip;
                     this.notify('success', `Found ${name} at ${ip}.`);
-                    // One click: this Mac shows the code, the other approves.
-                    await this.beginJoinAddr(`${ip}:${port}`, name);
+                    if (options.beginJoin !== false) {
+                        // First-cluster setup may join in either direction.
+                        // An existing coordinator only discovers here: the
+                        // new Mac initiates and this cluster approves its code.
+                        await this.beginJoinAddr(`${ip}:${port}`, name);
+                    }
                 } else {
                     this.notify(
                         'warning',
@@ -3110,6 +3131,9 @@ function clusterV2Wizard() {
                 this.planProposal = null;
                 this.stagingJob = null;
                 this.stagingActivation = null;
+                this.membershipPanelOpen = false;
+                this.membershipProposal = null;
+                this.membershipError = '';
                 await this.refreshDeployments();
                 await this.refreshRuntime();
             } catch (error) {
@@ -3232,6 +3256,213 @@ function clusterV2Wizard() {
                 );
             } finally {
                 this.executionReplanBusy = false;
+            }
+        },
+
+        // =================================================================
+        // Active membership — pair first, then sign one N-node re-plan.
+        // =================================================================
+        deploymentMemberIds(deployment = this.configuredDeployment()) {
+            return new Set(
+                (deployment?.assignments || [])
+                    .map((assignment) => assignment?.node_id)
+                    .filter(Boolean),
+            );
+        },
+
+        membershipCandidates(deployment = this.configuredDeployment()) {
+            const active = this.deploymentMemberIds(deployment);
+            return this.pairedDevices().filter(
+                (device) => device?.node_id && !active.has(device.node_id),
+            );
+        },
+
+        membershipActiveCount(deployment = this.configuredDeployment()) {
+            return this.deploymentMemberIds(deployment).size;
+        },
+
+        toggleMembershipPanel() {
+            this.membershipPanelOpen = !this.membershipPanelOpen;
+            this.membershipError = '';
+            if (!this.membershipPanelOpen) {
+                this.membershipProposal = null;
+                this.cancelPairing();
+            }
+        },
+
+        membershipRoleFor(nodeId, deployment = this.configuredDeployment()) {
+            const assignment = (deployment?.assignments || []).find(
+                (item) => item?.node_id === nodeId,
+            );
+            return assignment?.role || 'headless';
+        },
+
+        membershipPerformanceFor(
+            nodeId,
+            deployment = this.configuredDeployment(),
+        ) {
+            return (deployment?.performance_profiles || []).find(
+                (profile) => profile?.node_id === nodeId,
+            );
+        },
+
+        async previewMembershipExpansion() {
+            const deployment = this.configuredDeployment();
+            const candidates = this.membershipCandidates(deployment);
+            if (
+                !deployment?.deployment_id ||
+                !candidates.length ||
+                this.membershipBusy
+            ) {
+                return;
+            }
+            this.membershipBusy = true;
+            this.membershipError = '';
+            this.membershipProposal = null;
+            try {
+                await Promise.all(candidates.map((device) => this.probePeer(device)));
+                const hosts = this.deploymentHosts();
+                const roles = Object.fromEntries(
+                    hosts.map((host) => [
+                        host.node_id,
+                        this.membershipRoleFor(host.node_id, deployment),
+                    ]),
+                );
+                const measured = await this.apiFetch(
+                    CLUSTER_V2_API.nodeBudgets,
+                    {
+                        method: 'POST',
+                        body: JSON.stringify({
+                            hosts: hosts.map((host) => ({
+                                node_id: host.node_id,
+                                ssh: host.ssh,
+                                python_executable: host.python_executable,
+                            })),
+                            roles,
+                        }),
+                    },
+                );
+                const unavailable = (measured?.nodes || []).filter(
+                    (node) => node?.unusable || !(Number(node?.capacity_bytes) > 0),
+                );
+                if (unavailable.length) {
+                    throw new Error(
+                        unavailable
+                            .map(
+                                (node) =>
+                                    `${node.node_id}: ${node.error || 'memory probe unavailable'}`,
+                            )
+                            .join(' · '),
+                    );
+                }
+                const nodes = (measured?.nodes || []).map((node) => {
+                    const performance = this.membershipPerformanceFor(
+                        node.node_id,
+                        deployment,
+                    );
+                    return {
+                        node_id: node.node_id,
+                        capacity_bytes: Number(node.capacity_bytes),
+                        reserve_bytes: Number(node.reserve_bytes || 0),
+                        role: roles[node.node_id] || 'headless',
+                        memory_guard_tier: 'balanced',
+                        accelerator: 'metal',
+                        ...(performance ? { performance } : {}),
+                    };
+                });
+                const execution = this.deploymentExecution(deployment) || {};
+                const proposal = await this.apiFetch(
+                    CLUSTER_V2_API.autoconfigure,
+                    {
+                        method: 'POST',
+                        body: JSON.stringify({
+                            deployment_id: deployment.deployment_id,
+                            model_path: deployment.model,
+                            nodes,
+                            hosts,
+                            execution_profile: execution.profile || 'balanced',
+                            prefer: 'speed',
+                            strategy: 'auto',
+                            detect_transports: true,
+                            preflight: true,
+                            auto_tune: execution.auto_tune !== false,
+                            measure_performance: true,
+                            sampling_rank_only:
+                                execution.sampling_rank_only !== false,
+                            async_overlap: execution.async_overlap !== false,
+                            cache_affinity: execution.cache_affinity !== false,
+                            prompt_cache_ssd:
+                                execution.prompt_cache_ssd === true,
+                            prompt_cache_ssd_max_bytes:
+                                Number(execution.prompt_cache_ssd_max_bytes) ||
+                                20 * (1024 ** 3),
+                            max_kv_size:
+                                Number(execution.max_kv_size) || undefined,
+                            ring_connections_per_ip:
+                                Number(execution.ring_connections_per_ip) ||
+                                undefined,
+                            target_context_tokens:
+                                Number(deployment.target_context_tokens) || 8192,
+                            mtp_enabled: deployment.mtp_enabled === true,
+                            mtp_num_draft_tokens:
+                                Number(deployment.mtp_num_draft_tokens) || null,
+                        }),
+                    },
+                );
+                this.membershipProposal = proposal;
+                if (!proposal?.ready_to_activate) {
+                    this.membershipError =
+                        proposal?.fabric_blocker ||
+                        proposal?.preflight ||
+                        'The expanded pool is not ready to activate.';
+                }
+            } catch (error) {
+                this.membershipError =
+                    error?.message || 'Could not preview the expanded cluster.';
+            } finally {
+                this.membershipBusy = false;
+            }
+        },
+
+        membershipPlanAssignments() {
+            const assignments = this.membershipProposal?.plan?.assignments;
+            return Array.isArray(assignments) ? assignments : [];
+        },
+
+        membershipPlanNodeName(assignment) {
+            const device = this.allDevices().find(
+                (item) => item?.node_id === assignment?.node_id,
+            );
+            return device
+                ? this.deviceName(device)
+                : assignment?.node_id || `Rank ${assignment?.rank ?? '?'}`;
+        },
+
+        membershipPlanDetail(assignment) {
+            const gib = Number(assignment?.planned_weight_bytes || 0) / (1024 ** 3);
+            const tp = Number(assignment?.tensor_parallel_size || 1);
+            return tp > 1
+                ? `Tensor rank ${Number(assignment?.tensor_parallel_rank || 0) + 1}/${tp} · ${gib.toFixed(1)} GiB planned`
+                : `Layers ${assignment?.start_layer ?? 0}–${assignment?.end_layer ?? 0} · ${gib.toFixed(1)} GiB planned`;
+        },
+
+        async applyMembershipExpansion() {
+            const proposal = this.membershipProposal;
+            const activation = proposal?.activation;
+            if (
+                !proposal?.ready_to_activate ||
+                !activation ||
+                this.membershipBusy ||
+                this.activateBusy
+            ) {
+                return;
+            }
+            this.membershipBusy = true;
+            this.activateBusy = true;
+            try {
+                await this.stageModelToPeers(activation);
+            } finally {
+                this.membershipBusy = false;
             }
         },
 
