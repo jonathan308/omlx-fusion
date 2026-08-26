@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 import pytest
 from mlx.utils import tree_flatten
@@ -21,6 +22,8 @@ from omlx.patches.glm5_next.dsa import (
     Glm5NextDsaCache,
     Glm5NextDsaConfig,
     Glm5NextDsaContractError,
+    _sparse_mla_attention_from_projections,
+    _sparse_mla_attention_module,
     dsa_weight_shapes,
     sparse_mla_attention,
     validate_dsa_layer_index,
@@ -121,11 +124,82 @@ def test_sparse_mla_matches_expanded_reference_without_dense_scores():
     )
     np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-5, atol=2e-5)
 
-    source = inspect.getsource(sparse_mla_attention)
+    source = inspect.getsource(_sparse_mla_attention_from_projections)
     assert "_batch_take_rows" in source
-    assert "dense attention" in source
-    assert "mx.zeros" not in source
+    assert "active_width" in source
+    assert "2,051" in source
     assert '"bhlk"' not in source
+
+
+def test_sparse_mla_trims_fixed_invalid_width_without_changing_mask_result():
+    config = _tiny_config()
+    weights = _weights(config, seed=13)
+    mx.random.seed(15)
+    query = mx.random.normal((1, config.num_attention_heads, 2, 2))
+    latent = mx.random.normal((1, 3, config.kv_lora_rank))
+    # The upstream index ABI pads to top-k + tail width.  Only the first three
+    # columns can possibly name one of the three cached keys.
+    indices = mx.array([[[0, -1, -1, -1, -1], [2, 0, 1, -1, -1]]], dtype=mx.int32)
+    actual = sparse_mla_attention(
+        query, latent, indices, weights["kv_b_proj.weight"], config
+    )
+    expected = _dense_selected_reference(
+        query, latent, indices, weights["kv_b_proj.weight"], config
+    )
+    np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-5, atol=2e-5)
+
+
+def test_affine_q4_prepared_kv_split_matches_old_selected_projection_path():
+    config = Glm5NextDsaConfig(
+        hidden_size=64,
+        num_attention_heads=2,
+        q_lora_rank=8,
+        kv_lora_rank=64,
+        qk_nope_head_dim=4,
+        v_head_dim=4,
+        index_n_heads=2,
+        index_head_dim=4,
+        index_topk=4,
+        index_kpool=2,
+    )
+    layer = Glm5NextDsa(config, _weights(config, seed=31), layer_idx=3)
+    nn.quantize(
+        layer,
+        group_size=64,
+        bits=4,
+        mode="affine",
+        class_predicate=lambda path, _module: path == "kv_b_proj",
+    )
+    assert isinstance(layer.kv_b_proj, nn.QuantizedLinear)
+    key_projection, value_projection = layer.prepare_kv_b_projections()
+
+    mx.random.seed(37)
+    query = mx.random.normal((1, 2, 2, 4)).astype(mx.bfloat16)
+    latent = mx.random.normal((1, 5, 64)).astype(mx.bfloat16)
+    indices = mx.array([[[0, 2, 4, -1, -1, -1], [1, 3, 4, 0, -1, -1]]], dtype=mx.int32)
+    actual = _sparse_mla_attention_from_projections(
+        query,
+        latent,
+        indices,
+        key_projection,
+        value_projection,
+        config,
+    )
+    expected = _sparse_mla_attention_module(
+        query, latent, indices, layer.kv_b_proj, config
+    )
+    mx.eval(actual, expected)
+    np.testing.assert_allclose(
+        np.asarray(actual.astype(mx.float32)),
+        np.asarray(expected.astype(mx.float32)),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+    # Derived arrays remain runtime cache, not checkpoint parameters.
+    assert not any(
+        "kv_b_projections" in name for name, _ in tree_flatten(layer.parameters())
+    )
 
 
 def test_indexer_selection_is_causal_padding_safe_and_tail_exact():

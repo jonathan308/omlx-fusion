@@ -558,6 +558,16 @@ class TextModel(nn.Module):
             make_layer_cache(index, dsa_config) for index in range(MAIN_LAYER_COUNT)
         ]
 
+    def prepare_dsa_kv_projections(self) -> int:
+        """Materialize the 11 main-layer latent K/V decompositions."""
+
+        prepared = 0
+        for layer in self.model.layers:
+            if isinstance(layer.self_attn, Glm5NextDsa):
+                layer.self_attn.prepare_kv_b_projections()
+                prepared += 1
+        return prepared
+
     def make_mtp_cache(self):
         return [make_glm5_next_mtp_cache(self.args.dsa_config())]
 
@@ -690,6 +700,9 @@ class Model(nn.Module):
 
     def make_cache(self):
         return self.language_model.make_cache()
+
+    def prepare_dsa_kv_projections(self) -> int:
+        return self.language_model.prepare_dsa_kv_projections()
 
     def make_mtp_cache(self):
         return self.language_model.make_mtp_cache()

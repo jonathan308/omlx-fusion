@@ -928,18 +928,79 @@ def sparse_mla_attention(
     if topk_indices.shape[-1] <= 0:
         raise Glm5NextDsaContractError("sparse attention requires selected slots")
 
-    kv_length = kv_latent.shape[1]
-    valid = (topk_indices >= 0) & (topk_indices < kv_length)
-    safe = mx.clip(topk_indices, 0, max(kv_length - 1, 0)).astype(mx.int32)
-    selected_latent = _batch_take_rows(kv_latent, safe)
-
     projection = kv_b_proj_weight.reshape(
         config.num_attention_heads,
         config.qk_nope_head_dim + config.v_head_dim,
         config.kv_lora_rank,
     )
-    key_projection = projection[:, : config.qk_nope_head_dim]
-    value_projection = projection[:, config.qk_nope_head_dim :]
+    return _sparse_mla_attention_from_projections(
+        query_states,
+        kv_latent,
+        topk_indices,
+        projection[:, : config.qk_nope_head_dim],
+        projection[:, config.qk_nope_head_dim :],
+        config,
+    )
+
+
+def _sparse_mla_attention_from_projections(
+    query_states: mx.array,
+    kv_latent: mx.array,
+    topk_indices: mx.array,
+    key_projection: mx.array,
+    value_projection: mx.array,
+    config: Glm5NextDsaConfig,
+) -> mx.array:
+    """Selected-token MLA using a load-time K/V decomposition.
+
+    The official eager reference expands every cached latent through the
+    512 -> (64 * 512) ``kv_b_proj`` before applying the sparse mask.  Doing
+    that after gathering is especially expensive: the index ABI pads each
+    row to 2,051 slots, so even a one-token decode used to launch a 2,051-row
+    projection in every DSA layer.
+
+    MLA is algebraically separable.  Move the per-head key projection onto
+    the query, score selected 512-wide latents, reduce in latent space, then
+    apply the per-head value projection once.  This is exactly the same
+    equation without materialising ``[B,H,L,W,512]`` expanded K/V tensors.
+    """
+
+    batch, heads, q_length, qdim = query_states.shape
+    expected_key = (heads, qdim, config.kv_lora_rank)
+    expected_value = (heads, config.v_head_dim, config.kv_lora_rank)
+    if tuple(key_projection.shape) != expected_key:
+        raise Glm5NextDsaContractError(
+            f"key projection shape changed: expected {expected_key}, "
+            f"found {tuple(key_projection.shape)}"
+        )
+    if tuple(value_projection.shape) != expected_value:
+        raise Glm5NextDsaContractError(
+            f"value projection shape changed: expected {expected_value}, "
+            f"found {tuple(value_projection.shape)}"
+        )
+
+    kv_length = kv_latent.shape[1]
+    # The indexer lays out selected complete pools first, then the incomplete
+    # visible tail, then fixed-width -1 padding.  Preserve both meaningful
+    # segments while dropping only the trailing ABI padding.  ``kv_length``
+    # alone is not sufficient because an invalid selected pool can precede a
+    # valid tail entry (notably with left padding and early causal rows).
+    pool_width = min(
+        config.index_topk,
+        ((kv_length + config.index_kpool - 1) // config.index_kpool)
+        * config.index_kpool,
+    )
+    tail_width = config.index_kpool - 1
+    active_width = min(topk_indices.shape[-1], pool_width + tail_width)
+    if active_width <= 0:
+        return mx.zeros(
+            (batch, q_length, heads * config.v_head_dim),
+            dtype=query_states.dtype,
+        )
+    topk_indices = topk_indices[..., :active_width]
+    valid = (topk_indices >= 0) & (topk_indices < kv_length)
+    safe = mx.clip(topk_indices, 0, max(kv_length - 1, 0)).astype(mx.int32)
+    selected_latent = _batch_take_rows(kv_latent, safe)
 
     # Equivalent to expanding selected keys, but keeps the largest intermediate
     # at [B,H,L,C] / [B,L,W,C] rather than [B,H,L,K,D].
@@ -1072,9 +1133,71 @@ class Glm5NextDsa(nn.Module):
             bias=False,
         )
         self.indexer = _Glm5NextDsaIndexer(config)
+        # Prepared after checkpoint loading.  ``object.__setattr__`` keeps the
+        # derived arrays out of the parameter tree and therefore out of the
+        # strict checkpoint ABI.
+        object.__setattr__(self, "_kv_b_projections", None)
         if weights is not None:
             validated = validate_dsa_weights(weights, config)
             self.load_weights(list(validated.tensors.items()), strict=True)
+
+    def prepare_kv_b_projections(
+        self, *, evaluate: bool = True
+    ) -> tuple[mx.array, mx.array]:
+        """Prepare the exact per-head K/V decomposition once after loading.
+
+        Converted affine checkpoints replace ``kv_b_proj`` with
+        :class:`mlx.nn.QuantizedLinear`.  The sparse latent equation needs the
+        same quantized values arranged per head, so dequantize this one small
+        projection once (about 32 MiB BF16 per official DSA layer) instead of
+        re-running a 2,051-row QMM on every token.  Dense checkpoints retain
+        their original dtype and only create contiguous split views.
+        """
+
+        prepared = self._kv_b_projections
+        if prepared is not None:
+            return prepared
+
+        projection_module = self.kv_b_proj
+        if isinstance(projection_module, nn.QuantizedLinear):
+            if projection_module.mode != "affine":
+                raise Glm5NextDsaContractError(
+                    "latent DSA currently requires dense or affine kv_b_proj"
+                )
+            projection = mx.dequantize(
+                projection_module.weight,
+                projection_module.scales,
+                projection_module.get("biases"),
+                group_size=projection_module.group_size,
+                bits=projection_module.bits,
+                mode=projection_module.mode,
+                dtype=mx.bfloat16,
+            )
+        else:
+            projection = projection_module.weight
+
+        expected = (
+            self.config.num_attention_heads
+            * (self.config.qk_nope_head_dim + self.config.v_head_dim),
+            self.config.kv_lora_rank,
+        )
+        if tuple(projection.shape) != expected:
+            raise Glm5NextDsaContractError(
+                f"kv_b_proj.weight shape changed: expected {expected}, "
+                f"found {tuple(projection.shape)}"
+            )
+        projection = projection.reshape(
+            self.config.num_attention_heads,
+            self.config.qk_nope_head_dim + self.config.v_head_dim,
+            self.config.kv_lora_rank,
+        )
+        key_projection = mx.contiguous(projection[:, : self.config.qk_nope_head_dim])
+        value_projection = mx.contiguous(projection[:, self.config.qk_nope_head_dim :])
+        if evaluate:
+            mx.eval(key_projection, value_projection)
+        prepared = (key_projection, value_projection)
+        object.__setattr__(self, "_kv_b_projections", prepared)
+        return prepared
 
     def __call__(
         self,
@@ -1147,11 +1270,13 @@ class Glm5NextDsa(nn.Module):
             self.config,
             self.indexer.index_kpool_compress_ape,
         )
-        output = _sparse_mla_attention_module(
+        key_projection, value_projection = self.prepare_kv_b_projections()
+        output = _sparse_mla_attention_from_projections(
             query_states,
             full_latent,
             topk_indices,
-            self.kv_b_proj,
+            key_projection,
+            value_projection,
             self.config,
         )
         output = self.o_proj(output)

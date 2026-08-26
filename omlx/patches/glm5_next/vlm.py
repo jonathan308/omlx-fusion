@@ -192,6 +192,9 @@ class Model(nn.Module):
     def make_cache(self):
         return self.language_model.make_cache()
 
+    def prepare_dsa_kv_projections(self) -> int:
+        return self.language_model.prepare_dsa_kv_projections()
+
     def encode_image(self, pixel_values, image_grid_thw):
         """Expose oMLX's cacheable image-feature protocol."""
 
@@ -400,7 +403,15 @@ def install_mlx_format_sanitize_patch() -> bool:
 
         vlm_utils.safetensors.safe_open = safe_open
         try:
-            return current(model_path, lazy, **kwargs)
+            model = current(model_path, lazy, **kwargs)
+            # Affine Q4 replaces each DSA kv_b_proj during ``current``.  Build
+            # the algebraically equivalent per-head K/V split only after the
+            # checkpoint triples are loaded, keeping first-token latency out
+            # of the serving path.
+            prepare = getattr(model, "prepare_dsa_kv_projections", None)
+            if callable(prepare):
+                prepare()
+            return model
         finally:
             vlm_utils.safetensors.safe_open = original_safe_open
 
