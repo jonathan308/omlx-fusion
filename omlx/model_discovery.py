@@ -30,6 +30,7 @@ EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "au
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
+    "glm5_next",
     "qwen2_vl",
     "qwen2_5_vl",
     "qwen3_vl",
@@ -92,6 +93,23 @@ MLX_LM_TEXT_ONLY_MODEL_TYPES = {
     "qwen4_exp",
 }
 
+
+def _glm5_next_vision_ready() -> bool:
+    """Require both the native tower and an oMLX VLM-engine adapter."""
+
+    from .patches.glm5_next import GLM5_NEXT_VLM_ADAPTER_READY
+
+    from .patches.glm5_next.vision import (
+        GLM5_NEXT_VISION_RUNTIME_READY,
+        vision_runtime_gaps,
+    )
+
+    return (
+        GLM5_NEXT_VLM_ADAPTER_READY is True
+        and GLM5_NEXT_VISION_RUNTIME_READY is True
+        and not vision_runtime_gaps()
+    )
+
 # Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)
 # are never meant to be served as standalone chat models. Some declare a
 # distinctive top-level model_type — an ``*_assistant`` (e.g. gemma4_assistant)
@@ -149,6 +167,7 @@ def is_helper_model_config(config: dict) -> bool:
 
 # Known VLM architectures
 VLM_ARCHITECTURES = {
+    "Glm5NextForConditionalGeneration",
     "LlavaForConditionalGeneration",
     "LlavaNextForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
@@ -679,6 +698,14 @@ def detect_model_type(model_path: Path) -> ModelType:
             f"but architecture {architectures} is not an embedding architecture "
             "— treating as LLM"
         )
+
+    if normalized_type == "glm5_next" and not _glm5_next_vision_ready():
+        logger.warning(
+            "%s carries multimodal configuration, but native vision still has "
+            "declared runtime gaps; using the LLM engine",
+            model_type,
+        )
+        return "llm"
 
     if normalized_type in MLX_LM_TEXT_ONLY_MODEL_TYPES:
         if _has_vision_subconfig(config):

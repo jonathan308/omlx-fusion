@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Final, Mapping
+from typing import Any, Final
 
 OFFICIAL_REPOSITORY: Final = "zai-org/GLM-5.3-Flash"
 OFFICIAL_REVISION: Final = "84c6a6aa9497188e15a635ba793b0f95a79b1033"
@@ -47,7 +48,9 @@ def _load_object(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_bytes())
     except FileNotFoundError as exc:
-        raise Glm5NextContractError(f"missing required source file: {path.name}") from exc
+        raise Glm5NextContractError(
+            f"missing required source file: {path.name}"
+        ) from exc
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise Glm5NextContractError(f"invalid JSON source file: {path.name}") from exc
     if not isinstance(value, dict):
@@ -129,7 +132,9 @@ def validate_config(config: Mapping[str, Any]) -> None:
 
     linear = text.get("linear_attn_config")
     if not isinstance(linear, Mapping):
-        raise Glm5NextContractError("config.text_config.linear_attn_config must be an object")
+        raise Glm5NextContractError(
+            "config.text_config.linear_attn_config must be an object"
+        )
     for field, expected in {
         "num_heads": 64,
         "head_dim": 128,
@@ -204,7 +209,9 @@ def validate_weight_index(index: Mapping[str, Any]) -> None:
         for ordinal in range(1, OFFICIAL_SOURCE_SHARDS + 1)
     }
     if shards != expected_shards:
-        raise Glm5NextContractError("source shard set differs from pinned 62-shard layout")
+        raise Glm5NextContractError(
+            "source shard set differs from pinned 62-shard layout"
+        )
 
     names = set(weight_map)
     allowed = ("lm_head.", "model.language_model.", "model.visual.")
@@ -220,7 +227,9 @@ def validate_weight_index(index: Mapping[str, Any]) -> None:
         if (match := _LAYER_RE.match(name)) is not None
     }
     if layers != set(range(46)):
-        raise Glm5NextContractError("checkpoint must contain main layers 0..44 and MTP layer 45")
+        raise Glm5NextContractError(
+            "checkpoint must contain main layers 0..44 and MTP layer 45"
+        )
 
     indexer_layers = {
         int(match.group(1))

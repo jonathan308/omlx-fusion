@@ -371,6 +371,9 @@ def maybe_apply_pre_load_patches(
     - Qwen3.8 Flash Next's native ``qwen4_exp`` text backbone and exact
       four-token micro-block QSA backend. It never aliases the checkpoint to
       Qwen3.5 and has no dense-attention fallback.
+    - GLM-5.3-Flash's strict ``glm5_next`` text graph. The multimodal outer
+      config is routed here explicitly, while model construction remains
+      fail-closed until every exact primitive advertises runtime readiness.
     - Llama 4 attention offset patch when ``config.json`` declares
       ``model_type == "llama4"`` directly or under ``text_config``.
     - GLM-5.2 ``glm_moe_dsa`` patch (mlx-lm PR 1410) when ``config.json``
@@ -502,6 +505,17 @@ def maybe_apply_pre_load_patches(
 
         if apply_qwen4_exp_patch(model_name):
             logger.info("Qwen3.8 Flash Next pre-load patch applied for %s", model_name)
+
+    if model_type == "glm5_next":
+        from ..patches.glm5_next import apply_glm5_next_patch
+
+        if apply_glm5_next_patch():
+            logger.info("GLM5-Next strict text graph registered for %s", model_name)
+        if for_vlm:
+            from ..patches.glm5_next import apply_glm5_next_vlm_patch
+
+            if apply_glm5_next_vlm_patch():
+                logger.info("GLM5-Next native mlx-vlm graph registered for %s", model_name)
 
     if model_type == "laguna":
         # MLX-LM dynamically imports the architecture and tokenizer-configured
