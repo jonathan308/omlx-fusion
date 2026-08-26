@@ -47,8 +47,8 @@ from .ple import (
     mlx_q8_index_metadata,
 )
 
-CONVERTER_VERSION: Final = 3
-LAYOUT_VERSION: Final = "qwen4-exp-fused-gate-up-q8-v3"
+CONVERTER_VERSION: Final = 2
+LAYOUT_VERSION: Final = "qwen4-exp-split-q8-v2"
 DEFAULT_SOURCE_SHARDS: Final = 131
 COMPUTE_DIRNAME: Final = "compute-q8"
 PLE_BF16_DIRNAME: Final = "ple-bf16"
@@ -87,7 +87,7 @@ _PACKED_DOWN_SUFFIX: Final = ".experts.down_proj"
 
 
 def _compute_layout_version(bits: int) -> str:
-    return LAYOUT_VERSION if bits == 8 else f"qwen4-exp-fused-gate-up-q{bits}-v3"
+    return LAYOUT_VERSION if bits == 8 else f"qwen4-exp-split-q{bits}-v2"
 
 
 def _compute_dirname(bits: int) -> str:
@@ -394,7 +394,7 @@ def _quantized_packed_moe_tensors(
     group_size: int,
     bits: int,
 ) -> dict[str, _EncodedTensor] | None:
-    """Keep the official packed gate/up tensor fused in Fusion v3."""
+    """Convert official packed MoE tensors into loadable SwitchGLU Q8 keys."""
 
     if name.endswith(_PACKED_GATE_UP_SUFFIX):
         if tensor.data.ndim != 3 or tensor.shape[-2] % 2:
@@ -402,13 +402,22 @@ def _quantized_packed_moe_tensors(
                 f"packed gate/up tensor has invalid shape: {name} {tensor.shape}"
             )
         prefix = name[: -len(_PACKED_GATE_UP_SUFFIX)] + ".switch_mlp"
-        return _quantized_tensors(
-            f"{prefix}.gate_up_proj.weight",
-            tensor,
-            quantizer=quantizer,
-            group_size=group_size,
-            bits=bits,
-        )
+        intermediate = tensor.shape[-2] // 2
+        outputs: dict[str, _EncodedTensor] = {}
+        for projection, data in (
+            ("gate_proj", tensor.data[..., :intermediate, :]),
+            ("up_proj", tensor.data[..., intermediate:, :]),
+        ):
+            outputs.update(
+                _quantized_tensors(
+                    f"{prefix}.{projection}.weight",
+                    _EncodedTensor(data, tensor.dtype_name),
+                    quantizer=quantizer,
+                    group_size=group_size,
+                    bits=bits,
+                )
+            )
+        return outputs
     if name.endswith(_PACKED_DOWN_SUFFIX):
         if tensor.data.ndim != 3:
             raise Qwen4ExpConversionError(
@@ -428,7 +437,7 @@ def _quantized_packed_moe_tensors(
 def _packed_moe_output_names(name: str) -> set[str]:
     if name.endswith(_PACKED_GATE_UP_SUFFIX):
         prefix = name[: -len(_PACKED_GATE_UP_SUFFIX)] + ".switch_mlp"
-        projections = ("gate_up_proj",)
+        projections = ("gate_proj", "up_proj")
     elif name.endswith(_PACKED_DOWN_SUFFIX):
         prefix = name[: -len(_PACKED_DOWN_SUFFIX)] + ".switch_mlp"
         projections = ("down_proj",)

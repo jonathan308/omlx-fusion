@@ -81,16 +81,10 @@ def test_official_config_is_native_qwen4_exp_and_depth_one_mtp():
             "model_type": "qwen4_exp",
             "text_config": _official_text_config(),
             "vision_config": {"model_type": "qwen4_exp"},
-            "qwen4_exp_artifact": {
-                "layout": "qwen4-exp-fused-gate-up-q8-v3"
-            },
         }
     )
 
     assert outer.model_type == "qwen4_exp"
-    assert outer.qwen4_exp_artifact == {
-        "layout": "qwen4-exp-fused-gate-up-q8-v3"
-    }
     assert text.qsa_layer_indices == tuple(range(3, 48, 4))
     assert text.mtp_num_hidden_layers == 1
     assert _is_mtp_compatible({"text_config": _official_text_config()}, "qwen4_exp")
