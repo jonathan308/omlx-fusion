@@ -10,6 +10,7 @@ from omlx.cluster.deployment import (
     ClusterDeployment,
     ClusterHost,
     _assignment_from_dict,
+    decode_worker_execution,
     decode_worker_plan,
     decode_worker_serving_mode,
     decode_worker_speculation,
@@ -385,6 +386,9 @@ def test_disaggregated_deployment_round_trip_and_worker_contract():
     assert restored == deployment
     assert restored.to_dict()["serving_mode"] == "disaggregated"
     assert mode == ("disaggregated", 1, 0)
+    assert decode_worker_execution(deployment.encode_worker_plan()) == (
+        deployment.execution
+    )
 
 
 @pytest.mark.parametrize(

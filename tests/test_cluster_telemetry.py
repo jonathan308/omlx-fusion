@@ -61,6 +61,27 @@ def test_snapshot_capacity_agreement_uses_largest_reliable_rank_charge():
     ]
 
 
+def test_phase_handoff_metrics_publish_real_bytes_and_bandwidth():
+    telemetry = RuntimeTelemetry(_Marker(), clock=_Clock(), publish_interval=0)
+
+    telemetry.observe_phase_handoff(
+        tensor_bytes=2_000_000_000,
+        array_count=128,
+        elapsed_seconds=0.25,
+        queue_depth=3,
+    )
+
+    phase = telemetry.snapshot()["phase_split"]
+    assert phase == {
+        "handoffs_completed": 1,
+        "last_handoff_bytes": 2_000_000_000,
+        "last_handoff_arrays": 128,
+        "last_handoff_seconds": 0.25,
+        "last_handoff_bytes_per_second": 8_000_000_000.0,
+        "queue_depth": 3,
+    }
+
+
 class _Clock:
     def __init__(self) -> None:
         self.value = 0.0

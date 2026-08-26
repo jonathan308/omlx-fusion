@@ -302,6 +302,7 @@ class RuntimeTelemetry:
         self._cache_ssd_pending_bytes = 0
         self._cache_ssd_pending_max_bytes = 0
         self._cache_ssd_write_failures = 0
+        self._phase_split: dict[str, Any] | None = None
         # Rank-side force-cancel surface. The coordinator drops a cancel file
         # next to the runtime markers; the heartbeat picks it up and removes
         # every active uid through BatchGenerator.remove — MLX-LM's own
@@ -500,6 +501,43 @@ class RuntimeTelemetry:
 
         with self._lock:
             return len(self._requests)
+
+    def observe_phase_handoff(
+        self,
+        *,
+        tensor_bytes: int,
+        array_count: int,
+        elapsed_seconds: float,
+        queue_depth: int = 0,
+    ) -> None:
+        """Publish one completed full-replica prefill→decode cache handoff."""
+
+        now = float(self._clock())
+        elapsed = max(0.0, float(elapsed_seconds))
+        nbytes = max(0, int(tensor_bytes))
+        with self._lock:
+            self._phase_split = {
+                "handoffs_completed": int(
+                    (self._phase_split or {}).get("handoffs_completed", 0)
+                )
+                + 1,
+                "last_handoff_bytes": nbytes,
+                "last_handoff_arrays": max(0, int(array_count)),
+                "last_handoff_seconds": elapsed,
+                "last_handoff_bytes_per_second": (
+                    nbytes / elapsed if elapsed > 0 else 0.0
+                ),
+                "queue_depth": max(0, int(queue_depth)),
+            }
+            self._publish_locked(now, force=True)
+
+    def cancel_request(self, request_id: int) -> None:
+        """Retire one request cancelled by a serving adapter without a batch UID."""
+
+        now = float(self._clock())
+        with self._lock:
+            if self._finish_locked(request_id, now=now, status="cancelled"):
+                self._publish_locked(now, force=True)
 
     def make_cancel_vote(self, uids: Any) -> dict[str, Any]:
         """Create the next rank-zero-owned, monotonically ordered cancel vote."""
@@ -1330,6 +1368,8 @@ class RuntimeTelemetry:
             },
             "last_request": current,
         }
+        if self._phase_split is not None:
+            result["phase_split"] = copy.deepcopy(self._phase_split)
         try:
             from omlx.patches.mlx_lm_mtp.batch_generator import (
                 mtp_runtime_stats_snapshot,

@@ -3615,6 +3615,9 @@ class ClusterReplanRequest(BaseModel):
     max_kv_size: int | None = Field(default=None, gt=0)
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     tensor_parallel_size: int | None = Field(default=None, ge=1, le=64)
+    serving_mode: Literal["sharded", "disaggregated"] | None = None
+    prefill_rank: int | None = Field(default=None, ge=0, le=63)
+    decode_rank: int | None = Field(default=None, ge=0, le=63)
     target_context_tokens: int | None = Field(
         default=None, ge=1, le=1_048_576
     )
@@ -3748,6 +3751,27 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
                 else current.tensor_parallel_size
                 if current is not None
                 else 1
+            ),
+            serving_mode=(
+                request.serving_mode
+                if request.serving_mode is not None
+                else current.serving_mode
+                if current is not None
+                else "sharded"
+            ),
+            prefill_rank=(
+                request.prefill_rank
+                if "prefill_rank" in request.model_fields_set
+                else current.prefill_rank
+                if current is not None
+                else None
+            ),
+            decode_rank=(
+                request.decode_rank
+                if "decode_rank" in request.model_fields_set
+                else current.decode_rank
+                if current is not None
+                else None
             ),
             target_context_tokens=(
                 request.target_context_tokens

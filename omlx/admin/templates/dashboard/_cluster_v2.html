@@ -1104,6 +1104,24 @@
                             No request measured yet. Prefill and decode rates appear here when inference starts.
                         </div>
                     </template>
+                    <div x-show="configuredDeployment()?.serving_mode === 'disaggregated'"
+                         x-cloak
+                         class="grid grid-cols-1 sm:grid-cols-2 gap-px bg-neutral-200 border-b border-neutral-200"
+                         data-cluster-v2-phase-runtime>
+                        <div class="bg-white px-4 py-3">
+                            <div class="text-[9px] uppercase tracking-wider text-violet-700">RDMA cache handoff</div>
+                            <div class="text-sm font-semibold text-neutral-900 mt-0.5 tabular-nums"
+                                 x-text="phaseHandoffRateLabel()"></div>
+                            <div class="text-[10px] text-neutral-600 mt-0.5"
+                                 x-text="phaseHandoffDetail()"></div>
+                        </div>
+                        <div class="bg-white px-4 py-3">
+                            <div class="text-[9px] uppercase tracking-wider text-violet-700">Phase pipeline</div>
+                            <div class="text-sm font-semibold text-neutral-900 mt-0.5">Prefill → Decode</div>
+                            <div class="text-[10px] text-neutral-600 mt-0.5"
+                                 x-text="(deploymentPhaseMetrics()?.handoffs_completed || 0) + ' completed handoffs · ' + (deploymentPhaseMetrics()?.queue_depth || 0) + ' queued'"></div>
+                        </div>
+                    </div>
                     <div class="divide-y divide-neutral-100"
                          x-show="deploymentRequestMetrics().length">
                         <template x-for="(request, index) in deploymentRequestMetrics()"
@@ -1150,6 +1168,10 @@
                                      x-text="deviceName(device)"></div>
                                 <div class="text-[10px] text-neutral-500"
                                      x-text="deviceChipLabel(device) + ' · ' + deviceRamLabel(device) + ' · ' + deviceLinkMeta(device).label"></div>
+                                <div x-show="activeDevicePhaseRole(device)"
+                                     x-cloak
+                                     class="text-[10px] font-medium text-violet-700 mt-0.5"
+                                     x-text="activeDevicePhaseRole(device)"></div>
                             </div>
                             <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[10px] font-semibold"
                                   :class="deviceStateTone(device)"

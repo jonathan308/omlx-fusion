@@ -871,6 +871,7 @@ class ClusterDeployment:
             "serving_mode": self.serving_mode,
             "prefill_rank": self.prefill_rank,
             "decode_rank": self.decode_rank,
+            "execution": self.execution.to_dict(),
             "path_map": dict(sorted(self.path_map.items())),
         }
         if self.tensor_parallel_qualification is not None:
@@ -1030,6 +1031,18 @@ def decode_worker_serving_mode(
     if {prefill_rank, decode_rank} != {0, 1}:
         raise ValueError("disaggregated worker phase ranks are invalid")
     return mode, int(prefill_rank), int(decode_rank)
+
+
+def decode_worker_execution(encoded: str) -> ExecutionSettings:
+    """Validated execution settings carried to persistent worker ranks.
+
+    Schema 1-3 launch contracts created before this field was added retain the
+    balanced profile defaults. New contracts carry the exact signed settings so
+    telemetry and serving behavior cannot drift from the dashboard proposal.
+    """
+
+    payload = _decode_worker_payload(encoded)
+    return ExecutionSettings.from_dict(payload.get("execution"))
 
 
 def decode_worker_plan(encoded: str) -> tuple[str, tuple[PipelineAssignment, ...]]:

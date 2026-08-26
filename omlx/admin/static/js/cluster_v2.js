@@ -729,10 +729,54 @@ function clusterV2Wizard() {
             ) {
                 return 'Cache hit';
             }
-            const rate = progress?.active
-                ? Number(progress.average_speed || request?.prefill_tps || 0)
-                : Number(request?.prefill_tps || 0);
+            // The final prompt-progress callback freezes at the compute
+            // boundary. Prefer it even after decode begins: TTFT also includes
+            // queueing and phase handoff and can make a 900 tok/s prefill look
+            // like an 11 tok/s request on a long/contended run.
+            const rate = Number(
+                progress?.average_speed || request?.prefill_tps || 0,
+            );
             return this.formatRequestRate(rate);
+        },
+
+        deploymentPhaseMetrics(deployment = this.configuredDeployment()) {
+            if (deployment?.serving_mode !== 'disaggregated') return null;
+            const phase = this.deploymentMetricsJob(deployment)?.metrics?.phase_split;
+            return phase && typeof phase === 'object' ? phase : null;
+        },
+
+        phaseHandoffRateLabel(deployment = this.configuredDeployment()) {
+            const value = Number(
+                this.deploymentPhaseMetrics(deployment)
+                    ?.last_handoff_bytes_per_second || 0,
+            );
+            if (!(value > 0)) return 'Waiting';
+            return `${(value / 1e9).toFixed(2)} GB/s`;
+        },
+
+        phaseHandoffDetail(deployment = this.configuredDeployment()) {
+            const phase = this.deploymentPhaseMetrics(deployment);
+            if (!phase) return 'No cache handoff measured yet';
+            const gib = Number(phase.last_handoff_bytes || 0) / (1024 ** 3);
+            const ms = Number(phase.last_handoff_seconds || 0) * 1000;
+            return `${gib.toFixed(2)} GiB · ${ms.toFixed(0)} ms · ${Number(
+                phase.last_handoff_arrays || 0,
+            )} tensors`;
+        },
+
+        activeDevicePhaseRole(device, deployment = this.configuredDeployment()) {
+            if (deployment?.serving_mode !== 'disaggregated') return '';
+            const assignment = (deployment.assignments || []).find(
+                (item) => item?.node_id === device?.node_id,
+            );
+            if (!assignment) return '';
+            if (Number(assignment.rank) === Number(deployment.prefill_rank)) {
+                return 'Prefill · full replica';
+            }
+            if (Number(assignment.rank) === Number(deployment.decode_rank)) {
+                return 'Decode + API · full replica';
+            }
+            return 'Full replica';
         },
 
         requestPrefillDetail(request) {
@@ -2827,6 +2871,11 @@ function clusterV2Wizard() {
                 target_context_tokens:
                     Number(deployment.target_context_tokens) || 8192,
             };
+            if (deployment.serving_mode === 'disaggregated') {
+                body.serving_mode = 'disaggregated';
+                body.prefill_rank = Number(deployment.prefill_rank);
+                body.decode_rank = Number(deployment.decode_rank);
+            }
             if (Number(execution.max_kv_size) > 0) {
                 body.max_kv_size = Number(execution.max_kv_size);
             }

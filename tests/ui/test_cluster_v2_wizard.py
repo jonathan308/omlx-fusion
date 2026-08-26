@@ -804,6 +804,7 @@ def test_active_profile_change_uses_preview_signature_for_replan_apply():
 global.setTimeout = () => 0;
 component.deploymentsPayload = [{
   deployment_id: 'pool-a', model: '/models/m', target_context_tokens: 131072,
+  serving_mode: 'disaggregated', prefill_rank: 1, decode_rank: 0,
   mtp_enabled: false,
   execution: {
     profile: 'balanced', auto_tune: true, sampling_rank_only: true,
@@ -848,6 +849,9 @@ component.apiFetch = async (url, options) => {
     assert preview["execution_profile"] == "throughput"
     assert preview["max_kv_size"] == 131072
     assert preview["prompt_cache_ssd"] is True
+    assert preview["serving_mode"] == "disaggregated"
+    assert preview["prefill_rank"] == 1
+    assert preview["decode_rank"] == 0
     assert "approved_placement" not in preview
     assert apply == preview | {"approved_placement": "f" * 16}
     assert "nodes" not in apply and "hosts" not in apply
@@ -858,6 +862,41 @@ component.apiFetch = async (url, options) => {
     assert "data-cluster-v2-serving-replan" in template
     assert "data-cluster-v2-serving-replan-confirm" in template
     assert "data-cluster-v2-serving-replan-apply" in template
+
+
+def test_phase_runtime_helpers_show_roles_and_rdma_handoff():
+    result = _run_wizard(
+        """
+component.deploymentsPayload = [{
+  deployment_id: 'phase-a', serving_mode: 'disaggregated',
+  prefill_rank: 1, decode_rank: 0,
+  assignments: [
+    { node_id: 'm3', rank: 0 },
+    { node_id: 'm5', rank: 1 },
+  ],
+}];
+component.runtimePayload = { jobs: [{
+  deployment_id: 'phase-a', rank: 0, live: true,
+  metrics: { phase_split: {
+    handoffs_completed: 4, last_handoff_bytes: 2147483648,
+    last_handoff_arrays: 128, last_handoff_seconds: 0.25,
+    last_handoff_bytes_per_second: 8589934592, queue_depth: 2,
+  } },
+}] };
+process.stdout.write(JSON.stringify({
+  rate: component.phaseHandoffRateLabel(),
+  detail: component.phaseHandoffDetail(),
+  prefill: component.activeDevicePhaseRole({ node_id: 'm5' }),
+  decode: component.activeDevicePhaseRole({ node_id: 'm3' }),
+}));
+"""
+    )
+
+    assert result["rate"] == "8.59 GB/s"
+    assert result["detail"] == "2.00 GiB · 250 ms · 128 tensors"
+    assert result["prefill"] == "Prefill · full replica"
+    assert result["decode"] == "Decode + API · full replica"
+    assert "data-cluster-v2-phase-runtime" in _read(TEMPLATE)
 
 
 def test_dark_tensor_controls_use_explicit_high_contrast_palette():

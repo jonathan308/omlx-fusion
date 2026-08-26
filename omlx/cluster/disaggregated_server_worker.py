@@ -5,31 +5,59 @@ from __future__ import annotations
 
 import argparse
 import copy
-from dataclasses import dataclass
 import json
-import logging
 import os
-from pathlib import Path
-from queue import Empty, Queue
 import struct
 import threading
 import time
+from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import suppress
+from dataclasses import dataclass
+from pathlib import Path
+from queue import Empty, Queue
 from types import SimpleNamespace
-from typing import Any, Iterator
+from typing import Any
 
-from .cache_transfer import recv_cache_transfer, send_cache_transfer, prepare_cache_transfer
-
+from .cache_transfer import (
+    prepare_cache_transfer,
+    recv_cache_transfer,
+    send_cache_transfer,
+)
 
 _PROGRESS = struct.Struct("!II")
+_CANCEL = struct.Struct("!B")
+_PREFILL_START = struct.Struct("!IIIIQQQQ")
 _LOGITS_HEADER = struct.Struct("!III")
 _DTYPE_TO_CODE = {"float16": 1, "bfloat16": 2, "float32": 3}
 _CODE_TO_DTYPE = {value: key for key, value in _DTYPE_TO_CODE.items()}
+_CACHE_TIER_TO_CODE = {None: 0, "memory": 1, "ssd": 2}
+_CACHE_CODE_TO_TIER = {value: key for key, value in _CACHE_TIER_TO_CODE.items()}
+
+
+def _phase_event(rank: int, stage: str, **details: Any) -> None:
+    print(
+        "OMLX_CLUSTER_EVENT:"
+        + json.dumps(
+            {
+                "type": "phase_trace",
+                "rank": rank,
+                "stage": stage,
+                **details,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
 
 
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--backend", choices=("ring", "jaccl", "jaccl-ring"), required=True)
+    parser.add_argument(
+        "--backend", choices=("ring", "jaccl", "jaccl-ring"), required=True
+    )
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--deployment-id", required=True)
     parser.add_argument("--plan-hash", required=True)
@@ -40,6 +68,14 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--control-token", required=True)
     parser.add_argument("--prefill-step-size", type=int, default=2048)
     parser.add_argument("--prompt-cache-size", type=int, default=1)
+    parser.add_argument("--prompt-cache-bytes", type=int, default=None)
+    parser.add_argument("--max-kv-size", type=int, default=None)
+    parser.add_argument("--prompt-cache-ssd", action="store_true")
+    parser.add_argument(
+        "--prompt-cache-ssd-max-bytes",
+        type=int,
+        default=20 * 1024**3,
+    )
     parser.add_argument("--decode-concurrency", type=int, default=1)
     parser.add_argument("--prompt-concurrency", type=int, default=1)
     parser.add_argument("--trust-remote-code", action="store_true")
@@ -56,6 +92,10 @@ def _cache_states(cache: list[Any]) -> list[Any]:
 
 
 def _prefill_calls(prompt_tokens: int, step: int) -> int:
+    if prompt_tokens <= 0:
+        return 0
+    if prompt_tokens == 1:
+        return 1
     return (max(0, prompt_tokens - 2) // step) + 2
 
 
@@ -67,7 +107,7 @@ def _prefill_logits(
     *,
     step: int,
     progress: Any,
-) -> tuple[Any, float]:
+) -> tuple[Any | None, float]:
     started = time.perf_counter()
     values = mx.array(tokens, dtype=mx.int32)
     processed = 0
@@ -77,20 +117,20 @@ def _prefill_logits(
         _ = model(values[None, processed : processed + width], cache=cache)
         mx.eval(_cache_states(cache))
         processed += width
-        progress(processed, total)
+        if progress(processed, total) is False:
+            return None, time.perf_counter() - started
         mx.clear_cache()
     logits = model(values[None, processed:], cache=cache)[:, -1, :]
     mx.eval(logits, _cache_states(cache))
-    progress(total, total)
+    if progress(total, total) is False:
+        return None, time.perf_counter() - started
     return logits, time.perf_counter() - started
 
 
 def _state_machine(tokenizer: Any, stop_words: list[str]):
     from mlx_lm.generate import SequenceStateMachine
 
-    transitions: dict[str, list[tuple[tuple[int, ...], str | None]]] = {
-        "normal": []
-    }
+    transitions: dict[str, list[tuple[tuple[int, ...], str | None]]] = {"normal": []}
     sequences: dict[tuple[int, ...], str] = {}
     common = []
     for token in tokenizer.eos_token_ids:
@@ -121,8 +161,202 @@ def _state_machine(tokenizer: Any, stop_words: list[str]):
     return SequenceStateMachine(transitions, initial="normal"), sequences
 
 
+class _PhasePromptCache:
+    """Prefill-rank hot/SSD prefix cache with exact-logit reuse."""
+
+    def __init__(
+        self,
+        *,
+        model: Any,
+        model_key: str,
+        max_size: int,
+        max_bytes: int | None,
+        ssd_directory: str | None,
+        ssd_max_bytes: int,
+        step: int,
+    ) -> None:
+        from mlx_lm.server import LRUPromptCache
+
+        self.model = model
+        self.model_key = model_key
+        self.max_size = max(1, int(max_size))
+        self.hot = LRUPromptCache(
+            max_size=self.max_size,
+            max_bytes=int(max_bytes) if max_bytes is not None else 1 << 63,
+        )
+        self.exact_logits: OrderedDict[tuple[int, ...], Any] = OrderedDict()
+        self.active = threading.Event()
+        self.ssd = None
+        if ssd_directory:
+            from .prompt_snapshot_cache import SSDPromptSnapshotStore
+
+            self.ssd = SSDPromptSnapshotStore(
+                ssd_directory,
+                step=max(1, int(step)),
+                max_entries=512,
+                max_bytes=max(1, int(ssd_max_bytes)),
+                persistent=True,
+                write_behind=True,
+            )
+
+    def lookup(
+        self, tokens: list[int]
+    ) -> tuple[list[Any], list[int], Any | None, str | None]:
+        from mlx_lm.models.cache import (
+            can_trim_prompt_cache,
+            make_prompt_cache,
+            trim_prompt_cache,
+        )
+
+        cache, rest = self.hot.fetch_nearest_cache(self.model_key, tokens)
+        if cache is not None:
+            exact = self.exact_logits.get(tuple(tokens)) if not rest else None
+            if exact is not None:
+                return cache, [], exact, "memory"
+            if not rest:
+                if can_trim_prompt_cache(cache):
+                    trim_prompt_cache(cache, 1)
+                    rest = tokens[-1:]
+                else:
+                    cache = None
+            if cache is not None:
+                return cache, list(rest), None, "memory"
+
+        if self.ssd is not None and len(tokens) > 1:
+            boundaries = self.ssd.present_boundaries(self.model_key, tokens)
+            boundary = next((value for value in boundaries if value < len(tokens)), 0)
+            if boundary:
+                restored = self.ssd.load(self.model_key, tokens, boundary)
+                if restored is not None:
+                    return restored, tokens[boundary:], None, "ssd"
+
+        return make_prompt_cache(self.model), list(tokens), None, None
+
+    def checkpoint(self, tokens: list[int], cache: list[Any], position: int) -> None:
+        if self.ssd is not None and position > 0 and position % self.ssd.step == 0:
+            self.ssd.put(self.model_key, tokens[:position], cache)
+
+    def insert(self, tokens: list[int], cache: list[Any], logits: Any) -> None:
+        key = tuple(tokens)
+        self.hot.insert_cache(self.model_key, list(tokens), cache, cache_type="user")
+        self.exact_logits[key] = logits
+        self.exact_logits.move_to_end(key)
+        while len(self.exact_logits) > self.max_size:
+            self.exact_logits.popitem(last=False)
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "memory_entries": len(self.hot),
+            "memory_bytes": int(self.hot.nbytes),
+            "ssd_entries": len(self.ssd) if self.ssd is not None else 0,
+            "ssd_bytes": self.ssd.nbytes if self.ssd is not None else 0,
+        }
+
+    def clear(self, *, hot: bool, ssd: bool) -> dict[str, int]:
+        if self.active.is_set():
+            raise RuntimeError("phase prompt cache is active")
+        hot_cleared = len(self.hot) if hot else 0
+        if hot:
+            self.hot.trim_to(n_sequences=0, n_bytes=0)
+            self.exact_logits.clear()
+        ssd_deleted = self.ssd.clear(timeout=30.0) if ssd and self.ssd else 0
+        return {
+            "hot_cleared": hot_cleared,
+            "ssd_deleted": int(ssd_deleted),
+        }
+
+    def close(self) -> None:
+        if self.ssd is not None and not self.ssd.close(timeout=10.0):
+            raise RuntimeError("phase prompt-cache SSD writer did not stop")
+
+
+class _PhaseCacheMaintenance:
+    """Poll the existing rank cache-clear protocol on the prefill owner."""
+
+    def __init__(
+        self,
+        *,
+        prompt_cache: _PhasePromptCache,
+        state_dir: str,
+        deployment_id: str,
+        plan_hash: str,
+        rank: int,
+    ) -> None:
+        root = Path(state_dir).expanduser()
+        self.prompt_cache = prompt_cache
+        self.request_path = root / f"{deployment_id}-cache-clear.json"
+        self.ack_path = root / f"{deployment_id}-cache-clear-rank-{rank}.json"
+        self.deployment_id = deployment_id
+        self.plan_hash = plan_hash
+        self.rank = rank
+        self.epoch_floor = time.time_ns()
+        self.last_epoch = self.epoch_floor
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def poll(self) -> None:
+        if not self.request_path.is_file() or self.request_path.stat().st_size > 65536:
+            return
+        try:
+            request = json.loads(self.request_path.read_text(encoding="utf-8"))
+            epoch = int(request.get("epoch", 0))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return
+        if (
+            epoch <= self.last_epoch
+            or epoch < self.epoch_floor
+            or request.get("deployment_id") != self.deployment_id
+            or request.get("plan_hash") != self.plan_hash
+        ):
+            return
+        self.last_epoch = epoch
+        try:
+            report = self.prompt_cache.clear(
+                hot=bool(request.get("hot")),
+                ssd=bool(request.get("ssd")),
+            )
+            ack = {"status": "ok", "rank": self.rank, "epoch": epoch, **report}
+        except Exception as exc:
+            ack = {
+                "status": "error",
+                "rank": self.rank,
+                "epoch": epoch,
+                "error": f"{type(exc).__name__}: {exc}"[:1000],
+            }
+        self.ack_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.ack_path.with_name(self.ack_path.name + ".tmp")
+        temporary.write_text(
+            json.dumps(ack, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
+        os.replace(temporary, self.ack_path)
+
+    def start(self) -> None:
+        if self.thread is not None:
+            return
+
+        def run() -> None:
+            while not self.stop_event.wait(0.5):
+                with suppress(Exception):
+                    self.poll()
+
+        self.thread = threading.Thread(
+            target=run,
+            name="omlx-phase-cache-maintenance",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        thread, self.thread = self.thread, None
+        if thread is not None:
+            thread.join(timeout=2.0)
+
+
 @dataclass
 class _ServingRequest:
+    request_id: int
     prompt: list[int]
     args: Any
     context: Any
@@ -148,6 +382,8 @@ class _PhaseResponseGenerator:
         prefill_step_size: int,
         cli_args: Any,
         stream: Any,
+        deployment_id: str,
+        telemetry: Any,
     ) -> None:
         if decode_rank != 0 or prefill_rank != 1:
             raise RuntimeError(
@@ -165,6 +401,8 @@ class _PhaseResponseGenerator:
         self.prefill_step_size = prefill_step_size
         self.cli_args = cli_args
         self.stream = stream
+        self.deployment_id = deployment_id
+        self.telemetry = telemetry
         self.requests: Queue = Queue()
         self._stopping = threading.Event()
         self._decode_thread: threading.Thread | None = None
@@ -215,8 +453,20 @@ class _PhaseResponseGenerator:
             prompt_cache_count=0,
         )
         output: Queue = Queue()
+        request_id = self.telemetry.begin_request(
+            getattr(request, "_omlx_transport_request_id", None)
+        )
+        self.telemetry.observe_context(
+            request_id,
+            prompt_tokens=len(prompt),
+            cached_tokens=0,
+        )
+        self.telemetry.mark_pending_uid(request_id)
+        self.telemetry.bind_pending_uid((request_id,))
+        self.telemetry.register_context(request_id, context)
         self.requests.put(
             _ServingRequest(
+                request_id=request_id,
                 prompt=prompt,
                 args=args,
                 context=context,
@@ -244,11 +494,30 @@ class _PhaseResponseGenerator:
             expected_size=_PROGRESS.size,
         )
         processed, total = _PROGRESS.unpack(packet)
-        request.progress(int(processed), int(total))
+        try:
+            request.progress(int(processed), int(total))
+        except (BrokenPipeError, ConnectionError, OSError):
+            request.context.stop()
+        self.telemetry.observe_prefill_progress(
+            request.request_id,
+            processed_tokens=int(processed),
+            total_tokens=int(total),
+        )
+        cancelled = bool(request.context._should_stop)
+        self.control.broadcast_owned_bytes(
+            _CANCEL.pack(1 if cancelled else 0),
+            source_rank=self.decode_rank,
+            expected_size=_CANCEL.size,
+        )
         return packet
 
     def _decode(self, request: _ServingRequest, cache: list[Any], logits: Any) -> None:
-        from mlx_lm.server import Response, _format_top_logprobs, _make_logits_processors, _make_sampler
+        from mlx_lm.server import (
+            Response,
+            _format_top_logprobs,
+            _make_logits_processors,
+            _make_sampler,
+        )
 
         self.mx.set_default_stream(self.stream)
         args = request.args
@@ -259,8 +528,15 @@ class _PhaseResponseGenerator:
         history = self.mx.array(request.prompt, dtype=self.mx.int32)
         state = request.state_machine.make_state()
         detokenizer = self.tokenizer.detokenizer
+        reset = getattr(detokenizer, "reset", None)
+        if callable(reset):
+            reset()
+        failed = False
         try:
             for index in range(args.max_tokens):
+                if request.context._should_stop:
+                    break
+                step_started = time.perf_counter()
                 adjusted = logits
                 for processor in processors:
                     adjusted = processor(history, adjusted)
@@ -268,7 +544,15 @@ class _PhaseResponseGenerator:
                 sampled = sampler(logprobs)
                 self.mx.eval(sampled, logprobs)
                 token = int(sampled.item())
-                state, matched, current_state = request.state_machine.match(state, token)
+                self.telemetry.observe_batch_step(
+                    prompt_responses=0,
+                    generation_responses=1,
+                    elapsed_seconds=time.perf_counter() - step_started,
+                )
+                self.telemetry.observe_token(request.request_id)
+                state, matched, current_state = request.state_machine.match(
+                    state, token
+                )
                 detokenizer.add_token(token)
                 finish_reason = None
                 if matched is not None and current_state is None:
@@ -301,9 +585,14 @@ class _PhaseResponseGenerator:
                 )[:, -1, :]
                 self.mx.eval(logits)
         except BaseException as exc:
+            failed = True
             request.output.put(exc)
         finally:
             detokenizer.finalize()
+            if request.context._should_stop:
+                self.telemetry.cancel_request(request.request_id)
+            else:
+                self.telemetry.finish_request(request.request_id, failed=failed)
             request.output.put(None)
 
     def _broker_loop(self) -> None:
@@ -317,6 +606,7 @@ class _PhaseResponseGenerator:
             if request is None:
                 break
             try:
+                _phase_event(0, "broker_request", prompt_tokens=len(request.prompt))
                 self.control.broadcast_object(
                     {
                         "op": "prefill",
@@ -324,7 +614,45 @@ class _PhaseResponseGenerator:
                         "prefill_step_size": self.prefill_step_size,
                     }
                 )
-                for _ in range(_prefill_calls(len(request.prompt), self.prefill_step_size)):
+                start_packet = self.control.broadcast_owned_bytes(
+                    None,
+                    source_rank=self.prefill_rank,
+                    expected_size=_PREFILL_START.size,
+                )
+                (
+                    cached_tokens,
+                    uncached_tokens,
+                    progress_calls,
+                    cache_tier_code,
+                    cache_entries,
+                    cache_bytes,
+                    ssd_entries,
+                    ssd_bytes,
+                ) = _PREFILL_START.unpack(start_packet)
+                if (
+                    cached_tokens + uncached_tokens != len(request.prompt)
+                    or progress_calls
+                    != _prefill_calls(uncached_tokens, self.prefill_step_size)
+                    or cache_tier_code not in _CACHE_CODE_TO_TIER
+                ):
+                    raise RuntimeError("prefill rank returned invalid cache metadata")
+                self.telemetry.observe_context(
+                    request.request_id,
+                    prompt_tokens=len(request.prompt),
+                    cached_tokens=cached_tokens,
+                )
+                self.telemetry.observe_cache_lookup(
+                    prompt_tokens=len(request.prompt),
+                    remaining_tokens=uncached_tokens,
+                    entries=cache_entries + ssd_entries,
+                    nbytes=cache_bytes + ssd_bytes,
+                    memory_entries=cache_entries,
+                    memory_bytes=cache_bytes,
+                    ssd_entries=ssd_entries,
+                    ssd_bytes=ssd_bytes,
+                    hit_tier=_CACHE_CODE_TO_TIER[cache_tier_code],
+                )
+                for _ in range(progress_calls):
                     self._recv_progress(request)
                 header = self.control.broadcast_owned_bytes(
                     None,
@@ -332,6 +660,11 @@ class _PhaseResponseGenerator:
                     expected_size=_LOGITS_HEADER.size,
                 )
                 dtype_code, rows, columns = _LOGITS_HEADER.unpack(header)
+                if (dtype_code, rows, columns) == (0, 0, 0):
+                    self.telemetry.cancel_request(request.request_id)
+                    request.output.put(None)
+                    continue
+                _phase_event(0, "broker_prefill_ready", logits_columns=columns)
                 dtype_name = _CODE_TO_DTYPE.get(dtype_code)
                 if dtype_name is None or rows != 1 or columns <= 0:
                     raise RuntimeError("prefill rank returned an invalid logits header")
@@ -342,7 +675,8 @@ class _PhaseResponseGenerator:
                 if previous is not None:
                     previous.join()
                 self.control.barrier()
-                cache, _manifest, _stats = recv_cache_transfer(
+                _phase_event(0, "broker_cache_recv_start")
+                cache, _manifest, stats = recv_cache_transfer(
                     self.mx,
                     src=self.prefill_rank,
                     group=self.group,
@@ -356,6 +690,17 @@ class _PhaseResponseGenerator:
                 )
                 self.mx.eval(logits)
                 self.mx.synchronize()
+                self.telemetry.observe_phase_handoff(
+                    tensor_bytes=stats.tensor_bytes,
+                    array_count=stats.array_count,
+                    elapsed_seconds=stats.elapsed_seconds,
+                    queue_depth=self.requests.qsize(),
+                )
+                if request.context._should_stop:
+                    self.telemetry.cancel_request(request.request_id)
+                    request.output.put(None)
+                    continue
+                _phase_event(0, "broker_cache_recv_done")
                 previous = threading.Thread(
                     target=self._decode,
                     args=(request, cache, logits),
@@ -364,15 +709,16 @@ class _PhaseResponseGenerator:
                 )
                 previous.start()
             except BaseException as exc:
+                if request.context._should_stop:
+                    self.telemetry.cancel_request(request.request_id)
+                else:
+                    self.telemetry.finish_request(request.request_id, failed=True)
                 request.output.put(exc)
                 request.output.put(None)
         if previous is not None:
             previous.join()
-        with threading.Lock():
-            try:
-                self.control.broadcast_object({"op": "stop"})
-            except Exception:
-                pass
+        with suppress(Exception):
+            self.control.broadcast_object({"op": "stop"})
 
     def stop_and_join(self) -> None:
         self._stopping.set()
@@ -390,9 +736,9 @@ def _prefill_rank_loop(
     group: Any,
     control: Any,
     model_identity: str,
+    rank: int,
+    prompt_cache: _PhasePromptCache,
 ) -> None:
-    from mlx_lm.models.cache import make_prompt_cache
-
     while True:
         request = control.broadcast_object(None)
         if not isinstance(request, dict):
@@ -405,32 +751,87 @@ def _prefill_rank_loop(
         step = int(request.get("prefill_step_size") or 2048)
         if len(prompt) < 2 or step < 1:
             raise RuntimeError("phase broker sent an invalid prompt")
-        cache = make_prompt_cache(model)
+        prompt_cache.active.set()
+        cache, rest, logits, cache_tier = prompt_cache.lookup(prompt)
+        cached_tokens = len(prompt) - len(rest)
+        cache_stats = prompt_cache.stats()
+        progress_calls = _prefill_calls(len(rest), step)
+        control.broadcast_owned_bytes(
+            _PREFILL_START.pack(
+                cached_tokens,
+                len(rest),
+                progress_calls,
+                _CACHE_TIER_TO_CODE[cache_tier],
+                cache_stats["memory_entries"],
+                cache_stats["memory_bytes"],
+                cache_stats["ssd_entries"],
+                cache_stats["ssd_bytes"],
+            ),
+            source_rank=1,
+            expected_size=_PREFILL_START.size,
+        )
+        _phase_event(
+            rank,
+            "prefill_request",
+            prompt_tokens=len(prompt),
+            cached_tokens=cached_tokens,
+            cache_tier=cache_tier or "miss",
+        )
 
-        def progress(processed: int, total: int) -> None:
+        def progress(
+            processed: int,
+            total: int,
+            prompt_tokens: list[int] = prompt,
+            prompt_state: list[Any] = cache,
+            prefix_tokens: int = cached_tokens,
+        ) -> bool:
+            prompt_cache.checkpoint(
+                prompt_tokens,
+                prompt_state,
+                prefix_tokens + processed,
+            )
             control.broadcast_owned_bytes(
                 _PROGRESS.pack(processed, total),
                 source_rank=1,
                 expected_size=_PROGRESS.size,
             )
+            cancel_packet = control.broadcast_owned_bytes(
+                None,
+                source_rank=0,
+                expected_size=_CANCEL.size,
+            )
+            return _CANCEL.unpack(cancel_packet)[0] == 0
 
-        logits, _seconds = _prefill_logits(
-            mx,
-            model,
-            cache,
-            prompt,
-            step=step,
-            progress=progress,
-        )
+        if logits is None:
+            logits, _seconds = _prefill_logits(
+                mx,
+                model,
+                cache,
+                rest,
+                step=step,
+                progress=progress,
+            )
+        if logits is None:
+            control.broadcast_owned_bytes(
+                _LOGITS_HEADER.pack(0, 0, 0),
+                source_rank=1,
+                expected_size=_LOGITS_HEADER.size,
+            )
+            _phase_event(rank, "prefill_cancelled")
+            prompt_cache.active.clear()
+            continue
+        _phase_event(rank, "prefill_compute_done")
         dtype_code = _DTYPE_TO_CODE.get(_dtype_name(logits.dtype))
         if dtype_code is None or logits.ndim != 2:
             raise RuntimeError("phase prefill produced unsupported logits")
+        prompt_cache.insert(prompt, cache, logits)
         control.broadcast_owned_bytes(
             _LOGITS_HEADER.pack(dtype_code, int(logits.shape[0]), int(logits.shape[1])),
             source_rank=1,
             expected_size=_LOGITS_HEADER.size,
         )
         control.barrier()
+        _phase_event(rank, "prefill_cache_send_start")
         prepared = prepare_cache_transfer(
             cache,
             model_identity=model_identity,
@@ -439,6 +840,8 @@ def _prefill_rank_loop(
         send_cache_transfer(mx, prepared, dst=0, group=group)
         mx.eval(mx.distributed.send(mx.contiguous(logits), 0, group=group))
         mx.synchronize()
+        prompt_cache.active.clear()
+        _phase_event(rank, "prefill_cache_send_done")
 
 
 def run_worker(args: argparse.Namespace) -> int:
@@ -447,18 +850,23 @@ def run_worker(args: argparse.Namespace) -> int:
     install_torch_stub()
     import mlx.core as mx
     from mlx_lm import load
-    from mlx_lm.server import _run_http_server
+    from mlx_lm.server import APIHandler, _run_http_server
+
+    from omlx.utils.model_loading import maybe_apply_pre_load_patches
 
     from .control_plane import RankControlPlane
     from .deployment import (
         decode_worker_contract,
+        decode_worker_execution,
         decode_worker_path_map,
         decode_worker_serving_mode,
     )
     from .inference_worker import (
+        RuntimeMarker,
         _apply_rank_wired_limit,
         _emit_event,
         _install_signal_handlers,
+        _prompt_cache_ssd_dir,
         _release_metal_memory,
         _runtime_assignment,
         _wait_for_serve_release,
@@ -471,13 +879,14 @@ def run_worker(args: argparse.Namespace) -> int:
         guard_rank_load,
     )
     from .staging import model_identity_digest
-    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+    from .telemetry import RuntimeTelemetry
 
     _install_signal_handlers()
     plan_hash, assignments, _profiles, tensor_parallel_size = decode_worker_contract(
         args.plan
     )
     mode, prefill_rank, decode_rank = decode_worker_serving_mode(args.plan)
+    execution = decode_worker_execution(args.plan)
     if mode != "disaggregated" or tensor_parallel_size != 1:
         raise RuntimeError("phase server received a non-disaggregated plan")
     if args.plan_hash != plan_hash:
@@ -492,12 +901,33 @@ def run_worker(args: argparse.Namespace) -> int:
         if init_backend == "jaccl"
         else None
     )
+    marker = None
+    phase_prompt_cache = None
+    cache_maintenance = None
+    preserve_failure_marker = False
     try:
         group = init_cluster_group(mx, backend=init_backend, strict=True)
         rank = int(group.rank())
         if group.size() != 2:
             raise RuntimeError("phase server currently requires two ranks")
         assignment = sorted(assignments, key=lambda item: item.rank)[rank]
+        marker = RuntimeMarker(
+            state_dir=args.state_dir,
+            deployment_id=args.deployment_id,
+            rank=rank,
+            world_size=2,
+            model=args.model,
+            backend=args.backend,
+            plan_hash=plan_hash,
+        )
+        marker.update(
+            "loading",
+            load_stage="initializing_full_replica",
+            serving_mode="disaggregated",
+            prefill_rank=prefill_rank,
+            decode_rank=decode_rank,
+        )
+        marker.start_heartbeat()
         admission_ceiling = guard_rank_load(
             assignment,
             rank=rank,
@@ -530,6 +960,29 @@ def run_worker(args: argparse.Namespace) -> int:
         )
         model.eval()
         measured = max(0, int(mx.get_active_memory()) - before)
+        if rank == prefill_rank:
+            phase_prompt_cache = _PhasePromptCache(
+                model=model,
+                model_key=identity,
+                max_size=args.prompt_cache_size,
+                max_bytes=args.prompt_cache_bytes,
+                ssd_directory=_prompt_cache_ssd_dir(args, rank),
+                ssd_max_bytes=args.prompt_cache_ssd_max_bytes,
+                step=args.prefill_step_size,
+            )
+            cache_maintenance = _PhaseCacheMaintenance(
+                prompt_cache=phase_prompt_cache,
+                state_dir=args.state_dir,
+                deployment_id=args.deployment_id,
+                plan_hash=plan_hash,
+                rank=rank,
+            )
+        marker.update(
+            "loading",
+            load_stage="weights_resident",
+            measured_weight_bytes=measured,
+            assignments=[_runtime_assignment(item) for item in assignments],
+        )
         _emit_event(
             {
                 "type": "rank_ready",
@@ -557,9 +1010,17 @@ def run_worker(args: argparse.Namespace) -> int:
             io_timeout=3600.0,
         ) as control:
             control.barrier()
+            marker.update(
+                "ready",
+                load_stage="ready",
+                measured_weight_bytes=measured,
+                serving_mode="disaggregated",
+                prefill_rank=prefill_rank,
+                decode_rank=decode_rank,
+            )
             if rank == 0:
                 cli_args = SimpleNamespace(
-                    allowed_origins=None,
+                    allowed_origins=["*"],
                     num_draft_tokens=0,
                     max_tokens=4096,
                     temp=0.0,
@@ -568,6 +1029,23 @@ def run_worker(args: argparse.Namespace) -> int:
                     min_p=0.0,
                     model=str(model_path),
                     chat_template_args={},
+                )
+                telemetry = RuntimeTelemetry(
+                    marker,
+                    execution=execution,
+                    assignment=assignment,
+                    cancel_path=(
+                        marker.path.parent / f"{args.deployment_id}-cancel.json"
+                    ),
+                    cancel_deployment_id=args.deployment_id,
+                    cancel_plan_hash=plan_hash,
+                    cancel_epoch_floor=int(time.time() * 1000),
+                    prompt_cache_ssd_enabled=execution.prompt_cache_ssd,
+                    prompt_cache_ssd_max_bytes=(
+                        execution.prompt_cache_ssd_max_bytes
+                        if execution.prompt_cache_ssd
+                        else 0
+                    ),
                 )
                 generator = _PhaseResponseGenerator(
                     mx=mx,
@@ -581,6 +1059,8 @@ def run_worker(args: argparse.Namespace) -> int:
                     prefill_step_size=args.prefill_step_size,
                     cli_args=cli_args,
                     stream=stream,
+                    deployment_id=args.deployment_id,
+                    telemetry=telemetry,
                 )
                 _emit_event(
                     {
@@ -596,27 +1076,115 @@ def run_worker(args: argparse.Namespace) -> int:
                         "decode_rank": decode_rank,
                     }
                 )
-                _run_http_server("127.0.0.1", args.port, generator)
+
+                class PhaseAPIHandler(APIHandler):
+                    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+                        prefix = "/omlx/internal/cache/"
+                        if not self.path.startswith(prefix):
+                            return super().do_POST()
+                        mode = self.path.removeprefix(prefix).removesuffix("/clear")
+                        if self.headers.get(
+                            "X-oMLX-Plan-Hash"
+                        ) != plan_hash or mode not in {"hot", "ssd", "all"}:
+                            status = 403
+                            payload = {
+                                "status": "error",
+                                "error": "invalid cache clear",
+                            }
+                        elif telemetry.active_request_count():
+                            status = 409
+                            payload = {
+                                "status": "error",
+                                "error": "requests are active",
+                            }
+                        else:
+                            status = 200
+                            payload = {
+                                "status": "ok",
+                                "rank": 0,
+                                "hot_cleared": 0,
+                                "ssd_deleted": 0,
+                            }
+                        body = json.dumps(payload, separators=(",", ":")).encode()
+                        self.send_response(status)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+
+                    def handle_completion(self, request: Any, stop_words: Any) -> Any:
+                        request_id = self.headers.get("X-oMLX-Request-ID")
+                        if isinstance(request_id, str) and request_id.strip():
+                            request._omlx_transport_request_id = request_id.strip()[
+                                :128
+                            ]
+                        return super().handle_completion(request, stop_words)
+
+                marker.stop_heartbeat()
+                telemetry.start_heartbeat()
+                try:
+                    _run_http_server(
+                        "127.0.0.1",
+                        args.port,
+                        generator,
+                        handler_class=PhaseAPIHandler,
+                    )
+                finally:
+                    telemetry.stop_heartbeat()
+                    generator.stop_and_join()
             else:
+                if phase_prompt_cache is None:
+                    raise RuntimeError("prefill rank cache was not initialized")
+                if cache_maintenance is not None:
+                    cache_maintenance.start()
                 _prefill_rank_loop(
                     mx=mx,
                     model=model,
                     group=group,
                     control=control,
                     model_identity=identity,
+                    rank=rank,
+                    prompt_cache=phase_prompt_cache,
                 )
         return 0
+    except KeyboardInterrupt:
+        return 0
+    except BaseException as exc:
+        preserve_failure_marker = True
+        if marker is not None:
+            with suppress(Exception):
+                marker.update(
+                    "failed",
+                    error=f"{type(exc).__name__}: {exc}"[:1000],
+                )
+        raise
     finally:
+        if marker is not None:
+            marker.stop_heartbeat()
+            if not preserve_failure_marker:
+                marker.remove()
         if lease is not None:
             lease.close()
-        try:
+        if cache_maintenance is not None:
+            cache_maintenance.stop()
+        if phase_prompt_cache is not None:
+            with suppress(Exception):
+                phase_prompt_cache.close()
+        with suppress(Exception):
             _release_metal_memory("phase server shutdown")
-        except Exception:
-            pass
 
 
 def main() -> int:
-    return run_worker(_arguments())
+    args = _arguments()
+    try:
+        return run_worker(args)
+    except BaseException as exc:
+        _phase_event(
+            int(os.environ.get("MLX_RANK", "-1")),
+            "rank_failed",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
 
 
 if __name__ == "__main__":
