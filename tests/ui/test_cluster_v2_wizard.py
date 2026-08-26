@@ -624,6 +624,54 @@ process.stdout.write(JSON.stringify({
     }
 
 
+def test_activation_progress_tracks_rank_stages_until_readiness():
+    result = _run_wizard(
+        """
+component.deploymentsPayload = [{ deployment_id: 'pool-a', model: '/models/qwen' }];
+component.deploymentsLoaded = true;
+component.runtimeLoaded = true;
+component.runtimePayload = { jobs: [{
+  deployment_id: 'pool-a', rank: 0, world_size: 2,
+  phase: 'loading', load_stage: 'materializing_layers',
+  live: true, ownership: 'loading',
+}], launchers: [] };
+const loading = {
+  visible: component.activationProgressVisible(),
+  percent: component.activationProgressPercent(),
+  label: component.activationProgressLabel(),
+  detail: component.activationProgressDetail(),
+  steps: component.wizardSteps().map((step) => step.state),
+};
+component.runtimePayload.jobs[0] = {
+  ...component.runtimePayload.jobs[0], phase: 'ready', load_stage: 'ready',
+  ownership: 'loaded', live: true,
+};
+const ready = {
+  visible: component.activationProgressVisible(),
+  steps: component.wizardSteps().map((step) => step.state),
+};
+process.stdout.write(JSON.stringify({ loading, ready }));
+"""
+    )
+
+    assert result["loading"] == {
+        "visible": True,
+        "percent": 60,
+        "label": "Materializing model layers",
+        "detail": "0 of 1 ranks ready · readiness canary runs last",
+        "steps": ["done", "done", "done", "done", "active"],
+    }
+    assert result["ready"] == {
+        "visible": False,
+        "steps": ["done", "done", "done", "done", "done"],
+    }
+
+    template = _read(TEMPLATE)
+    assert "data-cluster-v2-activation-progress" in template
+    assert "data-cluster-v2-activation-progress-bar" in template
+    assert '<i data-lucide="check" class="w-3 h-3"></i>' not in template
+
+
 def test_cold_saved_setups_open_one_model_picker_instead_of_a_fake_active_card():
     result = _run_wizard(
         """

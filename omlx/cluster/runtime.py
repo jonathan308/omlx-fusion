@@ -16,7 +16,18 @@ from .performance import ExecutionSettings, NodePerformanceProfile
 _MAX_MARKERS = 64
 _MAX_MARKER_BYTES = 64 * 1024
 _PHASES = {"loading", "ready", "peer_lost", "launcher_lost", "failed"}
-_LOAD_STAGES = {"initializing", "loading_weights", "validating", "ready"}
+_LOAD_STAGES = {
+    "initializing",
+    "initializing_full_replica",
+    "loading_weights",
+    "materializing_fixed",
+    "materializing_layers",
+    "tensor_ready",
+    "weights_resident",
+    "validating",
+    "warming_prefill_shape",
+    "ready",
+}
 _BACKENDS = {"ring", "jaccl", "jaccl-ring"}
 _REQUEST_STATES = {"running", "completed", "failed", "cancelled"}
 _MAX_COUNTER = 2**63 - 1

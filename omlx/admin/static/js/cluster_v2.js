@@ -1081,6 +1081,10 @@ function clusterV2Wizard() {
         },
 
         wizardSteps() {
+            // Snapshot the derived state once. Runtime polling can land between
+            // Alpine expressions; recomputing it five times allowed one render
+            // to mix Plan and Active semantics during activation.
+            const wizard = this.wizardState();
             const steps = [
                 { key: 'discover', title: 'Find devices', hint: 'Automatic on your network' },
                 { key: 'pair', title: 'Pair', hint: 'One code, both Macs' },
@@ -1098,19 +1102,144 @@ function clusterV2Wizard() {
                 plan: 3,
                 active: 4,
             };
-            const activeSlot = slotFor[this.wizardState()] ?? 0;
+            const activeSlot = slotFor[wizard] ?? 0;
+            const activationComplete =
+                wizard === 'active' && this.deploymentRuntimeState() === 'ready';
             return steps.map((step, index) => ({
                 ...step,
                 state:
-                    this.wizardState() === 'error'
+                    wizard === 'error'
                         ? 'todo'
                         : index < activeSlot ||
-                          (this.wizardState() === 'active' && index === 4)
+                          (activationComplete && index === 4)
                         ? 'done'
                         : index === activeSlot
                         ? 'active'
                         : 'todo',
             }));
+        },
+
+        activationDeploymentId() {
+            return (
+                this.configuredDeployment()?.deployment_id ||
+                this.stagingActivation?.deployment_id ||
+                this.activationRequestBody()?.deployment_id ||
+                ''
+            );
+        },
+
+        activationRuntimeJobs() {
+            const jobs = Array.isArray(this.runtimePayload?.jobs)
+                ? this.runtimePayload.jobs
+                : [];
+            const id = this.activationDeploymentId();
+            if (id) return jobs.filter((job) => job?.deployment_id === id);
+            return jobs.filter((job) =>
+                ['loading', 'loaded'].includes(job?.ownership),
+            );
+        },
+
+        activationProgressVisible() {
+            return (
+                this.activateBusy ||
+                this.deploymentRuntimeState() === 'loading'
+            );
+        },
+
+        activationLoadStage() {
+            if (this.stagingJob && this.stagingJob.status !== 'completed') {
+                return 'staging';
+            }
+            const order = [
+                'initializing',
+                'initializing_full_replica',
+                'loading_weights',
+                'materializing_fixed',
+                'materializing_layers',
+                'tensor_ready',
+                'weights_resident',
+                'validating',
+                'warming_prefill_shape',
+                'ready',
+            ];
+            const jobs = this.activationRuntimeJobs();
+            if (jobs.length) {
+                return jobs.reduce((slowest, job) => {
+                    const candidate = String(job?.load_stage || 'initializing');
+                    return order.indexOf(candidate) < order.indexOf(slowest)
+                        ? candidate
+                        : slowest;
+                }, 'ready');
+            }
+            const launcher = this.deploymentRuntimeLauncher();
+            if (launcher?.phase === 'preflight') return 'preflight';
+            if (launcher?.phase === 'loading') return 'initializing';
+            return this.activateBusy ? 'starting' : 'ready';
+        },
+
+        activationProgressPercent() {
+            if (this.activationLoadStage() === 'staging') {
+                const nodes = this.stagingNodes();
+                const total = nodes.reduce(
+                    (sum, node) => sum + Math.max(0, Number(node.files_total || 0)),
+                    0,
+                );
+                const done = nodes.reduce(
+                    (sum, node) =>
+                        sum + Math.max(0, Number(node.files_completed || 0)),
+                    0,
+                );
+                return Math.round(5 + 35 * (total > 0 ? done / total : 0));
+            }
+            const milestones = {
+                starting: 5,
+                preflight: 10,
+                initializing: 15,
+                initializing_full_replica: 20,
+                loading_weights: 35,
+                materializing_fixed: 45,
+                materializing_layers: 60,
+                tensor_ready: 70,
+                weights_resident: 75,
+                validating: 85,
+                warming_prefill_shape: 94,
+                ready: 100,
+            };
+            return milestones[this.activationLoadStage()] ?? 5;
+        },
+
+        activationProgressLabel() {
+            const labels = {
+                staging: 'Syncing model files across the pool',
+                starting: 'Starting cluster activation',
+                preflight: 'Verifying the signed deployment',
+                initializing: 'Starting rank processes',
+                initializing_full_replica: 'Initializing full model replicas',
+                loading_weights: 'Loading model weights',
+                materializing_fixed: 'Materializing shared weights',
+                materializing_layers: 'Materializing model layers',
+                tensor_ready: 'Finalizing tensor shards',
+                weights_resident: 'Model weights are resident',
+                validating: 'Validating every rank',
+                warming_prefill_shape: 'Warming the prefill path',
+                ready: 'Cluster ready',
+            };
+            const stage = this.activationLoadStage();
+            return labels[stage] || labels.starting;
+        },
+
+        activationProgressDetail() {
+            if (this.activationLoadStage() === 'staging') {
+                return this.stagingOverallLabel();
+            }
+            const jobs = this.activationRuntimeJobs();
+            if (!jobs.length) {
+                return 'Preparing the launcher and waiting for rank heartbeats.';
+            }
+            const ready = jobs.filter(
+                (job) => job?.phase === 'ready' && job?.live === true,
+            ).length;
+            return `${ready} of ${jobs.length} ranks ready · readiness canary runs last`;
         },
 
         // Step-4 hint is strategy-aware: a tensor split gives every Mac every

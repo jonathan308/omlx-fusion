@@ -4,6 +4,8 @@ import json
 import os
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from omlx.cluster.performance import NodePerformanceProfile, execution_profile
 from omlx.cluster.runtime import read_runtime_markers
 
@@ -139,6 +141,31 @@ def test_failed_runtime_phase_never_looks_live_while_process_exits(tmp_path):
     assert result["jobs"][0]["phase"] == "launcher_lost"
     assert result["jobs"][0]["live"] is False
     assert result["jobs"][0]["error"] == "rank launcher parent changed"
+
+
+@pytest.mark.parametrize(
+    "load_stage",
+    (
+        "initializing",
+        "initializing_full_replica",
+        "loading_weights",
+        "materializing_fixed",
+        "materializing_layers",
+        "tensor_ready",
+        "weights_resident",
+        "validating",
+        "warming_prefill_shape",
+    ),
+)
+def test_runtime_preserves_real_intermediate_load_stages(tmp_path, load_stage):
+    (tmp_path / "job.json").write_text(
+        json.dumps(_marker(phase="loading", load_stage=load_stage))
+    )
+
+    result = read_runtime_markers(tmp_path)
+
+    assert result["warnings"] == []
+    assert result["jobs"][0]["load_stage"] == load_stage
 
 
 def test_runtime_marker_rejects_non_string_failure_evidence(tmp_path):
