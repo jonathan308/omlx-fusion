@@ -300,6 +300,41 @@ def test_official_layout_and_exact_checkpoint_binding() -> None:
     assert OFFICIAL_PLE_LAYOUT.table_dtype == "BF16"
 
 
+def test_prime_layout_derivation_is_cached_and_row_grouping_reads_it_once() -> None:
+    ple_module._find_nth_prime_after.cache_clear()
+    layout = PLELayout(
+        unigram_vocab_size=64,
+        ngram_vocab_size_base=20_000_000,
+        head_dim=2,
+        eos_token_id=63,
+        seed=1234,
+        make_vocab_divisible_by=128,
+        table_dtype="F32",
+    )
+    expected = layout.rows_per_shard
+    first = ple_module._find_nth_prime_after.cache_info()
+    assert first.misses == 16
+    for _ in range(32):
+        assert layout.rows_per_shard == expected
+    after = ple_module._find_nth_prime_after.cache_info()
+    assert after.misses == first.misses
+
+    class CountingLayout:
+        calls = 0
+
+        @property
+        def rows_per_shard(self):
+            self.calls += 1
+            return expected
+
+    pool = object.__new__(Qwen4ExpPLESSDPool)
+    pool.layout = CountingLayout()
+    pool.rows_per_page = 2
+    groups = pool._group_row_ids(np.asarray([0, 1, expected, expected + 1]))
+    assert len(groups) == 2
+    assert pool.layout.calls == 1
+
+
 def test_artifact_format_detection_distinguishes_bf16_from_q8() -> None:
     assert (
         ple_module._layout_from_index_metadata(
@@ -389,7 +424,7 @@ def test_constructor_auto_detects_q8_layout_from_exact_metadata(tmp_path: Path) 
 def test_q8_token_lookup_uses_only_hashed_rows(tmp_path: Path) -> None:
     expected = _build_q8_artifact(tmp_path)
     tokens = np.asarray([[1, 2, 3], [4, 63, 5]], dtype=np.int64)
-    with Qwen4ExpPLESSDPool(tmp_path, layout=TINY_Q8_LAYOUT) as pool:
+    with Qwen4ExpPLESSDPool(tmp_path, layout=TINY_Q8_LAYOUT, io_workers=0) as pool:
         row_ids = pool.hash_ids(tokens)
         got = pool.lookup(tokens)
     wanted_rows = []
@@ -436,6 +471,51 @@ def test_q8_reads_only_selected_pages_and_bounds_combined_cache(
         }
         assert pool.cache_info["bytes"] <= page_bytes
         assert pool.cache_info["pages"] <= 1
+
+
+def test_q8_large_gather_reads_only_selected_rows(tmp_path: Path, monkeypatch) -> None:
+    expected = _build_q8_artifact(tmp_path)
+    calls = []
+    original = ple_module._MappedTensor.read_indices
+
+    def tracked_read_indices(self, indices):
+        calls.append((self.descriptor.name, np.asarray(indices).copy()))
+        return original(self, indices)
+
+    monkeypatch.setattr(ple_module._MappedTensor, "read_indices", tracked_read_indices)
+    rows = np.arange(64, dtype=np.int64)
+    with Qwen4ExpPLESSDPool(tmp_path, layout=TINY_Q8_LAYOUT, io_workers=0) as pool:
+        got = pool.gather(rows)
+        assert pool.cache_info["pages"] == 0
+    wanted = np.stack(
+        [
+            expected[divmod(int(row), TINY_Q8_LAYOUT.rows_per_shard)[0]][
+                divmod(int(row), TINY_Q8_LAYOUT.rows_per_shard)[1]
+            ]
+            for row in rows
+        ]
+    )
+    assert np.array_equal(got, wanted)
+    assert calls
+    assert sum(len(indices) for _, indices in calls) == 64 * 3
+
+
+def test_q8_large_gather_concurrent_pread_matches_reference(tmp_path: Path) -> None:
+    expected = _build_q8_artifact(tmp_path)
+    rows = np.arange(64, dtype=np.int64)
+    with Qwen4ExpPLESSDPool(tmp_path, layout=TINY_Q8_LAYOUT, io_workers=4) as pool:
+        got = pool.gather(rows)
+        assert pool.cache_info["direct_rows"] == 64
+        assert pool.cache_info["pages"] == 0
+    wanted = np.stack(
+        [
+            expected[divmod(int(row), TINY_Q8_LAYOUT.rows_per_shard)[0]][
+                divmod(int(row), TINY_Q8_LAYOUT.rows_per_shard)[1]
+            ]
+            for row in rows
+        ]
+    )
+    assert np.array_equal(got, wanted)
 
 
 @pytest.mark.parametrize(
@@ -546,6 +626,53 @@ def test_gather_reads_only_selected_pages_and_bounds_cache(
         assert all(stop - start <= 2 for _, start, stop in calls)
         assert pool.cache_info["bytes"] <= page_bytes
         assert pool.cache_info["pages"] <= 1
+
+
+def test_large_gather_reads_only_selected_rows(tmp_path: Path, monkeypatch) -> None:
+    expected = _build_artifact(tmp_path)
+    calls = []
+    original = ple_module._MappedTensor.read_indices
+
+    def tracked_read_indices(self, indices):
+        calls.append(np.asarray(indices).copy())
+        return original(self, indices)
+
+    monkeypatch.setattr(ple_module._MappedTensor, "read_indices", tracked_read_indices)
+    rows = np.arange(64, dtype=np.int64)
+    with Qwen4ExpPLESSDPool(tmp_path, layout=TINY_LAYOUT, io_workers=0) as pool:
+        got = pool.gather(rows)
+        assert pool.cache_info["pages"] == 0
+    wanted = np.stack(
+        [
+            expected[divmod(int(row), TINY_LAYOUT.rows_per_shard)[0]][
+                divmod(int(row), TINY_LAYOUT.rows_per_shard)[1]
+            ]
+            for row in rows
+        ]
+    )
+    assert np.array_equal(got, wanted)
+    assert sum(len(indices) for indices in calls) == 64
+
+
+def test_large_gather_concurrent_pread_matches_reference(tmp_path: Path) -> None:
+    expected = _build_artifact(tmp_path)
+    rows = np.arange(64, dtype=np.int64)
+    with Qwen4ExpPLESSDPool(tmp_path, layout=TINY_LAYOUT, io_workers=4) as pool:
+        got = pool.gather(rows)
+        info = pool.cache_info
+        assert info["io_workers"] == 4
+        assert info["direct_calls"] == 1
+        assert info["direct_rows"] == 64
+        assert info["pages"] == 0
+    wanted = np.stack(
+        [
+            expected[divmod(int(row), TINY_LAYOUT.rows_per_shard)[0]][
+                divmod(int(row), TINY_LAYOUT.rows_per_shard)[1]
+            ]
+            for row in rows
+        ]
+    )
+    assert np.array_equal(got, wanted)
 
 
 def test_cache_hits_and_prefetch_executor_seam(tmp_path: Path) -> None:
