@@ -89,6 +89,19 @@ class CacheTypeRegistry:
         logger.debug(f"Registered handler for {handler.cache_type.value}")
 
     @classmethod
+    def register_class_name(
+        cls,
+        class_name: str,
+        cache_type: CacheType,
+        handler: CacheTypeHandler | None = None,
+    ) -> None:
+        """Register a model-specific cache class and its exact handler."""
+
+        cls._class_name_map[class_name] = cache_type
+        if handler is not None:
+            cls.register(handler)
+
+    @classmethod
     def get_handler(cls, cache_type: CacheType) -> CacheTypeHandler:
         """Get handler for a cache type.
 

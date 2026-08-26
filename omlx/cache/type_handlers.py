@@ -40,6 +40,8 @@ class CacheType(Enum):
     BATCH_POOLING_CACHE = "BatchPoolingCache"
     MINIMAX_M3_KVCACHE = "MiniMaxM3KVCache"
     MINIMAX_M3_BATCH_KVCACHE = "MiniMaxM3BatchKVCache"
+    GLM5_NEXT_KDA_CACHE = "Glm5NextKDACache"
+    GLM5_NEXT_DSA_CACHE = "Glm5NextDsaCache"
 
 
 @dataclass

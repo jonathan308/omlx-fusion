@@ -86,6 +86,9 @@ def apply_glm5_next_patch() -> bool:
         models_package.glm5_next = existing
         applied = False
     _APPLIED = True
+    from .cache_handlers import register_glm5_next_cache_handlers
+
+    register_glm5_next_cache_handlers()
     return applied
 
 
@@ -146,9 +149,11 @@ def apply_glm5_next_vlm_patch() -> bool:
         models_package = importlib.import_module("mlx_vlm.models")
         models_package.glm5_next = existing
         applied = False
+    from .cache_handlers import register_glm5_next_cache_handlers
     from .processor import install_glm5_next_processor_namespace
 
     install_glm5_next_processor_namespace()
+    register_glm5_next_cache_handlers()
     _VLM_APPLIED = True
     return applied
 

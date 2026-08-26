@@ -2058,7 +2058,14 @@ class BlockAwarePrefixCache(CacheManager):
                         continue
 
                     axis_info = handler.get_state_axis_info()
-                    if len(state) != 2 or len(axis_info) != 2:
+                    if (
+                        len(state) != 2
+                        or len(axis_info) != 2
+                        or any(
+                            info.sequence_axis != 2 or not info.sliceable
+                            for info in axis_info
+                        )
+                    ):
                         seq_len = handler.get_state_seq_len_from_tuple(tuple(state))
                         actual_end = min(end_idx, seq_len)
                         if seq_len <= 0 or start_idx >= actual_end:
