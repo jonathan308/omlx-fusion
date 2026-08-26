@@ -15,6 +15,7 @@ without allocating model weights (or even importing Metal).
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any
@@ -131,6 +132,65 @@ def validate_gdn_weight_layout(weights: Mapping[str, Any], prefix: str) -> None:
         )
 
 
+def _base_supports_mtp_rollback(owner: Any, base_call: Any) -> bool:
+    """Whether the pinned base exposes the complete PR-990 rollback edge.
+
+    Merely accepting ``**kwargs`` is insufficient.  Partial MTP acceptance
+    needs both the explicit ``n_confirmed`` call contract and
+    ``_process_chunk`` so the caller can replay the kept prefix from
+    ``rollback_state`` / ``_mtp_draft_stash``.
+    """
+
+    if not callable(getattr(owner, "_process_chunk", None)):
+        return False
+    try:
+        parameters = inspect.signature(base_call).parameters
+    except (TypeError, ValueError):
+        return False
+    return "n_confirmed" in parameters
+
+
+def _call_pinned_gdn(
+    owner: Any,
+    base_call: Any,
+    inputs: Any,
+    *,
+    mask: Any = None,
+    cache: Any = None,
+    n_confirmed: int = 0,
+) -> Any:
+    """Dispatch without leaking MTP kwargs into an unpatched base.
+
+    The zero/ordinary path intentionally omits ``n_confirmed``.  This keeps
+    stock and DFlash-shaped hooks compatible.  A nonzero verify window must
+    never fall back to an ordinary forward because that would advance the
+    recurrent cache without creating a rollback snapshot.
+    """
+
+    if n_confirmed:
+        if not _base_supports_mtp_rollback(owner, base_call):
+            raise RuntimeError(
+                "qwen4_exp received n_confirmed but the pinned Qwen3.5 "
+                "GatedDeltaNet lacks the MTP rollback patch "
+                "(_process_chunk + explicit n_confirmed); refusing to "
+                "advance recurrent state without a rollback snapshot"
+            )
+        return base_call(
+            inputs,
+            mask=mask,
+            cache=cache,
+            n_confirmed=n_confirmed,
+        )
+    return base_call(inputs, mask=mask, cache=cache)
+
+
+def _coerce_recurrent_state_fp32(cache: Any, mx: Any) -> None:
+    """Keep ArraysCache slot 1 and therefore rollback snapshots in fp32."""
+
+    if cache is not None and cache[1] is not None:
+        cache[1] = cache[1].astype(mx.float32)
+
+
 @lru_cache(maxsize=1)
 def _implementation_class():
     """Build the real MLX module only when a model is instantiated."""
@@ -171,15 +231,23 @@ def _implementation_class():
                 self.head_v_dim, eps=self.layer_norm_epsilon
             )
 
-        def __call__(self, inputs, mask=None, cache=None):
+        def __call__(self, inputs, mask=None, cache=None, n_confirmed: int = 0):
             # ``mlx_lm.models.gated_delta.gated_delta_update`` creates new
             # state in fp32.  Coerce restored/legacy cache state too so the
-            # recurrent product cannot silently fall back to bf16.
-            if cache is not None and cache[1] is not None:
-                cache[1] = cache[1].astype(mx.float32)
-            output = super().__call__(inputs, mask=mask, cache=cache)
-            if cache is not None and cache[1] is not None:
-                cache[1] = cache[1].astype(mx.float32)
+            # recurrent product cannot silently fall back to bf16.  The
+            # common MTP patch snapshots these already-coerced references in
+            # ``rollback_state`` and stashes qkv/a/b for exact kept-prefix
+            # replay in ``_mtp_draft_stash``.
+            _coerce_recurrent_state_fp32(cache, mx)
+            output = _call_pinned_gdn(
+                self,
+                super().__call__,
+                inputs,
+                mask=mask,
+                cache=cache,
+                n_confirmed=n_confirmed,
+            )
+            _coerce_recurrent_state_fp32(cache, mx)
             return output
 
     _Qwen4ExpGatedDeltaNet.__name__ = "Qwen4ExpGatedDeltaNet"
@@ -192,7 +260,8 @@ class Qwen4ExpGatedDeltaNet:
     """Lazy constructor for the MLX Qwen4-Exp GatedDeltaNet module.
 
     ``Qwen4ExpGatedDeltaNet(config, layer_idx)`` returns an ``mlx.nn.Module``
-    with the standard ``(inputs, mask=None, cache=None)`` call signature.
+    with the standard
+    ``(inputs, mask=None, cache=None, n_confirmed=0)`` call signature.
     """
 
     def __new__(cls, config: Any, layer_idx: int):

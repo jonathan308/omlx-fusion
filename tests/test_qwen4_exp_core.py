@@ -119,6 +119,110 @@ def test_gdn_accepts_only_linear_layer_and_official_split_projection():
         gdn.validate_gdn_weight_layout(fused, prefix)
 
 
+def test_gdn_forwards_nonzero_n_confirmed_only_to_rollback_capable_base():
+    gdn = importlib.import_module("omlx.patches.qwen4_exp.gdn")
+    seen = {}
+
+    class Cache(list):
+        rollback_state = None
+        _mtp_draft_stash = None
+
+    class PatchedOwner:
+        def _process_chunk(self):
+            raise AssertionError("dispatch must not execute replay itself")
+
+    def patched_base(inputs, *, mask=None, cache=None, n_confirmed=0):
+        seen.update(
+            inputs=inputs,
+            mask=mask,
+            cache=cache,
+            n_confirmed=n_confirmed,
+        )
+        cache.rollback_state = ("conv-before", "ssm-before-fp32")
+        cache._mtp_draft_stash = ("qkv", "a", "b")
+        return "verified"
+
+    cache = Cache([None, None])
+    output = gdn._call_pinned_gdn(
+        PatchedOwner(),
+        patched_base,
+        "window",
+        mask="mask",
+        cache=cache,
+        n_confirmed=1,
+    )
+
+    assert output == "verified"
+    assert seen == {
+        "inputs": "window",
+        "mask": "mask",
+        "cache": cache,
+        "n_confirmed": 1,
+    }
+    assert cache.rollback_state == ("conv-before", "ssm-before-fp32")
+    assert cache._mtp_draft_stash == ("qkv", "a", "b")
+
+
+def test_gdn_fails_closed_if_nonzero_n_confirmed_reaches_unpatched_base():
+    gdn = importlib.import_module("omlx.patches.qwen4_exp.gdn")
+    calls = []
+
+    class UnpatchedOwner:
+        pass
+
+    def unpatched_base(inputs, *, mask=None, cache=None):
+        calls.append((inputs, mask, cache))
+        return "ordinary"
+
+    # Ordinary forwards omit the kwarg and remain compatible with an
+    # unpatched/DFlash-shaped base.
+    assert (
+        gdn._call_pinned_gdn(
+            UnpatchedOwner(),
+            unpatched_base,
+            "token",
+            mask="mask",
+            cache="cache",
+            n_confirmed=0,
+        )
+        == "ordinary"
+    )
+    assert calls == [("token", "mask", "cache")]
+
+    with pytest.raises(RuntimeError, match="refusing to advance recurrent state"):
+        gdn._call_pinned_gdn(
+            UnpatchedOwner(),
+            unpatched_base,
+            "verify-window",
+            n_confirmed=1,
+        )
+    assert calls == [("token", "mask", "cache")]
+
+
+def test_gdn_recurrent_cache_is_coerced_to_fp32_before_snapshot():
+    gdn = importlib.import_module("omlx.patches.qwen4_exp.gdn")
+    fp32 = object()
+
+    class FakeMX:
+        float32 = fp32
+
+    class State:
+        def __init__(self, dtype):
+            self.dtype = dtype
+            self.cast_targets = []
+
+        def astype(self, dtype):
+            self.cast_targets.append(dtype)
+            return State(dtype)
+
+    original = State("bfloat16")
+    cache = [None, original]
+    gdn._coerce_recurrent_state_fp32(cache, FakeMX)
+
+    assert original.cast_targets == [fp32]
+    assert cache[1].dtype is fp32
+
+
 def test_hc_requires_four_streams_rank_320_and_exact_weight_names():
     hc = importlib.import_module("omlx.patches.qwen4_exp.hc")
     hc.validate_hc_config(_config())
