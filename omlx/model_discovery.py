@@ -84,6 +84,12 @@ VLM_NATIVE_TEXT_MODEL_TYPES = {
 # Remove a family once mlx-vlm provides its multimodal implementation.
 MLX_LM_TEXT_ONLY_MODEL_TYPES = {
     "mimo_v2",
+    # Qwen3.8 Flash Next ships a multimodal outer config, but Fusion's
+    # day-zero qwen4_exp overlay intentionally exposes only the native text
+    # backbone until the vision tower has an independently validated MLX
+    # implementation.  Route it directly to BatchedEngine so media requests
+    # fail explicitly instead of silently falling back after a VLM load.
+    "qwen4_exp",
 }
 
 # Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)

@@ -368,6 +368,9 @@ def maybe_apply_pre_load_patches(
     - Ling 3.0 Flash mixed MLA/KDA model when ``config.json`` declares
       ``model_type == "bailing_hybrid"``. The vendored module is registered
       as ``mlx_lm.models.bailing_hybrid`` before mlx-lm resolves its classes.
+    - Qwen3.8 Flash Next's native ``qwen4_exp`` text backbone and exact
+      four-token micro-block QSA backend. It never aliases the checkpoint to
+      Qwen3.5 and has no dense-attention fallback.
     - Llama 4 attention offset patch when ``config.json`` declares
       ``model_type == "llama4"`` directly or under ``text_config``.
     - GLM-5.2 ``glm_moe_dsa`` patch (mlx-lm PR 1410) when ``config.json``
@@ -493,6 +496,12 @@ def maybe_apply_pre_load_patches(
 
         if apply_bailing_hybrid_patch():
             logger.info("Ling 3.0 Flash pre-load patch applied for %s", model_name)
+
+    if model_type == "qwen4_exp":
+        from ..patches.qwen4_exp import apply_qwen4_exp_patch
+
+        if apply_qwen4_exp_patch(model_name):
+            logger.info("Qwen3.8 Flash Next pre-load patch applied for %s", model_name)
 
     if model_type == "laguna":
         # MLX-LM dynamically imports the architecture and tokenizer-configured
@@ -648,6 +657,11 @@ def maybe_apply_pre_load_patches(
                 set_mtp_depth(
                     int(mtp_cfg.get("num_nextn_predict_layers", 0) or 0) or 3
                 )
+            elif model_type == "qwen4_exp":
+                # The official Flash-Next checkpoint contains exactly one
+                # hybrid QSA+MoE MTP layer.  Never apply Qwen3.5's adaptive
+                # multi-depth default to it.
+                set_mtp_depth(1)
             else:
                 set_mtp_depth(3)
             if mtp_enabled:
@@ -975,6 +989,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
     return (
         model_type.startswith("qwen3_5")
         or model_type.startswith("qwen3_6")
+        or model_type == "qwen4_exp"
         or model_type.startswith("deepseek_v4")
         or model_type.startswith("nemotron_h")
         or model_type == "glm_moe_dsa"

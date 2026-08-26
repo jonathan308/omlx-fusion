@@ -1705,6 +1705,10 @@ def _clear_rollback(prompt_cache: List[Any]) -> None:
             c.rollback_state = None
         if getattr(c, "_mtp_draft_stash", None) is not None:
             c._mtp_draft_stash = None
+        if getattr(c, "_qwen4_ple_rollback_state", None) is not None:
+            c._qwen4_ple_rollback_state = None
+        if getattr(c, "_qwen4_ple_draft_stash", None) is not None:
+            c._qwen4_ple_draft_stash = None
         if getattr(c, "_mtp_undo", None) is not None:
             c._mtp_undo = None
         if getattr(c, "_undo", None) is not None:
