@@ -365,6 +365,281 @@ def _bounded_decode_all_selected(
     return output.transpose(0, 2, 1, 3)
 
 
+_PREFILL_QUERY_CHUNK = 16
+
+
+def _batch_gather_tokens(values: mx.array, indices: mx.array) -> mx.array:
+    """Gather token rows independently for every batch without a host read."""
+
+    batch, tokens = values.shape[:2]
+    trailing = values.shape[2:]
+    offset_shape = (batch,) + (1,) * (indices.ndim - 1)
+    offsets = mx.arange(batch, dtype=mx.int32).reshape(offset_shape) * tokens
+    flat_indices = (indices.astype(mx.int32) + offsets).reshape(-1)
+    flat_values = values.reshape(batch * tokens, *trailing)
+    return flat_values[flat_indices].reshape(*indices.shape, *trailing)
+
+
+def _compact_visible_indices(visible: mx.array) -> tuple[mx.array, mx.array]:
+    """Stable compact of ``[..., key_tokens]`` booleans using GPU scatter.
+
+    Visible and invisible destinations together form a permutation, so the
+    scatter has no collisions.  This preserves arbitrary padding/hole masks
+    without the row-level ``sum(...).item()`` synchronization used by the
+    scalar reference path.
+    """
+
+    key_tokens = visible.shape[-1]
+    visible_i = visible.astype(mx.int32)
+    invisible_i = 1 - visible_i
+    counts = mx.sum(visible_i, axis=-1)
+    visible_rank = mx.cumsum(visible_i, axis=-1) - 1
+    invisible_rank = mx.cumsum(invisible_i, axis=-1) - 1
+    destinations = mx.where(
+        visible,
+        visible_rank,
+        counts[..., None] + invisible_rank,
+    ).astype(mx.int32)
+    positions = mx.arange(key_tokens, dtype=mx.int32)
+    positions = mx.broadcast_to(positions, visible.shape)
+    sources = mx.where(visible, positions, key_tokens)
+    compact = mx.full(visible.shape, key_tokens, dtype=mx.int32)
+    return mx.put_along_axis(compact, destinations, sources, axis=-1), counts
+
+
+def _bounded_prefill_all_selected(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    cos: mx.array,
+    sin: mx.array,
+    mask: mx.array,
+    *,
+    geometry: Qwen4ExpQSAGeometry,
+    query_chunk: int = _PREFILL_QUERY_CHUNK,
+) -> mx.array:
+    """Exact chunked prefill while every visible block fits the budget."""
+
+    batch, _, query_tokens, _ = queries.shape
+    key_tokens = keys.shape[2]
+    query_start = key_tokens - query_tokens
+    rotated_keys = apply_partial_rope(
+        keys,
+        cos[:, None, :, :],
+        sin[:, None, :, :],
+        rotary_dim=geometry.rotary_dim,
+    )
+    groups = geometry.num_query_heads // geometry.num_key_value_heads
+    outputs: list[mx.array] = []
+    for start in range(0, query_tokens, query_chunk):
+        stop = min(start + query_chunk, query_tokens)
+        chunk_tokens = stop - start
+        chunk_queries = queries[:, :, start:stop].transpose(0, 2, 1, 3)
+        chunk_cos = cos[:, query_start + start : query_start + stop]
+        chunk_sin = sin[:, query_start + start : query_start + stop]
+        chunk_queries = apply_partial_rope(
+            chunk_queries,
+            chunk_cos[:, :, None, :],
+            chunk_sin[:, :, None, :],
+            rotary_dim=geometry.rotary_dim,
+        )
+        grouped_queries = chunk_queries.reshape(
+            batch,
+            chunk_tokens,
+            geometry.num_key_value_heads,
+            groups,
+            geometry.head_dim,
+        )
+        scores = (
+            grouped_queries.astype(mx.float32)
+            @ rotated_keys.astype(mx.float32)[:, None, :, :, :].swapaxes(-1, -2)
+        ) / math.sqrt(geometry.head_dim)
+        visible = mask[:, 0, start:stop, None, None, :]
+        if visible.dtype == mx.bool_:
+            scores = mx.where(visible, scores, mx.finfo(scores.dtype).min)
+        else:
+            scores = scores + visible
+        probabilities = mx.softmax(scores, axis=-1).astype(chunk_queries.dtype)
+        output = probabilities @ values[:, None, :, :, :]
+        outputs.append(
+            output.reshape(
+                batch, chunk_tokens, geometry.num_query_heads, geometry.head_dim
+            )
+        )
+    return mx.concatenate(outputs, axis=1)
+
+
+def _vectorized_sparse_prefill(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    index_queries: mx.array,
+    index_keys: mx.array,
+    cos: mx.array,
+    sin: mx.array,
+    mask: mx.array,
+    *,
+    geometry: Qwen4ExpQSAGeometry,
+    index_key_norm: IndexKeyNorm,
+    query_chunk: int = _PREFILL_QUERY_CHUNK,
+) -> mx.array:
+    """Batch QSA selection/attention over bounded groups of query rows.
+
+    The only dense context dimension is bounded by ``query_chunk``.  Main
+    attention always gathers at most ``token_budget + compress_ratio - 1``
+    rows, so 10K/20K prompts never construct dense QxK attention scores.
+    """
+
+    batch, _, query_tokens, _ = queries.shape
+    key_tokens = keys.shape[2]
+    ratio = geometry.compress_ratio
+    max_blocks = key_tokens // ratio
+    block_budget = geometry.block_budget
+    query_start = key_tokens - query_tokens
+    key_rows = keys.transpose(0, 2, 1, 3)
+    value_rows = values.transpose(0, 2, 1, 3)
+    outputs: list[mx.array] = []
+
+    for start in range(0, query_tokens, query_chunk):
+        stop = min(start + query_chunk, query_tokens)
+        chunk_tokens = stop - start
+        chunk_mask = mask[:, 0, start:stop]
+        visible = chunk_mask if chunk_mask.dtype == mx.bool_ else chunk_mask == 0
+        compact, visible_counts = _compact_visible_indices(visible)
+        complete_counts = visible_counts // ratio
+
+        if max_blocks:
+            block_tokens = compact[..., : max_blocks * ratio].reshape(
+                batch, chunk_tokens, max_blocks, ratio
+            )
+            safe_block_tokens = mx.minimum(block_tokens, key_tokens - 1)
+            grouped_keys = _batch_gather_tokens(index_keys, safe_block_tokens)
+            pooled = mx.mean(grouped_keys.astype(mx.float32), axis=-2).astype(
+                index_keys.dtype
+            )
+            pooled = index_key_norm(pooled)
+            block_starts = safe_block_tokens[..., 0]
+            pooled = apply_partial_rope(
+                pooled,
+                _batch_gather_tokens(cos, block_starts),
+                _batch_gather_tokens(sin, block_starts),
+                rotary_dim=geometry.rotary_dim,
+            )
+            chunk_query_cos = cos[:, query_start + start : query_start + stop]
+            chunk_query_sin = sin[:, query_start + start : query_start + stop]
+            rotated_index_queries = apply_partial_rope(
+                index_queries[:, start:stop],
+                chunk_query_cos[:, :, None, :],
+                chunk_query_sin[:, :, None, :],
+                rotary_dim=geometry.rotary_dim,
+            )
+            block_scores = (
+                rotated_index_queries.astype(mx.float32)
+                @ pooled.astype(mx.float32).swapaxes(-1, -2)
+            ).swapaxes(-1, -2)
+            block_scores = mx.sum(mx.maximum(block_scores, 0), axis=-1) / math.sqrt(
+                geometry.indexer_head_dim
+            )
+            valid_blocks = (
+                mx.arange(max_blocks)[None, None, :] < complete_counts[..., None]
+            )
+            block_scores = mx.where(
+                valid_blocks, block_scores, mx.finfo(block_scores.dtype).min
+            )
+
+            selected_width = min(max_blocks, block_budget)
+            canonical = mx.broadcast_to(
+                mx.arange(selected_width, dtype=mx.int32)[None, None],
+                (batch, chunk_tokens, selected_width),
+            )
+            if max_blocks > block_budget:
+                ranked = mx.argpartition(-block_scores, kth=block_budget - 1, axis=-1)[
+                    ..., :block_budget
+                ].astype(mx.int32)
+                selected_block_rows = mx.where(
+                    (complete_counts <= block_budget)[..., None],
+                    canonical,
+                    ranked,
+                )
+            else:
+                selected_block_rows = canonical
+            selected_count = mx.minimum(complete_counts, block_budget)
+            selected_blocks = mx.take_along_axis(
+                block_tokens,
+                selected_block_rows[..., None],
+                axis=-2,
+            )
+            selected_indices = selected_blocks.reshape(
+                batch, chunk_tokens, selected_width * ratio
+            )
+            selected_valid = mx.broadcast_to(
+                mx.arange(selected_width)[None, None, :, None]
+                < selected_count[..., None, None],
+                (batch, chunk_tokens, selected_width, ratio),
+            ).reshape(batch, chunk_tokens, selected_width * ratio)
+        else:
+            selected_indices = mx.zeros((batch, chunk_tokens, 0), dtype=mx.int32)
+            selected_valid = mx.zeros((batch, chunk_tokens, 0), dtype=mx.bool_)
+
+        tail_width = ratio - 1
+        tail_offsets = mx.arange(tail_width, dtype=mx.int32)
+        tail_positions = complete_counts[..., None] * ratio + tail_offsets
+        tail_valid = tail_positions < visible_counts[..., None]
+        safe_tail_positions = mx.minimum(tail_positions, key_tokens - 1)
+        tail = mx.take_along_axis(compact, safe_tail_positions, axis=-1)
+        selected_indices = mx.concatenate((selected_indices, tail), axis=-1)
+        selected_valid = mx.concatenate((selected_valid, tail_valid), axis=-1)
+        safe_selected = mx.where(selected_valid, selected_indices, 0).astype(mx.int32)
+
+        selected_keys = _batch_gather_tokens(key_rows, safe_selected)
+        selected_values = _batch_gather_tokens(value_rows, safe_selected)
+        selected_cos = _batch_gather_tokens(cos, safe_selected)
+        selected_sin = _batch_gather_tokens(sin, safe_selected)
+        selected_keys = apply_partial_rope(
+            selected_keys,
+            selected_cos[..., None, :],
+            selected_sin[..., None, :],
+            rotary_dim=geometry.rotary_dim,
+        ).transpose(0, 1, 3, 2, 4)
+        selected_values = selected_values.transpose(0, 1, 3, 2, 4)
+
+        chunk_queries = queries[:, :, start:stop].transpose(0, 2, 1, 3)
+        chunk_query_cos = cos[:, query_start + start : query_start + stop]
+        chunk_query_sin = sin[:, query_start + start : query_start + stop]
+        chunk_queries = apply_partial_rope(
+            chunk_queries,
+            chunk_query_cos[:, :, None, :],
+            chunk_query_sin[:, :, None, :],
+            rotary_dim=geometry.rotary_dim,
+        )
+        groups = geometry.num_query_heads // geometry.num_key_value_heads
+        grouped_queries = chunk_queries.reshape(
+            batch,
+            chunk_tokens,
+            geometry.num_key_value_heads,
+            groups,
+            geometry.head_dim,
+        )
+        scores = (
+            grouped_queries.astype(mx.float32)
+            @ selected_keys.astype(mx.float32).swapaxes(-1, -2)
+        ) / math.sqrt(geometry.head_dim)
+        scores = mx.where(
+            selected_valid[:, :, None, None, :],
+            scores,
+            mx.finfo(scores.dtype).min,
+        )
+        probabilities = mx.softmax(scores, axis=-1).astype(chunk_queries.dtype)
+        output = probabilities @ selected_values
+        outputs.append(
+            output.reshape(
+                batch, chunk_tokens, geometry.num_query_heads, geometry.head_dim
+            )
+        )
+
+    return mx.concatenate(outputs, axis=1)
+
+
 def micro_block_sparse_qsa(
     request: Qwen4ExpQSARequest,
     *,
@@ -456,6 +731,35 @@ def micro_block_sparse_qsa(
             sin,
             mask,
             geometry=geometry,
+        )
+
+    if (
+        query_tokens > 1
+        and key_tokens <= geometry.token_budget
+        and row_observer is None
+    ):
+        return _bounded_prefill_all_selected(
+            queries,
+            keys,
+            values,
+            cos,
+            sin,
+            mask,
+            geometry=geometry,
+        )
+
+    if query_tokens > 1 and row_observer is None:
+        return _vectorized_sparse_prefill(
+            queries,
+            keys,
+            values,
+            index_queries,
+            index_keys,
+            cos,
+            sin,
+            mask,
+            geometry=geometry,
+            index_key_norm=index_key_norm,
         )
 
     # The request convention is append-only: current query positions are the
