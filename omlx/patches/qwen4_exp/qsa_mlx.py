@@ -315,6 +315,56 @@ def sparse_attention_row(
     return output.reshape(geometry.num_query_heads, geometry.head_dim)
 
 
+def _bounded_decode_all_selected(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    cos: mx.array,
+    sin: mx.array,
+    mask: mx.array,
+    *,
+    geometry: Qwen4ExpQSAGeometry,
+) -> mx.array:
+    """Vectorized exact decode when the QSA budget retains every visible key."""
+
+    query_cos = cos[:, -1:, :]
+    query_sin = sin[:, -1:, :]
+    queries = apply_partial_rope(
+        queries,
+        query_cos[:, None, :, :],
+        query_sin[:, None, :, :],
+        rotary_dim=geometry.rotary_dim,
+    )
+    keys = apply_partial_rope(
+        keys,
+        cos[:, None, :, :],
+        sin[:, None, :, :],
+        rotary_dim=geometry.rotary_dim,
+    )
+    batch, _, _, head_dim = queries.shape
+    groups = geometry.num_query_heads // geometry.num_key_value_heads
+    grouped_queries = queries.reshape(
+        batch,
+        geometry.num_key_value_heads,
+        groups,
+        1,
+        head_dim,
+    )
+    scores = (
+        grouped_queries.astype(mx.float32)
+        @ keys.astype(mx.float32)[:, :, None].swapaxes(-1, -2)
+    ) / math.sqrt(head_dim)
+    visible = mask[:, :, None]
+    if visible.dtype == mx.bool_:
+        scores = mx.where(visible, scores, mx.finfo(scores.dtype).min)
+    else:
+        scores = scores + visible
+    probabilities = mx.softmax(scores, axis=-1).astype(queries.dtype)
+    output = probabilities @ values[:, :, None]
+    output = output.reshape(batch, geometry.num_query_heads, 1, head_dim)
+    return output.transpose(0, 2, 1, 3)
+
+
 def micro_block_sparse_qsa(
     request: Qwen4ExpQSARequest,
     *,
@@ -389,6 +439,24 @@ def micro_block_sparse_qsa(
         raise Qwen4ExpQSAInputError("queries do not match QSA geometry")
     if query_tokens > key_tokens:
         raise Qwen4ExpQSAInputError("query length cannot exceed key length")
+
+    # Before the 2048-token budget is exceeded, QSA retains every causally
+    # visible key. Decode can therefore run the exact selected set as one
+    # bounded vectorized operation, avoiding twelve per-layer host syncs.
+    if (
+        query_tokens == 1
+        and key_tokens <= geometry.token_budget
+        and row_observer is None
+    ):
+        return _bounded_decode_all_selected(
+            queries,
+            keys,
+            values,
+            cos,
+            sin,
+            mask,
+            geometry=geometry,
+        )
 
     # The request convention is append-only: current query positions are the
     # final query_tokens rows in the full positional cache.

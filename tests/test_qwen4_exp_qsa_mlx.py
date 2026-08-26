@@ -273,6 +273,24 @@ def test_cache_seam_appends_prefill_then_single_token_decode():
     assert bool(mx.all(decode.attention_mask).item())
 
 
+def test_short_decode_fast_path_matches_row_reference():
+    request = _small_request(query_tokens=1, key_tokens=9)
+    fast = micro_block_sparse_qsa(request, geometry=SMALL, index_key_norm=_identity)
+    traced = []
+    row_reference = micro_block_sparse_qsa(
+        request,
+        geometry=SMALL,
+        index_key_norm=_identity,
+        row_observer=traced.append,
+    )
+    mx.eval(fast, row_reference)
+
+    np.testing.assert_allclose(
+        np.asarray(fast), np.asarray(row_reference), rtol=2e-5, atol=2e-5
+    )
+    assert len(traced) == 1
+
+
 def _official_text_config():
     return {
         "model_type": "qwen4_exp_text",
