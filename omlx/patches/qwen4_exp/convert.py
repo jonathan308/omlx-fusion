@@ -47,8 +47,8 @@ from .ple import (
     mlx_q8_index_metadata,
 )
 
-CONVERTER_VERSION: Final = 1
-LAYOUT_VERSION: Final = "qwen4-exp-split-q8-v1"
+CONVERTER_VERSION: Final = 2
+LAYOUT_VERSION: Final = "qwen4-exp-split-q8-v2"
 DEFAULT_SOURCE_SHARDS: Final = 131
 COMPUTE_DIRNAME: Final = "compute-q8"
 PLE_BF16_DIRNAME: Final = "ple-bf16"
@@ -82,6 +82,8 @@ _TOKENIZER_FILES: Final = frozenset(
     }
 )
 _MTP_LAYER_RE: Final = re.compile(r"^mtp\.layers\.(\d+)\.")
+_PACKED_GATE_UP_SUFFIX: Final = ".experts.gate_up_proj"
+_PACKED_DOWN_SUFFIX: Final = ".experts.down_proj"
 
 
 class Qwen4ExpConversionError(ValueError):
@@ -371,6 +373,70 @@ def _quantized_tensors(
         f"{base}.weight": _EncodedTensor(np.asarray(weight), "U32"),
         f"{base}.scales": _EncodedTensor(np.asarray(scales), scale_dtype),
         f"{base}.biases": _EncodedTensor(np.asarray(biases), scale_dtype),
+    }
+
+
+def _quantized_packed_moe_tensors(
+    name: str,
+    tensor: _EncodedTensor,
+    *,
+    quantizer: Quantizer,
+    group_size: int,
+    bits: int,
+) -> dict[str, _EncodedTensor] | None:
+    """Convert official packed MoE tensors into loadable SwitchGLU Q8 keys."""
+
+    if name.endswith(_PACKED_GATE_UP_SUFFIX):
+        if tensor.data.ndim != 3 or tensor.shape[-2] % 2:
+            raise Qwen4ExpConversionError(
+                f"packed gate/up tensor has invalid shape: {name} {tensor.shape}"
+            )
+        prefix = name[: -len(_PACKED_GATE_UP_SUFFIX)] + ".switch_mlp"
+        intermediate = tensor.shape[-2] // 2
+        outputs: dict[str, _EncodedTensor] = {}
+        for projection, data in (
+            ("gate_proj", tensor.data[..., :intermediate, :]),
+            ("up_proj", tensor.data[..., intermediate:, :]),
+        ):
+            outputs.update(
+                _quantized_tensors(
+                    f"{prefix}.{projection}.weight",
+                    _EncodedTensor(data, tensor.dtype_name),
+                    quantizer=quantizer,
+                    group_size=group_size,
+                    bits=bits,
+                )
+            )
+        return outputs
+    if name.endswith(_PACKED_DOWN_SUFFIX):
+        if tensor.data.ndim != 3:
+            raise Qwen4ExpConversionError(
+                f"packed down tensor has invalid shape: {name} {tensor.shape}"
+            )
+        prefix = name[: -len(_PACKED_DOWN_SUFFIX)] + ".switch_mlp.down_proj.weight"
+        return _quantized_tensors(
+            prefix,
+            tensor,
+            quantizer=quantizer,
+            group_size=group_size,
+            bits=bits,
+        )
+    return None
+
+
+def _packed_moe_output_names(name: str) -> set[str]:
+    if name.endswith(_PACKED_GATE_UP_SUFFIX):
+        prefix = name[: -len(_PACKED_GATE_UP_SUFFIX)] + ".switch_mlp"
+        projections = ("gate_proj", "up_proj")
+    elif name.endswith(_PACKED_DOWN_SUFFIX):
+        prefix = name[: -len(_PACKED_DOWN_SUFFIX)] + ".switch_mlp"
+        projections = ("down_proj",)
+    else:
+        return set()
+    return {
+        f"{prefix}.{projection}.{component}"
+        for projection in projections
+        for component in ("weight", "scales", "biases")
     }
 
 
@@ -764,7 +830,16 @@ def convert_qwen38_flash_next(
                     )
                 )
             else:
-                if _eligible_q8(name, tensor.data, group_size=PLE_MLX_Q8_GROUP_SIZE):
+                packed_moe = _quantized_packed_moe_tensors(
+                    name,
+                    tensor,
+                    quantizer=quantizer,
+                    group_size=PLE_MLX_Q8_GROUP_SIZE,
+                    bits=PLE_MLX_Q8_BITS,
+                )
+                if packed_moe is not None:
+                    compute_tensors.update(packed_moe)
+                elif _eligible_q8(name, tensor.data, group_size=PLE_MLX_Q8_GROUP_SIZE):
                     compute_tensors.update(
                         _quantized_tensors(
                             name,
@@ -858,13 +933,26 @@ def convert_qwen38_flash_next(
             )
         ple_metadata.update(q8_metadata)
     ple_index = _index_from_records(records, "ple", metadata=ple_metadata)
+    compute_names = set(compute_index["weight_map"])
     source_mtp_names = {name for name in weight_map if name.startswith("mtp.")}
-    missing_mtp = source_mtp_names.difference(compute_index["weight_map"])
+    ordinary_mtp_names = {
+        name for name in source_mtp_names if not _packed_moe_output_names(name)
+    }
+    missing_mtp = ordinary_mtp_names.difference(compute_names)
     if missing_mtp:
         preview = ", ".join(sorted(missing_mtp)[:3])
         raise Qwen4ExpConversionError(
             f"conversion dropped {len(missing_mtp)} MTP tensor(s): {preview}"
         )
+    for packed_name in (name for name in weight_map if _packed_moe_output_names(name)):
+        missing_outputs = _packed_moe_output_names(packed_name).difference(
+            compute_names
+        )
+        if missing_outputs:
+            raise Qwen4ExpConversionError(
+                f"conversion dropped packed MoE outputs for {packed_name}: "
+                + ", ".join(sorted(missing_outputs))
+            )
     if any(_is_ple_table(name) for name in compute_index["weight_map"]):
         raise Qwen4ExpConversionError("PLE table leaked into compute artifact")
     table_tensors_per_shard = 1 if ple_quantization == "bf16" else 3
