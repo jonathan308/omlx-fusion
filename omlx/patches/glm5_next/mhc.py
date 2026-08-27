@@ -313,7 +313,8 @@ def make_mhc_class():
                     import logging
 
                     logging.getLogger(__name__).info(
-                        "GLM5-Next compiled mHC decode engaged"
+                        "GLM5-Next compiled mHC decode engaged: shape=%s",
+                        tuple(hidden_streams.shape),
                     )
                 mixer = _compiled_mhc_mix(
                     hc,

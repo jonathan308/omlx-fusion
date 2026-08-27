@@ -489,7 +489,7 @@ class DecoderLayer(nn.Module):
         self.hc_ffn = mhc_class(args.mhc_config())
 
     def __call__(self, streams, mask, cache=None):
-        if streams.shape[1] <= 4 and self.layer_idx == 0:
+        if streams.shape[1] <= 4:
             _log_layer_probe_once(self, streams, mask, cache)
         post, comb, collapsed = _profiled("mhc.attn", self.hc_attn, streams)
         branch_input = self.input_layernorm(collapsed)
