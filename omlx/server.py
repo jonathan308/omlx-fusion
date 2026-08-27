@@ -249,6 +249,46 @@ def _reject_cluster_text_backbone_multimodal(
             ),
         )
 
+
+def _contains_audio_content(value: object) -> bool:
+    """Return whether an API content tree carries audio input parts."""
+
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        value = model_dump(exclude_none=True)
+
+    if isinstance(value, dict):
+        content_type = value.get("type")
+        if isinstance(content_type, str) and content_type.lower() in (
+            "audio",
+            "input_audio",
+        ):
+            return True
+        return any(_contains_audio_content(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_audio_content(item) for item in value)
+    return False
+
+
+def _reject_glm5_next_audio(engine: object, content: object) -> None:
+    """Fail honestly when GLM5-Next receives audio it cannot serve.
+
+    The checkpoint exposes text, image, and video towers only; silently
+    dropping audio would produce answers that pretend the media existed.
+    """
+
+    if (
+        getattr(engine, "model_type", None) == "glm5_next"
+        and _contains_audio_content(content)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "GLM-5.3-Flash has no audio tower; it supports text, image, "
+                "and video inputs only. Remove the audio part and resend."
+            ),
+        )
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -3874,6 +3914,7 @@ async def create_chat_completion(
         # Use the exact model selected by the pool, including fallback.
         resolved_model = _serving_model_id(lease, request.model)
         _reject_cluster_text_backbone_multimodal(engine, request.messages)
+        _reject_glm5_next_audio(engine, request.messages)
 
         # Get per-model settings
         max_tool_result_tokens = None
@@ -5911,6 +5952,7 @@ async def create_anthropic_message(
         # Use the exact model selected by the pool, including fallback.
         resolved_model = _serving_model_id(lease, request.model)
         _reject_cluster_text_backbone_multimodal(engine, request.messages)
+        _reject_glm5_next_audio(engine, request.messages)
 
         # Get per-model settings
         max_tool_result_tokens = None
@@ -6417,6 +6459,7 @@ async def create_response(
 
         resolved_model = _serving_model_id(lease, request.model)
         _reject_cluster_text_backbone_multimodal(engine, request.input)
+        _reject_glm5_next_audio(engine, request.input)
 
         current_input_messages = convert_responses_input_to_messages(
             request.input,
