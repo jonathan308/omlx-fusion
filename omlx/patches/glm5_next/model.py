@@ -510,7 +510,8 @@ class DecoderLayer(nn.Module):
         return apply_mhc_residual(post, comb, branch, streams)
 
 
-_PROFILE_ENABLED: Final = os.environ.get("GLM5_NEXT_PROFILE") == "1"
+_PROFILE_MODE: Final = os.environ.get("GLM5_NEXT_PROFILE", "0")
+_PROFILE_ENABLED: Final = _PROFILE_MODE in ("1", "2")
 _PROFILE_LOCK = threading.Lock()
 _PROFILE_STATS: dict[str, list[float]] = {}
 _PROFILE_CALLS = [0]
@@ -545,7 +546,9 @@ def _profiled(section, fn, *args, **kwargs):
     start = time.perf_counter()
     result = fn(*args, **kwargs)
     built = time.perf_counter()
-    mx.eval(*[value for _path, value in tree_flatten(result)])
+    if _PROFILE_MODE == "1":
+        # Barriered mode: eval each section to attribute GPU time.
+        mx.eval(*[value for _path, value in tree_flatten(result)])
     end = time.perf_counter()
     _profile_record(section, end - start)
     _profile_record(section + ".build", built - start)
