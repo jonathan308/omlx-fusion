@@ -62,6 +62,7 @@ KDA_LAYERS: Final = tuple(
 DSA_LAYERS: Final = tuple(MAIN_DSA_LAYERS)
 
 logger = logging.getLogger(__name__)
+_TRACED_LENGTHS: set = set()
 
 
 class Glm5NextModelContractError(ValueError):
@@ -560,6 +561,14 @@ class Glm5NextTextBackbone(PipelineMixin, nn.Module):
             raise ValueError("GLM5-Next cache must contain exactly 45 layer entries")
         for layer, layer_cache in zip(self.pipeline_layers, cache):
             batch, length = hidden.shape[:2]
+            if length not in _TRACED_LENGTHS:
+                _TRACED_LENGTHS.add(length)
+                logger.info(
+                    "GLM5-Next backbone call: batch=%d length=%d cache0=%s",
+                    batch,
+                    length,
+                    type(cache[0]).__name__ if cache else None,
+                )
             if isinstance(layer_cache, Glm5NextDsaCache):
                 # The final DSA module derives prepared batch validity from its
                 # own cache. Passing a KDA-style mask here would discard its
