@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -156,6 +157,92 @@ def apply_mhc_residual(post, comb, branch_output, residual):
     return placed + mixed
 
 
+def _mhc_mix_pyre(
+    hidden_streams,
+    fn_pre,
+    fn_post,
+    fn_comb,
+    base_pre,
+    base_post,
+    base_comb,
+    scale_pre,
+    scale_post,
+    scale_comb,
+    config: MHCConfig,
+):
+    """Pure functional form of the mHC mixer, exactly the class semantics.
+
+    Exposed separately so decode can run the identical math through a compiled
+    graph: the 20-iteration Sinkhorn loop otherwise launches ~40 tiny kernels
+    per call, which dominates single-token decode latency.
+    """
+
+    mx, _ = _mlx_runtime()
+    input_dtype = hidden_streams.dtype
+    flat = hidden_streams.reshape(*hidden_streams.shape[:2], -1).astype(mx.float32)
+    variance = mx.mean(flat * flat, axis=-1, keepdims=True)
+    flat = flat * mx.rsqrt(variance + config.rms_norm_eps)
+    hc = config.streams
+    pre_w = flat @ fn_pre.astype(mx.float32).swapaxes(-1, -2)
+    post_w = flat @ fn_post.astype(mx.float32).swapaxes(-1, -2)
+    comb_w = flat @ fn_comb.astype(mx.float32).swapaxes(-1, -2)
+    base_pre = base_pre.astype(mx.float32)
+    base_post = base_post.astype(mx.float32)
+    base_comb = base_comb.astype(mx.float32)
+    pre_scale = scale_pre.astype(mx.float32)
+    post_scale = scale_post.astype(mx.float32)
+    comb_scale = scale_comb.astype(mx.float32)
+    pre = mx.sigmoid(pre_w * pre_scale + base_pre) + config.eps
+    post = 2.0 * mx.sigmoid(post_w * post_scale + base_post)
+    comb_logits = comb_w.reshape(*comb_w.shape[:-1], hc, hc) * comb_scale
+    comb_logits = comb_logits + base_comb.reshape(hc, hc)
+    comb = mx.softmax(comb_logits, axis=-1, precise=True) + config.eps
+    comb = comb / (comb.sum(axis=-2, keepdims=True) + config.eps)
+    for _ in range(config.sinkhorn_iters - 1):
+        comb = comb / (comb.sum(axis=-1, keepdims=True) + config.eps)
+        comb = comb / (comb.sum(axis=-2, keepdims=True) + config.eps)
+    collapsed = (pre[..., None] * hidden_streams.astype(mx.float32)).sum(axis=2)
+    return post, comb, collapsed.astype(input_dtype)
+
+
+@lru_cache(maxsize=4)
+def _compiled_mhc_mix(streams: int, eps: float, rms_eps: float, iters: int):
+    """Compile the pure mixer once per config; shapeless for prefill/decode."""
+
+    mx, _ = _mlx_runtime()
+    config = MHCConfig(
+        streams=streams, eps=eps, rms_norm_eps=rms_eps, sinkhorn_iters=iters
+    )
+
+    def _run(
+        hidden_streams,
+        fn_pre,
+        fn_post,
+        fn_comb,
+        base_pre,
+        base_post,
+        base_comb,
+        scale_pre,
+        scale_post,
+        scale_comb,
+    ):
+        return _mhc_mix_pyre(
+            hidden_streams,
+            fn_pre,
+            fn_post,
+            fn_comb,
+            base_pre,
+            base_post,
+            base_comb,
+            scale_pre,
+            scale_post,
+            scale_comb,
+            config,
+        )
+
+    return mx.compile(_run, shapeless=True)
+
+
 @lru_cache(maxsize=1)
 def make_mhc_class():
     """Return the lazily constructed MLX ``Glm5NextMHC`` module class."""
@@ -190,6 +277,29 @@ def make_mhc_class():
                     f"found {hidden_streams.shape[2:]}"
                 )
             input_dtype = hidden_streams.dtype
+            if os.environ.get("GLM5_NEXT_MHC_COMPILE", "1") == "1":
+                hc = self.config.streams
+                mixer = _compiled_mhc_mix(
+                    hc,
+                    self.config.eps,
+                    self.config.rms_norm_eps,
+                    self.config.sinkhorn_iters,
+                )
+                # Split eagerly (views) so the compiled graph holds only
+                # matmul/elementwise/reduction primitives.
+                fn, base, scale = self.fn, self.base, self.scale
+                return mixer(
+                    hidden_streams,
+                    fn[:hc],
+                    fn[hc : 2 * hc],
+                    fn[2 * hc :],
+                    base[:hc],
+                    base[hc : 2 * hc],
+                    base[2 * hc :],
+                    scale[0],
+                    scale[1],
+                    scale[2],
+                )
             flat = hidden_streams.reshape(*hidden_streams.shape[:2], -1).astype(
                 mx.float32
             )
