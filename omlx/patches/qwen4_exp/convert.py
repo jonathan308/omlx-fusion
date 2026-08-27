@@ -47,8 +47,8 @@ from .ple import (
     mlx_q8_index_metadata,
 )
 
-CONVERTER_VERSION: Final = 1
-LAYOUT_VERSION: Final = "qwen4-exp-split-q8-v1"
+CONVERTER_VERSION: Final = 2
+LAYOUT_VERSION: Final = "qwen4-exp-split-q8-v2"
 DEFAULT_SOURCE_SHARDS: Final = 131
 COMPUTE_DIRNAME: Final = "compute-q8"
 PLE_BF16_DIRNAME: Final = "ple-bf16"
@@ -82,6 +82,16 @@ _TOKENIZER_FILES: Final = frozenset(
     }
 )
 _MTP_LAYER_RE: Final = re.compile(r"^mtp\.layers\.(\d+)\.")
+_PACKED_GATE_UP_SUFFIX: Final = ".experts.gate_up_proj"
+_PACKED_DOWN_SUFFIX: Final = ".experts.down_proj"
+
+
+def _compute_layout_version(bits: int) -> str:
+    return LAYOUT_VERSION if bits == 8 else f"qwen4-exp-split-q{bits}-v2"
+
+
+def _compute_dirname(bits: int) -> str:
+    return COMPUTE_DIRNAME if bits == 8 else f"compute-q{bits}"
 
 
 class Qwen4ExpConversionError(ValueError):
@@ -325,8 +335,10 @@ def _eligible_q8(name: str, tensor: np.ndarray, *, group_size: int) -> bool:
 def _mlx_affine_q8(
     tensor: np.ndarray, group_size: int, bits: int, source_dtype: str
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    if bits != 8:
-        raise Qwen4ExpConversionError("Qwen4-Exp streaming converter only emits Q8")
+    if bits not in {4, 8}:
+        raise Qwen4ExpConversionError(
+            "Qwen4-Exp streaming converter emits affine Q4 or Q8"
+        )
     try:
         import mlx.core as mx
     except ImportError as exc:  # pragma: no cover - platform/package guard
@@ -371,6 +383,70 @@ def _quantized_tensors(
         f"{base}.weight": _EncodedTensor(np.asarray(weight), "U32"),
         f"{base}.scales": _EncodedTensor(np.asarray(scales), scale_dtype),
         f"{base}.biases": _EncodedTensor(np.asarray(biases), scale_dtype),
+    }
+
+
+def _quantized_packed_moe_tensors(
+    name: str,
+    tensor: _EncodedTensor,
+    *,
+    quantizer: Quantizer,
+    group_size: int,
+    bits: int,
+) -> dict[str, _EncodedTensor] | None:
+    """Convert official packed MoE tensors into loadable SwitchGLU Q8 keys."""
+
+    if name.endswith(_PACKED_GATE_UP_SUFFIX):
+        if tensor.data.ndim != 3 or tensor.shape[-2] % 2:
+            raise Qwen4ExpConversionError(
+                f"packed gate/up tensor has invalid shape: {name} {tensor.shape}"
+            )
+        prefix = name[: -len(_PACKED_GATE_UP_SUFFIX)] + ".switch_mlp"
+        intermediate = tensor.shape[-2] // 2
+        outputs: dict[str, _EncodedTensor] = {}
+        for projection, data in (
+            ("gate_proj", tensor.data[..., :intermediate, :]),
+            ("up_proj", tensor.data[..., intermediate:, :]),
+        ):
+            outputs.update(
+                _quantized_tensors(
+                    f"{prefix}.{projection}.weight",
+                    _EncodedTensor(data, tensor.dtype_name),
+                    quantizer=quantizer,
+                    group_size=group_size,
+                    bits=bits,
+                )
+            )
+        return outputs
+    if name.endswith(_PACKED_DOWN_SUFFIX):
+        if tensor.data.ndim != 3:
+            raise Qwen4ExpConversionError(
+                f"packed down tensor has invalid shape: {name} {tensor.shape}"
+            )
+        prefix = name[: -len(_PACKED_DOWN_SUFFIX)] + ".switch_mlp.down_proj.weight"
+        return _quantized_tensors(
+            prefix,
+            tensor,
+            quantizer=quantizer,
+            group_size=group_size,
+            bits=bits,
+        )
+    return None
+
+
+def _packed_moe_output_names(name: str) -> set[str]:
+    if name.endswith(_PACKED_GATE_UP_SUFFIX):
+        prefix = name[: -len(_PACKED_GATE_UP_SUFFIX)] + ".switch_mlp"
+        projections = ("gate_proj", "up_proj")
+    elif name.endswith(_PACKED_DOWN_SUFFIX):
+        prefix = name[: -len(_PACKED_DOWN_SUFFIX)] + ".switch_mlp"
+        projections = ("down_proj",)
+    else:
+        return set()
+    return {
+        f"{prefix}.{projection}.{component}"
+        for projection in projections
+        for component in ("weight", "scales", "biases")
     }
 
 
@@ -578,16 +654,21 @@ def _copy_metadata_files(source: Path, compute_dir: Path, ple_dir: Path) -> None
 
 
 def _write_compute_config(
-    source_config: Mapping[str, Any], compute_dir: Path, *, ple_dirname: str
+    source_config: Mapping[str, Any],
+    compute_dir: Path,
+    *,
+    ple_dirname: str,
+    compute_bits: int,
+    layout_version: str,
 ) -> None:
     config = dict(source_config)
     config["quantization"] = {
-        "bits": PLE_MLX_Q8_BITS,
+        "bits": compute_bits,
         "group_size": PLE_MLX_Q8_GROUP_SIZE,
         "mode": "affine",
     }
     config["qwen4_exp_artifact"] = {
-        "layout": LAYOUT_VERSION,
+        "layout": layout_version,
         "ple_artifact": f"../{ple_dirname}",
         "ple_residency": "ssd_mmap",
     }
@@ -625,6 +706,7 @@ def convert_qwen38_flash_next(
     ple_head_dim: int = OFFICIAL_PLE_LAYOUT.head_dim,
     ple_source_dtype: str = "BF16",
     ple_quantization: str = "bf16",
+    compute_bits: int = 8,
     quantizer: Quantizer = _mlx_affine_q8,
     source_revision: str | None = None,
 ) -> ConversionResult:
@@ -632,6 +714,8 @@ def convert_qwen38_flash_next(
 
     if ple_quantization not in {"bf16", "q8"}:
         raise Qwen4ExpConversionError("ple_quantization must be 'bf16' or 'q8'")
+    if isinstance(compute_bits, bool) or compute_bits not in {4, 8}:
+        raise Qwen4ExpConversionError("compute_bits must be 4 or 8")
     source = Path(source_dir).resolve()
     output = Path(output_dir).resolve()
     if source == output or source in output.parents:
@@ -642,7 +726,9 @@ def convert_qwen38_flash_next(
         expected_ple_shards=expected_ple_shards,
     )
     output.mkdir(parents=True, exist_ok=True)
-    compute_dir = output / COMPUTE_DIRNAME
+    compute_dirname = _compute_dirname(compute_bits)
+    layout_version = _compute_layout_version(compute_bits)
+    compute_dir = output / compute_dirname
     ple_dirname = PLE_BF16_DIRNAME if ple_quantization == "bf16" else PLE_Q8_DIRNAME
     ple_dir = output / ple_dirname
     compute_dir.mkdir(exist_ok=True)
@@ -651,11 +737,11 @@ def convert_qwen38_flash_next(
     source_index_sha = _sha256(source / INDEX_NAME)
     identity = {
         "converter_version": CONVERTER_VERSION,
-        "layout_version": LAYOUT_VERSION,
+        "layout_version": layout_version,
         "source_index_sha256": source_index_sha,
         "source_revision": source_revision,
         "source_shard_count": len(source_shards),
-        "q8_bits": PLE_MLX_Q8_BITS,
+        "q8_bits": compute_bits,
         "q8_group_size": PLE_MLX_Q8_GROUP_SIZE,
         "q8_mode": "affine",
         "ple_shard_count": expected_ple_shards,
@@ -764,14 +850,23 @@ def convert_qwen38_flash_next(
                     )
                 )
             else:
-                if _eligible_q8(name, tensor.data, group_size=PLE_MLX_Q8_GROUP_SIZE):
+                packed_moe = _quantized_packed_moe_tensors(
+                    name,
+                    tensor,
+                    quantizer=quantizer,
+                    group_size=PLE_MLX_Q8_GROUP_SIZE,
+                    bits=compute_bits,
+                )
+                if packed_moe is not None:
+                    compute_tensors.update(packed_moe)
+                elif _eligible_q8(name, tensor.data, group_size=PLE_MLX_Q8_GROUP_SIZE):
                     compute_tensors.update(
                         _quantized_tensors(
                             name,
                             tensor,
                             quantizer=quantizer,
                             group_size=PLE_MLX_Q8_GROUP_SIZE,
-                            bits=PLE_MLX_Q8_BITS,
+                            bits=compute_bits,
                         )
                     )
                 else:
@@ -785,7 +880,7 @@ def convert_qwen38_flash_next(
         output_name = f"model-{ordinal:05d}-of-{len(source_shards):05d}.safetensors"
         record: dict[str, Any] = {"source_sha256": source_sha}
         if compute_tensors:
-            relative = f"{COMPUTE_DIRNAME}/{output_name}"
+            relative = f"{compute_dirname}/{output_name}"
             checksum = _atomic_safetensors(output / relative, compute_tensors)
             record["compute"] = {
                 "file": relative,
@@ -825,7 +920,7 @@ def convert_qwen38_flash_next(
         "compute",
         metadata={
             "format": "mlx",
-            "qwen4_exp_layout": LAYOUT_VERSION,
+            "qwen4_exp_layout": layout_version,
             "qwen4_exp_source_index_sha256": source_index_sha,
             "qwen4_exp_mtp_depth": 1,
         },
@@ -858,13 +953,26 @@ def convert_qwen38_flash_next(
             )
         ple_metadata.update(q8_metadata)
     ple_index = _index_from_records(records, "ple", metadata=ple_metadata)
+    compute_names = set(compute_index["weight_map"])
     source_mtp_names = {name for name in weight_map if name.startswith("mtp.")}
-    missing_mtp = source_mtp_names.difference(compute_index["weight_map"])
+    ordinary_mtp_names = {
+        name for name in source_mtp_names if not _packed_moe_output_names(name)
+    }
+    missing_mtp = ordinary_mtp_names.difference(compute_names)
     if missing_mtp:
         preview = ", ".join(sorted(missing_mtp)[:3])
         raise Qwen4ExpConversionError(
             f"conversion dropped {len(missing_mtp)} MTP tensor(s): {preview}"
         )
+    for packed_name in (name for name in weight_map if _packed_moe_output_names(name)):
+        missing_outputs = _packed_moe_output_names(packed_name).difference(
+            compute_names
+        )
+        if missing_outputs:
+            raise Qwen4ExpConversionError(
+                f"conversion dropped packed MoE outputs for {packed_name}: "
+                + ", ".join(sorted(missing_outputs))
+            )
     if any(_is_ple_table(name) for name in compute_index["weight_map"]):
         raise Qwen4ExpConversionError("PLE table leaked into compute artifact")
     table_tensors_per_shard = 1 if ple_quantization == "bf16" else 3
@@ -879,7 +987,13 @@ def convert_qwen38_flash_next(
     _atomic_bytes(compute_dir / INDEX_NAME, _json_bytes(compute_index))
     _atomic_bytes(ple_dir / INDEX_NAME, _json_bytes(ple_index))
     _copy_metadata_files(source, compute_dir, ple_dir)
-    _write_compute_config(config, compute_dir, ple_dirname=ple_dirname)
+    _write_compute_config(
+        config,
+        compute_dir,
+        ple_dirname=ple_dirname,
+        compute_bits=compute_bits,
+        layout_version=layout_version,
+    )
     manifest["complete"] = True
     manifest["compute_index_sha256"] = _sha256(compute_dir / INDEX_NAME)
     manifest["ple_index_sha256"] = _sha256(ple_dir / INDEX_NAME)
@@ -889,13 +1003,20 @@ def convert_qwen38_flash_next(
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Stream official Qwen3.8-Flash-Next BF16 into split MLX Q8 artifacts"
+        description="Stream official Qwen3.8-Flash-Next BF16 into split MLX Q4/Q8 artifacts"
     )
     parser.add_argument("source", help="official 131-shard BF16 model directory")
     parser.add_argument("output", help="new output directory")
     parser.add_argument(
         "--source-revision",
         help="optional Hugging Face commit SHA recorded in the manifest",
+    )
+    parser.add_argument(
+        "--compute-bits",
+        type=int,
+        choices=(4, 8),
+        default=8,
+        help="MLX affine precision for compute weights (default: 8)",
     )
     parser.add_argument(
         "--ple-q8",
@@ -907,6 +1028,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.source,
         args.output,
         source_revision=args.source_revision,
+        compute_bits=args.compute_bits,
         ple_quantization="q8" if args.ple_q8 else "bf16",
     )
     print(result.compute_dir)

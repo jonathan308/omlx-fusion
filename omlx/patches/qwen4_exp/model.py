@@ -9,6 +9,8 @@ micro-block sparse adapter and never falls back to dense attention or DSA.
 
 from __future__ import annotations
 
+import weakref
+
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.base import create_attention_mask, create_ssm_mask
@@ -47,6 +49,14 @@ from omlx.patches.qwen4_exp.qsa_mlx import (
 )
 
 QWEN4_EXP_STRICT_QSA = True
+
+
+def expand_hyper_streams(hidden, hc_count: int):
+    """Repeat the complete hidden vector once per mHC stream."""
+
+    if hc_count <= 1:
+        raise ValueError("Qwen4-Exp requires more than one hyper stream")
+    return mx.concatenate([hidden] * hc_count, axis=-1)
 
 
 class ZeroCenteredRMSNorm(nn.Module):
@@ -134,6 +144,7 @@ class Qwen4ExpAttention(nn.Module):
 
     def __call__(self, x, mask=None, cache=None):
         batch, length, _ = x.shape
+        contiguous_causal = batch == 1 and mask is None
         projected = self.q_proj(x).reshape(
             batch, length, self.num_attention_heads, self.head_dim * 2
         )
@@ -173,7 +184,7 @@ class Qwen4ExpAttention(nn.Module):
             prepared_mask = (
                 mask
                 if isinstance(mask, mx.array)
-                else main_cache.make_mask(length, return_array=True)
+                else main_cache.make_mask(length, return_array=True, window_size=None)
             )
             keys, values = main_cache.update_and_fetch(keys, values)
             auxiliary_values = mx.concatenate((cos, sin), axis=-1)[:, None]
@@ -191,6 +202,7 @@ class Qwen4ExpAttention(nn.Module):
                 position_cos=cos,
                 position_sin=sin,
                 attention_mask=prepared_mask,
+                contiguous_causal=contiguous_causal,
             )
         else:
             request = prepare_qsa_request(
@@ -203,6 +215,7 @@ class Qwen4ExpAttention(nn.Module):
                 position_sin=sin,
                 attention_mask=mask if isinstance(mask, mx.array) else None,
                 cache=cache,
+                contiguous_causal=contiguous_causal,
             )
         output = self.qsa(request).reshape(batch, length, -1)
         return self.o_proj(output * mx.sigmoid(gate))
@@ -241,6 +254,8 @@ class Qwen4ExpPLELayer(nn.Module):
             bias=False,
         )
         self._pool: Qwen4ExpPLESSDPool | None = None
+        self._pool_finalizer: weakref.finalize | None = None
+        self._residency_policy = getattr(args, "ple_residency_policy", None)
 
     def _get_pool(self) -> Qwen4ExpPLESSDPool:
         if self._pool is None:
@@ -249,8 +264,23 @@ class Qwen4ExpPLELayer(nn.Module):
             model_dir = get_model_dir()
             if model_dir is None:
                 raise RuntimeError("qwen4_exp PLE has no bound checkpoint directory")
-            self._pool = Qwen4ExpPLESSDPool(model_dir)
+            pool = Qwen4ExpPLESSDPool(
+                model_dir, residency_policy=self._residency_policy
+            )
+            self._pool = pool
+            # Model teardown is not uniformly routed through Model.close() by
+            # every mlx-lm engine. Keep the pool out of the callback's object
+            # graph and close its mappings when this layer is collected.
+            self._pool_finalizer = weakref.finalize(self, pool.close)
         return self._pool
+
+    def close(self) -> None:
+        finalizer = self._pool_finalizer
+        if finalizer is not None and finalizer.alive:
+            finalizer()
+        elif self._pool is not None:
+            self._pool.close()
+        self._pool = None
 
     def __call__(self, hidden_states, input_ids, cache=None, mask=None):
         import numpy as np
@@ -445,7 +475,7 @@ class Qwen4ExpTextModel(PipelineMixin, nn.Module):
         hidden = (
             self.embed_tokens(inputs) if input_embeddings is None else input_embeddings
         )
-        hidden = mx.repeat(hidden, self.args.hc_count, axis=-1)
+        hidden = expand_hyper_streams(hidden, self.args.hc_count)
         if cache is None:
             cache = [None] * len(self.pipeline_layers)
 
@@ -618,6 +648,14 @@ class Model(nn.Module):
         self.args = args
         self.model_type = args.model_type
         text_args = TextModelArgs.from_dict(args.text_config)
+        for key in (
+            "ple_residency_policy",
+            "qwen4_exp_ple_residency",
+            "ple_residency",
+        ):
+            if args.text_config.get(key) is not None:
+                text_args.ple_residency_policy = args.text_config[key]
+                break
         self.language_model = TextModel(text_args)
         self._quantized_checkpoint = bool(args.quantization or args.quantization_config)
 
@@ -662,6 +700,15 @@ class Model(nn.Module):
 
     def make_cache(self):
         return self.language_model.make_cache()
+
+    def close(self) -> None:
+        """Release PLE file mappings; safe to call repeatedly during unload."""
+
+        layers = getattr(getattr(self.language_model, "model", None), "layers", ())
+        if len(layers) > 1:
+            ple = getattr(layers[1], "ple", None)
+            if ple is not None:
+                ple.close()
 
     def sanitize(self, weights):
         # Validate and bind all 128 SSD-backed PLE ranges during load, before
@@ -751,6 +798,7 @@ __all__ = [
     "TextModelArgs",
     "build_mtp_decoder_layer",
     "create_attention_mask",
+    "expand_hyper_streams",
     "make_qsa_cache",
 ]
 

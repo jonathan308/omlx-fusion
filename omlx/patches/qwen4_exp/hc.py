@@ -17,6 +17,121 @@ from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any
 
+_INJECT_QMV_KERNELS: dict[int, Any] = {}
+
+
+def _inject_qmv_kernel(mx: Any, bits: int):
+    kernel = _INJECT_QMV_KERNELS.get(bits)
+    if kernel is not None:
+        return kernel
+    if bits == 8:
+        values_per_thread = 4
+        block_size = 128
+        sum_code = "for (uint i = 0; i < 4; ++i) { sum += values[i]; }"
+        weight_setup = (
+            "const device uchar* wb = reinterpret_cast<const device uchar*>(qweight);"
+        )
+        dot = """
+            float accum = 0.0f;
+            for (uint i = 0; i < 4; ++i) {
+              accum += values[i] * float(wb[out * K + base + i]);
+            }
+        """
+    elif bits == 4:
+        values_per_thread = 8
+        block_size = 256
+        sum_code = """
+            sum += values[0] + values[1] + values[2] + values[3];
+            sum += values[4] + values[5] + values[6] + values[7];
+        """
+        weight_setup = (
+            "const device ushort* wb = reinterpret_cast<const device ushort*>(qweight);"
+        )
+        dot = """
+            float accum = 0.0f;
+            for (uint pack = 0; pack < 2; ++pack) {
+              ushort packed = wb[out * (K / 4) + base / 4 + pack];
+              uint offset = pack * 4;
+              accum +=
+                  values[offset] * float(packed & 0x000f) +
+                  (values[offset + 1] / 16.0f) * float(packed & 0x00f0) +
+                  (values[offset + 2] / 256.0f) * float(packed & 0x0f00) +
+                  (values[offset + 3] / 4096.0f) * float(packed & 0xf000);
+            }
+        """
+    else:  # pragma: no cover - guarded by caller
+        raise ValueError("Qwen4-Exp HC injection supports affine Q4/Q8")
+    source = f"""
+        uint lane = thread_position_in_threadgroup.x;
+        constexpr uint K = 10240;
+        constexpr uint GROUPS = 320;
+        {weight_setup}
+        float result[4] = {{0.0f, 0.0f, 0.0f, 0.0f}};
+        for (uint base = lane * {values_per_thread};
+             base < K;
+             base += {block_size}) {{
+          float values[{values_per_thread}];
+          float sum = 0.0f;
+          for (uint i = 0; i < {values_per_thread}; ++i) {{
+            values[i] = float(x[base + i]);
+          }}
+          {sum_code}
+          uint group = base / 32;
+          for (uint out = 0; out < 4; ++out) {{
+            {dot}
+            result[out] += float(scales[out * GROUPS + group]) * accum +
+                           sum * float(biases[out * GROUPS + group]);
+          }}
+        }}
+        for (uint out = 0; out < 4; ++out) {{
+          float total = simd_sum(result[out]);
+          if (lane == 0) {{
+            y[out] = T(total);
+          }}
+        }}
+    """
+    kernel = mx.fast.metal_kernel(
+        name=f"omlx_qwen4_hc_inject_qmv_q{bits}",
+        input_names=["x", "qweight", "scales", "biases"],
+        output_names=["y"],
+        source=source,
+    )
+    _INJECT_QMV_KERNELS[bits] = kernel
+    return kernel
+
+
+def _fast_quantized_injection(mx: Any, nn: Any, projection: Any, normalized: Any):
+    """Run the exact batch-one Q8 four-output HC injection kernel."""
+
+    if (
+        not mx.metal.is_available()
+        or not isinstance(projection, nn.QuantizedLinear)
+        or normalized.ndim != 3
+        or normalized.shape[:2] != (1, 1)
+        or normalized.shape[-1] != 10240
+        or projection.scales.shape[-1] * projection.group_size != 10240
+        or projection.weight.shape[-2] != 4
+        or projection.group_size != 32
+        or projection.bits != 8
+        or projection.mode != "affine"
+        or projection.get("biases") is None
+        or "bias" in projection
+    ):
+        return None
+    return _inject_qmv_kernel(mx, projection.bits)(
+        inputs=[
+            normalized,
+            projection.weight,
+            projection.scales,
+            projection.biases,
+        ],
+        template=[("T", normalized.dtype)],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(*normalized.shape[:-1], 4)],
+        output_dtypes=[normalized.dtype],
+    )[0]
+
 
 def _get(config: Any, name: str, default: Any = None) -> Any:
     if isinstance(config, Mapping):
@@ -152,9 +267,12 @@ def _implementation_class():
             mixed_input = mx.mean(input_mix_weight * streams, axis=-2)
             if self.block_inject_weight is None:
                 return mixed_input
-            injection_weights = 2 * mx.sigmoid(
-                self.block_inject_weight(hyper_input_normed) / self.hc_count
+            injection_logits = _fast_quantized_injection(
+                mx, nn, self.block_inject_weight, hyper_input_normed
             )
+            if injection_logits is None:
+                injection_logits = self.block_inject_weight(hyper_input_normed)
+            injection_weights = 2 * mx.sigmoid(injection_logits / self.hc_count)
             return mixed_input, hyper_input, injection_weights
 
     _Qwen4ExpGatedResidual.__name__ = "Qwen4ExpGatedResidual"

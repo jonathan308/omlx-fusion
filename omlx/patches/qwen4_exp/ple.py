@@ -23,10 +23,12 @@ import os
 import stat
 import struct
 import threading
+import weakref
 from collections import OrderedDict, defaultdict
-from concurrent.futures import Executor, Future
+from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Any, Final
 
@@ -44,6 +46,13 @@ PLE_MLX_Q8_BITS: Final = 8
 PLE_MLX_Q8_GROUP_SIZE: Final = 32
 PLE_MLX_Q8_MODE: Final = "affine"
 PLE_MLX_Q8_FORMAT: Final = "mlx-affine-q8-v1"
+PLE_RESIDENCY_SSD_MMAP: Final = "ssd_mmap"
+PLE_RESIDENCY_MEMORY: Final = "memory"
+PLE_RESIDENCY_ENV: Final = "OMLX_QWEN4_EXP_PLE_RESIDENCY"
+PLE_RESIDENCY_METADATA_KEY: Final = "qwen4_exp_ple_residency"
+PLE_DIRECT_GATHER_MIN_ROWS: Final = 64
+PLE_IO_WORKERS_ENV: Final = "OMLX_QWEN4_EXP_PLE_IO_WORKERS"
+PLE_DEFAULT_IO_WORKERS: Final = 32
 
 # These flat model.safetensors.index.json metadata fields are part of the Q8
 # artifact contract.  They make a mixed compute-Q4 / PLE-Q8 conversion
@@ -84,6 +93,9 @@ _DTYPES: Final[dict[str, tuple[np.dtype[Any], int]]] = {
     "U32": (np.dtype("<u4"), 4),
 }
 
+_ACTIVE_POOLS: weakref.WeakSet[Qwen4ExpPLESSDPool] = weakref.WeakSet()
+_ACTIVE_POOLS_LOCK = threading.RLock()
+
 
 class PLEArtifactError(ValueError):
     """The PLE checkpoint is incomplete, unsafe, or structurally invalid."""
@@ -121,7 +133,18 @@ def _is_prime(value: int) -> bool:
     return all(value % divisor for divisor in range(3, math.isqrt(value) + 1, 2))
 
 
+@cache
 def _find_nth_prime_after(start: int, count: int) -> int:
+    """Return a stable PLE head modulus without redoing primality search.
+
+    The published layout derives sixteen ~20M prime moduli.  ``rows_per_shard``
+    depends on their sum and is queried while grouping every selected table
+    row.  Re-running the trial-division search there cost roughly 9 ms per PLE
+    row (about 150 seconds for a 1K-token prompt).  Layout inputs are immutable,
+    so caching this pure derivation preserves exact IDs while removing that
+    accidental CPU critical path.
+    """
+
     prime = start
     for _ in range(count):
         prime += 1
@@ -247,6 +270,21 @@ def _layout_from_q8_metadata(metadata: dict[str, Any]) -> PLELayout:
         raise PLEArtifactError(f"invalid MLX Q8 PLE layout metadata: {exc}") from exc
 
 
+def _layout_from_index_metadata(metadata: Any) -> PLELayout:
+    """Select dense BF16 or affine Q8 from an explicit format marker."""
+
+    if not isinstance(metadata, dict):
+        return OFFICIAL_PLE_LAYOUT
+    artifact_format = metadata.get("qwen4_exp_ple_format")
+    if artifact_format == PLE_MLX_Q8_FORMAT:
+        return _layout_from_q8_metadata(metadata)
+    if artifact_format in (None, "bf16-ssd-mmap-v1"):
+        return OFFICIAL_PLE_LAYOUT
+    raise PLEArtifactError(
+        f"unsupported Qwen4-Exp PLE artifact format: {artifact_format!r}"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _FileFingerprint:
     device: int
@@ -280,8 +318,14 @@ class _TensorDescriptor:
 class _MappedTensor:
     """A tensor-range mmap that does not fault data in until rows are read."""
 
-    def __init__(self, descriptor: _TensorDescriptor) -> None:
+    def __init__(
+        self,
+        descriptor: _TensorDescriptor,
+        *,
+        random_access: bool = True,
+    ) -> None:
         self.descriptor = descriptor
+        self._random_access = random_access
         self._mapping: mmap.mmap | None = None
         self._mapping_delta = 0
         self._lock = threading.Lock()
@@ -313,12 +357,33 @@ class _MappedTensor:
             finally:
                 os.close(file_descriptor)
 
-            if hasattr(self._mapping, "madvise") and hasattr(mmap, "MADV_RANDOM"):
+            if (
+                self._random_access
+                and hasattr(self._mapping, "madvise")
+                and hasattr(mmap, "MADV_RANDOM")
+            ):
                 # The hint is an optimization.  Some macOS/filesystem
                 # combinations expose madvise but reject MADV_RANDOM.
                 with suppress(OSError, ValueError):
                     self._mapping.madvise(mmap.MADV_RANDOM)
             return self._mapping
+
+    def advise(self, advice: int) -> int:
+        """Apply a best-effort VM hint and report logical tensor bytes hinted."""
+
+        mapping = self._ensure_open()
+        if not hasattr(mapping, "madvise"):
+            return 0
+        try:
+            mapping.madvise(advice)
+        except (OSError, ValueError):
+            return 0
+        return self.descriptor.byte_length
+
+    @property
+    def mapped_bytes(self) -> int:
+        with self._lock:
+            return self.descriptor.byte_length if self._mapping is not None else 0
 
     def read_rows(self, start: int, stop: int) -> NDArray[Any]:
         rows, columns = self.descriptor.shape
@@ -334,6 +399,24 @@ class _MappedTensor:
         # A copy is intentional: callers never retain an mmap view, and the
         # explicit cache remains byte-bounded and safe to close independently.
         return array[start:stop].copy()
+
+    def read_indices(self, indices: NDArray[np.intp]) -> NDArray[Any]:
+        """Copy selected rows without materializing the gaps between them."""
+
+        rows, columns = self.descriptor.shape
+        indices = np.asarray(indices, dtype=np.intp)
+        if indices.ndim != 1:
+            raise IndexError("row indices must be a rank-1 integer array")
+        if indices.size and (indices.min() < 0 or indices.max() >= rows):
+            raise IndexError(f"row indices are outside [0, {rows})")
+        mapping = self._ensure_open()
+        array = np.ndarray(
+            (rows, columns),
+            dtype=self.descriptor.numpy_dtype,
+            buffer=mapping,
+            offset=self._mapping_delta,
+        )
+        return array[indices].copy()
 
     def read_all(self) -> NDArray[Any]:
         if len(self.descriptor.shape) != 1:
@@ -379,6 +462,13 @@ class _Q8MappedShard:
             biases=self.biases.read_rows(start, stop),
         )
 
+    def read_indices(self, indices: NDArray[np.intp]) -> _Q8Page:
+        return _Q8Page(
+            weight=self.weight.read_indices(indices),
+            scales=self.scales.read_indices(indices),
+            biases=self.biases.read_indices(indices),
+        )
+
     def close(self) -> None:
         self.weight.close()
         self.scales.close()
@@ -422,10 +512,13 @@ class _BoundedPageCache:
                 _, evicted = self._pages.popitem(last=False)
                 self._size -= evicted.nbytes
 
-    def clear(self) -> None:
+    def clear(self) -> tuple[int, int]:
         with self._lock:
+            pages = len(self._pages)
+            size = self._size
             self._pages.clear()
             self._size = 0
+            return pages, size
 
     @property
     def size_bytes(self) -> int:
@@ -452,6 +545,66 @@ def _checked_model_file(model_dir: Path, filename: object) -> Path:
     if not stat.S_ISREG(info.st_mode):
         raise PLEArtifactError(f"safetensors shard is not a regular file: {filename}")
     return path
+
+
+def _normalize_residency_policy(value: object, *, source: str) -> str:
+    if not isinstance(value, str):
+        raise PLEArtifactError(f"{source} must be a string")
+    normalized = value.strip().lower().replace("-", "_")
+    aliases = {
+        "ssd": PLE_RESIDENCY_SSD_MMAP,
+        "ssd_mmap": PLE_RESIDENCY_SSD_MMAP,
+        "mmap": PLE_RESIDENCY_SSD_MMAP,
+        "memory": PLE_RESIDENCY_MEMORY,
+        "file_cache_pinned": PLE_RESIDENCY_MEMORY,
+        "filecache_pinned": PLE_RESIDENCY_MEMORY,
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        raise PLEArtifactError(
+            f"unsupported {source} {value!r}; expected 'ssd_mmap' or 'memory'"
+        ) from exc
+
+
+def _artifact_residency_policy(model_dir: Path, metadata: object) -> str | None:
+    if isinstance(metadata, dict) and PLE_RESIDENCY_METADATA_KEY in metadata:
+        return _normalize_residency_policy(
+            metadata[PLE_RESIDENCY_METADATA_KEY], source=PLE_RESIDENCY_METADATA_KEY
+        )
+
+    config_path = model_dir / "config.json"
+    if not config_path.is_file():
+        return None
+    try:
+        config = json.loads(config_path.read_bytes())
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise PLEArtifactError(f"invalid Qwen4-Exp config: {config_path}") from exc
+    if not isinstance(config, dict):
+        raise PLEArtifactError(f"Qwen4-Exp config must be an object: {config_path}")
+    artifact = config.get("qwen4_exp_artifact")
+    candidates = (
+        config.get(PLE_RESIDENCY_METADATA_KEY),
+        config.get("ple_residency_policy"),
+        artifact.get("ple_residency") if isinstance(artifact, dict) else None,
+    )
+    for value in candidates:
+        if value is not None:
+            return _normalize_residency_policy(value, source="PLE residency policy")
+    return None
+
+
+def _resolve_residency_policy(
+    model_dir: Path,
+    metadata: object,
+    explicit: str | None,
+) -> str:
+    if explicit is not None:
+        return _normalize_residency_policy(explicit, source="PLE residency policy")
+    environment = os.environ.get(PLE_RESIDENCY_ENV)
+    if environment is not None:
+        return _normalize_residency_policy(environment, source=PLE_RESIDENCY_ENV)
+    return _artifact_residency_policy(model_dir, metadata) or PLE_RESIDENCY_SSD_MMAP
 
 
 def _parse_safetensors_header(
@@ -579,15 +732,36 @@ class Qwen4ExpPLESSDPool:
         index_name: str = "model.safetensors.index.json",
         rows_per_page: int = 256,
         max_cache_bytes: int = 64 * 1024 * 1024,
+        residency_policy: str | None = None,
+        io_workers: int | None = None,
     ) -> None:
         if rows_per_page <= 0:
             raise ValueError("rows_per_page must be positive")
+        if io_workers is None:
+            configured_workers = os.environ.get(PLE_IO_WORKERS_ENV)
+            try:
+                io_workers = (
+                    PLE_DEFAULT_IO_WORKERS
+                    if configured_workers is None
+                    else int(configured_workers)
+                )
+            except ValueError as exc:
+                raise ValueError(f"{PLE_IO_WORKERS_ENV} must be an integer") from exc
+        if isinstance(io_workers, bool) or not 0 <= io_workers <= 64:
+            raise ValueError("io_workers must be an integer in [0, 64]")
         self.model_dir = Path(model_dir)
         self.rows_per_page = rows_per_page
+        self.io_workers = io_workers
         self._cache = _BoundedPageCache(max_cache_bytes)
         self._closed = False
         self._state = threading.Condition()
         self._active_reads = 0
+        self._io_lock = threading.Lock()
+        self._io_executor: ThreadPoolExecutor | None = None
+        self._fd_lock = threading.Lock()
+        self._file_descriptors: dict[Path, int] = {}
+        self._direct_calls = 0
+        self._direct_rows = 0
 
         index_path = self.model_dir / index_name
         try:
@@ -602,16 +776,12 @@ class Qwen4ExpPLESSDPool:
             )
         weight_map: dict[str, Any] = index["weight_map"]
         metadata = index.get("metadata")
+        self.residency_policy = _resolve_residency_policy(
+            self.model_dir, metadata, residency_policy
+        )
+        self._prefetched_bytes = 0
         if layout is None:
-            q8_metadata_present = isinstance(metadata, dict) and any(
-                isinstance(key, str) and key.startswith("qwen4_exp_ple_")
-                for key in metadata
-            )
-            layout = (
-                _layout_from_q8_metadata(metadata)
-                if q8_metadata_present
-                else OFFICIAL_PLE_LAYOUT
-            )
+            layout = _layout_from_index_metadata(metadata)
         self.layout = layout
 
         table_names = [
@@ -663,6 +833,7 @@ class Qwen4ExpPLESSDPool:
                 if isinstance(key, str)
                 and key.startswith("qwen4_exp_ple_")
                 and key not in expected_metadata
+                and key != PLE_RESIDENCY_METADATA_KEY
             }
             if unexpected_metadata:
                 preview = ", ".join(sorted(unexpected_metadata)[:3])
@@ -710,21 +881,24 @@ class Qwen4ExpPLESSDPool:
                             table_names[shard],
                             "U32",
                             (layout.rows_per_shard, packed_columns),
-                        )
+                        ),
+                        random_access=self.residency_policy == PLE_RESIDENCY_SSD_MMAP,
                     ),
                     scales=_MappedTensor(
                         descriptor(
                             q8_scales_names[shard],
                             "BF16",
                             (layout.rows_per_shard, group_columns),
-                        )
+                        ),
+                        random_access=self.residency_policy == PLE_RESIDENCY_SSD_MMAP,
                     ),
                     biases=_MappedTensor(
                         descriptor(
                             q8_biases_names[shard],
                             "BF16",
                             (layout.rows_per_shard, group_columns),
-                        )
+                        ),
+                        random_access=self.residency_policy == PLE_RESIDENCY_SSD_MMAP,
                     ),
                 )
                 for shard in range(PLE_SHARD_COUNT)
@@ -732,7 +906,10 @@ class Qwen4ExpPLESSDPool:
         else:
             table_shape = (layout.rows_per_shard, layout.head_dim)
             self._shards = [
-                _MappedTensor(descriptor(name, layout.table_dtype, table_shape))
+                _MappedTensor(
+                    descriptor(name, layout.table_dtype, table_shape),
+                    random_access=self.residency_policy == PLE_RESIDENCY_SSD_MMAP,
+                )
                 for name in table_names
             ]
         aux_tensors = {
@@ -774,6 +951,35 @@ class Qwen4ExpPLESSDPool:
         if last_used_row > layout.padded_vocab_size:
             self.close()
             raise PLEArtifactError("PLE head ranges exceed the table")
+
+        if self.residency_policy == PLE_RESIDENCY_MEMORY:
+            try:
+                self._prefetched_bytes = self._prefetch_all_mappings()
+            except BaseException:
+                self.close()
+                raise
+        with _ACTIVE_POOLS_LOCK:
+            _ACTIVE_POOLS.add(self)
+
+    def _iter_mapped_tensors(self):
+        for shard in self._shards:
+            if isinstance(shard, _Q8MappedShard):
+                yield shard.weight
+                yield shard.scales
+                yield shard.biases
+            else:
+                yield shard
+
+    def _prefetch_all_mappings(self) -> int:
+        """Map every shard and ask the OS to populate its file-backed pages."""
+
+        advice = getattr(mmap, "MADV_WILLNEED", None)
+        hinted = 0
+        for tensor in self._iter_mapped_tensors():
+            tensor._ensure_open()
+            if advice is not None:
+                hinted += tensor.advise(advice)
+        return hinted
 
     def _check_open(self) -> None:
         with self._state:
@@ -821,23 +1027,154 @@ class Qwen4ExpPLESSDPool:
         if ids.dtype.kind not in "iu":
             raise TypeError("PLE row IDs must be integers")
         flat = ids.astype(np.int64, copy=False).reshape(-1)
-        if flat.size and (
-            flat.min() < 0 or flat.max() >= self.layout.padded_vocab_size
-        ):
-            raise IndexError(
-                f"PLE row IDs must be in [0, {self.layout.padded_vocab_size})"
-            )
+        padded_vocab_size = self.layout.padded_vocab_size
+        if flat.size and (flat.min() < 0 or flat.max() >= padded_vocab_size):
+            raise IndexError(f"PLE row IDs must be in [0, {padded_vocab_size})")
         return ids.shape, flat
 
     def _group_row_ids(
         self, flat: NDArray[np.int64]
     ) -> dict[tuple[int, int], list[tuple[int, int]]]:
         groups: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
+        rows_per_shard = self.layout.rows_per_shard
         for output_index, global_row in enumerate(flat):
-            shard_index, local_row = divmod(int(global_row), self.layout.rows_per_shard)
+            shard_index, local_row = divmod(int(global_row), rows_per_shard)
             page_index, row_in_page = divmod(local_row, self.rows_per_page)
             groups[(shard_index, page_index)].append((output_index, row_in_page))
         return groups
+
+    def _group_rows_by_shard(
+        self, flat: NDArray[np.int64]
+    ) -> dict[int, list[tuple[int, int]]]:
+        groups: dict[int, list[tuple[int, int]]] = defaultdict(list)
+        rows_per_shard = self.layout.rows_per_shard
+        for output_index, global_row in enumerate(flat):
+            shard_index, local_row = divmod(int(global_row), rows_per_shard)
+            groups[shard_index].append((output_index, local_row))
+        return groups
+
+    def _get_io_executor(self) -> ThreadPoolExecutor | None:
+        if self.io_workers == 0:
+            return None
+        with self._io_lock:
+            if self._io_executor is None:
+                self._io_executor = ThreadPoolExecutor(
+                    max_workers=self.io_workers,
+                    thread_name_prefix="qwen4-ple-io",
+                )
+            return self._io_executor
+
+    def _pread_fd(self, descriptor: _TensorDescriptor) -> int:
+        with self._fd_lock:
+            cached = self._file_descriptors.get(descriptor.path)
+            if cached is not None:
+                return cached
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            file_descriptor = os.open(descriptor.path, flags)
+            actual = _FileFingerprint.from_stat(os.fstat(file_descriptor))
+            if actual != descriptor.fingerprint:
+                os.close(file_descriptor)
+                raise PLEArtifactError(
+                    f"safetensors file changed after validation: {descriptor.path}"
+                )
+            self._file_descriptors[descriptor.path] = file_descriptor
+            return file_descriptor
+
+    def _pread_tensor_row(self, tensor: _MappedTensor, row_index: int) -> NDArray[Any]:
+        descriptor = tensor.descriptor
+        rows, columns = descriptor.shape
+        if not 0 <= row_index < rows:
+            raise IndexError(f"row index {row_index} is outside [0, {rows})")
+        row_bytes = columns * descriptor.numpy_dtype.itemsize
+        offset = descriptor.byte_start + row_index * row_bytes
+        payload = os.pread(self._pread_fd(descriptor), row_bytes, offset)
+        if len(payload) != row_bytes:
+            raise PLEArtifactError(
+                f"short PLE row read for {descriptor.name}: "
+                f"expected {row_bytes} bytes, found {len(payload)}"
+            )
+        return np.frombuffer(payload, dtype=descriptor.numpy_dtype, count=columns)
+
+    def _direct_locations(
+        self, flat: NDArray[np.int64]
+    ) -> dict[tuple[int, int], list[int]]:
+        locations: dict[tuple[int, int], list[int]] = defaultdict(list)
+        rows_per_shard = self.layout.rows_per_shard
+        for output_index, global_row in enumerate(flat):
+            locations[divmod(int(global_row), rows_per_shard)].append(output_index)
+        return locations
+
+    def _pread_dense_task(
+        self, task: tuple[int, int]
+    ) -> tuple[tuple[int, int], NDArray[Any]]:
+        shard_index, local_row = task
+        shard = self._shards[shard_index]
+        if not isinstance(shard, _MappedTensor):  # pragma: no cover - invariant
+            raise PLEArtifactError("dense PLE shard returned Q8 storage")
+        return task, self._pread_tensor_row(shard, local_row)
+
+    def _pread_q8_task(self, task: tuple[int, int]) -> tuple[tuple[int, int], _Q8Page]:
+        shard_index, local_row = task
+        shard = self._shards[shard_index]
+        if not isinstance(shard, _Q8MappedShard):  # pragma: no cover - invariant
+            raise PLEArtifactError("Q8 PLE shard returned dense storage")
+        return task, _Q8Page(
+            weight=self._pread_tensor_row(shard.weight, local_row)[None, :],
+            scales=self._pread_tensor_row(shard.scales, local_row)[None, :],
+            biases=self._pread_tensor_row(shard.biases, local_row)[None, :],
+        )
+
+    def _gather_dense_direct(
+        self,
+        flat: NDArray[np.int64],
+        output: NDArray[Any],
+    ) -> None:
+        locations = self._direct_locations(flat)
+        executor = self._get_io_executor()
+        if executor is not None:
+            for task, row in executor.map(
+                self._pread_dense_task, locations, chunksize=1
+            ):
+                output[locations[task]] = row
+        else:
+            for shard_index, positions in self._group_rows_by_shard(flat).items():
+                output_positions, local_rows = self._positions(positions)
+                unique_rows, inverse = np.unique(local_rows, return_inverse=True)
+                shard = self._shards[shard_index]
+                if not isinstance(shard, _MappedTensor):  # pragma: no cover
+                    raise PLEArtifactError("dense PLE shard returned Q8 storage")
+                output[output_positions] = shard.read_indices(unique_rows)[inverse]
+        self._direct_calls += 1
+        self._direct_rows += flat.size
+
+    def _gather_q8_direct(
+        self,
+        flat: NDArray[np.int64],
+        output: NDArray[np.float32],
+    ) -> None:
+        locations = self._direct_locations(flat)
+        executor = self._get_io_executor()
+        if executor is not None:
+            zero = np.zeros(1, dtype=np.intp)
+            for task, selected in executor.map(
+                self._pread_q8_task, locations, chunksize=1
+            ):
+                output[locations[task]] = self._decode_q8_rows(selected, zero)[0]
+        else:
+            for shard_index, positions in self._group_rows_by_shard(flat).items():
+                output_positions, local_rows = self._positions(positions)
+                unique_rows, inverse = np.unique(local_rows, return_inverse=True)
+                shard = self._shards[shard_index]
+                if not isinstance(shard, _Q8MappedShard):  # pragma: no cover
+                    raise PLEArtifactError("Q8 PLE shard returned dense storage")
+                selected = shard.read_indices(unique_rows)
+                decoded = self._decode_q8_rows(
+                    selected,
+                    np.arange(unique_rows.size, dtype=np.intp),
+                )
+                output[output_positions] = decoded[inverse]
+        self._direct_calls += 1
+        self._direct_rows += flat.size
 
     @staticmethod
     def _positions(
@@ -889,6 +1226,13 @@ class Qwen4ExpPLESSDPool:
             (flat.size, self.layout.head_dim),
             dtype=_DTYPES[self.layout.table_dtype][0],
         )
+        if flat.size >= PLE_DIRECT_GATHER_MIN_ROWS:
+            self._begin_read()
+            try:
+                self._gather_dense_direct(flat, output)
+            finally:
+                self._end_read()
+            return output.reshape((*original_shape, self.layout.head_dim))
         for (shard_index, page_index), positions in self._group_row_ids(flat).items():
             page = self._load_page(shard_index, page_index)
             if not isinstance(page, np.ndarray):  # pragma: no cover - invariant
@@ -904,6 +1248,13 @@ class Qwen4ExpPLESSDPool:
             self._check_open()
             original_shape, flat = self._normalize_row_ids(row_ids)
             output = np.empty((flat.size, self.layout.head_dim), dtype=np.float32)
+            if flat.size >= PLE_DIRECT_GATHER_MIN_ROWS:
+                self._begin_read()
+                try:
+                    self._gather_q8_direct(flat, output)
+                finally:
+                    self._end_read()
+                return output.reshape((*original_shape, self.layout.head_dim))
             for (shard_index, page_index), positions in self._group_row_ids(
                 flat
             ).items():
@@ -930,10 +1281,11 @@ class Qwen4ExpPLESSDPool:
 
         self._check_open()
         _, flat = self._normalize_row_ids(row_ids)
+        rows_per_shard = self.layout.rows_per_shard
         pages = {
             (
-                int(row) // self.layout.rows_per_shard,
-                (int(row) % self.layout.rows_per_shard) // self.rows_per_page,
+                int(row) // rows_per_shard,
+                (int(row) % rows_per_shard) // self.rows_per_page,
             )
             for row in flat
         }
@@ -1065,10 +1417,39 @@ class Qwen4ExpPLESSDPool:
             "pages": self._cache.page_count,
             "bytes": self._cache.size_bytes,
             "max_bytes": self._cache.max_bytes,
+            "mapped_bytes": sum(
+                tensor.mapped_bytes for tensor in self._iter_mapped_tensors()
+            ),
+            "prefetched_bytes": self._prefetched_bytes,
+            "io_workers": self.io_workers,
+            "direct_calls": self._direct_calls,
+            "direct_rows": self._direct_rows,
         }
 
-    def clear_cache(self) -> None:
-        self._cache.clear()
+    def clear_cache(self) -> dict[str, int]:
+        pages, size = self._cache.clear()
+        return {"pages": pages, "bytes": size}
+
+    def drop_resident_pages(self) -> dict[str, int]:
+        """Drop copied pages and best-effort file-backed resident page hints."""
+
+        self._begin_read()
+        try:
+            cleared = self.clear_cache()
+            dropped = 0
+            advice = getattr(mmap, "MADV_DONTNEED", None)
+            if advice is not None:
+                for tensor in self._iter_mapped_tensors():
+                    if tensor.mapped_bytes:
+                        dropped += tensor.advise(advice)
+            self._prefetched_bytes = max(0, self._prefetched_bytes - dropped)
+            return {
+                **cleared,
+                "resident_bytes": dropped,
+                "bytes": cleared["bytes"] + dropped,
+            }
+        finally:
+            self._end_read()
 
     def close(self) -> None:
         state = getattr(self, "_state", None)
@@ -1080,9 +1461,21 @@ class Qwen4ExpPLESSDPool:
             self._closed = True
             while self._active_reads:
                 state.wait()
+        with self._io_lock:
+            executor = self._io_executor
+            self._io_executor = None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        with self._fd_lock:
+            file_descriptors = tuple(self._file_descriptors.values())
+            self._file_descriptors.clear()
+        for file_descriptor in file_descriptors:
+            os.close(file_descriptor)
         self._cache.clear()
         for shard in getattr(self, "_shards", ()):
             shard.close()
+        with _ACTIVE_POOLS_LOCK:
+            _ACTIVE_POOLS.discard(self)
 
     def __enter__(self) -> Qwen4ExpPLESSDPool:
         self._check_open()
@@ -1095,6 +1488,68 @@ class Qwen4ExpPLESSDPool:
         self.close()
 
 
+def _active_pool_snapshot() -> tuple[Qwen4ExpPLESSDPool, ...]:
+    with _ACTIVE_POOLS_LOCK:
+        return tuple(pool for pool in _ACTIVE_POOLS if not pool._closed)
+
+
+def active_ple_pool_info() -> dict[str, int]:
+    """Aggregate bounded-cache and mapping telemetry for all live PLE pools."""
+
+    pools = _active_pool_snapshot()
+    infos = [pool.cache_info for pool in pools]
+    return {
+        "pools": len(pools),
+        "hits": sum(info["hits"] for info in infos),
+        "misses": sum(info["misses"] for info in infos),
+        "pages": sum(info["pages"] for info in infos),
+        "bytes": sum(info["bytes"] for info in infos),
+        "max_bytes": sum(info["max_bytes"] for info in infos),
+        "mapped_bytes": sum(info["mapped_bytes"] for info in infos),
+        "prefetched_bytes": sum(info["prefetched_bytes"] for info in infos),
+        "io_workers": sum(info["io_workers"] for info in infos),
+        "direct_calls": sum(info["direct_calls"] for info in infos),
+        "direct_rows": sum(info["direct_rows"] for info in infos),
+        "memory_pools": sum(
+            pool.residency_policy == PLE_RESIDENCY_MEMORY for pool in pools
+        ),
+        "ssd_mmap_pools": sum(
+            pool.residency_policy == PLE_RESIDENCY_SSD_MMAP for pool in pools
+        ),
+    }
+
+
+def clear_active_ple_page_caches() -> dict[str, int]:
+    """Release only explicit copied PLE pages, retaining lazy file mappings."""
+
+    pools = _active_pool_snapshot()
+    reports = [pool.clear_cache() for pool in pools if not pool._closed]
+    return {
+        "pools": len(pools),
+        "pages": sum(report["pages"] for report in reports),
+        "bytes": sum(report["bytes"] for report in reports),
+    }
+
+
+def drop_active_ple_resident_pages() -> dict[str, int]:
+    """Release copied pages and ask the VM to evict mapped PLE file pages."""
+
+    pools = _active_pool_snapshot()
+    reports = []
+    for pool in pools:
+        try:
+            reports.append(pool.drop_resident_pages())
+        except RuntimeError:
+            # A model may finish unloading after the weak-registry snapshot.
+            continue
+    return {
+        "pools": len(reports),
+        "pages": sum(report["pages"] for report in reports),
+        "bytes": sum(report["bytes"] for report in reports),
+        "resident_bytes": sum(report["resident_bytes"] for report in reports),
+    }
+
+
 __all__ = [
     "OFFICIAL_PLE_LAYOUT",
     "OFFICIAL_PLE_Q8_LAYOUT",
@@ -1104,11 +1559,18 @@ __all__ = [
     "PLE_MLX_Q8_GROUP_SIZE",
     "PLE_MLX_Q8_METADATA",
     "PLE_MLX_Q8_MODE",
+    "PLE_RESIDENCY_ENV",
+    "PLE_RESIDENCY_MEMORY",
+    "PLE_RESIDENCY_METADATA_KEY",
+    "PLE_RESIDENCY_SSD_MMAP",
     "PLEArtifactError",
     "PLELayout",
     "PLE_PREFIX",
     "PLE_SHARD_COUNT",
     "PLE_TABLE_PREFIX",
     "Qwen4ExpPLESSDPool",
+    "active_ple_pool_info",
+    "clear_active_ple_page_caches",
+    "drop_active_ple_resident_pages",
     "mlx_q8_index_metadata",
 ]

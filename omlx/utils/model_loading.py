@@ -1150,6 +1150,15 @@ def maybe_load_custom_quantization(
         )
         return None
 
+    from ..patches.qwen4_exp import nvfp4 as qwen4_nvfp4
+
+    if qwen4_nvfp4.is_supported_config(config):
+        if is_vlm:
+            raise ValueError(
+                "Qwen4-Exp NVFP4 vision is not yet enabled; use the native text engine"
+            )
+        return qwen4_nvfp4.load(model_name)
+
     quant_config = config.get("quantization_config")
     quant_method = quant_config.get("quant_method") if quant_config else None
 

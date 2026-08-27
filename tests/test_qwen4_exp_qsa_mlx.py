@@ -273,6 +273,128 @@ def test_cache_seam_appends_prefill_then_single_token_decode():
     assert bool(mx.all(decode.attention_mask).item())
 
 
+def test_short_decode_fast_path_matches_row_reference():
+    request = _small_request(query_tokens=1, key_tokens=9)
+    fast = micro_block_sparse_qsa(request, geometry=SMALL, index_key_norm=_identity)
+    traced = []
+    row_reference = micro_block_sparse_qsa(
+        request,
+        geometry=SMALL,
+        index_key_norm=_identity,
+        row_observer=traced.append,
+    )
+    mx.eval(fast, row_reference)
+
+    np.testing.assert_allclose(
+        np.asarray(fast), np.asarray(row_reference), rtol=2e-5, atol=2e-5
+    )
+    assert len(traced) == 1
+
+
+@pytest.mark.parametrize("additive", [False, True])
+def test_vectorized_prefill_matches_row_reference_with_padding_holes_and_tail(additive):
+    batch, query_tokens, key_tokens = 2, 19, 43
+    mx.random.seed(314)
+    cos, sin = _positions(batch, key_tokens)
+    query_start = key_tokens - query_tokens
+    qpos = query_start + np.arange(query_tokens)
+    kpos = np.arange(key_tokens)
+    causal = kpos[None, :] <= qpos[:, None]
+    masks = np.broadcast_to(causal[None], (batch, query_tokens, key_tokens)).copy()
+    # Non-prefix visibility proves stable compaction semantics. Keep every
+    # query's own position visible so attention never receives an empty row.
+    masks[0, :, 1::5] = False
+    masks[1, :, 2::7] = False
+    for b in range(batch):
+        masks[b, np.arange(query_tokens), qpos] = True
+    mask = mx.array(masks[:, None])
+    if additive:
+        mask = mx.where(mask, mx.array(0.0), mx.array(-float("inf")))
+    request = prepare_qsa_request(
+        queries=mx.random.normal((batch, 4, query_tokens, 4)),
+        keys=mx.random.normal((batch, 2, key_tokens, 4)),
+        values=mx.random.normal((batch, 2, key_tokens, 4)),
+        index_queries=mx.random.normal((batch, query_tokens, 2, 2)),
+        index_keys=mx.random.normal((batch, key_tokens, 2)),
+        position_cos=cos,
+        position_sin=sin,
+        attention_mask=mask,
+    )
+    vectorized = micro_block_sparse_qsa(
+        request, geometry=SMALL, index_key_norm=_identity
+    )
+    traces = []
+    reference = micro_block_sparse_qsa(
+        request,
+        geometry=SMALL,
+        index_key_norm=_identity,
+        row_observer=traces.append,
+    )
+    mx.eval(vectorized, reference)
+
+    np.testing.assert_allclose(
+        np.asarray(vectorized), np.asarray(reference), rtol=2e-5, atol=2e-5
+    )
+    assert len(traces) == batch * query_tokens
+    assert max(trace.selected_tokens for trace in traces) <= (
+        SMALL.token_budget + SMALL.compress_ratio - 1
+    )
+
+
+@pytest.mark.parametrize("additive", [False, True])
+def test_contiguous_causal_prefill_matches_generic_sparse_path(additive):
+    query_tokens, key_tokens = 19, 43
+    mx.random.seed(812)
+    cos, sin = _positions(1, key_tokens)
+    query_start = key_tokens - query_tokens
+    qpos = query_start + mx.arange(query_tokens)
+    kpos = mx.arange(key_tokens)
+    mask = (kpos[None, :] <= qpos[:, None])[None, None]
+    if additive:
+        mask = mx.where(mask, mx.array(0.0), mx.array(-float("inf")))
+    request = prepare_qsa_request(
+        queries=mx.random.normal((1, 4, query_tokens, 4)),
+        keys=mx.random.normal((1, 2, key_tokens, 4)),
+        values=mx.random.normal((1, 2, key_tokens, 4)),
+        index_queries=mx.random.normal((1, query_tokens, 2, 2)),
+        index_keys=mx.random.normal((1, key_tokens, 2)),
+        position_cos=cos,
+        position_sin=sin,
+        attention_mask=mask,
+        contiguous_causal=True,
+    )
+    generic = type(request)(**{**request.__dict__, "contiguous_causal": False})
+    fast = micro_block_sparse_qsa(request, geometry=SMALL, index_key_norm=_identity)
+    expected = micro_block_sparse_qsa(generic, geometry=SMALL, index_key_norm=_identity)
+    mx.eval(fast, expected)
+
+    np.testing.assert_allclose(
+        np.asarray(fast), np.asarray(expected), rtol=2e-5, atol=2e-5
+    )
+
+
+def test_contiguous_causal_query_chunk_adapts_to_context() -> None:
+    import omlx.patches.qwen4_exp.qsa_mlx as module
+
+    assert module._contiguous_causal_query_chunk(4096) == 32
+    assert module._contiguous_causal_query_chunk(4097) == 64
+    assert module._contiguous_causal_query_chunk(16384) == 64
+    assert module._contiguous_causal_query_chunk(16385) == 128
+
+
+def test_production_prefill_never_enters_rowwise_visible_item_path(monkeypatch):
+    import omlx.patches.qwen4_exp.qsa_mlx as module
+
+    def forbidden(_mask):
+        raise AssertionError("row-wise visible compaction was called")
+
+    monkeypatch.setattr(module, "_visible_indices", forbidden)
+    request = _small_request(query_tokens=19, key_tokens=43)
+    result = micro_block_sparse_qsa(request, geometry=SMALL, index_key_norm=_identity)
+    mx.eval(result)
+    assert result.shape == (1, 19, 4, 4)
+
+
 def _official_text_config():
     return {
         "model_type": "qwen4_exp_text",

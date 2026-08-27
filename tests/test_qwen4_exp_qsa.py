@@ -200,6 +200,13 @@ def test_request_shape_validation_happens_before_backend_dispatch():
         executor(request)
 
 
+def test_contiguous_causal_hint_must_be_boolean():
+    contract = Qwen4ExpQSAContract.from_config(_official_text_config())
+    request = replace(_request(), contiguous_causal="yes")
+    with pytest.raises(Qwen4ExpQSAInputError, match="contiguous_causal"):
+        request.validate(contract)
+
+
 def test_injected_micro_block_backend_receives_validated_contract_and_request():
     sentinel = object()
 

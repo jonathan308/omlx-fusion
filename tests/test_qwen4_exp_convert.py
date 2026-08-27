@@ -35,6 +35,20 @@ def _fake_q8(array: np.ndarray, group_size: int, bits: int, source_dtype: str):
     )
 
 
+def _fake_q4(array: np.ndarray, group_size: int, bits: int, source_dtype: str):
+    assert bits == 4
+    assert source_dtype in {"BF16", "F32"}
+    assert array.shape[-1] % group_size == 0
+    packed_shape = (*array.shape[:-1], array.shape[-1] // 8)
+    group_shape = (*array.shape[:-1], array.shape[-1] // group_size)
+    scale_dtype = np.uint16 if source_dtype == "BF16" else np.float32
+    return (
+        np.zeros(packed_shape, dtype=np.uint32),
+        np.ones(group_shape, dtype=scale_dtype),
+        np.zeros(group_shape, dtype=scale_dtype),
+    )
+
+
 def _write_source(root: Path, *, bf16: bool = False) -> dict[str, str]:
     root.mkdir()
     config = {
@@ -76,9 +90,8 @@ def _write_source(root: Path, *, bf16: bool = False) -> dict[str, str]:
             (3,), dtype=np.float32
         ),
         "mtp.fc_hidden.weight": np.ones((4, 32), dtype=np.float32),
-        "mtp.layers.0.mlp.experts.gate_up_proj.weight": np.ones(
-            (2, 4, 32), dtype=np.float32
-        ),
+        "mtp.layers.0.mlp.experts.gate_up_proj": np.ones((2, 4, 32), dtype=np.float32),
+        "mtp.layers.0.mlp.experts.down_proj": np.ones((2, 32, 32), dtype=np.float32),
     }
     weight_map: dict[str, str] = {}
     for ordinal, tensors in enumerate((first, second), start=1):
@@ -111,6 +124,7 @@ def _convert(
     ple_source_dtype="F32",
     **kwargs,
 ):
+    quantizer = kwargs.pop("quantizer", _fake_q8)
     return convert_qwen38_flash_next(
         source,
         destination,
@@ -120,7 +134,7 @@ def _convert(
         ple_head_dim=32,
         ple_source_dtype=ple_source_dtype,
         ple_quantization=ple_quantization,
-        quantizer=_fake_q8,
+        quantizer=quantizer,
         source_revision="synthetic-source-sha",
         **kwargs,
     )
@@ -156,10 +170,19 @@ def test_streams_split_artifacts_without_ple_leak_and_preserves_mtp(tmp_path):
     )
 
     source_mtp = {name for name in source_weight_map if name.startswith("mtp.")}
-    for name in source_mtp:
-        assert name in compute_names
+    ordinary_mtp = {
+        name
+        for name in source_mtp
+        if not name.endswith((".experts.gate_up_proj", ".experts.down_proj"))
+    }
+    assert ordinary_mtp <= compute_names
     assert "mtp.fc_embedding.scales" in compute_names
     assert "mtp.fc_embedding.biases" in compute_names
+    assert "mtp.layers.0.mlp.experts.gate_up_proj" not in compute_names
+    assert "mtp.layers.0.mlp.experts.down_proj" not in compute_names
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        base = f"mtp.layers.0.mlp.switch_mlp.{projection}"
+        assert {f"{base}.weight", f"{base}.scales", f"{base}.biases"} <= compute_names
 
     # Numerically sensitive/state tensors and both conv/norm paths remain dense.
     for name in (
@@ -176,10 +199,38 @@ def test_streams_split_artifacts_without_ple_leak_and_preserves_mtp(tmp_path):
     assert config["quantization"] == {"bits": 8, "group_size": 32, "mode": "affine"}
     assert (result.compute_dir / "tokenizer_config.json").is_file()
     assert (result.ple_dir / "tokenizer_config.json").is_file()
-    assert result.stats.max_source_tensor_bytes < 20 * 32 * 4
+    assert result.stats.max_source_tensor_bytes == 2 * 32 * 32 * 4
     assert result.stats.source_tensors_read == len(source_weight_map) - 2
     assert result.stats.ple_table_tensors_stream_copied == 2
     assert not list(result.root.rglob("*.tmp"))
+
+
+def test_affine_q4_compute_uses_distinct_layout_and_preserves_bf16_ple(tmp_path):
+    source = tmp_path / "source"
+    _write_source(source)
+    result = _convert(
+        source,
+        tmp_path / "output",
+        compute_bits=4,
+        quantizer=_fake_q4,
+    )
+
+    assert result.compute_dir.name == "compute-q4"
+    assert result.ple_dir.name == "ple-bf16"
+    config = json.loads((result.compute_dir / "config.json").read_text())
+    assert config["quantization"] == {
+        "bits": 4,
+        "group_size": 32,
+        "mode": "affine",
+    }
+    assert config["qwen4_exp_artifact"]["layout"] == "qwen4-exp-split-q4-v2"
+    manifest = json.loads(result.manifest_path.read_text())
+    assert manifest["layout_version"] == "qwen4-exp-split-q4-v2"
+    assert manifest["q8_bits"] == 4
+    assert not any(
+        name.startswith(f"{PLE_TABLE_PREFIX}.shard_")
+        for name in _index(result.compute_dir)["weight_map"]
+    )
 
 
 def test_output_shards_are_valid_and_indexed_atomically(tmp_path):
@@ -199,7 +250,7 @@ def test_output_shards_are_valid_and_indexed_atomically(tmp_path):
     assert manifest["complete"] is True
     assert manifest["source_revision"] == "synthetic-source-sha"
     assert len(manifest["source_index_sha256"]) == 64
-    assert manifest["layout_version"] == "qwen4-exp-split-q8-v1"
+    assert manifest["layout_version"] == "qwen4-exp-split-q8-v2"
     assert manifest["ple_quantization"] == "bf16"
 
 
@@ -236,7 +287,7 @@ def test_bf16_words_convert_without_numpy_bfloat16_dependency(tmp_path):
     scale_file = result.ple_dir / ple["weight_map"][table_scale]
     header, _ = _safetensors_header(scale_file)
     assert header[table_scale]["dtype"] == "BF16"
-    assert result.stats.max_source_tensor_bytes == 20 * 32 * 2
+    assert result.stats.max_source_tensor_bytes == 2 * 32 * 32 * 2
     assert ple["metadata"]["qwen4_exp_ple_scale_dtype"] == "BF16"
 
 

@@ -5854,6 +5854,9 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
     total_deleted = 0
     distributed_ranks = 0
     distributed_failures = []
+    from ..patches.qwen4_exp.ple import drop_active_ple_resident_pages
+
+    ple_cleared = drop_active_ple_resident_pages()
 
     for model_id, scheduler, core in _iter_loaded_engine_records():
         distributed_clear = getattr(core, "clear_prompt_caches", None)
@@ -5946,11 +5949,18 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
             status_code=503,
             detail="; ".join(distributed_failures)[:1000],
         )
-    return {
+    response = {
         "status": "ok",
         "total_deleted": total_deleted,
         "distributed_ranks": distributed_ranks,
     }
+    if ple_cleared["pools"]:
+        response.update(
+            ple_cleared_bytes=ple_cleared["bytes"],
+            ple_cleared_pages=ple_cleared["pages"],
+            ple_pools=ple_cleared["pools"],
+        )
+    return response
 
 
 @router.post("/api/hot-cache/clear")
@@ -5965,10 +5975,12 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
     import gc
 
     from ..engine_core import get_mlx_executor
+    from ..patches.qwen4_exp.ple import clear_active_ple_page_caches
     from ..scheduler import _sync_and_clear_cache
     from ..utils.proc_memory import get_phys_footprint
 
     footprint_before = get_phys_footprint()
+    ple_cleared = clear_active_ple_page_caches()
     total_cleared = 0
     distributed_ranks = 0
     distributed_failures = []
@@ -6049,12 +6061,19 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
             status_code=503,
             detail="; ".join(distributed_failures)[:1000],
         )
-    return {
+    response = {
         "status": "ok",
         "total_cleared": total_cleared,
         "bytes_reclaimed": bytes_reclaimed,
         "distributed_ranks": distributed_ranks,
     }
+    if ple_cleared["pools"]:
+        response.update(
+            ple_cleared_bytes=ple_cleared["bytes"],
+            ple_cleared_pages=ple_cleared["pages"],
+            ple_pools=ple_cleared["pools"],
+        )
+    return response
 
 
 def _normalize_probe_tool_calls(messages: list[dict]) -> list[dict]:

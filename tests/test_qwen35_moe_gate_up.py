@@ -151,6 +151,13 @@ def test_unsupported_family_skipped():
     assert hasattr(model.blocks[0], "gate_proj")
 
 
+def test_qwen4_exp_family_is_supported():
+    qwen4_model = type("Model", (), {})
+    qwen4_model.__module__ = "mlx_lm.models.qwen4_exp"
+
+    assert patch_mod._is_supported_family(qwen4_model())
+
+
 def test_per_layer_pool_drain(monkeypatch):
     calls = []
     monkeypatch.setattr(patch_mod, "_sync_and_clear_cache", lambda: calls.append(1))

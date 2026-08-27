@@ -255,6 +255,44 @@ def test_final_hc_mixer_forbids_block_injection_weights():
         hc.validate_hc_weight_layout(weights, prefix, use_combine=False)
 
 
+def test_hc_shape_specialized_q8_injection_is_bit_exact():
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    if not mx.metal.is_available():
+        pytest.skip("Metal is required")
+    hc = importlib.import_module("omlx.patches.qwen4_exp.hc")
+    projection = nn.QuantizedLinear(
+        10240,
+        4,
+        bias=False,
+        group_size=32,
+        bits=8,
+        mode="affine",
+    )
+    projection.scales = projection.scales.astype(mx.bfloat16)
+    projection.biases = projection.biases.astype(mx.bfloat16)
+    mx.eval(projection.parameters())
+    for seed in range(8):
+        mx.random.seed(seed)
+        normalized = mx.random.normal((1, 1, 10240)).astype(mx.bfloat16)
+        expected = projection(normalized)
+        actual = hc._fast_quantized_injection(mx, nn, projection, normalized)
+        assert actual is not None
+        mx.eval(expected, actual)
+        assert bool(mx.array_equal(expected, actual).item())
+
+    assert (
+        hc._fast_quantized_injection(
+            mx,
+            nn,
+            projection,
+            mx.zeros((1, 2, 10240), dtype=mx.bfloat16),
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize(
     ("field", "bad"),
     [
