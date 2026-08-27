@@ -1251,6 +1251,10 @@ class Glm5NextDsa(nn.Module):
         )
         key_projection = mx.contiguous(projection[:, : self.config.qk_nope_head_dim])
         value_projection = mx.contiguous(projection[:, self.config.qk_nope_head_dim :])
+        # The sparse latent attention reduces in fp32; keep fp32 copies so the
+        # per-token path never re-casts 67 MiB of projections per layer.
+        key_projection = key_projection.astype(mx.float32)
+        value_projection = value_projection.astype(mx.float32)
         if evaluate:
             mx.eval(key_projection, value_projection)
         prepared = (key_projection, value_projection)
