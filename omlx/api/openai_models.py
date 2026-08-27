@@ -62,13 +62,17 @@ class ContentPart(BaseModel):
     Supports:
     - text: Plain text content
     - image_url: Image input for vision models
+    - video_url / video / input_video: Video input for native video models
     - input_audio: Audio input for multimodal audio models
     - file: Document or text input for attachment preprocessing
     """
 
-    type: str  # "text", "image_url", "input_audio", or "file"
+    type: str  # "text", "image_url", "video_url", "input_audio", or "file"
     text: Optional[str] = None
     image_url: Optional[ImageURL] = None
+    video_url: Optional[Any] = None  # {"url": ...}, plain URL/path, or frame list
+    video: Optional[Any] = None
+    input_video: Optional[Any] = None
     input_audio: Optional[InputAudio] = None
     file: Optional[FileContent] = None
 

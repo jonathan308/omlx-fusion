@@ -239,6 +239,14 @@ def _extract_multimodal_content_list(content: list) -> list:
                             "input_audio": input_audio,
                         }
                     )
+            elif item_type in ("video_url", "video", "input_video"):
+                # Video input: pass the reference (URL, path, or frame list)
+                # through for engines with a native video tower.
+                value = item.get("video_url")
+                if value is None:
+                    value = item.get("video", item.get("input_video"))
+                if value is not None:
+                    parts.append({"type": "video_url", "video_url": value})
     return parts
 
 
@@ -1259,9 +1267,9 @@ def extract_multimodal_content(
         if isinstance(content, str):
             processed_messages.append({"role": role, "content": content, **_extra})
         elif isinstance(content, list):
-            # Preserve image_url and input_audio parts for VLM processing
+            # Preserve image_url, video_url, and input_audio parts for VLM processing
             multimodal_parts = _extract_multimodal_content_list(content)
-            multimodal_types = {"image_url", "input_audio"}
+            multimodal_types = {"image_url", "input_audio", "video_url"}
             has_multimodal = any(
                 p.get("type") in multimodal_types for p in multimodal_parts
             )
