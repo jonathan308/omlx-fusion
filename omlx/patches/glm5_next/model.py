@@ -8,7 +8,11 @@ being ignored.  The module is registered solely as ``mlx_lm.models.glm5_next``.
 
 from __future__ import annotations
 
+import logging
+import os
 import re
+import threading
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from typing import Any, Final
@@ -56,6 +60,8 @@ KDA_LAYERS: Final = tuple(
     index for index in range(MAIN_LAYER_COUNT) if index not in MAIN_DSA_LAYERS
 )
 DSA_LAYERS: Final = tuple(MAIN_DSA_LAYERS)
+
+logger = logging.getLogger(__name__)
 
 
 class Glm5NextModelContractError(ValueError):
@@ -468,17 +474,62 @@ class DecoderLayer(nn.Module):
         self.hc_ffn = mhc_class(args.mhc_config())
 
     def __call__(self, streams, mask, cache=None):
-        post, comb, collapsed = self.hc_attn(streams)
+        post, comb, collapsed = _profiled("mhc.attn", self.hc_attn, streams)
         branch_input = self.input_layernorm(collapsed)
-        branch = (
-            self.self_attn(branch_input, mask=mask, cache=cache)
-            if self.is_linear
-            else self.self_attn(branch_input, mask, cache=cache)
-        )
+        kind = "kda" if self.is_linear else "dsa"
+        if self.is_linear:
+            branch = _profiled(
+                "attn.kda", self.self_attn, branch_input, mask=mask, cache=cache
+            )
+        else:
+            branch = _profiled(
+                "attn.dsa", self.self_attn, branch_input, mask, cache=cache
+            )
         streams = apply_mhc_residual(post, comb, branch, streams)
-        post, comb, collapsed = self.hc_ffn(streams)
-        branch = self.mlp(self.post_attention_layernorm(collapsed))
+        post, comb, collapsed = _profiled("mhc.ffn", self.hc_ffn, streams)
+        branch = _profiled(
+            f"mlp.{kind}", self.mlp, self.post_attention_layernorm(collapsed)
+        )
         return apply_mhc_residual(post, comb, branch, streams)
+
+
+_PROFILE_ENABLED: Final = os.environ.get("GLM5_NEXT_PROFILE") == "1"
+_PROFILE_LOCK = threading.Lock()
+_PROFILE_STATS: dict[str, list[float]] = {}
+_PROFILE_CALLS = [0]
+
+
+def _profile_record(section: str, elapsed: float) -> None:
+    with _PROFILE_LOCK:
+        bucket = _PROFILE_STATS.setdefault(section, [])
+        bucket.append(elapsed)
+        _PROFILE_CALLS[0] += 1
+        calls = _PROFILE_CALLS[0]
+    if calls % 200 == 0:
+        _profile_report()
+
+
+def _profile_report() -> None:
+    with _PROFILE_LOCK:
+        snapshot = {key: list(value) for key, value in _PROFILE_STATS.items()}
+        _PROFILE_STATS.clear()
+    parts = []
+    for key in sorted(snapshot):
+        values = snapshot[key]
+        parts.append(f"{key}={1000 * sum(values) / len(values):.2f}ms x{len(values)}")
+    logger.info("GLM5_NEXT_PROFILE %s", " ".join(parts))
+
+
+def _profiled(section, fn, *args, **kwargs):
+    if not _PROFILE_ENABLED:
+        return fn(*args, **kwargs)
+    from mlx.utils import tree_flatten
+
+    start = time.perf_counter()
+    result = fn(*args, **kwargs)
+    mx.eval(*[value for _path, value in tree_flatten(result)])
+    _profile_record(section, time.perf_counter() - start)
+    return result
 
 
 Glm5NextMTPBlock = make_mtp_block_class()
@@ -517,8 +568,9 @@ class Glm5NextTextBackbone(PipelineMixin, nn.Module):
                     mask = mx.ones((batch, length), dtype=mx.bool_)
             else:
                 mask = mx.ones((batch, length), dtype=mx.bool_)
-            hidden = layer(hidden, mask, cache=layer_cache)
-        hidden = self.norm(self.hyper_head(hidden))
+            kind = "kda" if layer.is_linear else "dsa"
+            hidden = _profiled(f"layer.{kind}", layer, hidden, mask, cache=layer_cache)
+        hidden = _profiled("head", lambda h: self.norm(self.hyper_head(h)), hidden)
         return hidden
 
 
@@ -545,7 +597,7 @@ class TextModel(nn.Module):
     ):
         reject_unsupported_media(media)
         hidden = self.model(inputs, cache=cache, input_embeddings=input_embeddings)
-        logits = self.lm_head(hidden)
+        logits = _profiled("lm_head", self.lm_head, hidden)
         return (logits, hidden) if return_hidden else logits
 
     def make_cache(self):
