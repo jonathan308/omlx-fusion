@@ -527,8 +527,11 @@ def _profiled(section, fn, *args, **kwargs):
 
     start = time.perf_counter()
     result = fn(*args, **kwargs)
+    built = time.perf_counter()
     mx.eval(*[value for _path, value in tree_flatten(result)])
-    _profile_record(section, time.perf_counter() - start)
+    end = time.perf_counter()
+    _profile_record(section, end - start)
+    _profile_record(section + ".build", built - start)
     return result
 
 
