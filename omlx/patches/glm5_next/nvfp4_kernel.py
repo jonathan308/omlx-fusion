@@ -205,3 +205,130 @@ __all__ = [
     "nvfp4_gather_gemv",
     "nvfp4_gather_gemv_available",
 ]
+
+# ---------------------------------------------------------------------------
+# Grouped-GEMM prefill kernel
+# ---------------------------------------------------------------------------
+
+# One threadgroup per (expert, 256-output tile).  Each thread owns one output
+# and TT token accumulators; X tiles are staged cooperatively; each active
+# expert's packed weight rows are read exactly once per chunk.  The grid is
+# static (E x OUT/256); per-expert token ranges come from device-side
+# start/count arrays, so no host sync is needed.
+_SOURCE_GEMM = r"""
+    constexpr int TG = 256;
+    constexpr int TT = 8;    // tokens per pass
+
+    const int e = threadgroup_position_in_grid.x;
+    const int o = threadgroup_position_in_grid.y * TG + thread_position_in_threadgroup.x;
+
+    const int start = offsets[e];
+    const int count = offsets[E + e];
+    if (count == 0) return;
+
+    const int GROUPS = IN / 16;
+    const int WORDS = IN / 8;
+    const device uint* wrow = w + ((long)e * OUT + o) * WORDS;
+    const device uchar* srow = s + ((long)e * OUT + o) * GROUPS;
+
+    // No staging, no barriers: every thread streams its own packed weight
+    // row exactly once while the group's threads all read the same x
+    // element at the same time (broadcast), which stays L2-hot.
+    for (int t0 = 0; t0 < count; t0 += TT) {
+        const int rows = min(TT, count - t0);
+        float acc[TT];
+        for (int t = 0; t < TT; ++t) acc[t] = 0.0f;
+        for (int g = 0; g < GROUPS; ++g) {
+            const uint w0 = wrow[2 * g];
+            const uint w1 = wrow[2 * g + 1];
+            const float sc = omlx_e4m3fn_decode(srow[g]);
+            for (int t = 0; t < TT; ++t) {
+                if (t >= rows) break;
+                const device InT* xr = x + (long)(start + t0 + t) * IN + 16 * g;
+                float partial = 0.0f;
+                for (int j = 0; j < 8; ++j) {
+                    partial += omlx_e2m1_decode((w0 >> (4 * j)) & 0xFu)
+                        * (float)xr[j];
+                    partial += omlx_e2m1_decode((w1 >> (4 * j)) & 0xFu)
+                        * (float)xr[8 + j];
+                }
+                acc[t] += partial * sc;
+            }
+        }
+        for (int t = 0; t < rows; ++t) {
+            out[(long)(start + t0 + t) * OUT + o] = (InT)(acc[t] * gs[e]);
+        }
+    }
+"""
+
+_gemm_kernel_cache: dict[tuple[Any, ...], Any] = {}
+
+
+def _get_gemm_kernel(dtype: Any):
+    import mlx.core as mx
+
+    kernel = _gemm_kernel_cache.get(dtype)
+    if kernel is None:
+        kernel = mx.fast.metal_kernel(
+            name="omlx_glm5_next_nvfp4_grouped_gemm",
+            input_names=["x", "w", "s", "gs", "offsets", "E", "IN", "OUT"],
+            output_names=["out"],
+            source=_SOURCE_GEMM,
+            header=_HEADER,
+        )
+        _gemm_kernel_cache[dtype] = kernel
+    return kernel
+
+
+def nvfp4_grouped_gemm_sorted(
+    x_sorted: Any,
+    weight: Any,
+    scales: Any,
+    global_scale: Any,
+    idx_sorted: Any,
+) -> Any:
+    """Grouped NVFP4 GEMM over expert-sorted (token, expert) pairs.
+
+    x_sorted: (NP, IN) activation rows sorted by expert; idx_sorted: (NP,)
+    int32 expert id per row.  Returns (NP, OUT) in x dtype.  Rows are
+    contiguous per expert (the caller's _gather_sort guarantees this).
+    """
+
+    import mlx.core as mx
+
+    experts = weight.shape[0]
+    out_features = weight.shape[1]
+    in_features = x_sorted.shape[-1]
+    # Expert histogram on GPU: one-hot scatter-sum, no host sync.
+    onehot = (mx.arange(experts)[None, :] == idx_sorted[:, None]).astype(mx.int32)
+    counts = mx.sum(onehot, axis=0)
+    starts = mx.cumsum(counts, axis=0) - counts
+    # mx.fast.metal_kernel on this pinned build mis-binds the second same-dtype
+    # array input, so starts/counts travel in one packed (2E,) buffer.
+    offsets = mx.concatenate([starts, counts])
+    (out,) = _get_gemm_kernel(x_sorted.dtype)(
+        inputs=[
+            mx.contiguous(x_sorted),
+            weight,
+            scales,
+            global_scale,
+            offsets,
+            experts,
+            in_features,
+            out_features,
+        ],
+        template=[("InT", x_sorted.dtype)],
+        grid=(256 * experts, out_features, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(x_sorted.shape[0], out_features)],
+        output_dtypes=[x_sorted.dtype],
+    )
+    return out
+
+
+def nvfp4_grouped_gemm_available() -> bool:
+    # EXPERIMENTAL: the grouped prefill GEMM currently miscompiles under the
+    # Metal JIT on the pinned stack (token-loop iterations past the first
+    # produce corrupt accumulators).  Not wired into any model path; keep
+    # disabled until the kernel is reimplemented in the C++ extension.
+    return os.environ.get("GLM5_NEXT_NVFP4_GEMM", "0") == "1"
