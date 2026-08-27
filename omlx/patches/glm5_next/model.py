@@ -566,9 +566,9 @@ class Glm5NextTextBackbone(PipelineMixin, nn.Module):
                 # right-padding/finalize semantics.
                 mask = None
             elif isinstance(layer_cache, KDACache):
+                # A None mask means fully-valid rows; forcing an all-ones mask
+                # here would defeat the mask-free compiled decode fast path.
                 mask = layer_cache.make_mask(length)
-                if mask is None:
-                    mask = mx.ones((batch, length), dtype=mx.bool_)
             else:
                 mask = mx.ones((batch, length), dtype=mx.bool_)
             kind = "kda" if layer.is_linear else "dsa"
