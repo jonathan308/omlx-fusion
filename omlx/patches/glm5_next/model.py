@@ -511,7 +511,7 @@ class DecoderLayer(nn.Module):
 
 
 _PROFILE_MODE: Final = os.environ.get("GLM5_NEXT_PROFILE", "0")
-_PROFILE_ENABLED: Final = _PROFILE_MODE in ("1", "2")
+_PROFILE_ENABLED: Final = _PROFILE_MODE in ("1", "2", "3")
 _PROFILE_LOCK = threading.Lock()
 _PROFILE_STATS: dict[str, list[float]] = {}
 _PROFILE_CALLS = [0]
@@ -634,6 +634,9 @@ class TextModel(nn.Module):
             # Wall time here is pure Python graph construction; evaluation
             # happens later at the sampler.  No barrier, no distortion.
             _profile_record("forward.build", time.perf_counter() - start)
+            if _PROFILE_MODE == "3":
+                mx.eval(logits)
+                _profile_record("forward.total", time.perf_counter() - start)
         else:
             hidden = self.model(inputs, cache=cache, input_embeddings=input_embeddings)
             logits = self.lm_head(hidden)
