@@ -219,6 +219,48 @@ def extract_images_from_messages(
     return text_messages, images, audio
 
 
+def extract_videos_from_messages(messages: List[Dict[str, Any]]) -> List[Any]:
+    """
+    Collect video content-part values from OpenAI-format messages, in order.
+
+    ``extract_images_from_messages`` strips every non-text/non-image/non-audio
+    part when it builds text-only messages, so video parts never survive into
+    the rendered prompt.  This companion collects the raw video references
+    (file paths, URLs, or frame lists) so engines with a native video tower
+    can route them to their processor.  The message list is not modified.
+
+    Supported part shapes:
+    - OpenAI: ``{"type": "video_url", "video_url": {"url": ...}}``
+    - Flat: ``{"type": "video", "video": ...}``
+    - Responses-style: ``{"type": "input_video", "input_video": ...}``
+    """
+    videos = []
+    for msg in messages:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict):
+                part_type = part.get("type")
+            else:
+                part_type = getattr(part, "type", None)
+            if part_type not in ("video", "video_url", "input_video"):
+                continue
+            if isinstance(part, dict):
+                value = part.get("video_url")
+                if value is None:
+                    value = part.get("video", part.get("input_video"))
+            else:
+                value = getattr(part, "video_url", None) or getattr(
+                    part, "video", getattr(part, "input_video", None)
+                )
+            if isinstance(value, dict):
+                value = value.get("url")
+            if value is not None:
+                videos.append(value)
+    return videos
+
+
 def compute_image_hash(images: List[Image.Image]) -> Optional[str]:
     """
     Compute a SHA256 hash from a list of images for prefix cache deduplication.

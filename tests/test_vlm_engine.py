@@ -1143,6 +1143,7 @@ class TestProcessChatMessages:
             text_msgs,
             [],
             audio=None,
+            videos=None,
             chat_template_kwargs=None,
             tools=None,
             is_partial=None,
