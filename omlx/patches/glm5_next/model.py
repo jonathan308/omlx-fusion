@@ -63,6 +63,20 @@ DSA_LAYERS: Final = tuple(MAIN_DSA_LAYERS)
 
 logger = logging.getLogger(__name__)
 _TRACED_LENGTHS: set = set()
+_LAYER_PROBE_DONE = [False]
+
+
+def _log_layer_probe_once(layer, streams, mask, cache) -> None:
+    if _LAYER_PROBE_DONE[0]:
+        return
+    _LAYER_PROBE_DONE[0] = True
+    logger.info(
+        "GLM5-Next decode layer probe: attn=%s mask=%s cache=%s cache_len=%s",
+        type(layer.self_attn).__name__,
+        None if mask is None else tuple(mask.shape),
+        type(cache).__name__,
+        getattr(cache, "lengths", "n/a"),
+    )
 
 
 class Glm5NextModelContractError(ValueError):
@@ -475,6 +489,8 @@ class DecoderLayer(nn.Module):
         self.hc_ffn = mhc_class(args.mhc_config())
 
     def __call__(self, streams, mask, cache=None):
+        if streams.shape[1] <= 4 and self.layer_idx == 0:
+            _log_layer_probe_once(self, streams, mask, cache)
         post, comb, collapsed = _profiled("mhc.attn", self.hc_attn, streams)
         branch_input = self.input_layernorm(collapsed)
         kind = "kda" if self.is_linear else "dsa"
