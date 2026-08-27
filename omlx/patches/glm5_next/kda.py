@@ -380,6 +380,18 @@ def _mlx_runtime() -> tuple[Any, Any, Any, Any]:
     return mx, nn, ops, kernel
 
 
+_LOGGED: set = set()
+
+
+def _log_once(key: str, message: str) -> None:
+    if key in _LOGGED:
+        return
+    _LOGGED.add(key)
+    import logging
+
+    logging.getLogger(__name__).info("%s", message)
+
+
 @lru_cache(maxsize=2)
 def _compiled_kda_decode(heads: int, head_dim: int, eps: float, gate_lower: float):
     """One compiled graph for every KDA layer at decode shapes.
@@ -568,6 +580,7 @@ def make_kda_class():
                 and mx.default_device() == mx.gpu
                 and mx.metal.is_available()
             ):
+                _log_once("kda", "GLM5-Next compiled KDA decode engaged")
                 out, q_s, k_s, v_s, rec = _compiled_kda_decode(
                     self.config.num_heads,
                     self.config.head_dim,

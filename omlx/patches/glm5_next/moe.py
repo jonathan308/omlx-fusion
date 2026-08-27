@@ -646,6 +646,13 @@ def _implementation_class(validate_official: bool = True):
             if x.shape[1] <= 4 and os.environ.get("GLM5_NEXT_MOE_COMPILE", "1") == "1":
                 args = _nvfp4_decode_args(self)
                 if args is not None:
+                    if not getattr(self, "_compiled_logged", False):
+                        self._compiled_logged = True
+                        import logging
+
+                        logging.getLogger(__name__).info(
+                            "GLM5-Next compiled NVFP4 MoE decode engaged"
+                        )
                     return _compiled_nvfp4_sparse_decode()(x, *args)
             indices, scores = self.gate(x)
             routed = self.switch_mlp(x, indices)

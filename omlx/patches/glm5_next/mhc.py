@@ -308,6 +308,13 @@ def make_mhc_class():
                 # construction.  Prefill keeps the eager path (identical
                 # math, no reshape-specialization risk on long sequences).
                 hc = self.config.streams
+                if not getattr(self, "_compiled_logged", False):
+                    self._compiled_logged = True
+                    import logging
+
+                    logging.getLogger(__name__).info(
+                        "GLM5-Next compiled mHC decode engaged"
+                    )
                 mixer = _compiled_mhc_mix(
                     hc,
                     self.config.eps,
