@@ -581,13 +581,25 @@ class Glm5NextVideoProcessor:
         return_tensors: str | None = None,
         **kwargs: Any,
     ) -> ProcessorBatch:
-        items = (
-            videos
-            if isinstance(videos, (list, tuple))
+        if isinstance(videos, (str, Path)) or (
+            isinstance(videos, np.ndarray) and videos.ndim == 4
+        ):
+            items = [videos]
+        elif (
+            isinstance(videos, (list, tuple))
             and videos
-            and np.asarray(videos[0]).ndim == 4
-            else [videos]
-        )
+            and all(
+                isinstance(item, Image.Image)
+                or (isinstance(item, np.ndarray) and item.ndim == 3)
+                for item in videos
+            )
+        ):
+            # One video supplied directly as a list of frames.
+            items = [videos]
+        else:
+            # A list of independent videos: each entry is a path/URL decoded
+            # through the pinned backend, a 4-D frame array, or a frame list.
+            items = list(videos)
         metadata_items = (
             list(video_metadata)
             if isinstance(video_metadata, (list, tuple))
