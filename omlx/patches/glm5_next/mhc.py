@@ -147,9 +147,29 @@ def _mlx_runtime() -> tuple[Any, Any]:
     return importlib.import_module("mlx.core"), importlib.import_module("mlx.nn")
 
 
+@lru_cache(maxsize=1)
+def _compiled_mhc_residual():
+    """Compile the residual placement+mix graph for decode-sized calls."""
+
+    mx, _ = _mlx_runtime()
+
+    def _run(post, comb, branch_output, residual):
+        dtype = residual.dtype
+        placed = post.astype(dtype)[..., None] * branch_output[..., None, :]
+        mixed = mx.matmul(comb.astype(dtype).swapaxes(-1, -2), residual)
+        return placed + mixed
+
+    return mx.compile(_run)
+
+
 def apply_mhc_residual(post, comb, branch_output, residual):
     """Apply the exact post-placement and transposed stream mixer equation."""
 
+    if (
+        os.environ.get("GLM5_NEXT_MHC_COMPILE", "1") == "1"
+        and residual.shape[1] <= 4
+    ):
+        return _compiled_mhc_residual()(post, comb, branch_output, residual)
     mx, _ = _mlx_runtime()
     dtype = residual.dtype
     placed = post.astype(dtype)[..., None] * branch_output[..., None, :]

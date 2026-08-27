@@ -14,6 +14,7 @@ resolved lazily so source inspection and conversion planning never allocate a
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Callable, Mapping
 from functools import lru_cache
@@ -345,6 +346,114 @@ def _runtime_geometry(config: Any, *, validate_official: bool) -> dict[str, Any]
 
 
 @lru_cache(maxsize=2)
+def _compiled_nvfp4_sparse_decode():
+    """One compiled graph for every NVFP4 sparse MoE block at decode shapes.
+
+    Mirrors ``_FP32Router`` + ``_ClampedSwitchGLU`` (ScaledNVFP4SwitchLinear)
+    + ``_SharedExperts`` (plain dense) exactly.  Weights are passed as
+    arguments so all 43 blocks share a single compiled graph.  Only used for
+    single-token-style calls; prefill stays on the eager modules.
+    """
+
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    def _qmm(x, weight, scales, global_scale, indices):
+        out = mx.gather_qmm(
+            x,
+            weight,
+            scales,
+            rhs_indices=indices,
+            transpose=True,
+            group_size=16,
+            bits=4,
+            mode="nvfp4",
+            sorted_indices=False,
+        )
+        selected = global_scale[indices].astype(out.dtype)
+        return out * selected[..., None, None]
+
+    def _run(
+        x,
+        gate_w,
+        e_bias,
+        sw_gate_w,
+        sw_gate_s,
+        sw_gate_g,
+        sw_up_w,
+        sw_up_s,
+        sw_up_g,
+        sw_down_w,
+        sw_down_s,
+        sw_down_g,
+        sh_gate_w,
+        sh_up_w,
+        sh_down_w,
+        top_k,
+        scaling,
+        limit,
+    ):
+        logits = x.astype(mx.float32) @ gate_w.astype(mx.float32).T
+        scores = mx.sigmoid(logits)
+        selection = scores + e_bias.astype(mx.float32)
+        indices = mx.argpartition(-selection, kth=top_k - 1, axis=-1)[..., :top_k]
+        weights = mx.take_along_axis(scores, indices, axis=-1)
+        weights = weights / (mx.sum(weights, axis=-1, keepdims=True) + 1e-20)
+        weights = weights * scaling
+
+        xe = mx.expand_dims(x, (-2, -3))
+        up = _qmm(xe, sw_up_w, sw_up_s, sw_up_g, indices)
+        gate = _qmm(xe, sw_gate_w, sw_gate_s, sw_gate_g, indices)
+        gate = mx.minimum(gate, mx.array(limit, dtype=gate.dtype))
+        up = mx.clip(up, -limit, limit)
+        routed = _qmm(nn.silu(gate) * up, sw_down_w, sw_down_s, sw_down_g, indices)
+        routed = routed.squeeze(-2)
+        routed = mx.sum(routed * weights[..., None], axis=-2).astype(x.dtype)
+
+        shared_gate = x @ sh_gate_w.swapaxes(-1, -2)
+        shared_up = x @ sh_up_w.swapaxes(-1, -2)
+        shared_gate = mx.minimum(shared_gate, mx.array(limit, dtype=shared_gate.dtype))
+        shared_up = mx.clip(shared_up, -limit, limit)
+        shared = (nn.silu(shared_gate) * shared_up) @ sh_down_w.swapaxes(-1, -2)
+        return routed + shared
+
+    return mx.compile(_run)
+
+
+def _nvfp4_decode_args(block: Any):
+    """Return the compiled-graph argument tuple, or None when ineligible."""
+
+    switch = getattr(block, "switch_mlp", None)
+    shared = getattr(block, "shared_experts", None)
+    gate = getattr(block, "gate", None)
+    if switch is None or shared is None or gate is None:
+        return None
+    if type(switch.gate_proj).__name__ != "ScaledNVFP4SwitchLinear":
+        return None
+    if "bias" in switch.gate_proj or "bias" in shared.gate_proj:
+        return None
+    return (
+        gate.weight,
+        gate.e_score_correction_bias,
+        switch.gate_proj["weight"],
+        switch.gate_proj["scales"],
+        switch.gate_proj["global_scale"],
+        switch.up_proj["weight"],
+        switch.up_proj["scales"],
+        switch.up_proj["global_scale"],
+        switch.down_proj["weight"],
+        switch.down_proj["scales"],
+        switch.down_proj["global_scale"],
+        shared.gate_proj.weight,
+        shared.up_proj.weight,
+        shared.down_proj.weight,
+        gate.top_k,
+        gate.routed_scaling_factor,
+        switch.limit,
+    )
+
+
+@lru_cache(maxsize=2)
 def _implementation_class(validate_official: bool = True):
     """Create the exact router/FP8 wrapper only if a runtime instantiates it."""
 
@@ -534,6 +643,10 @@ def _implementation_class(validate_official: bool = True):
             self.shared_experts = _SharedExperts(geometry)
 
         def __call__(self, x):
+            if x.shape[1] <= 4 and os.environ.get("GLM5_NEXT_MOE_COMPILE", "1") == "1":
+                args = _nvfp4_decode_args(self)
+                if args is not None:
+                    return _compiled_nvfp4_sparse_decode()(x, *args)
             indices, scores = self.gate(x)
             routed = self.switch_mlp(x, indices)
             routed = mx.sum(routed * scores[..., None], axis=-2).astype(x.dtype)

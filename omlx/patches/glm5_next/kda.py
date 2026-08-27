@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -379,6 +380,104 @@ def _mlx_runtime() -> tuple[Any, Any, Any, Any]:
     return mx, nn, ops, kernel
 
 
+@lru_cache(maxsize=2)
+def _compiled_kda_decode(heads: int, head_dim: int, eps: float, gate_lower: float):
+    """One compiled graph for every KDA layer at decode shapes.
+
+    Replays ``Glm5NextKDA.__call__`` exactly for the mask-free single-row
+    decode case: short-conv state updates, fp32 normalization, the pinned
+    gated-delta Metal kernel, and the output gate.  Weights and states are
+    arguments so all 34 KDA layers share one compiled graph.  Returns the
+    layer output plus the four updated cache states; the caller owns the
+    cache mutation.
+    """
+
+    mx, nn, delta_ops, delta_kernel = _mlx_runtime()
+
+    def _conv_tap(conv_input, weight, length):
+        # Exact groups=C kernel-4 Conv1d without the module wrapper.
+        # MLX Conv1d weight layout is (channels, kernel, in/groups=1).
+        out = None
+        for tap in range(4):
+            piece = conv_input[:, tap : tap + length, :] * weight[:, tap, 0]
+            out = piece if out is None else out + piece
+        return out
+
+    def _run(
+        x,
+        qw,
+        kw,
+        vw,
+        qcw,
+        kcw,
+        vcw,
+        fa_w,
+        fb_w,
+        b_w,
+        ga_w,
+        gb_w,
+        onorm_w,
+        ow,
+        a_log,
+        dt_bias,
+        q_state,
+        k_state,
+        v_state,
+        recurrent,
+    ):
+        batch, length, _ = x.shape
+        input_dtype = x.dtype
+        keep = 3
+
+        def _proj(w):
+            return x @ w.swapaxes(-1, -2)
+
+        conv_input = mx.concatenate([q_state.astype(x.dtype), _proj(qw)], axis=1)
+        q = nn.silu(_conv_tap(conv_input, qcw, length))
+        new_q_state = mx.contiguous(conv_input[:, -keep:, :])
+        conv_input = mx.concatenate([k_state.astype(x.dtype), _proj(kw)], axis=1)
+        k = nn.silu(_conv_tap(conv_input, kcw, length))
+        new_k_state = mx.contiguous(conv_input[:, -keep:, :])
+        conv_input = mx.concatenate([v_state.astype(x.dtype), _proj(vw)], axis=1)
+        v = nn.silu(_conv_tap(conv_input, vcw, length))
+        new_v_state = mx.contiguous(conv_input[:, -keep:, :])
+
+        shape = (batch, length, heads, head_dim)
+        q = q.reshape(shape).astype(mx.float32)
+        k = k.reshape(shape).astype(mx.float32)
+        v = v.reshape(shape).astype(mx.float32)
+        q = q / mx.sqrt(mx.sum(q * q, axis=-1, keepdims=True) + 1e-6)
+        k = k / mx.sqrt(mx.sum(k * k, axis=-1, keepdims=True) + 1e-6)
+        q = q * (head_dim**-0.5)
+
+        gate_logits = ((_proj(fa_w) @ fb_w.swapaxes(-1, -2))).astype(mx.float32)
+        gate_logits = gate_logits.reshape(shape) + dt_bias.astype(mx.float32).reshape(
+            1, 1, heads, head_dim
+        )
+        rate = mx.exp(a_log.astype(mx.float32)).reshape(1, 1, heads, 1)
+        log_decay = gate_lower * mx.sigmoid(rate * gate_logits)
+        decay = mx.exp(log_decay)
+        beta = mx.sigmoid(_proj(b_w).astype(mx.float32))
+
+        recurrent_f = recurrent.astype(mx.float32)
+        output, recurrent_f = delta_kernel(
+            q, k, v, decay, beta, recurrent_f, None
+        )
+        recurrent_f = recurrent_f.astype(mx.float32)
+
+        gate = (_proj(ga_w) @ gb_w.swapaxes(-1, -2)).astype(mx.float32).reshape(shape)
+        normed = output.astype(mx.float32)
+        variance = mx.mean(normed * normed, axis=-1, keepdims=True)
+        normed = normed * mx.rsqrt(variance + eps)
+        normed = normed * onorm_w.astype(mx.float32)
+        normed = normed * mx.sigmoid(gate)
+        normed = normed.astype(input_dtype).reshape(batch, length, -1)
+        out = (normed @ ow.swapaxes(-1, -2)).astype(input_dtype)
+        return out, new_q_state, new_k_state, new_v_state, recurrent_f
+
+    return mx.compile(_run)
+
+
 @lru_cache(maxsize=1)
 def make_kda_class():
     """Return the lazily constructed MLX ``Glm5NextKDA`` module class."""
@@ -459,6 +558,51 @@ def make_kda_class():
                 else [cache[i] for i in range(4)]
             )
             lengths = None if cache is None else getattr(cache, "lengths", None)
+            if (
+                use_kernel
+                and length <= 4
+                and mask is None
+                and lengths is None
+                and states[3] is not None
+                and os.environ.get("GLM5_NEXT_KDA_COMPILE", "1") == "1"
+                and mx.default_device() == mx.gpu
+                and mx.metal.is_available()
+            ):
+                out, q_s, k_s, v_s, rec = _compiled_kda_decode(
+                    self.config.num_heads,
+                    self.config.head_dim,
+                    self.config.rms_norm_eps,
+                    self.config.gate_lower_bound,
+                )(
+                    x,
+                    self.q_proj.weight,
+                    self.k_proj.weight,
+                    self.v_proj.weight,
+                    self.q_conv1d.weight,
+                    self.k_conv1d.weight,
+                    self.v_conv1d.weight,
+                    self.f_a_proj.weight,
+                    self.f_b_proj.weight,
+                    self.b_proj.weight,
+                    self.g_a_proj.weight,
+                    self.g_b_proj.weight,
+                    self.o_norm.weight,
+                    self.o_proj.weight,
+                    self.A_log,
+                    self.dt_bias,
+                    states[0],
+                    states[1],
+                    states[2],
+                    states[3],
+                )
+                if isinstance(cache, KDACache):
+                    cache.update(q_s, k_s, v_s, rec, length)
+                else:
+                    cache[0], cache[1], cache[2], cache[3] = q_s, k_s, v_s, rec
+                    if hasattr(cache, "advance"):
+                        cache.advance(length)
+                return out
+
             q, q_state = self._short_conv(
                 self.q_conv1d, self.q_proj(x), states[0], mask, lengths
             )
