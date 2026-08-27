@@ -240,7 +240,9 @@ def _compiled_mhc_mix(streams: int, eps: float, rms_eps: float, iters: int):
             config,
         )
 
-    return mx.compile(_run, shapeless=True)
+    # Concrete-shape compilation: shapeless tracing cannot infer the
+    # comb (.., hc*hc) -> (.., hc, hc) reshape, so prefill stays eager.
+    return mx.compile(_run)
 
 
 @lru_cache(maxsize=1)
@@ -277,7 +279,14 @@ def make_mhc_class():
                     f"found {hidden_streams.shape[2:]}"
                 )
             input_dtype = hidden_streams.dtype
-            if os.environ.get("GLM5_NEXT_MHC_COMPILE", "1") == "1":
+            if (
+                os.environ.get("GLM5_NEXT_MHC_COMPILE", "1") == "1"
+                and hidden_streams.shape[1] <= 4
+            ):
+                # Decode/verify-sized calls: the compiled graph eliminates
+                # ~40 tiny kernel launches plus per-call Python graph
+                # construction.  Prefill keeps the eager path (identical
+                # math, no reshape-specialization risk on long sequences).
                 hc = self.config.streams
                 mixer = _compiled_mhc_mix(
                     hc,
