@@ -426,6 +426,39 @@ def _replace_switch(
     )
 
 
+def _replace_block_fp8_with_dense(
+    module: Any, *, input_dims: int, output_dims: int
+) -> Any:
+    """Bind a plain dense projection for routed-only NVFP4 shared experts.
+
+    The routed-only ModelOpt repack quantizes only the 288-expert switch
+    banks; shared experts remain dense BF16 ``weight``-only tensors in the
+    checkpoint.  The default runtime tree builds them as block-FP8 carriers
+    with a ``weight_scale_inv`` sidecar the checkpoint does not contain, so
+    they are rebound as exact plain ``nn.Linear`` modules here.  This is a
+    parameter-tree correction, not an NVFP4 carrier, and is therefore not
+    part of the adapter's NVFP4 module count.
+    """
+
+    import mlx.nn as nn
+
+    if "weight_scale_inv" not in module:
+        shape = tuple(getattr(getattr(module, "weight", None), "shape", ()))
+        if shape == (output_dims, input_dims):
+            return module
+        raise Glm5NextNVFP4Error(
+            f"shared-expert module geometry changed: found {shape}, expected "
+            f"{(output_dims, input_dims)}"
+        )
+    shape = tuple(getattr(getattr(module, "weight", None), "shape", ()))
+    if shape != (output_dims, input_dims):
+        raise Glm5NextNVFP4Error(
+            f"shared-expert module geometry changed: found {shape}, expected "
+            f"{(output_dims, input_dims)}"
+        )
+    return nn.Linear(input_dims, output_dims, bias=False)
+
+
 def configure_glm5_next_nvfp4(
     model: Any, quantization: Mapping[str, Any] | None
 ) -> NVFP4AdapterResult:
@@ -434,7 +467,10 @@ def configure_glm5_next_nvfp4(
     Only the three dense MLPs, 42 routed switch banks, and their 42 shared
     experts are replaced.  Attention/KDA/DSA, mHC, routers, norms, convolutions,
     embeddings, LM head, vision, and MTP remain untouched.  Official geometry
-    is required; an unexpected module shape fails closed.
+    is required; an unexpected module shape fails closed.  Under the
+    routed-only scope the shared experts (main layers and the MTP block) are
+    rebound as plain dense modules because the checkpoint stores them as
+    BF16 ``weight``-only tensors without block-FP8 sidecars.
     """
 
     if quantization is None:
@@ -484,22 +520,29 @@ def configure_glm5_next_nvfp4(
             setattr(switch, projection, replacement)
             count += int(replacement is not current)
 
-            if not routed_only:
-                current_shared = getattr(shared, projection)
+            current_shared = getattr(shared, projection)
+            if routed_only:
+                replacement_shared = _replace_block_fp8_with_dense(
+                    current_shared, input_dims=dims[0], output_dims=dims[1]
+                )
+            else:
                 replacement_shared = _replace_dense(
                     current_shared, input_dims=dims[0], output_dims=dims[1]
                 )
-                setattr(shared, projection, replacement_shared)
-                count += int(replacement_shared is not current_shared)
+            setattr(shared, projection, replacement_shared)
+            count += int(not routed_only and replacement_shared is not current_shared)
 
     if routed_only:
         heads = getattr(text, "mtp", None)
         if not isinstance(heads, list) or len(heads) != 1:
             raise Glm5NextNVFP4Error("routed-only NVFP4 requires one MTP head")
-        switch = getattr(getattr(heads[0], "block", None), "mlp", None)
-        switch = getattr(switch, "switch_mlp", None)
+        mtp_mlp = getattr(getattr(heads[0], "block", None), "mlp", None)
+        switch = getattr(mtp_mlp, "switch_mlp", None)
         if switch is None:
             raise Glm5NextNVFP4Error("routed-only NVFP4 MTP SwitchGLU is missing")
+        shared = getattr(mtp_mlp, "shared_experts", None)
+        if shared is None:
+            raise Glm5NextNVFP4Error("routed-only NVFP4 MTP shared expert is missing")
         for projection, dims in (
             ("gate_proj", (4096, 2048)),
             ("up_proj", (4096, 2048)),
@@ -511,7 +554,51 @@ def configure_glm5_next_nvfp4(
             )
             setattr(switch, projection, replacement)
             count += int(replacement is not current)
+            setattr(
+                shared,
+                projection,
+                _replace_block_fp8_with_dense(
+                    getattr(shared, projection),
+                    input_dims=dims[0],
+                    output_dims=dims[1],
+                ),
+            )
     return NVFP4AdapterResult(True, count)
+
+
+def bind_glm5_next_nvfp4(model: Any, quantization: Any) -> bool:
+    """Single text/VLM invariant for exact NVFP4 carrier binding.
+
+    Both the text outer model and the mlx-vlm multimodal outer model must run
+    this exact routine before ``load_weights`` so their parameter trees can
+    never drift apart: the checkpoint supplies one ModelOpt
+    ``weight``/``scales``/``global_scale`` triple per bound projection, and a
+    graph that keeps ordinary modules would reject those tensors as
+    unexpected.
+
+    Returns ``True`` when ``quantization`` is the exact GLM5-Next ModelOpt
+    NVFP4 contract and every expected projection module was replaced; returns
+    ``False`` for non-NVFP4 checkpoints so the caller can apply ordinary
+    affine handling.  A partial bind or an unexpected module count fails
+    closed.
+    """
+
+    if not is_glm5_next_nvfp4_config(quantization):
+        return False
+    if GLM5_NEXT_NVFP4_RUNTIME_READY is not True:
+        raise Glm5NextNVFP4Error(
+            "GLM5-Next NVFP4 runtime adapter is unavailable"
+        )
+    result = configure_glm5_next_nvfp4(model, quantization)
+    expected_modules = (
+        129 if quantization.get("scope") == "glm5_next_routed_experts" else 261
+    )
+    if not result.configured or result.module_count != expected_modules:
+        raise Glm5NextNVFP4Error(
+            "GLM5-Next NVFP4 did not bind every expected MLP projection: "
+            f"{result.module_count}/{expected_modules}"
+        )
+    return True
 
 
 __all__ = [
@@ -522,6 +609,7 @@ __all__ = [
     "NVFP4_BITS",
     "NVFP4_GROUP_SIZE",
     "NVFP4_LAYOUT",
+    "bind_glm5_next_nvfp4",
     "configure_glm5_next_nvfp4",
     "decode_e2m1",
     "decode_e4m3fn",

@@ -27,6 +27,7 @@ from omlx.patches.glm5_next.model import (
     native_vision_ready,
     require_runtime_ready,
 )
+from omlx.patches.glm5_next.nvfp4 import bind_glm5_next_nvfp4
 from omlx.patches.glm5_next.processor import (
     Glm5NextImageProcessor,
     Glm5NextProcessor,
@@ -183,7 +184,13 @@ class Model(nn.Module):
         self.model_type = config.model_type
         self.vision_tower = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config, config)
-        self._converted_affine = isinstance(config.quantization, Mapping)
+        # The multimodal outer model must bind the exact ModelOpt NVFP4
+        # carriers through the same shared invariant as the text outer model;
+        # the checkpoint supplies 129 routed/MTP ``global_scale`` tensors that
+        # ordinary SwitchLinear modules cannot accept.
+        quantization = config.quantization or config.quantization_config
+        self._nvfp4 = bind_glm5_next_nvfp4(self, quantization)
+        self._converted_affine = isinstance(quantization, Mapping) and not self._nvfp4
 
     @property
     def layers(self):

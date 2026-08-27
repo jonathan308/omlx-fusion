@@ -42,11 +42,7 @@ from omlx.patches.glm5_next.mtp import (
 from omlx.patches.glm5_next.mtp import (
     mtp_partial_rollback as rollback_glm5_next_mtp_cache,
 )
-from omlx.patches.glm5_next.nvfp4 import (
-    GLM5_NEXT_NVFP4_RUNTIME_READY,
-    configure_glm5_next_nvfp4,
-    is_glm5_next_nvfp4_config,
-)
+from omlx.patches.glm5_next.nvfp4 import bind_glm5_next_nvfp4
 from omlx.patches.glm5_next.vision import (
     VISION_PREFIX,
     reject_unsupported_media,
@@ -657,21 +653,7 @@ class Model(nn.Module):
         validate_mtp_config(args.text_config)
         self.language_model = TextModel(text_args)
         quantization = args.quantization or args.quantization_config
-        self._nvfp4 = is_glm5_next_nvfp4_config(quantization)
-        if self._nvfp4:
-            if GLM5_NEXT_NVFP4_RUNTIME_READY is not True:
-                raise Glm5NextRuntimeUnavailableError(
-                    "GLM5-Next NVFP4 runtime adapter is unavailable"
-                )
-            result = configure_glm5_next_nvfp4(self, quantization)
-            expected_modules = (
-                129 if quantization.get("scope") == "glm5_next_routed_experts" else 261
-            )
-            if not result.configured or result.module_count != expected_modules:
-                raise Glm5NextRuntimeUnavailableError(
-                    "GLM5-Next NVFP4 did not bind every expected MLP projection: "
-                    f"{result.module_count}/{expected_modules}"
-                )
+        self._nvfp4 = bind_glm5_next_nvfp4(self, quantization)
         self._converted_affine = isinstance(quantization, Mapping) and not self._nvfp4
 
     def __call__(

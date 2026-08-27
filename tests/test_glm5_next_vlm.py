@@ -261,3 +261,123 @@ def test_cached_image_features_skip_tower_but_still_inject():
         cached_image_features=mx.array([[1.0, 2.0, 3.0, 4.0]]),
     )
     assert result.inputs_embeds[0, 1].tolist() == [1.0, 2.0, 3.0, 4.0]
+
+
+def _nvfp4_quantization():
+    """The exact ModelOpt NVFP4 runtime contract of the Fusion checkpoint."""
+
+    return {
+        "bits": 4,
+        "group_size": 16,
+        "mode": "nvfp4",
+        "layout": "glm5-next-modelopt-nvfp4-v1",
+        "modelopt_global_scale": True,
+        "scope": "glm5_next_routed_experts",
+        "source_layout": "modelopt-0.45-per-expert",
+    }
+
+
+def _expected_nvfp4_triples():
+    expected = set()
+    bases = [
+        f"language_model.model.layers.{index}.mlp.switch_mlp.{projection}"
+        for index in range(3, 45)
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    ]
+    bases += [
+        f"language_model.mtp.0.block.mlp.switch_mlp.{projection}"
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    ]
+    assert len(bases) == 129
+    for base in bases:
+        expected |= {base + ".weight", base + ".scales", base + ".global_scale"}
+    return expected
+
+
+def _flat_parameter_paths(model):
+    from mlx.utils import tree_flatten
+
+    return {path for path, _value in tree_flatten(model.parameters())}
+
+
+def test_vlm_binds_all_129_exact_nvfp4_global_scale_triples():
+    pytest.importorskip("mlx.core")
+    from mlx_vlm.models.glm5_next import Model, ModelConfig
+
+    config = ModelConfig.from_dict(
+        {**_config(), "quantization": _nvfp4_quantization()}
+    )
+    model = Model(config)
+    assert model._nvfp4 is True
+    # NVFP4 is not an affine checkpoint; sanitize must not take affine paths.
+    assert model._converted_affine is False
+
+    expected = _expected_nvfp4_triples()
+    assert len(expected) == 129 * 3
+    missing = expected - _flat_parameter_paths(model)
+    assert not missing, f"VLM tree lacks bound NVFP4 tensors: {sorted(missing)[:3]}"
+
+    switch = model.language_model.model.layers[3].mlp.switch_mlp.gate_proj
+    assert type(switch).__name__ == "ScaledNVFP4SwitchLinear"
+    assert switch.weight.shape == (288, 2048, 512)
+    assert switch.scales.shape == (288, 2048, 256)
+    assert switch.global_scale.shape == (288,)
+    mtp_switch = model.language_model.mtp[0].block.mlp.switch_mlp.down_proj
+    assert type(mtp_switch).__name__ == "ScaledNVFP4SwitchLinear"
+    assert mtp_switch.weight.shape == (288, 4096, 256)
+    # Dense MLPs and shared experts stay ordinary under routed-only scope.
+    dense = model.language_model.model.layers[0].mlp.gate_proj
+    assert type(dense).__name__ != "ScaledNVFP4Linear"
+    shared = model.language_model.model.layers[3].mlp.shared_experts.gate_proj
+    assert type(shared).__name__ != "ScaledNVFP4Linear"
+    # Routed-only NVFP4 stores shared experts as dense BF16 weight-only
+    # tensors; no block-FP8 sidecar may remain in the bound tree.
+    assert "weight_scale_inv" not in shared
+    mtp_shared = model.language_model.mtp[0].block.mlp.shared_experts.up_proj
+    assert "weight_scale_inv" not in mtp_shared
+
+
+def test_text_and_vlm_outer_models_share_one_nvfp4_binding_invariant():
+    pytest.importorskip("mlx.core")
+    from omlx.patches.glm5_next.model import Model as TextOuter, ModelArgs
+    from mlx_vlm.models.glm5_next import Model as VlmOuter, ModelConfig
+
+    quantization = _nvfp4_quantization()
+    text = TextOuter(
+        ModelArgs.from_dict({**_config(), "quantization": quantization})
+    )
+    vlm = VlmOuter(ModelConfig.from_dict({**_config(), "quantization": quantization}))
+    assert text._nvfp4 is True and vlm._nvfp4 is True
+    assert text._converted_affine is False and vlm._converted_affine is False
+
+    for index in range(45):
+        text_mlp = text.language_model.model.layers[index].mlp
+        vlm_mlp = vlm.language_model.model.layers[index].mlp
+        assert type(text_mlp) is type(vlm_mlp)
+        if index < 3:
+            continue
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            text_switch = getattr(text_mlp.switch_mlp, projection)
+            vlm_switch = getattr(vlm_mlp.switch_mlp, projection)
+            assert type(text_switch) is type(vlm_switch)
+            assert type(vlm_switch).__name__ == "ScaledNVFP4SwitchLinear"
+    text_mtp = text.language_model.mtp[0].block.mlp.switch_mlp.gate_proj
+    vlm_mtp = vlm.language_model.mtp[0].block.mlp.switch_mlp.gate_proj
+    assert type(text_mtp) is type(vlm_mtp)
+
+
+def test_vlm_nvfp4_binding_fails_closed_on_partial_bind(monkeypatch):
+    pytest.importorskip("mlx.core")
+    from omlx.patches.glm5_next import nvfp4
+    from mlx_vlm.models.glm5_next import Model, ModelConfig
+
+    config = ModelConfig.from_dict(
+        {**_config(), "quantization": _nvfp4_quantization()}
+    )
+
+    def partial_bind(_model, _quantization):
+        return nvfp4.NVFP4AdapterResult(True, 128)
+
+    monkeypatch.setattr(nvfp4, "configure_glm5_next_nvfp4", partial_bind)
+    with pytest.raises(nvfp4.Glm5NextNVFP4Error, match="128/129"):
+        Model(config)
