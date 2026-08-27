@@ -216,13 +216,36 @@ def _mhc_mix_pyre(
     post = 2.0 * mx.sigmoid(post_w * post_scale + base_post)
     comb_logits = comb_w.reshape(*comb_w.shape[:-1], hc, hc) * comb_scale
     comb_logits = comb_logits + base_comb.reshape(hc, hc)
+    comb = _sinkhorn_exact(comb_logits, config)
+    collapsed = (pre[..., None] * hidden_streams.astype(mx.float32)).sum(axis=2)
+    return post, comb, collapsed.astype(input_dtype)
+
+
+def _sinkhorn_exact(comb_logits, config: MHCConfig):
+    """Exact 20-iteration Sinkhorn: fused single-kernel when on Metal."""
+
+    mx, _ = _mlx_runtime()
+    if (
+        config.streams == 4
+        and config.sinkhorn_iters == 20
+        and os.environ.get("GLM5_NEXT_SINKHORN_FUSED", "1") == "1"
+    ):
+        try:
+            from omlx.patches.glm5_next.sinkhorn_kernel import (
+                sinkhorn4x4,
+                sinkhorn4x4_available,
+            )
+
+            if sinkhorn4x4_available():
+                return sinkhorn4x4(comb_logits, config.eps)
+        except Exception:
+            pass
     comb = mx.softmax(comb_logits, axis=-1, precise=True) + config.eps
     comb = comb / (comb.sum(axis=-2, keepdims=True) + config.eps)
     for _ in range(config.sinkhorn_iters - 1):
         comb = comb / (comb.sum(axis=-1, keepdims=True) + config.eps)
         comb = comb / (comb.sum(axis=-2, keepdims=True) + config.eps)
-    collapsed = (pre[..., None] * hidden_streams.astype(mx.float32)).sum(axis=2)
-    return post, comb, collapsed.astype(input_dtype)
+    return comb
 
 
 @lru_cache(maxsize=4)
@@ -354,11 +377,7 @@ def make_mhc_class():
             post = 2.0 * mx.sigmoid(post_w * post_scale + post_b)
             comb_logits = comb_w.reshape(*comb_w.shape[:-1], hc, hc) * comb_scale
             comb_logits = comb_logits + comb_b.reshape(hc, hc)
-            comb = mx.softmax(comb_logits, axis=-1, precise=True) + self.config.eps
-            comb = comb / (comb.sum(axis=-2, keepdims=True) + self.config.eps)
-            for _ in range(self.config.sinkhorn_iters - 1):
-                comb = comb / (comb.sum(axis=-1, keepdims=True) + self.config.eps)
-                comb = comb / (comb.sum(axis=-2, keepdims=True) + self.config.eps)
+            comb = _sinkhorn_exact(comb_logits, self.config)
             collapsed = (pre[..., None] * hidden_streams.astype(mx.float32)).sum(axis=2)
             return post, comb, collapsed.astype(input_dtype)
 
