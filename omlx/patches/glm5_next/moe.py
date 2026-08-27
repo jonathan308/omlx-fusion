@@ -633,6 +633,19 @@ def _implementation_class(validate_official: bool = True):
             weights = weights * self.routed_scaling_factor
             return indices, weights
 
+    def _gather_sort(x, indices):
+        *_, M = indices.shape
+        indices = indices.flatten()
+        order = mx.argsort(indices)
+        inv_order = mx.argsort(order)
+        return x.flatten(0, -3)[order // M], indices[order], inv_order
+
+    def _scatter_unsort(x, inv_order, shape=None):
+        x = x[inv_order]
+        if shape is not None:
+            x = mx.unflatten(x, 0, shape)
+        return x
+
     class _ClampedSwitchGLU(nn.Module):
         def __init__(self, geometry):
             super().__init__()
@@ -651,14 +664,25 @@ def _implementation_class(validate_official: bool = True):
             self.limit = geometry["swiglu_limit"]
 
         def __call__(self, x, indices):
-            # Keep the simple unsorted path: it supports both affine gather-qmm
-            # modules and selected-expert block-FP8 dequantisation exactly.
+            # Sort (token, expert) slots by expert id when there are many so
+            # the gather_qmm kernel tiles contiguous expert rows; the block-FP8
+            # decode path has no sorted mode and stays unsorted.
             x = mx.expand_dims(x, (-2, -3))
-            up = self.up_proj(x, indices, sorted_indices=False)
-            gate = self.gate_proj(x, indices, sorted_indices=False)
+            do_sort = indices.size >= 64 and all(
+                type(p).__name__ != "_BlockFP8SwitchLinear"
+                for p in (self.gate_proj, self.up_proj, self.down_proj)
+            )
+            idx = indices
+            inv_order = None
+            if do_sort:
+                x, idx, inv_order = _gather_sort(x, indices)
+            up = self.up_proj(x, idx, sorted_indices=do_sort)
+            gate = self.gate_proj(x, idx, sorted_indices=do_sort)
             gate = mx.minimum(gate, mx.array(self.limit, dtype=gate.dtype))
             up = mx.clip(up, -self.limit, self.limit)
-            output = self.down_proj(nn.silu(gate) * up, indices, sorted_indices=False)
+            output = self.down_proj(nn.silu(gate) * up, idx, sorted_indices=do_sort)
+            if do_sort:
+                output = _scatter_unsort(output, inv_order, indices.shape)
             return output.squeeze(-2)
 
     class _SharedExperts(nn.Module):
