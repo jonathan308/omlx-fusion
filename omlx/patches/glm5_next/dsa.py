@@ -259,8 +259,16 @@ class Glm5NextDsaCache(_BaseCache):
     """
 
     def __init__(self, config: Glm5NextDsaConfig | None = None) -> None:
-        self.kv_latent = None
-        self.indexer_states = None
+        self._kv_live = None
+        self._idx_live = None
+        # Capacity-backed stores behind the live views.  Appends scatter into
+        # these buffers instead of concatenating, so decode keeps stable
+        # tensor shapes and avoids copying the whole history every token.
+        # Any bulk reassignment of the live views invalidates the buffers;
+        # the next append rebuilds them once.
+        self._kv_buf = None
+        self._idx_buf = None
+        self._capacity = 0
         self.kv_lora_rank = None if config is None else config.kv_lora_rank
         self.index_state_dim = None if config is None else 2 * config.index_head_dim + 1
         self._idx = 0
@@ -269,6 +277,26 @@ class Glm5NextDsaCache(_BaseCache):
         self._prepared_left_padding = None
         self._right_padding = None
         self._prepared_lengths = None
+
+    @property
+    def kv_latent(self):
+        return self._kv_live
+
+    @kv_latent.setter
+    def kv_latent(self, value) -> None:
+        self._kv_live = value
+        self._kv_buf = None
+        self._capacity = 0
+
+    @property
+    def indexer_states(self):
+        return self._idx_live
+
+    @indexer_states.setter
+    def indexer_states(self, value) -> None:
+        self._idx_live = value
+        self._idx_buf = None
+        self._capacity = 0
 
     @property
     def batch_size(self) -> int | None:
@@ -311,6 +339,35 @@ class Glm5NextDsaCache(_BaseCache):
                 f"cache batch changed: expected {self._batch_size}, found {batch_size}"
             )
 
+    def _grow_buffers(
+        self, needed: int, latent_dim: int, index_dim: int, dtypes
+    ) -> None:
+        """Ensure capacity-backed stores cover ``needed`` rows (doubling)."""
+
+        batch = self._batch_size or 1
+        latent_dtype, index_dtype = dtypes
+        if self._kv_buf is None:
+            capacity = max(256, 1 << (max(needed, 1) - 1).bit_length())
+            self._kv_buf = mx.zeros((batch, capacity, latent_dim), dtype=latent_dtype)
+            self._idx_buf = mx.zeros((batch, capacity, index_dim), dtype=index_dtype)
+            self._capacity = capacity
+            if self._idx:
+                self._kv_buf[:, : self._idx] = self._kv_live
+                self._idx_buf[:, : self._idx] = self._idx_live
+            return
+        while self._capacity < needed:
+            new_capacity = self._capacity * 2
+            kv = mx.zeros(
+                (batch, new_capacity, latent_dim), dtype=self._kv_buf.dtype
+            )
+            idx = mx.zeros(
+                (batch, new_capacity, index_dim), dtype=self._idx_buf.dtype
+            )
+            kv[:, : self._capacity] = self._kv_buf
+            idx[:, : self._capacity] = self._idx_buf
+            self._kv_buf, self._idx_buf = kv, idx
+            self._capacity = new_capacity
+
     def append(
         self,
         kv_latent: mx.array,
@@ -329,20 +386,21 @@ class Glm5NextDsaCache(_BaseCache):
             raise Glm5NextDsaContractError("cached MLA latent width changed")
         if indexer_states.shape[2] != self.index_state_dim:
             raise Glm5NextDsaContractError("cached indexer state width changed")
-        if (self.kv_latent is None) != (self.indexer_states is None):
+        if (self._kv_live is None) != (self._idx_live is None):
             raise Glm5NextDsaContractError("partial DSA cache state is forbidden")
-        if self.kv_latent is None:
-            self.kv_latent = kv_latent
-            self.indexer_states = indexer_states
-        else:
-            self.kv_latent = mx.concatenate(
-                (self.kv_latent[:, : self._idx], kv_latent), axis=1
-            )
-            self.indexer_states = mx.concatenate(
-                (self.indexer_states[:, : self._idx], indexer_states), axis=1
-            )
-        self._idx += kv_latent.shape[1]
-        return self.kv_latent[:, : self._idx], self.indexer_states[:, : self._idx]
+        rows = kv_latent.shape[1]
+        self._grow_buffers(
+            self._idx + rows,
+            kv_latent.shape[2],
+            indexer_states.shape[2],
+            (kv_latent.dtype, indexer_states.dtype),
+        )
+        self._kv_buf[:, self._idx : self._idx + rows] = kv_latent
+        self._idx_buf[:, self._idx : self._idx + rows] = indexer_states
+        self._idx += rows
+        self._kv_live = self._kv_buf[:, : self._idx]
+        self._idx_live = self._idx_buf[:, : self._idx]
+        return self._kv_live, self._idx_live
 
     update_and_fetch = append
 
