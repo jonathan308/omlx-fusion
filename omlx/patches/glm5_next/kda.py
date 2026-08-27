@@ -616,13 +616,17 @@ def make_kda_class():
                         cache.advance(length)
                 return out
 
-            if os.environ.get("GLM5_NEXT_KDA_COMPILE", "1") == "1":
+            if (
+                os.environ.get("GLM5_NEXT_KDA_COMPILE", "1") == "1"
+                and use_kernel
+                and length <= 4
+            ):
                 _log_once(
                     "kda_gate",
-                    "GLM5-Next KDA compiled decode gated off: "
-                    f"use_kernel={use_kernel} length={length} "
+                    "GLM5-Next KDA decode-shape call: "
                     f"mask_none={mask is None} lengths_none={lengths is None} "
-                    f"has_recurrent={states[3] is not None}",
+                    f"has_recurrent={states[3] is not None} "
+                    f"gpu={mx.default_device() == mx.gpu}",
                 )
             q, q_state = self._short_conv(
                 self.q_conv1d, self.q_proj(x), states[0], mask, lengths
