@@ -1735,6 +1735,26 @@ class VLMBatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
+        if (self.model_type or "") == "glm5_next":
+            # GLM5-Next hybrid cache: prefill chunks are clamped to paged
+            # block boundaries (KDA recurrent state snapshots only exist at
+            # chunk ends), so the block size IS the prefill quantum.  Allow
+            # an explicit override for chunk-size experiments; 256 remains
+            # the default prefix-cache granularity.
+            import os
+
+            override = int(os.environ.get("OMLX_GLM5_BLOCK_SIZE", "256") or 256)
+            if override != 256 and (override <= 0 or override & (override - 1)):
+                raise ValueError(
+                    f"OMLX_GLM5_BLOCK_SIZE must be a power of two, got {override}"
+                )
+            if override != scheduler_config.paged_cache_block_size:
+                logger.info(
+                    "GLM5-Next paged block size override: %d -> %d tokens",
+                    scheduler_config.paged_cache_block_size,
+                    override,
+                )
+                scheduler_config.paged_cache_block_size = override
 
         engine_config = EngineConfig(
             model_name=self._model_name,
