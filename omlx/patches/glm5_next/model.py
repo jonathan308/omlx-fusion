@@ -69,6 +69,7 @@ DSA_LAYERS: Final = tuple(MAIN_DSA_LAYERS)
 logger = logging.getLogger(__name__)
 _TRACED_LENGTHS: set = set()
 _LAYER_PROBE_DONE = [False]
+_FUSED_ENGAGED = [False]
 
 
 def _log_layer_probe_once(layer, streams, mask, cache) -> None:
@@ -508,6 +509,9 @@ class DecoderLayer(nn.Module):
             and mx.default_device() == mx.gpu
         ):
             moe_args = _nvfp4_decode_args(self.mlp)
+            if moe_args is not None and not _FUSED_ENGAGED[0]:
+                _FUSED_ENGAGED[0] = True
+                logger.info("GLM5-Next fused sparse KDA layer step engaged")
             if moe_args is not None:
                 # The trailing (top_k, scaling, limit) scalars are baked into
                 # the fused graph; only the 14 weight arrays are arguments.
