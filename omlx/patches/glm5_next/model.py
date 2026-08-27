@@ -15,6 +15,7 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
+from functools import lru_cache
 from typing import Any, Final
 
 import mlx.core as mx
@@ -34,7 +35,11 @@ from omlx.patches.glm5_next.mhc import (
     make_hyper_head_class,
     make_mhc_class,
 )
-from omlx.patches.glm5_next.moe import make_sparse_moe_class, sanitize_moe_weights
+from omlx.patches.glm5_next.moe import (
+    _nvfp4_decode_args,
+    make_sparse_moe_class,
+    sanitize_moe_weights,
+)
 from omlx.patches.glm5_next.mtp import (
     make_mtp_block_class,
     sanitize_mtp_weights,
@@ -491,6 +496,56 @@ class DecoderLayer(nn.Module):
     def __call__(self, streams, mask, cache=None):
         if streams.shape[1] <= 4:
             _log_layer_probe_once(self, streams, mask, cache)
+        if (
+            _LAYER_COMPILE
+            and self.is_linear
+            and self.layer_idx >= 3
+            and mask is None
+            and streams.shape[1] <= 4
+            and isinstance(cache, KDACache)
+            and cache.lengths is None
+            and cache[3] is not None
+            and mx.default_device() == mx.gpu
+        ):
+            moe_args = _nvfp4_decode_args(self.mlp)
+            if moe_args is not None:
+                # The trailing (top_k, scaling, limit) scalars are baked into
+                # the fused graph; only the 14 weight arrays are arguments.
+                moe_weights = moe_args[:14]
+                attn = self.self_attn
+                streams_out, q_s, k_s, v_s, rec = _compiled_sparse_kda_layer_step()(
+                    streams,
+                    cache[0],
+                    cache[1],
+                    cache[2],
+                    cache[3],
+                    self.hc_attn.fn,
+                    self.hc_attn.base,
+                    self.hc_attn.scale,
+                    self.input_layernorm.weight,
+                    attn.q_proj.weight,
+                    attn.k_proj.weight,
+                    attn.v_proj.weight,
+                    attn.q_conv1d.weight,
+                    attn.k_conv1d.weight,
+                    attn.v_conv1d.weight,
+                    attn.f_a_proj.weight,
+                    attn.f_b_proj.weight,
+                    attn.b_proj.weight,
+                    attn.g_a_proj.weight,
+                    attn.g_b_proj.weight,
+                    attn.o_norm.weight,
+                    attn.o_proj.weight,
+                    attn.A_log,
+                    attn.dt_bias,
+                    self.hc_ffn.fn,
+                    self.hc_ffn.base,
+                    self.hc_ffn.scale,
+                    self.post_attention_layernorm.weight,
+                    *moe_weights,
+                )
+                cache.update(q_s, k_s, v_s, rec, streams.shape[1])
+                return streams_out
         post, comb, collapsed = _profiled("mhc.attn", self.hc_attn, streams)
         branch_input = self.input_layernorm(collapsed)
         kind = "kda" if self.is_linear else "dsa"
@@ -512,6 +567,124 @@ class DecoderLayer(nn.Module):
 
 _PROFILE_MODE: Final = os.environ.get("GLM5_NEXT_PROFILE", "0")
 _PROFILE_ENABLED: Final = _PROFILE_MODE in ("1", "2", "3")
+_LAYER_COMPILE: Final = os.environ.get("GLM5_NEXT_LAYER_COMPILE", "1") == "1"
+
+
+@lru_cache(maxsize=2)
+def _compiled_sparse_kda_layer_step():
+    """One compiled graph for a full sparse KDA decoder layer at decode shape.
+
+    Fuses mHC -> norm -> KDA -> residual -> mHC -> norm -> NVFP4 MoE ->
+    residual into a single compiled call, eliminating per-section dispatch.
+    All weights/states are arguments, so all 31 sparse KDA layers share the
+    graph.  The math is exactly the unfused modules' sequence.
+    """
+
+    from omlx.patches.glm5_next.kda import _kda_decode_math
+    from omlx.patches.glm5_next.kda import _mlx_runtime as _kda_rt
+    from omlx.patches.glm5_next.mhc import (
+        MHCConfig,
+        _mhc_mix_pyre,
+        _mhc_residual_math,
+    )
+    from omlx.patches.glm5_next.moe import _nvfp4_sparse_moe_math
+
+    mhc_cfg = MHCConfig()
+    kda_cfg = KDAConfig()
+    delta_kernel = _kda_rt()[3]
+    rms_eps = 1e-5
+
+    def _mix(streams, fn, base, scale):
+        hc = mhc_cfg.streams
+        return _mhc_mix_pyre(
+            streams,
+            fn[:hc],
+            fn[hc : 2 * hc],
+            fn[2 * hc :],
+            base[:hc],
+            base[hc : 2 * hc],
+            base[2 * hc :],
+            scale[0:1],
+            scale[1:2],
+            scale[2:3],
+            mhc_cfg,
+        )
+
+    def _run(
+        streams,
+        q_state,
+        k_state,
+        v_state,
+        recurrent,
+        ha_fn,
+        ha_base,
+        ha_scale,
+        norm1_w,
+        qw,
+        kw,
+        vw,
+        qcw,
+        kcw,
+        vcw,
+        fa_w,
+        fb_w,
+        b_w,
+        ga_w,
+        gb_w,
+        onorm_w,
+        ow,
+        a_log,
+        dt_bias,
+        hf_fn,
+        hf_base,
+        hf_scale,
+        norm2_w,
+        gate_w,
+        e_bias,
+        sw_gate_w,
+        sw_gate_s,
+        sw_gate_g,
+        sw_up_w,
+        sw_up_s,
+        sw_up_g,
+        sw_down_w,
+        sw_down_s,
+        sw_down_g,
+        sh_gate_w,
+        sh_up_w,
+        sh_down_w,
+    ):
+        post, comb, collapsed = _mix(streams, ha_fn, ha_base, ha_scale)
+        branch_input = mx.fast.rms_norm(collapsed, norm1_w, rms_eps)
+        attn_out, q_s, k_s, v_s, rec = _kda_decode_math(
+            branch_input,
+            qw, kw, vw, qcw, kcw, vcw, fa_w, fb_w, b_w, ga_w, gb_w,
+            onorm_w, ow, a_log, dt_bias,
+            q_state, k_state, v_state, recurrent,
+            heads=kda_cfg.num_heads,
+            head_dim=kda_cfg.head_dim,
+            eps=kda_cfg.rms_norm_eps,
+            gate_lower=kda_cfg.gate_lower_bound,
+            delta_kernel=delta_kernel,
+        )
+        streams = _mhc_residual_math(post, comb, attn_out, streams)
+        post, comb, collapsed = _mix(streams, hf_fn, hf_base, hf_scale)
+        branch_input = mx.fast.rms_norm(collapsed, norm2_w, rms_eps)
+        mlp_out = _nvfp4_sparse_moe_math(
+            branch_input,
+            gate_w, e_bias,
+            sw_gate_w, sw_gate_s, sw_gate_g,
+            sw_up_w, sw_up_s, sw_up_g,
+            sw_down_w, sw_down_s, sw_down_g,
+            sh_gate_w, sh_up_w, sh_down_w,
+            8,  # num_experts_per_tok
+            2.5,  # routed_scaling_factor
+            10.0,  # swiglu_limit
+        )
+        streams = _mhc_residual_math(post, comb, mlp_out, streams)
+        return streams, q_s, k_s, v_s, rec
+
+    return mx.compile(_run)
 _PROFILE_LOCK = threading.Lock()
 _PROFILE_STATS: dict[str, list[float]] = {}
 _PROFILE_CALLS = [0]

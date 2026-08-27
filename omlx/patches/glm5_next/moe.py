@@ -358,21 +358,6 @@ def _compiled_nvfp4_sparse_decode():
     import mlx.core as mx
     import mlx.nn as nn
 
-    def _qmm(x, weight, scales, global_scale, indices):
-        out = mx.gather_qmm(
-            x,
-            weight,
-            scales,
-            rhs_indices=indices,
-            transpose=True,
-            group_size=16,
-            bits=4,
-            mode="nvfp4",
-            sorted_indices=False,
-        )
-        selected = global_scale[indices].astype(out.dtype)
-        return out * selected[..., None, None]
-
     def _run(
         x,
         gate_w,
@@ -393,31 +378,93 @@ def _compiled_nvfp4_sparse_decode():
         scaling,
         limit,
     ):
-        logits = x.astype(mx.float32) @ gate_w.astype(mx.float32).T
-        scores = mx.sigmoid(logits)
-        selection = scores + e_bias.astype(mx.float32)
-        indices = mx.argpartition(-selection, kth=top_k - 1, axis=-1)[..., :top_k]
-        weights = mx.take_along_axis(scores, indices, axis=-1)
-        weights = weights / (mx.sum(weights, axis=-1, keepdims=True) + 1e-20)
-        weights = weights * scaling
-
-        xe = mx.expand_dims(x, (-2, -3))
-        up = _qmm(xe, sw_up_w, sw_up_s, sw_up_g, indices)
-        gate = _qmm(xe, sw_gate_w, sw_gate_s, sw_gate_g, indices)
-        gate = mx.minimum(gate, mx.array(limit, dtype=gate.dtype))
-        up = mx.clip(up, -limit, limit)
-        routed = _qmm(nn.silu(gate) * up, sw_down_w, sw_down_s, sw_down_g, indices)
-        routed = routed.squeeze(-2)
-        routed = mx.sum(routed * weights[..., None], axis=-2).astype(x.dtype)
-
-        shared_gate = x @ sh_gate_w.swapaxes(-1, -2)
-        shared_up = x @ sh_up_w.swapaxes(-1, -2)
-        shared_gate = mx.minimum(shared_gate, mx.array(limit, dtype=shared_gate.dtype))
-        shared_up = mx.clip(shared_up, -limit, limit)
-        shared = (nn.silu(shared_gate) * shared_up) @ sh_down_w.swapaxes(-1, -2)
-        return routed + shared
+        return _nvfp4_sparse_moe_math(
+            x,
+            gate_w,
+            e_bias,
+            sw_gate_w,
+            sw_gate_s,
+            sw_gate_g,
+            sw_up_w,
+            sw_up_s,
+            sw_up_g,
+            sw_down_w,
+            sw_down_s,
+            sw_down_g,
+            sh_gate_w,
+            sh_up_w,
+            sh_down_w,
+            top_k,
+            scaling,
+            limit,
+        )
 
     return mx.compile(_run)
+
+
+def _nvfp4_sparse_moe_math(
+    x,
+    gate_w,
+    e_bias,
+    sw_gate_w,
+    sw_gate_s,
+    sw_gate_g,
+    sw_up_w,
+    sw_up_s,
+    sw_up_g,
+    sw_down_w,
+    sw_down_s,
+    sw_down_g,
+    sh_gate_w,
+    sh_up_w,
+    sh_down_w,
+    top_k,
+    scaling,
+    limit,
+):
+    """Pure NVFP4 sparse-MoE math shared by the compiled call and fusion."""
+
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    def _qmm(x, weight, scales, global_scale, indices):
+        out = mx.gather_qmm(
+            x,
+            weight,
+            scales,
+            rhs_indices=indices,
+            transpose=True,
+            group_size=16,
+            bits=4,
+            mode="nvfp4",
+            sorted_indices=False,
+        )
+        selected = global_scale[indices].astype(out.dtype)
+        return out * selected[..., None, None]
+
+    logits = x.astype(mx.float32) @ gate_w.astype(mx.float32).T
+    scores = mx.sigmoid(logits)
+    selection = scores + e_bias.astype(mx.float32)
+    indices = mx.argpartition(-selection, kth=top_k - 1, axis=-1)[..., :top_k]
+    weights = mx.take_along_axis(scores, indices, axis=-1)
+    weights = weights / (mx.sum(weights, axis=-1, keepdims=True) + 1e-20)
+    weights = weights * scaling
+
+    xe = mx.expand_dims(x, (-2, -3))
+    up = _qmm(xe, sw_up_w, sw_up_s, sw_up_g, indices)
+    gate = _qmm(xe, sw_gate_w, sw_gate_s, sw_gate_g, indices)
+    gate = mx.minimum(gate, mx.array(limit, dtype=gate.dtype))
+    up = mx.clip(up, -limit, limit)
+    routed = _qmm(nn.silu(gate) * up, sw_down_w, sw_down_s, sw_down_g, indices)
+    routed = routed.squeeze(-2)
+    routed = mx.sum(routed * weights[..., None], axis=-2).astype(x.dtype)
+
+    shared_gate = x @ sh_gate_w.swapaxes(-1, -2)
+    shared_up = x @ sh_up_w.swapaxes(-1, -2)
+    shared_gate = mx.minimum(shared_gate, mx.array(limit, dtype=shared_gate.dtype))
+    shared_up = mx.clip(shared_up, -limit, limit)
+    shared = (nn.silu(shared_gate) * shared_up) @ sh_down_w.swapaxes(-1, -2)
+    return routed + shared
 
 
 def _nvfp4_decode_args(block: Any):

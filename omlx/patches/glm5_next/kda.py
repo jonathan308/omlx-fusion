@@ -392,6 +392,97 @@ def _log_once(key: str, message: str) -> None:
     logging.getLogger(__name__).info("%s", message)
 
 
+def _kda_decode_math(
+    x,
+    qw,
+    kw,
+    vw,
+    qcw,
+    kcw,
+    vcw,
+    fa_w,
+    fb_w,
+    b_w,
+    ga_w,
+    gb_w,
+    onorm_w,
+    ow,
+    a_log,
+    dt_bias,
+    q_state,
+    k_state,
+    v_state,
+    recurrent,
+    *,
+    heads,
+    head_dim,
+    eps,
+    gate_lower,
+    delta_kernel,
+):
+    """Pure KDA decode math shared by the compiled call and layer fusion."""
+
+    mx, nn, _ops, _kernel = _mlx_runtime()
+    del _kernel  # the caller passes the pinned kernel explicitly
+
+    def _conv_tap(conv_input, weight, length):
+        # Exact groups=C kernel-4 Conv1d without the module wrapper.
+        # MLX Conv1d weight layout is (channels, kernel, in/groups=1).
+        out = None
+        for tap in range(4):
+            piece = conv_input[:, tap : tap + length, :] * weight[:, tap, 0]
+            out = piece if out is None else out + piece
+        return out
+
+    batch, length, _ = x.shape
+    input_dtype = x.dtype
+    keep = 3
+
+    def _proj(w):
+        return x @ w.swapaxes(-1, -2)
+
+    conv_input = mx.concatenate([q_state.astype(x.dtype), _proj(qw)], axis=1)
+    q = nn.silu(_conv_tap(conv_input, qcw, length))
+    new_q_state = mx.contiguous(conv_input[:, -keep:, :])
+    conv_input = mx.concatenate([k_state.astype(x.dtype), _proj(kw)], axis=1)
+    k = nn.silu(_conv_tap(conv_input, kcw, length))
+    new_k_state = mx.contiguous(conv_input[:, -keep:, :])
+    conv_input = mx.concatenate([v_state.astype(x.dtype), _proj(vw)], axis=1)
+    v = nn.silu(_conv_tap(conv_input, vcw, length))
+    new_v_state = mx.contiguous(conv_input[:, -keep:, :])
+
+    shape = (batch, length, heads, head_dim)
+    q = q.reshape(shape).astype(mx.float32)
+    k = k.reshape(shape).astype(mx.float32)
+    v = v.reshape(shape).astype(mx.float32)
+    q = q / mx.sqrt(mx.sum(q * q, axis=-1, keepdims=True) + 1e-6)
+    k = k / mx.sqrt(mx.sum(k * k, axis=-1, keepdims=True) + 1e-6)
+    q = q * (head_dim**-0.5)
+
+    gate_logits = ((_proj(fa_w) @ fb_w.swapaxes(-1, -2))).astype(mx.float32)
+    gate_logits = gate_logits.reshape(shape) + dt_bias.astype(mx.float32).reshape(
+        1, 1, heads, head_dim
+    )
+    rate = mx.exp(a_log.astype(mx.float32)).reshape(1, 1, heads, 1)
+    log_decay = gate_lower * mx.sigmoid(rate * gate_logits)
+    decay = mx.exp(log_decay)
+    beta = mx.sigmoid(_proj(b_w).astype(mx.float32))
+
+    recurrent_f = recurrent.astype(mx.float32)
+    output, recurrent_f = delta_kernel(q, k, v, decay, beta, recurrent_f, None)
+    recurrent_f = recurrent_f.astype(mx.float32)
+
+    gate = (_proj(ga_w) @ gb_w.swapaxes(-1, -2)).astype(mx.float32).reshape(shape)
+    normed = output.astype(mx.float32)
+    variance = mx.mean(normed * normed, axis=-1, keepdims=True)
+    normed = normed * mx.rsqrt(variance + eps)
+    normed = normed * onorm_w.astype(mx.float32)
+    normed = normed * mx.sigmoid(gate)
+    normed = normed.astype(input_dtype).reshape(batch, length, -1)
+    out = (normed @ ow.swapaxes(-1, -2)).astype(input_dtype)
+    return out, new_q_state, new_k_state, new_v_state, recurrent_f
+
+
 @lru_cache(maxsize=2)
 def _compiled_kda_decode(heads: int, head_dim: int, eps: float, gate_lower: float):
     """One compiled graph for every KDA layer at decode shapes.
@@ -437,55 +528,33 @@ def _compiled_kda_decode(heads: int, head_dim: int, eps: float, gate_lower: floa
         v_state,
         recurrent,
     ):
-        batch, length, _ = x.shape
-        input_dtype = x.dtype
-        keep = 3
-
-        def _proj(w):
-            return x @ w.swapaxes(-1, -2)
-
-        conv_input = mx.concatenate([q_state.astype(x.dtype), _proj(qw)], axis=1)
-        q = nn.silu(_conv_tap(conv_input, qcw, length))
-        new_q_state = mx.contiguous(conv_input[:, -keep:, :])
-        conv_input = mx.concatenate([k_state.astype(x.dtype), _proj(kw)], axis=1)
-        k = nn.silu(_conv_tap(conv_input, kcw, length))
-        new_k_state = mx.contiguous(conv_input[:, -keep:, :])
-        conv_input = mx.concatenate([v_state.astype(x.dtype), _proj(vw)], axis=1)
-        v = nn.silu(_conv_tap(conv_input, vcw, length))
-        new_v_state = mx.contiguous(conv_input[:, -keep:, :])
-
-        shape = (batch, length, heads, head_dim)
-        q = q.reshape(shape).astype(mx.float32)
-        k = k.reshape(shape).astype(mx.float32)
-        v = v.reshape(shape).astype(mx.float32)
-        q = q / mx.sqrt(mx.sum(q * q, axis=-1, keepdims=True) + 1e-6)
-        k = k / mx.sqrt(mx.sum(k * k, axis=-1, keepdims=True) + 1e-6)
-        q = q * (head_dim**-0.5)
-
-        gate_logits = ((_proj(fa_w) @ fb_w.swapaxes(-1, -2))).astype(mx.float32)
-        gate_logits = gate_logits.reshape(shape) + dt_bias.astype(mx.float32).reshape(
-            1, 1, heads, head_dim
+        return _kda_decode_math(
+            x,
+            qw,
+            kw,
+            vw,
+            qcw,
+            kcw,
+            vcw,
+            fa_w,
+            fb_w,
+            b_w,
+            ga_w,
+            gb_w,
+            onorm_w,
+            ow,
+            a_log,
+            dt_bias,
+            q_state,
+            k_state,
+            v_state,
+            recurrent,
+            heads=heads,
+            head_dim=head_dim,
+            eps=eps,
+            gate_lower=gate_lower,
+            delta_kernel=delta_kernel,
         )
-        rate = mx.exp(a_log.astype(mx.float32)).reshape(1, 1, heads, 1)
-        log_decay = gate_lower * mx.sigmoid(rate * gate_logits)
-        decay = mx.exp(log_decay)
-        beta = mx.sigmoid(_proj(b_w).astype(mx.float32))
-
-        recurrent_f = recurrent.astype(mx.float32)
-        output, recurrent_f = delta_kernel(
-            q, k, v, decay, beta, recurrent_f, None
-        )
-        recurrent_f = recurrent_f.astype(mx.float32)
-
-        gate = (_proj(ga_w) @ gb_w.swapaxes(-1, -2)).astype(mx.float32).reshape(shape)
-        normed = output.astype(mx.float32)
-        variance = mx.mean(normed * normed, axis=-1, keepdims=True)
-        normed = normed * mx.rsqrt(variance + eps)
-        normed = normed * onorm_w.astype(mx.float32)
-        normed = normed * mx.sigmoid(gate)
-        normed = normed.astype(input_dtype).reshape(batch, length, -1)
-        out = (normed @ ow.swapaxes(-1, -2)).astype(input_dtype)
-        return out, new_q_state, new_k_state, new_v_state, recurrent_f
 
     return mx.compile(_run)
 

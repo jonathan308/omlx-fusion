@@ -162,6 +162,16 @@ def _compiled_mhc_residual():
     return mx.compile(_run)
 
 
+def _mhc_residual_math(post, comb, branch_output, residual):
+    """Pure residual math (no compiled-branch dispatch) for layer fusion."""
+
+    mx, _ = _mlx_runtime()
+    dtype = residual.dtype
+    placed = post.astype(dtype)[..., None] * branch_output[..., None, :]
+    mixed = mx.matmul(comb.astype(dtype).swapaxes(-1, -2), residual)
+    return placed + mixed
+
+
 def apply_mhc_residual(post, comb, branch_output, residual):
     """Apply the exact post-placement and transposed stream mixer equation."""
 
