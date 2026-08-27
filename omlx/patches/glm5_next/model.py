@@ -599,8 +599,16 @@ class TextModel(nn.Module):
         **media,
     ):
         reject_unsupported_media(media)
-        hidden = self.model(inputs, cache=cache, input_embeddings=input_embeddings)
-        logits = _profiled("lm_head", self.lm_head, hidden)
+        if _PROFILE_ENABLED:
+            start = time.perf_counter()
+            hidden = self.model(inputs, cache=cache, input_embeddings=input_embeddings)
+            logits = self.lm_head(hidden)
+            # Wall time here is pure Python graph construction; evaluation
+            # happens later at the sampler.  No barrier, no distortion.
+            _profile_record("forward.build", time.perf_counter() - start)
+        else:
+            hidden = self.model(inputs, cache=cache, input_embeddings=input_embeddings)
+            logits = self.lm_head(hidden)
         return (logits, hidden) if return_hidden else logits
 
     def make_cache(self):
