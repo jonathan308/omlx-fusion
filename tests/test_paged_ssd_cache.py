@@ -639,9 +639,22 @@ class TestPagedSSDCacheManager:
                 assert first_temp.exists()
 
                 # This item remains queued while the first writer is paused.
-                assert manager._enqueue_ssd_write(
-                    queued_hash, entry_for(queued_hash, b"queued")
+                # Use the hot-cache-disabled preparation path, then reproduce
+                # size enforcement evicting its index entry before clear. The
+                # raw read-back buffer must still be removed by canceled-hash
+                # identity even though neither SSD index retains the block.
+                queued_entry = entry_for(queued_hash, b"queued")
+                queued_metadata = queued_entry["block_metadata"]
+                assert manager._queue_prepared_ssd_write(
+                    queued_hash,
+                    queued_entry["tensors_raw"],
+                    queued_entry["file_metadata"],
+                    queued_metadata.file_path,
+                    queued_metadata,
+                    queued_metadata.file_size,
+                    queued_entry,
                 )
+                assert manager._index.remove(queued_hash) is queued_metadata
                 clear_thread.start()
 
                 # Wait until clear owns the registration gate and is blocked on
@@ -661,11 +674,14 @@ class TestPagedSSDCacheManager:
                 assert writer_after_commit.wait(5)
                 clear_thread.join(5)
                 assert not clear_thread.is_alive(), "clear deadlocked with the writer"
-                assert clear_result == [2]
+                assert clear_result == [1]
                 assert len(write_paths) == 1, "queued pre-clear write was not cancelled"
                 assert not manager._get_file_path(first_hash).exists()
                 assert not manager._get_file_path(queued_hash).exists()
                 assert not first_temp.exists()
+                assert manager._hot_cache_get(queued_hash) is None
+                assert manager._pending_write_buffer_get(queued_hash) is None
+                assert not manager.has_block(queued_hash)
 
                 # Register the same hash in the new generation before the old
                 # writer clears its pending bookkeeping. Generation-aware
@@ -694,6 +710,151 @@ class TestPagedSSDCacheManager:
             if clear_thread.is_alive():
                 clear_thread.join(5)
             manager.close()
+
+    def test_clear_many_fences_shared_root_before_any_delete(self, tmp_path: Path):
+        """No manager may delete while a peer's shared-root commit is active."""
+        import omlx.cache.paged_ssd_cache as ssd_mod
+
+        cache_dir = tmp_path / "shared_ssd_cache"
+        manager_a = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=1024**3,
+            expected_model_name="model-a",
+        )
+        manager_b = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=1024**3,
+            expected_model_name="model-b",
+        )
+        block_hash = b"\x33" * 32
+        file_path = manager_b._get_file_path(block_hash)
+        now = time.time()
+        block_metadata = PagedSSDBlockMetadata(
+            block_hash=block_hash,
+            file_path=file_path,
+            file_size=8,
+            token_count=1,
+            created_at=now,
+            last_access=now,
+            num_layers=1,
+            model_name="model-b",
+        )
+        entry = {
+            "tensors_raw": {"value": (b"peer-data", "U8", [9])},
+            "file_metadata": {
+                "token_count": "1",
+                "num_layers": "1",
+                "model_name": "model-b",
+            },
+            "num_layers": 1,
+            "layer_cache_types": None,
+            "block_metadata": block_metadata,
+            "dirty": True,
+        }
+
+        temp_ready = threading.Event()
+        allow_commit = threading.Event()
+        delete_started = threading.Event()
+        original_write = ssd_mod._write_safetensors_no_mx
+        original_delete = manager_a.delete_block
+        write_count = 0
+
+        def controlled_write(path, tensors_raw, metadata):
+            nonlocal write_count
+            size = original_write(path, tensors_raw, metadata)
+            write_count += 1
+            if write_count == 1:
+                temp_ready.set()
+                assert allow_commit.wait(5), "peer writer commit was not released"
+            return size
+
+        def observed_delete(block_hash_to_delete):
+            delete_started.set()
+            return original_delete(block_hash_to_delete)
+
+        clear_result: list[int] = []
+        clear_thread = threading.Thread(
+            target=lambda: clear_result.append(
+                PagedSSDCacheManager.clear_many(
+                    [manager_a, manager_b],
+                    sweep_untracked=True,
+                )
+            ),
+            name="test-shared-root-ssd-clear",
+        )
+
+        try:
+            with (
+                patch.object(ssd_mod, "_write_safetensors_no_mx", controlled_write),
+                patch.object(manager_a, "delete_block", observed_delete),
+            ):
+                assert manager_b._enqueue_ssd_write(block_hash, entry)
+                # Model A's startup scan would retain this model-B payload in
+                # its incompatible index. Reproduce that shared-root ownership
+                # explicitly while B is still promoting the file.
+                manager_a._incompatible_index.add(block_metadata)
+                assert temp_ready.wait(5)
+
+                clear_thread.start()
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    acquired = []
+                    for manager in (manager_a, manager_b):
+                        got = manager._write_registration_lock.acquire(
+                            blocking=False
+                        )
+                        acquired.append((manager, got))
+                        if got:
+                            manager._write_registration_lock.release()
+                    if not any(got for _manager, got in acquired):
+                        break
+                    time.sleep(0.01)
+                else:
+                    pytest.fail("clear_many did not fence every manager")
+
+                assert clear_thread.is_alive()
+                assert not delete_started.is_set()
+                assert file_path.with_name(
+                    file_path.stem + "_tmp.safetensors"
+                ).exists()
+
+                allow_commit.set()
+                clear_thread.join(5)
+                assert not clear_thread.is_alive(), "shared-root clear deadlocked"
+                assert delete_started.is_set()
+                assert clear_result == [2]
+                assert not file_path.exists()
+                assert manager_a._stats["errors"] == 0
+                assert manager_b._stats["errors"] == 0
+
+                # B can start a new generation only after the all-manager
+                # boundary releases, and A can no longer delete that file.
+                replacement = dict(entry)
+                replacement["block_metadata"] = PagedSSDBlockMetadata(
+                    **{
+                        **block_metadata.__dict__,
+                        "created_at": time.time(),
+                        "last_access": time.time(),
+                    }
+                )
+                replacement["dirty"] = True
+                assert manager_b._enqueue_ssd_write(block_hash, replacement)
+
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    with manager_b._pending_write_hashes_lock:
+                        pending = block_hash in manager_b._pending_write_hashes
+                    if not pending and file_path.exists():
+                        break
+                    time.sleep(0.01)
+                else:
+                    pytest.fail("post-clear peer write did not persist")
+        finally:
+            allow_commit.set()
+            if clear_thread.is_alive():
+                clear_thread.join(5)
+            manager_a.close()
+            manager_b.close()
 
     def test_get_stats(self, tmp_path: Path):
         """Test getting statistics."""

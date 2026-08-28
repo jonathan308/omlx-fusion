@@ -3188,7 +3188,7 @@ class PagedSSDCacheManager(CacheManager):
             ):
                 entry["dirty"] = False
 
-    def _cancel_queued_writes_locked(self) -> int:
+    def _cancel_queued_writes_locked(self) -> list[tuple[int, bytes]]:
         """Drain queued writes after a clear generation change.
 
         The caller holds both lifecycle locks, so every ordinary item already
@@ -3226,7 +3226,7 @@ class PagedSSDCacheManager(CacheManager):
                 block_hash,
                 expected_generation=generation,
             )
-        return len(cancelled_writes)
+        return cancelled_writes
 
     def _writer_loop(self) -> None:
         """Background writer that drains the write queue.
@@ -4938,12 +4938,90 @@ class PagedSSDCacheManager(CacheManager):
         Returns:
             Number of files deleted.
         """
-        with self._write_registration_lock, self._write_commit_lock:
-            self._write_generation += 1
-            cancelled = self._cancel_queued_writes_locked()
-            return self._clear_ssd_files_locked(cancelled)
+        return self.clear_many([self])
 
-    def _clear_ssd_files_locked(self, cancelled_writes: int) -> int:
+    @classmethod
+    def clear_many(
+        cls,
+        managers: list[PagedSSDCacheManager],
+        *,
+        sweep_untracked: bool = False,
+    ) -> int:
+        """Clear multiple managers at one shared lifecycle boundary.
+
+        Managers commonly share the same SSD root, and each manager indexes
+        both compatible and incompatible files. Clearing them sequentially is
+        not safe: after manager A releases its gate, manager B can commit a new
+        file that A still has in its incompatible index and then delete it.
+
+        Acquire every registration gate in stable process order, followed by
+        every commit gate in that same order, before advancing any generation
+        or deleting any file. The two-phase lock order lets active writers keep
+        dequeuing while a producer is waiting for queue space and prevents
+        deadlock between overlapping clear-many calls.
+
+        ``sweep_untracked=True`` also removes crash-left/unindexed files from
+        the shared roots while the gates remain held. Callers selecting it must
+        provide every live manager for those roots; the admin route does so by
+        collecting its loaded schedulers before entering this method.
+        """
+        ordered = sorted(
+            {id(manager): manager for manager in managers}.values(),
+            key=id,
+        )
+        if not ordered:
+            return 0
+
+        with contextlib.ExitStack() as lifecycle:
+            for manager in ordered:
+                lifecycle.enter_context(manager._write_registration_lock)
+            for manager in ordered:
+                lifecycle.enter_context(manager._write_commit_lock)
+
+            cancelled_by_manager: dict[int, list[tuple[int, bytes]]] = {}
+            for manager in ordered:
+                manager._write_generation += 1
+                cancelled_by_manager[id(manager)] = (
+                    manager._cancel_queued_writes_locked()
+                )
+
+            deleted = sum(
+                manager._clear_ssd_files_locked(cancelled_by_manager[id(manager)])
+                for manager in ordered
+            )
+            if sweep_untracked:
+                deleted += cls._clear_untracked_roots_locked(ordered)
+            return deleted
+
+    @classmethod
+    def _clear_untracked_roots_locked(
+        cls,
+        managers: list[PagedSSDCacheManager],
+    ) -> int:
+        """Remove unindexed main-cache files under an all-manager barrier."""
+        roots = sorted(
+            {
+                manager._cache_dir.resolve()
+                for manager in managers
+                if manager._cache_dir is not None and manager._cache_dir.exists()
+            },
+            key=str,
+        )
+        deleted = 0
+        for cache_dir in roots:
+            for subdir in cls.SUBDIR_CHARS:
+                subdir_path = cache_dir / subdir
+                if not subdir_path.exists():
+                    continue
+                for file_path in subdir_path.glob("*.safetensors"):
+                    file_path.unlink()
+                    deleted += 1
+        return deleted
+
+    def _clear_ssd_files_locked(
+        self,
+        cancelled_writes: list[tuple[int, bytes]],
+    ) -> int:
         """Delete indexed files while both writer lifecycle locks are held."""
         with self._lock:
             count = 0
@@ -4953,6 +5031,7 @@ class PagedSSDCacheManager(CacheManager):
                 self._index.get_all_hashes()
                 + self._incompatible_index.get_all_hashes()
                 + pending_hashes
+                + [block_hash for _generation, block_hash in cancelled_writes]
             )
             for block_hash in dict.fromkeys(block_hashes):
                 if self.delete_block(block_hash):
@@ -4987,7 +5066,7 @@ class PagedSSDCacheManager(CacheManager):
             logger.info(
                 "Cleared SSD cache: deleted %d files, cancelled %d queued writes",
                 count,
-                cancelled_writes,
+                len(cancelled_writes),
             )
             return count
 

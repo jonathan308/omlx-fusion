@@ -5603,29 +5603,62 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
     is loaded.
     """
     total_deleted = 0
-    has_live_ssd_manager = False
+    live_managers = []
 
     for model_id, scheduler in _iter_loaded_schedulers():
         ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
         if ssd_manager is not None:
-            has_live_ssd_manager = True
+            live_managers.append((model_id, ssd_manager))
+
+    if live_managers:
+        managers = [manager for _model_id, manager in live_managers]
+        clear_many = getattr(managers[0], "clear_many", None)
+        if callable(clear_many):
             try:
-                total_deleted += ssd_manager.clear()
+                total_deleted += clear_many(managers, sweep_untracked=True)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clear SSD cache for loaded models %s: %s",
+                    [model_id for model_id, _manager in live_managers],
+                    exc,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "SSD cache clear was incomplete; live-manager "
+                        "filesystem fallback was not attempted"
+                    ),
+                ) from exc
+        else:
+            # Compatibility fallback for alternate/test cache-manager
+            # implementations that predate the multi-manager lifecycle API.
+            # More than one cannot be cleared sequentially without reopening
+            # the shared-root race, so fail closed.
+            if len(live_managers) != 1:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Loaded cache managers do not support coordinated clear",
+                )
+            model_id, manager = live_managers[0]
+            try:
+                total_deleted += manager.clear()
             except Exception as exc:
                 logger.warning(
                     "Failed to clear SSD cache for model '%s': %s",
                     model_id,
                     exc,
                 )
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"SSD cache clear was incomplete for model: {model_id}",
+                ) from exc
 
     # Phase 2: with no live manager, remove remaining files directly (covers
-    # unloaded models and crash-left staging files).  Never run this raw sweep
-    # after a live manager clear: a request may register a new-generation write
-    # as soon as manager.clear() releases its lifecycle gate.  Deleting either
-    # that writer's temp file or its just-promoted final file here would race the
-    # atomic commit and could mark a missing post-clear block as durable.
+    # unloaded models and crash-left staging files). With live managers,
+    # clear_many() performs this sweep while every writer lifecycle gate is
+    # still held; repeating it here would reopen the post-clear write race.
     global_settings = _get_global_settings()
-    if global_settings is not None and not has_live_ssd_manager:
+    if global_settings is not None and not live_managers:
         cache_dir = global_settings.cache.get_ssd_cache_dir(
             global_settings.base_path,
         )
@@ -5639,10 +5672,14 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
                         try:
                             f.unlink()
                             total_deleted += 1
-                        except OSError:
-                            pass
+                        except FileNotFoundError:
+                            continue
             except Exception as exc:
                 logger.warning("Failed to clean SSD cache directory: %s", exc)
+                raise HTTPException(
+                    status_code=500,
+                    detail="SSD cache filesystem clear was incomplete",
+                ) from exc
 
     return {"status": "ok", "total_deleted": total_deleted}
 
