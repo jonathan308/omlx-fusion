@@ -1775,6 +1775,21 @@ class PagedSSDCacheManager(CacheManager):
         # Eviction path: _hot_cache_put (holds _hot_cache_lock, releases), then
         # _enqueue_ssd_write (holds _pending_write_hashes_lock).
         self._pending_write_buffers: dict[bytes, dict] = {}
+        self._pending_write_generations: dict[bytes, int] = {}
+        # SSD writer lifecycle synchronization.
+        #
+        # Registration and commit use separate locks deliberately.  A save may
+        # wait briefly for space in the bounded queue while holding the
+        # registration lock; the writer must remain free to dequeue an item and
+        # make that space.  The writer takes only the commit lock around the
+        # temp-file write + atomic rename.  ``clear()`` takes the locks in that
+        # order, advances the generation, drains queued writes, waits for any
+        # active commit, and only then removes files.  This gives clear a
+        # linearization point without serializing normal enqueue traffic behind
+        # disk I/O or allowing a pre-clear write to reappear afterward.
+        self._write_registration_lock = threading.RLock()
+        self._write_commit_lock = threading.RLock()
+        self._write_generation = 0
         self._writer_shutdown = threading.Event()
         # Writer thread is only needed when writing to SSD.
         self._writer_thread = None
@@ -1904,6 +1919,21 @@ class PagedSSDCacheManager(CacheManager):
         caller writes inline so dirty hot-cache blocks are never dropped just
         because the background writer is behind.
         """
+        with self._write_registration_lock:
+            return self._enqueue_ssd_write_registered(
+                block_hash,
+                entry,
+                blocking=blocking,
+            )
+
+    def _enqueue_ssd_write_registered(
+        self,
+        block_hash: bytes,
+        entry: dict,
+        *,
+        blocking: bool = False,
+    ) -> bool:
+        """Register one write while ``_write_registration_lock`` is held."""
         if self._hot_cache_only:
             return False
         if not entry.get("dirty", True):
@@ -1924,8 +1954,10 @@ class PagedSSDCacheManager(CacheManager):
         with self._pending_write_hashes_lock:
             if block_hash in self._pending_write_buffers:
                 return True
+            entry["_ssd_write_generation"] = self._write_generation
             self._pending_write_buffers[block_hash] = entry
             self._pending_write_hashes.add(block_hash)
+            self._pending_write_generations[block_hash] = self._write_generation
 
         # 2. Index second — makes the block discoverable in has_block/contains.
         if not self._index.contains(block_hash):
@@ -1935,7 +1967,13 @@ class PagedSSDCacheManager(CacheManager):
 
         # 3. Queue third — enqueue for background writer.
         try:
-            item = (block_hash, tensors_raw, metadata, file_path)
+            item = (
+                self._write_generation,
+                block_hash,
+                tensors_raw,
+                metadata,
+                file_path,
+            )
             # Non-blocking callers (hot-cache LRU spill) also wait so a
             # transient writer backlog doesn't silently drop blocks. Blocking
             # callers (shutdown flush) use the same bounded wait.
@@ -1951,15 +1989,73 @@ class PagedSSDCacheManager(CacheManager):
                 f"SSD write queue saturated (cap={self._max_pending_writes}); "
                 f"writing evicted block {block_hash.hex()[:16]} inline"
             )
-            ok = self._write_block_file(
-                block_hash,
-                tensors_raw,
-                metadata,
-                file_path,
-                source="inline-fallback",
-            )
+            # ``clear()`` takes registration before commit, so it cannot
+            # advance the generation between this fallback decision and the
+            # atomic file promotion.
+            with self._write_commit_lock:
+                ok = self._write_block_file(
+                    block_hash,
+                    tensors_raw,
+                    metadata,
+                    file_path,
+                    source="inline-fallback",
+                )
             self._clear_pending_write(block_hash)
             return ok
+
+    def _queue_prepared_ssd_write(
+        self,
+        block_hash: bytes,
+        tensors_raw: dict[str, Any],
+        metadata: dict[str, str],
+        file_path: Path,
+        block_metadata: PagedSSDBlockMetadata,
+        estimated_size: int,
+        cache_entry: dict,
+    ) -> bool:
+        """Index and enqueue a prepared non-hot block atomically vs clear."""
+        with self._write_registration_lock:
+            self._enforce_size_limit_for_new_block(estimated_size)
+            self._incompatible_index.remove(block_hash)
+            self._index.add(block_metadata)
+
+            # Hot cache disabled: use a temporary in-memory read-back buffer
+            # until the background file promotion completes.
+            cache_entry["_ssd_write_generation"] = self._write_generation
+            with self._hot_cache_lock:
+                self._hot_cache[block_hash] = cache_entry
+            with self._pending_write_hashes_lock:
+                self._pending_write_hashes.add(block_hash)
+                self._pending_write_generations[block_hash] = self._write_generation
+
+            try:
+                self._write_queue.put(
+                    (
+                        self._write_generation,
+                        block_hash,
+                        tensors_raw,
+                        metadata,
+                        file_path,
+                    ),
+                    timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS,
+                )
+                return True
+            except queue.Full:
+                self._stats["ssd_inline_write_fallbacks"] += 1
+                logger.warning(
+                    f"SSD cache write queue saturated (cap={self._max_pending_writes}); "
+                    f"writing {block_hash.hex()[:16]} inline"
+                )
+                with self._write_commit_lock:
+                    ok = self._write_block_file(
+                        block_hash,
+                        tensors_raw,
+                        metadata,
+                        file_path,
+                        source="inline-fallback",
+                    )
+                self._clear_pending_write(block_hash, remove_hot_cache=True)
+                return ok
 
     def _hot_cache_get(self, block_hash: bytes) -> dict | None:
         """Get entry from hot cache, updating LRU order. Returns None on miss."""
@@ -3054,21 +3150,83 @@ class PagedSSDCacheManager(CacheManager):
             return False
 
     def _clear_pending_write(
-        self, block_hash: bytes, *, remove_hot_cache: bool = False
+        self,
+        block_hash: bytes,
+        *,
+        remove_hot_cache: bool = False,
+        expected_generation: int | None = None,
     ) -> None:
         """Clear pending-write bookkeeping after a queued or inline write."""
+        matched = False
         with self._pending_write_hashes_lock:
+            actual_generation = self._pending_write_generations.get(block_hash)
+            if (
+                expected_generation is not None
+                and actual_generation is not None
+                and actual_generation != expected_generation
+            ):
+                return
             self._pending_write_hashes.discard(block_hash)
             self._pending_write_buffers.pop(block_hash, None)
-        if remove_hot_cache:
+            self._pending_write_generations.pop(block_hash, None)
+            matched = True
+        if remove_hot_cache and matched:
             self._hot_cache_remove(block_hash)
 
-    def _mark_hot_cache_clean(self, block_hash: bytes) -> None:
-        """Mark a retained hot entry durable after its SSD write commits."""
+    def _mark_hot_cache_clean(
+        self,
+        block_hash: bytes,
+        *,
+        expected_generation: int,
+    ) -> None:
+        """Mark only the hot entry committed by this writer generation clean."""
         with self._hot_cache_lock:
             entry = self._hot_cache.get(block_hash)
-            if entry is not None:
+            if (
+                entry is not None
+                and entry.get("_ssd_write_generation") == expected_generation
+            ):
                 entry["dirty"] = False
+
+    def _cancel_queued_writes_locked(self) -> int:
+        """Drain queued writes after a clear generation change.
+
+        The caller holds both lifecycle locks, so every ordinary item already
+        in the queue belongs to an older generation and no producer can append
+        another until the clear completes.  A writer may have dequeued one item
+        just before clear acquired the commit lock; its generation check handles
+        that case when it resumes.
+        """
+        cancelled_writes: list[tuple[int, bytes]] = []
+        saw_shutdown_sentinel = False
+        while True:
+            try:
+                item = self._write_queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                saw_shutdown_sentinel = True
+                continue
+            try:
+                generation, block_hash, *_rest = item
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Discarding malformed SSD cache writer item during clear"
+                )
+                continue
+            cancelled_writes.append((generation, block_hash))
+
+        # Preserve close()'s wake-up signal if clear happened concurrently with
+        # teardown. The queue is empty here, so this cannot block.
+        if saw_shutdown_sentinel:
+            self._write_queue.put_nowait(None)
+
+        for generation, block_hash in cancelled_writes:
+            self._clear_pending_write(
+                block_hash,
+                expected_generation=generation,
+            )
+        return len(cancelled_writes)
 
     def _writer_loop(self) -> None:
         """Background writer that drains the write queue.
@@ -3094,21 +3252,41 @@ class PagedSSDCacheManager(CacheManager):
             if item is None:  # Sentinel for shutdown
                 break
 
-            block_hash, tensors_raw, metadata, file_path = item
+            generation, block_hash, tensors_raw, metadata, file_path = item
             try:
-                write_succeeded = self._write_block_file(
-                    block_hash, tensors_raw, metadata, file_path, source="background"
-                )
+                with self._write_commit_lock:
+                    if generation != self._write_generation:
+                        logger.debug(
+                            "Cancelled stale SSD cache write for %s "
+                            "(generation %d -> %d)",
+                            block_hash.hex()[:16],
+                            generation,
+                            self._write_generation,
+                        )
+                        write_succeeded = False
+                    else:
+                        write_succeeded = self._write_block_file(
+                            block_hash,
+                            tensors_raw,
+                            metadata,
+                            file_path,
+                            source="background",
+                        )
                 if write_succeeded:
-                    self._mark_hot_cache_clean(block_hash)
+                    self._mark_hot_cache_clean(
+                        block_hash,
+                        expected_generation=generation,
+                    )
                 self._clear_pending_write(
-                    block_hash, remove_hot_cache=not self._hot_cache_enabled
+                    block_hash,
+                    remove_hot_cache=not self._hot_cache_enabled,
+                    expected_generation=generation,
                 )
             finally:
                 # Avoid pinning the last raw tensor-byte batch while the
                 # writer thread blocks waiting for more work.
                 item = None
-                block_hash = tensors_raw = metadata = file_path = None
+                generation = block_hash = tensors_raw = metadata = file_path = None
 
     def save_block(
         self,
@@ -3505,49 +3683,16 @@ class PagedSSDCacheManager(CacheManager):
                     )
                 return ok
 
-            # Evict LRU blocks to make room for the new block. Done here
-            # (post-tensor-build) so the actual block size is known and the
-            # cache doesn't oscillate around the configured limit.
-            self._enforce_size_limit_for_new_block(estimated_size)
-
-            # SSD path: add to index for SSD file tracking
-            self._incompatible_index.remove(block_hash)
-            self._index.add(block_metadata)
-
-            # Hot cache disabled: use temporary buffer + immediate SSD write
-            with self._hot_cache_lock:
-                self._hot_cache[block_hash] = cache_entry
-
-            # Track pending write
-            with self._pending_write_hashes_lock:
-                self._pending_write_hashes.add(block_hash)
-
-            # Enqueue full file write for background thread. Wait on Full so
-            # transient bursts (faster than the writer can drain) don't
-            # immediately punch holes in the cache chain.
-            try:
-                self._write_queue.put(
-                    (block_hash, tensors_raw, metadata, file_path),
-                    timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS,
-                )
-            except queue.Full:
-                self._stats["ssd_inline_write_fallbacks"] += 1
-                logger.warning(
-                    f"SSD cache write queue saturated (cap={self._max_pending_writes}); "
-                    f"writing {block_hash.hex()[:16]} inline"
-                )
-                ok = self._write_block_file(
-                    block_hash,
-                    tensors_raw,
-                    metadata,
-                    file_path,
-                    source="inline-fallback",
-                )
-                self._clear_pending_write(block_hash, remove_hot_cache=True)
-                if not ok:
-                    return False
-                self._stats["saves"] += 1
-                return True
+            if not self._queue_prepared_ssd_write(
+                block_hash,
+                tensors_raw,
+                metadata,
+                file_path,
+                block_metadata,
+                estimated_size,
+                cache_entry,
+            ):
+                return False
 
             self._stats["saves"] += 1
             logger.debug(
@@ -4429,6 +4574,7 @@ class PagedSSDCacheManager(CacheManager):
                     removed = True
                 self._pending_write_buffers.pop(block_hash, None)
                 self._pending_write_hashes.discard(block_hash)
+                self._pending_write_generations.pop(block_hash, None)
 
             metadata = self._index.remove(block_hash)
             if metadata is not None:
@@ -4455,6 +4601,7 @@ class PagedSSDCacheManager(CacheManager):
             with self._pending_write_hashes_lock:
                 self._pending_write_buffers.pop(block_hash, None)
                 self._pending_write_hashes.discard(block_hash)
+                self._pending_write_generations.pop(block_hash, None)
 
             metadata = self._index.remove(block_hash)
             incompatible_metadata = self._incompatible_index.remove(block_hash)
@@ -4783,13 +4930,29 @@ class PagedSSDCacheManager(CacheManager):
         """
         Clear all SSD cache files.
 
+        The clear is linearized against the background writer: an active
+        temp-file commit finishes first and is then deleted, queued writes are
+        cancelled and drained, and writes registered after the generation
+        change are allowed to persist normally after this method returns.
+
         Returns:
             Number of files deleted.
         """
+        with self._write_registration_lock, self._write_commit_lock:
+            self._write_generation += 1
+            cancelled = self._cancel_queued_writes_locked()
+            return self._clear_ssd_files_locked(cancelled)
+
+    def _clear_ssd_files_locked(self, cancelled_writes: int) -> int:
+        """Delete indexed files while both writer lifecycle locks are held."""
         with self._lock:
             count = 0
+            with self._pending_write_hashes_lock:
+                pending_hashes = list(self._pending_write_hashes)
             block_hashes = (
-                self._index.get_all_hashes() + self._incompatible_index.get_all_hashes()
+                self._index.get_all_hashes()
+                + self._incompatible_index.get_all_hashes()
+                + pending_hashes
             )
             for block_hash in dict.fromkeys(block_hashes):
                 if self.delete_block(block_hash):
@@ -4821,7 +4984,11 @@ class PagedSSDCacheManager(CacheManager):
                         e,
                     )
 
-            logger.info(f"Cleared SSD cache: deleted {count} files")
+            logger.info(
+                "Cleared SSD cache: deleted %d files, cancelled %d queued writes",
+                count,
+                cancelled_writes,
+            )
             return count
 
     def get_stats(self) -> PagedSSDCacheStats:
@@ -5043,6 +5210,7 @@ class PagedSSDCacheManager(CacheManager):
         with self._pending_write_hashes_lock:
             self._pending_write_buffers.clear()
             self._pending_write_hashes.clear()
+            self._pending_write_generations.clear()
 
         logger.debug("PagedSSDCacheManager closed")
 

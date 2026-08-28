@@ -5603,10 +5603,12 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
     is loaded.
     """
     total_deleted = 0
+    has_live_ssd_manager = False
 
     for model_id, scheduler in _iter_loaded_schedulers():
         ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
         if ssd_manager is not None:
+            has_live_ssd_manager = True
             try:
                 total_deleted += ssd_manager.clear()
             except Exception as exc:
@@ -5616,9 +5618,14 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
                     exc,
                 )
 
-    # Phase 2: remove any remaining files on disk (covers unloaded models)
+    # Phase 2: with no live manager, remove remaining files directly (covers
+    # unloaded models and crash-left staging files).  Never run this raw sweep
+    # after a live manager clear: a request may register a new-generation write
+    # as soon as manager.clear() releases its lifecycle gate.  Deleting either
+    # that writer's temp file or its just-promoted final file here would race the
+    # atomic commit and could mark a missing post-clear block as durable.
     global_settings = _get_global_settings()
-    if global_settings is not None:
+    if global_settings is not None and not has_live_ssd_manager:
         cache_dir = global_settings.cache.get_ssd_cache_dir(
             global_settings.base_path,
         )

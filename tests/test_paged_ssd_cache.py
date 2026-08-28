@@ -552,6 +552,149 @@ class TestPagedSSDCacheManager:
         count = manager.clear()
         assert count == 0  # Empty cache
 
+    def test_clear_linearizes_active_and_queued_writes(self, tmp_path: Path):
+        """Clear waits for promotion, cancels the queue, and fences old cleanup.
+
+        Regression for the admin clear race where the filesystem sweep removed
+        ``*_tmp.safetensors`` while the background writer was between write and
+        rename.  The stale writer's eventual bookkeeping must also not remove a
+        same-hash write registered after clear returns.
+        """
+        import omlx.cache.paged_ssd_cache as ssd_mod
+
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+        )
+        first_hash = b"\x11" * 32
+        queued_hash = b"\x22" * 32
+
+        def entry_for(block_hash: bytes, value: bytes) -> dict:
+            file_path = manager._get_file_path(block_hash)
+            now = time.time()
+            block_metadata = PagedSSDBlockMetadata(
+                block_hash=block_hash,
+                file_path=file_path,
+                file_size=len(value),
+                token_count=1,
+                created_at=now,
+                last_access=now,
+                num_layers=1,
+            )
+            return {
+                "tensors_raw": {"value": (value, "U8", [len(value)])},
+                "file_metadata": {"token_count": "1", "num_layers": "1"},
+                "num_layers": 1,
+                "layer_cache_types": None,
+                "block_metadata": block_metadata,
+                "dirty": True,
+            }
+
+        temp_ready = threading.Event()
+        allow_first_commit = threading.Event()
+        writer_after_commit = threading.Event()
+        allow_old_cleanup = threading.Event()
+        write_paths: list[Path] = []
+        original_write = ssd_mod._write_safetensors_no_mx
+        original_mark_clean = manager._mark_hot_cache_clean
+        mark_count = 0
+
+        def controlled_write(path, tensors_raw, metadata):
+            size = original_write(path, tensors_raw, metadata)
+            write_paths.append(Path(path))
+            if len(write_paths) == 1:
+                temp_ready.set()
+                assert allow_first_commit.wait(5), "test writer commit was not released"
+            return size
+
+        def controlled_mark_clean(block_hash, *, expected_generation):
+            nonlocal mark_count
+            mark_count += 1
+            if mark_count == 1:
+                writer_after_commit.set()
+                assert allow_old_cleanup.wait(5), "test writer cleanup was not released"
+            original_mark_clean(
+                block_hash,
+                expected_generation=expected_generation,
+            )
+
+        clear_result: list[int] = []
+        clear_thread = threading.Thread(
+            target=lambda: clear_result.append(manager.clear()),
+            name="test-ssd-clear",
+        )
+
+        try:
+            with (
+                patch.object(ssd_mod, "_write_safetensors_no_mx", controlled_write),
+                patch.object(manager, "_mark_hot_cache_clean", controlled_mark_clean),
+            ):
+                assert manager._enqueue_ssd_write(
+                    first_hash, entry_for(first_hash, b"first")
+                )
+                assert temp_ready.wait(5)
+                first_temp = manager._get_file_path(first_hash).with_name(
+                    manager._get_file_path(first_hash).stem + "_tmp.safetensors"
+                )
+                assert first_temp.exists()
+
+                # This item remains queued while the first writer is paused.
+                assert manager._enqueue_ssd_write(
+                    queued_hash, entry_for(queued_hash, b"queued")
+                )
+                clear_thread.start()
+
+                # Wait until clear owns the registration gate and is blocked on
+                # the active commit. It must not unlink that writer's temp file.
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if not manager._write_registration_lock.acquire(blocking=False):
+                        break
+                    manager._write_registration_lock.release()
+                    time.sleep(0.01)
+                else:
+                    pytest.fail("clear did not acquire the writer registration gate")
+                assert clear_thread.is_alive()
+                assert first_temp.exists()
+
+                allow_first_commit.set()
+                assert writer_after_commit.wait(5)
+                clear_thread.join(5)
+                assert not clear_thread.is_alive(), "clear deadlocked with the writer"
+                assert clear_result == [2]
+                assert len(write_paths) == 1, "queued pre-clear write was not cancelled"
+                assert not manager._get_file_path(first_hash).exists()
+                assert not manager._get_file_path(queued_hash).exists()
+                assert not first_temp.exists()
+
+                # Register the same hash in the new generation before the old
+                # writer clears its pending bookkeeping. Generation-aware
+                # cleanup must leave this replacement intact.
+                assert manager._enqueue_ssd_write(
+                    first_hash, entry_for(first_hash, b"replacement")
+                )
+                allow_old_cleanup.set()
+
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    with manager._pending_write_hashes_lock:
+                        pending = first_hash in manager._pending_write_hashes
+                    if not pending and manager._get_file_path(first_hash).exists():
+                        break
+                    time.sleep(0.01)
+                else:
+                    pytest.fail("post-clear replacement write did not persist")
+
+                assert len(write_paths) == 2
+                assert manager._stats["errors"] == 0
+                assert manager._writer_thread.is_alive()
+        finally:
+            allow_first_commit.set()
+            allow_old_cleanup.set()
+            if clear_thread.is_alive():
+                clear_thread.join(5)
+            manager.close()
+
     def test_get_stats(self, tmp_path: Path):
         """Test getting statistics."""
         manager = PagedSSDCacheManager(
