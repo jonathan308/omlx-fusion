@@ -107,7 +107,7 @@ def _final_engine_thread_reclaim(stream: Any) -> None:
 
 
 def _init_mlx_thread() -> None:
-    """Replace generation_stream with a thread-local stream on the executor thread.
+    """Bind the executor default and generation streams to one local stream.
 
     mlx-lm's module-level ``generation_stream`` is created at import time in
     whichever thread imported it first (the main thread at server startup).
@@ -116,24 +116,39 @@ def _init_mlx_thread() -> None:
     subsequent ``.item()`` / ``mx.synchronize()`` calls from the executor
     thread fail with "There is no Stream(gpu, 0) in current thread".
 
-    Fix: create a thread-local stream HERE and replace the module-level
-    ``generation_stream`` in mlx_lm.generate and omlx.scheduler.
+    Fix: create a thread-local stream HERE, install it as this worker's MLX
+    default, and replace the module-level ``generation_stream`` in
+    mlx_lm.generate and omlx.scheduler. DFlash obtains its generation stream
+    through ``mx.default_stream`` instead of either module-level variable, so
+    setting the thread default is required to keep all three paths aligned.
     """
     import sys
 
     import mlx.core as mx
 
-    stream = mx.new_thread_local_stream(mx.default_device())
+    device = mx.default_device()
+    generation_stream = mx.new_thread_local_stream(device)
+    # ``set_default_stream`` accepts a concrete Stream, not MLX's
+    # ThreadLocalStream wrapper. Resolve this wrapper on the executor thread;
+    # subsequent uses of the same wrapper on this thread select this exact
+    # concrete stream, while DFlash's ``mx.default_stream`` sees it directly.
+    with mx.stream(generation_stream):
+        stream = mx.default_stream(device)
+    mx.set_default_stream(stream)
 
     gen_mod = sys.modules.get("mlx_lm.generate")
     if gen_mod is not None:
-        gen_mod.generation_stream = stream
+        gen_mod.generation_stream = generation_stream
 
     sched_mod = sys.modules.get("omlx.scheduler")
     if sched_mod is not None:
-        sched_mod.generation_stream = stream
+        sched_mod.generation_stream = generation_stream
 
-    logger.info(f"MLX executor thread initialized: generation_stream = {stream}")
+    logger.info(
+        "MLX executor thread initialized: generation_stream=%s default_stream=%s",
+        generation_stream,
+        stream,
+    )
 
 
 def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:

@@ -1383,6 +1383,49 @@ class TestEngineCoreAbortAllRequests:
 class TestGlobalMLXExecutor:
     """Tests for the global MLX executor singleton (issue #85)."""
 
+    def test_initializer_aligns_thread_default_and_generation_streams(
+        self, monkeypatch
+    ):
+        """DFlash reads the worker default, so it must match mlx-lm's stream."""
+        import sys
+        from contextlib import contextmanager
+        from types import SimpleNamespace
+
+        import mlx.core as mx
+
+        from omlx.engine_core import _init_mlx_thread
+
+        generation_stream = object()
+        resolved_stream = object()
+        default_calls = []
+        contexts = []
+        generation_module = SimpleNamespace(generation_stream=None)
+        scheduler_module = SimpleNamespace(generation_stream=None)
+
+        @contextmanager
+        def stream_context(stream):
+            contexts.append(stream)
+            yield
+
+        monkeypatch.setattr(mx, "default_device", lambda: "gpu")
+        monkeypatch.setattr(
+            mx,
+            "new_thread_local_stream",
+            lambda device: generation_stream,
+        )
+        monkeypatch.setattr(mx, "stream", stream_context)
+        monkeypatch.setattr(mx, "default_stream", lambda device: resolved_stream)
+        monkeypatch.setattr(mx, "set_default_stream", default_calls.append)
+        monkeypatch.setitem(sys.modules, "mlx_lm.generate", generation_module)
+        monkeypatch.setitem(sys.modules, "omlx.scheduler", scheduler_module)
+
+        _init_mlx_thread()
+
+        assert contexts == [generation_stream]
+        assert default_calls == [resolved_stream]
+        assert generation_module.generation_stream is generation_stream
+        assert scheduler_module.generation_stream is generation_stream
+
     def test_get_mlx_executor_returns_singleton(self):
         """get_mlx_executor() must always return the same executor instance."""
         from omlx.engine_core import get_mlx_executor
