@@ -66,6 +66,14 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       "use_wm4_wn1"_a = false);
   m.def(
+      "qwen4_qsa_indexer_scores",
+      &omlx::glm_kernels::qwen4_qsa_indexer_scores,
+      "queries"_a,
+      "pooled_keys"_a,
+      "mask_ratio"_a = 4,
+      "mask_q_offset"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
       "dsa_topk_indices",
       &omlx::glm_kernels::dsa_topk_indices,
       "scores"_a,

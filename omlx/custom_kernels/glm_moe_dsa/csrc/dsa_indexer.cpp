@@ -3,6 +3,7 @@
 #include "kernels/mma_dsa_indexer_score.h"
 
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <dlfcn.h>
 #include <filesystem>
@@ -350,6 +351,133 @@ class DSAIndexerScoresPrimitive : public Primitive {
   int mask_ratio_;
   int mask_q_offset_;
   bool prefer_nax_;
+};
+
+class Qwen4QSAIndexerScoresPrimitive : public Primitive {
+ public:
+  Qwen4QSAIndexerScoresPrimitive(
+      Stream stream,
+      int mask_ratio,
+      int mask_q_offset)
+      : Primitive(stream),
+        mask_ratio_(mask_ratio),
+        mask_q_offset_(mask_q_offset) {}
+
+  static bool unsupported(const array& q, const array& k, Stream s) {
+    if (s.device == Device::cpu || q.dtype() != k.dtype()) {
+      return true;
+    }
+    if (q.dtype() != float16 && q.dtype() != bfloat16) {
+      return true;
+    }
+    if (!row_contiguous(q) || !row_contiguous(k)) {
+      return true;
+    }
+    if (q.ndim() != 4 || k.ndim() != 4) {
+      return true;
+    }
+    // This is intentionally the production Qwen4-Exp geometry only. A stale
+    // config or generalized caller must stay on qsa_fast's fp32 MLX path.
+    return q.shape(0) != 1 || k.shape(0) != 1 || q.shape(1) != 4 ||
+        k.shape(1) != 1 || q.shape(2) <= 0 || k.shape(2) <= 0 ||
+        q.shape(3) != 128 || k.shape(3) != 128;
+  }
+
+  void eval_cpu(
+      const std::vector<array>& /* inputs */,
+      std::vector<array>& /* outputs */) override {
+    throw std::runtime_error(
+        "Qwen4QSAIndexerScoresPrimitive has no CPU path.");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    auto& out = outputs[0];
+    const auto& q = inputs[0];
+    const auto& k = inputs[1];
+
+    out.set_data(allocator::malloc(out.nbytes()));
+
+    constexpr int bm = 64;
+    constexpr int bn = 64;
+    constexpr int bk = 16;
+    constexpr int wm = 2;
+    constexpr int wn = 2;
+    const int B = q.shape(0);
+    const int H = q.shape(1);
+    const int M = q.shape(2);
+    const int N = k.shape(2);
+    const int D = q.shape(3);
+    const int tiles_m = (M + bm - 1) / bm;
+    const int tiles_n = (N + bn - 1) / bn;
+
+    mlx::steel::GEMMParams params{
+        /* const int M = */ M,
+        /* const int N = */ N,
+        /* const int K = */ D,
+        /* const int lda = */ D,
+        /* const int ldb = */ D,
+        /* const int ldd = */ N,
+        /* const int tiles_n = */ tiles_n,
+        /* const int tiles_m = */ tiles_m,
+        /* const int64_t batch_stride_a = */ int64_t(H) * M * D,
+        /* const int64_t batch_stride_b = */ int64_t(N) * D,
+        /* const int64_t batch_stride_d = */ int64_t(M) * N,
+        /* const int swizzle_log = */ 0,
+        /* const int gemm_k_iterations_aligned = */ D / bk,
+        /* const int batch_ndim = */ 1};
+
+    std::string base_name;
+    concatenate(
+        base_name,
+        "qwen4_qsa_indexer_score_",
+        type_to_name(q),
+        "_bm",
+        bm,
+        "_bn",
+        bn,
+        "_bk",
+        bk,
+        "_wm",
+        wm,
+        "_wn",
+        wn);
+
+    auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
+    auto kernel = d.get_kernel(base_name, lib);
+    auto& encoder = metal::get_command_encoder(s);
+    encoder.set_compute_pipeline_state(kernel);
+    encoder.set_input_array(q, 0);
+    encoder.set_input_array(k, 1);
+    encoder.set_output_array(out, 2);
+    encoder.set_bytes(params, 3);
+    encoder.set_bytes(mask_ratio_, 4);
+    encoder.set_bytes(mask_q_offset_, 5);
+    const float score_divisor = std::sqrt(static_cast<float>(D));
+    encoder.set_bytes(score_divisor, 6);
+    encoder.dispatch_threadgroups(
+        MTL::Size(tiles_n, tiles_m, B),
+        MTL::Size(wm * wn * 32, 1, 1));
+  }
+
+  DEFINE_NAME(OMLXQwen4QSAIndexerScores)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs =
+        static_cast<const Qwen4QSAIndexerScoresPrimitive&>(other);
+    return mask_ratio_ == rhs.mask_ratio_ &&
+        mask_q_offset_ == rhs.mask_q_offset_;
+  }
+  auto state() const {
+    return std::make_tuple(mask_ratio_, mask_q_offset_);
+  }
+
+ private:
+  int mask_ratio_;
+  int mask_q_offset_;
 };
 
 // ── v25 M2 MMA score kernel (mma_dsa_indexer_score.h) ───────────────────────
@@ -1018,6 +1146,53 @@ array dsa_indexer_scores(
           mask_q_offset,
           use_nax && dsa_indexer_nax_kernels_built()),
       std::move(inputs));
+}
+
+array qwen4_qsa_indexer_scores(
+    const array& queries,
+    const array& pooled_keys,
+    int mask_ratio,
+    int mask_q_offset,
+    StreamOrDevice s) {
+  if (queries.ndim() != 4 || pooled_keys.ndim() != 4) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.qwen4_qsa_indexer_scores] expected q/k rank "
+        << "4, got " << queries.shape() << " and " << pooled_keys.shape()
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (queries.dtype() != pooled_keys.dtype() ||
+      (queries.dtype() != float16 && queries.dtype() != bfloat16)) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.qwen4_qsa_indexer_scores] q/k must have matching "
+        "float16 or bfloat16 dtype.");
+  }
+  if (mask_ratio != 4 || mask_q_offset < 0) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.qwen4_qsa_indexer_scores] requires "
+        << "mask_ratio=4 and a non-negative mask_q_offset, got "
+        << mask_ratio << " and " << mask_q_offset << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto stream = to_stream(s);
+  auto q = ensure_row_contiguous(queries, stream);
+  auto k = ensure_row_contiguous(pooled_keys, stream);
+  if (Qwen4QSAIndexerScoresPrimitive::unsupported(q, k, stream)) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.qwen4_qsa_indexer_scores] unsupported shape "
+        << "or layout; expected q [1,4,M,128] and k [1,1,N,128], got "
+        << q.shape() << " and " << k.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  Shape out_shape{1, q.shape(2), k.shape(2)};
+  return array(
+      std::move(out_shape),
+      float32,
+      std::make_shared<Qwen4QSAIndexerScoresPrimitive>(
+          stream, mask_ratio, mask_q_offset),
+      std::vector<array>{q, k});
 }
 
 array dsa_indexer_scores_mma(

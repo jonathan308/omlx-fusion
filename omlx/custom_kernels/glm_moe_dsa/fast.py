@@ -145,6 +145,7 @@ _EXT_NAX_SCORE = _probe_nax_score(_ext)
 NATIVE_SYMBOLS = (
     "dsa_decode_scores",
     "dsa_indexer_scores",
+    "qwen4_qsa_indexer_scores",
     "dsa_topk_indices",
     "dspark_fp32_topk_indices",
     "ds4_router_topk_indices",
@@ -346,6 +347,36 @@ def dsa_indexer_scores(
             mask[None, None], scores, mx.finfo(scores.dtype).min
         )
     return scores
+
+
+def qwen4_qsa_indexer_scores(
+    queries: mx.array,
+    pooled_keys: mx.array,
+    mask_ratio: int = 4,
+    mask_q_offset: int = 0,
+    *,
+    stream=None,
+) -> mx.array:
+    """Fused, fp32 Qwen4 QSA block scores for the M3 prefill geometry.
+
+    ``queries`` is ``[1, 4, M, 128]`` and ``pooled_keys`` is
+    ``[1, 1, N, 128]`` in matching bf16/fp16. The result is fp32
+    ``[1, M, N]`` after head-summed ReLU, ``1/sqrt(128)`` scaling, and the
+    pooled-causal mask. The dedicated ABI intentionally has no implicit
+    fallback; ``qsa_fast`` owns the portable float32 fallback.
+    """
+    if _ext is None or not hasattr(_ext, "qwen4_qsa_indexer_scores"):
+        raise RuntimeError(
+            "qwen4_qsa_indexer_scores requires a local extension build that "
+            "exposes the Qwen4 QSA score kernel"
+        )
+    return _ext.qwen4_qsa_indexer_scores(
+        queries,
+        pooled_keys,
+        mask_ratio=mask_ratio,
+        mask_q_offset=mask_q_offset,
+        **_native_stream_kwargs(stream),
+    )
 
 
 def dsa_indexer_nax_kernels_built() -> bool:

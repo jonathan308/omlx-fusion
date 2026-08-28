@@ -211,6 +211,144 @@ template <typename T, typename O, int TOPK, int THREADS>
   }
 }
 
+// Qwen4 QSA's indexer has only four heads, but its portable score expression
+// casts both operands to fp32 and materializes [B,M,H,N] before the ReLU/head
+// reduction. This kernel keeps the same fp32 accumulation and final score
+// dtype while carrying only one MMA tile per thread. The input layout is the
+// natural GEMM-friendly [B,H,M,D] view; the public ABI fixes B=1,H=4,D=128.
+template <typename T, int BM, int BN, int BK, int WM, int WN>
+[[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void
+qwen4_qsa_indexer_score(
+    const device T* Q [[buffer(0)]],
+    const device T* K [[buffer(1)]],
+    device float* O [[buffer(2)]],
+    const constant GEMMParams* params [[buffer(3)]],
+    const constant int& mask_ratio [[buffer(4)]],
+    const constant int& mask_q_offset [[buffer(5)]],
+    const constant float& score_divisor [[buffer(6)]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]]) {
+  (void)lid;
+
+  using gemm_kernel = GEMMKernel<
+      T,
+      T,
+      BM,
+      BN,
+      BK,
+      WM,
+      WN,
+      false,
+      true,
+      true,
+      true,
+      float>;
+  using loader_a_t = typename gemm_kernel::loader_a_t;
+  using loader_b_t = typename gemm_kernel::loader_b_t;
+  using mma_t = typename gemm_kernel::mma_t;
+
+  const int tid_y = ((tid.y) << params->swizzle_log) +
+      ((tid.x) & ((1 << params->swizzle_log) - 1));
+  const int tid_x = (tid.x) >> params->swizzle_log;
+  if (params->tiles_n <= tid_x || params->tiles_m <= tid_y) {
+    return;
+  }
+
+  constexpr int H = 4;
+  const int M = params->M;
+  const int N = params->N;
+  const int D = params->K;
+  const int c_row = tid_y * BM;
+  const int c_col = tid_x * BN;
+  const short tgp_bm = short(metal::min(BM, M - c_row));
+  const short tgp_bn = short(metal::min(BN, N - c_col));
+
+  Q += size_t(tid.z) * H * M * D;
+  K += size_t(tid.z) * N * D;
+  O += size_t(tid.z) * M * N + size_t(c_row) * params->ldd + c_col;
+
+  threadgroup T As[gemm_kernel::tgp_mem_size_a];
+  threadgroup T Bs[gemm_kernel::tgp_mem_size_b];
+  thread mma_t mma_op(simd_group_id, simd_lane_id);
+
+  float accum[decltype(mma_op.Ctile)::kElemsPerTile];
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < decltype(mma_op.Ctile)::kElemsPerTile; ++i) {
+    accum[i] = 0.0f;
+  }
+
+  STEEL_PRAGMA_UNROLL
+  for (short h = 0; h < H; ++h) {
+    mma_op.Ctile.clear();
+    const device T* A = Q + size_t(h) * M * D + size_t(c_row) * D;
+    const device T* B = K + size_t(c_col) * D;
+    thread loader_a_t loader_a(A, params->lda, As, simd_group_id, simd_lane_id);
+    thread loader_b_t loader_b(B, params->ldb, Bs, simd_group_id, simd_lane_id);
+
+    for (int d = 0; d < params->gemm_k_iterations_aligned; ++d) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (tgp_bm == BM) {
+        loader_a.load_unsafe();
+      } else {
+        loader_a.load_safe(short2(BK, tgp_bm));
+      }
+      if (tgp_bn == BN) {
+        loader_b.load_unsafe();
+      } else {
+        loader_b.load_safe(short2(BK, tgp_bn));
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      mma_op.mma(As, Bs);
+      loader_a.next();
+      loader_b.next();
+    }
+    threadgroup_barrier(mem_flags::mem_none);
+
+    short ai = 0;
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < decltype(mma_op.Ctile)::kTileRows; ++i) {
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < decltype(mma_op.Ctile)::kTileCols; ++j) {
+        thread const auto& frag = mma_op.Ctile.frag_at(i, j);
+        STEEL_PRAGMA_UNROLL
+        for (short e = 0; e < decltype(mma_op.Ctile)::kElemsPerFrag; ++e) {
+          accum[ai++] += metal::max(frag[e], 0.0f);
+        }
+      }
+    }
+  }
+
+  const float pooled_sentinel = as_type<float>(uint(0xFF7FFFFF));
+  device float* Dst = O + size_t(mma_op.sm) * params->ldd + mma_op.sn;
+  short ai = 0;
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < decltype(mma_op.Ctile)::kTileRows; ++i) {
+    const int row = c_row + mma_op.sm + i * mma_t::TM_stride;
+    STEEL_PRAGMA_UNROLL
+    for (short j = 0; j < decltype(mma_op.Ctile)::kTileCols; ++j) {
+      const int col_base = c_col + mma_op.sn + j * mma_t::TN_stride;
+      const int out_base =
+          (i * decltype(mma_op.Ctile)::kFragRows) * WM * params->ldd +
+          (j * decltype(mma_op.Ctile)::kFragCols) * WN;
+      STEEL_PRAGMA_UNROLL
+      for (short e = 0; e < decltype(mma_op.Ctile)::kElemsPerFrag; ++e) {
+        const int col = col_base + e;
+        const bool pooled_masked =
+            col >= (mask_q_offset + row + 1) / mask_ratio;
+        const float value = pooled_masked
+            ? pooled_sentinel
+            : accum[ai] / score_divisor;
+        if (row < M && col < N) {
+          Dst[out_base + e] = value;
+        }
+        ai++;
+      }
+    }
+  }
+}
+
 METAL_FUNC uint dsa_ordered_key_32(float x) {
   const uint bits = as_type<uint>(x);
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
