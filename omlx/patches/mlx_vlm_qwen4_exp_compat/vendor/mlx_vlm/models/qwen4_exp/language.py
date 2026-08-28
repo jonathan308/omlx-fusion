@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import mmap
 import os
 import struct
+import threading
+import time
 import weakref
 from bisect import bisect_right
 from dataclasses import dataclass, replace
@@ -37,6 +40,153 @@ from .qsa_fast import (
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
 _HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
+_DECODE_PROFILE_LOCAL = threading.local()
+_DECODE_PROFILE_LOCK = threading.Lock()
+_DECODE_PROFILE_CALLS = 0
+
+logger = logging.getLogger(__name__)
+
+
+class _Qwen4DecodeProfileSample:
+    """One synchronized, diagnostic-only Qwen4 decode sample.
+
+    The profiler deliberately puts an evaluation boundary after every major
+    model stage.  That makes the category attribution trustworthy, but also
+    means the sampled token is not a production-throughput measurement.  The
+    feature is disabled unless ``OMLX_QWEN4_DECODE_PROFILE=1`` and samples only
+    one token per configured interval so ordinary decode stays representative.
+    """
+
+    def __init__(self, call_index: int, context_tokens: int):
+        self.call_index = call_index
+        self.context_tokens = context_tokens
+        self.stage_ns: dict[str, int] = {}
+        self.model_ns = 0
+
+    def add(self, stage: str, elapsed_ns: int) -> None:
+        self.stage_ns[stage] = self.stage_ns.get(stage, 0) + max(0, elapsed_ns)
+
+    def milliseconds(self, stage: str) -> float:
+        return self.stage_ns.get(stage, 0) / 1_000_000.0
+
+
+def _decode_profile_int(name: str, default: int, minimum: int) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _decode_profile_enabled() -> bool:
+    return os.environ.get("OMLX_QWEN4_DECODE_PROFILE", "0") == "1"
+
+
+def _decode_profile_context_tokens(model, cache) -> int | None:
+    if not cache:
+        return None
+    try:
+        entry = cache[model.fa_idx]
+        offset = entry._idx if hasattr(entry, "_idx") else entry.offset
+    except (AttributeError, IndexError, TypeError):
+        return None
+    if not isinstance(offset, int) or offset <= 0:
+        return None
+    return offset
+
+
+def _new_decode_profile_sample(model, inputs, inputs_embeds, mask, cache, kwargs):
+    """Return a sparse profile sample only for ordinary B1/T1 text decode."""
+
+    if not _decode_profile_enabled() or get_mtp_runtime().enabled:
+        return None
+    if not (
+        isinstance(inputs, mx.array)
+        and inputs.ndim == 2
+        and inputs.shape == (1, 1)
+        and inputs_embeds is None
+        and (mask is None or (isinstance(mask, str) and mask == "causal"))
+        and not kwargs.get("return_hidden", False)
+        and kwargs.get("capture_layer_ids") is None
+        and not kwargs.get("skip_logits", False)
+    ):
+        return None
+    context_tokens = _decode_profile_context_tokens(model, cache)
+    if context_tokens is None:
+        return None
+
+    global _DECODE_PROFILE_CALLS
+    with _DECODE_PROFILE_LOCK:
+        _DECODE_PROFILE_CALLS += 1
+        call_index = _DECODE_PROFILE_CALLS
+    warmup = _decode_profile_int("OMLX_QWEN4_DECODE_PROFILE_WARMUP", 8, 0)
+    interval = _decode_profile_int("OMLX_QWEN4_DECODE_PROFILE_INTERVAL", 16, 1)
+    if call_index <= warmup or (call_index - warmup - 1) % interval:
+        return None
+    return _Qwen4DecodeProfileSample(call_index, context_tokens)
+
+
+def _profile_eval(value) -> None:
+    """Evaluate a stage result before timing its synchronized boundary."""
+
+    arrays = []
+
+    def collect(current):
+        if isinstance(current, mx.array):
+            arrays.append(current)
+        elif isinstance(current, dict):
+            for child in current.values():
+                collect(child)
+        elif isinstance(current, (list, tuple)):
+            for child in current:
+                collect(child)
+
+    collect(value)
+    if arrays:
+        mx.eval(*arrays)
+    mx.synchronize()
+
+
+def _profile_stage(sample, stage: str, function):
+    started = time.perf_counter_ns()
+    result = function()
+    _profile_eval(result)
+    sample.add(stage, time.perf_counter_ns() - started)
+    return result
+
+
+def _current_decode_profile():
+    return getattr(_DECODE_PROFILE_LOCAL, "sample", None)
+
+
+def _log_decode_profile(sample: _Qwen4DecodeProfileSample, total_ns: int) -> None:
+    total_ms = total_ns / 1_000_000.0
+    model_ms = sample.model_ns / 1_000_000.0
+    outer_ms = max(0.0, total_ms - model_ms)
+    accounted_ms = sum(sample.stage_ns.values()) / 1_000_000.0
+    model_unaccounted_ms = max(0.0, model_ms - accounted_ms)
+    logger.info(
+        "[qwen4-decode-profile] synchronized diagnostic call=%d context=%d "
+        "total=%.3fms model=%.3fms outer+logits=%.3fms "
+        "embed+mask=%.3fms ple=%.3fms attn_hc=%.3fms gdn=%.3fms "
+        "qsa=%.3fms attn_residual=%.3fms mlp_hc=%.3fms moe=%.3fms "
+        "mlp_residual=%.3fms final_hc=%.3fms model_other=%.3fms",
+        sample.call_index,
+        sample.context_tokens,
+        total_ms,
+        model_ms,
+        outer_ms,
+        sample.milliseconds("embed+mask"),
+        sample.milliseconds("ple"),
+        sample.milliseconds("attn_hc"),
+        sample.milliseconds("gdn"),
+        sample.milliseconds("qsa"),
+        sample.milliseconds("attn_residual"),
+        sample.milliseconds("mlp_hc"),
+        sample.milliseconds("moe"),
+        sample.milliseconds("mlp_residual"),
+        sample.milliseconds("final_hc"),
+        model_unaccounted_ms,
+    )
 
 
 @dataclass(frozen=True)
@@ -2208,6 +2358,7 @@ class Qwen4ExpPLELayer(nn.Module):
 class Qwen4ExpDecoderLayer(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
+        self.layer_idx = layer_idx
         self.is_linear = config.layer_types[layer_idx] == "linear_attention"
         if self.is_linear:
             self.linear_attn = Qwen4ExpGatedDeltaNet(config)
@@ -2234,6 +2385,19 @@ class Qwen4ExpDecoderLayer(nn.Module):
         gdn_sink=None,
         target_verify: bool = False,
     ):
+        profile = _current_decode_profile()
+        if profile is not None:
+            return self._profiled_call(
+                profile,
+                hidden_states,
+                input_ids,
+                mask,
+                cache,
+                position_ids,
+                gdn_sink,
+                target_verify,
+            )
+
         if "ple" in self:
             hidden_states = hidden_states + self.ple(
                 hidden_states,
@@ -2274,6 +2438,91 @@ class Qwen4ExpDecoderLayer(nn.Module):
         injection = branch[..., None, :] * injection_weights[..., None]
         return hyper_input + injection.reshape(*hyper_input.shape)
 
+    def _profiled_call(
+        self,
+        profile,
+        hidden_states,
+        input_ids,
+        mask,
+        cache,
+        position_ids,
+        gdn_sink,
+        target_verify,
+    ):
+        if "ple" in self:
+            def apply_ple():
+                return hidden_states + self.ple(
+                    hidden_states,
+                    input_ids,
+                    cache,
+                    mask,
+                    target_verify=target_verify,
+                )
+
+            hidden_states = _profile_stage(profile, "ple", apply_ple)
+
+        def apply_attn_hyper_connection():
+            return self.attn_hyper_connection(
+                hidden_states,
+                target_verify=target_verify,
+            )
+
+        mixed, hyper_input, injection_weights = _profile_stage(
+            profile, "attn_hc", apply_attn_hyper_connection
+        )
+
+        def apply_attention():
+            if self.is_linear:
+                return self.linear_attn(
+                    mixed,
+                    mask=mask,
+                    cache=cache,
+                    gdn_sink=gdn_sink,
+                    target_verify=target_verify,
+                )
+            return self.self_attn(
+                mixed,
+                mask=mask,
+                cache=cache,
+                position_ids=position_ids,
+                target_verify=target_verify,
+            )
+
+        branch = _profile_stage(
+            profile,
+            "gdn" if self.is_linear else "qsa",
+            apply_attention,
+        )
+
+        def apply_attn_residual():
+            injection = branch[..., None, :] * injection_weights[..., None]
+            return hyper_input + injection.reshape(*hyper_input.shape)
+
+        hidden_states = _profile_stage(
+            profile, "attn_residual", apply_attn_residual
+        )
+
+        def apply_mlp_hyper_connection():
+            return self.mlp_hyper_connection(
+                hidden_states,
+                target_verify=target_verify,
+            )
+
+        mixed, hyper_input, injection_weights = _profile_stage(
+            profile, "mlp_hc", apply_mlp_hyper_connection
+        )
+
+        def apply_moe():
+            return self.mlp(mixed, target_verify=target_verify)
+
+        branch = _profile_stage(profile, "moe", apply_moe)
+
+        def apply_mlp_residual():
+            injection = branch[..., None, :] * injection_weights[..., None]
+            return hyper_input + injection.reshape(*hyper_input.shape)
+
+        return _profile_stage(profile, "mlp_residual", apply_mlp_residual)
+
 
 class Qwen4ExpModel(nn.Module):
     def __init__(self, config: TextConfig):
@@ -2305,17 +2554,46 @@ class Qwen4ExpModel(nn.Module):
         **kwargs,
     ):
         del kwargs
-        hidden_states = (
-            self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
-        )
-        hidden_states = mx.tile(hidden_states, (1, 1, self.args.hc_count))
+        profile = _current_decode_profile()
+        model_started = time.perf_counter_ns() if profile is not None else 0
+        if profile is None:
+            hidden_states = (
+                self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
+            )
+            hidden_states = mx.tile(hidden_states, (1, 1, self.args.hc_count))
+        else:
+            def embed_and_tile():
+                embedded = (
+                    self.embed_tokens(inputs)
+                    if inputs_embeds is None
+                    else inputs_embeds
+                )
+                return mx.tile(embedded, (1, 1, self.args.hc_count))
+
+            hidden_states = _profile_stage(profile, "embed+mask", embed_and_tile)
         if cache is None:
             cache = [None] * len(self.layers)
 
-        fa_mask = _create_qwen3_5_attention_mask(hidden_states, cache[self.fa_idx])
-        ssm_mask = _create_qwen3_5_ssm_mask(hidden_states, cache[self.ssm_idx])
-        if mask is not None and isinstance(mask, mx.array) and mask.ndim == 2:
-            ssm_mask = mask
+        if profile is None:
+            fa_mask = _create_qwen3_5_attention_mask(
+                hidden_states, cache[self.fa_idx]
+            )
+            ssm_mask = _create_qwen3_5_ssm_mask(
+                hidden_states, cache[self.ssm_idx]
+            )
+            if mask is not None and isinstance(mask, mx.array) and mask.ndim == 2:
+                ssm_mask = mask
+        else:
+            def make_masks():
+                fa = _create_qwen3_5_attention_mask(hidden_states, cache[self.fa_idx])
+                ssm = _create_qwen3_5_ssm_mask(hidden_states, cache[self.ssm_idx])
+                if mask is not None and isinstance(mask, mx.array) and mask.ndim == 2:
+                    ssm = mask
+                return fa, ssm
+
+            fa_mask, ssm_mask = _profile_stage(
+                profile, "embed+mask", make_masks
+            )
 
         capture = set(capture_layer_ids or [])
         for index, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
@@ -2356,10 +2634,21 @@ class Qwen4ExpModel(nn.Module):
             # mixer. Ordinary layer captures retain their mixed representation.
             hidden_sink.append(hidden_states)
 
-        return self.hyper_connection_mixer(
-            hidden_states,
-            target_verify=gdn_sink is not None,
-        )
+        if profile is None:
+            return self.hyper_connection_mixer(
+                hidden_states,
+                target_verify=gdn_sink is not None,
+            )
+
+        def apply_final_hyper_connection():
+            return self.hyper_connection_mixer(
+                hidden_states,
+                target_verify=gdn_sink is not None,
+            )
+
+        output = _profile_stage(profile, "final_hc", apply_final_hyper_connection)
+        profile.model_ns = time.perf_counter_ns() - model_started
+        return output
 
 
 class Qwen4ExpMTPModule(nn.Module):
@@ -2499,9 +2788,34 @@ class LanguageModel(Qwen3_5LanguageModel):
         mtp_capture = return_hidden and kwargs.get("capture_layer_ids") is None
         if mtp_capture:
             kwargs["capture_layer_ids"] = []
-        output = super().__call__(inputs, inputs_embeds, mask, cache, **kwargs)
+        profile = _new_decode_profile_sample(
+            self.model,
+            inputs,
+            inputs_embeds,
+            mask,
+            cache,
+            kwargs,
+        )
+        previous_profile = _current_decode_profile()
+        if profile is not None:
+            mx.synchronize()
+            outer_started = time.perf_counter_ns()
+            _DECODE_PROFILE_LOCAL.sample = profile
+        try:
+            output = super().__call__(inputs, inputs_embeds, mask, cache, **kwargs)
+            if profile is not None:
+                _profile_eval(output.logits)
+                total_ns = time.perf_counter_ns() - outer_started
+        finally:
+            if profile is not None:
+                if previous_profile is None:
+                    del _DECODE_PROFILE_LOCAL.sample
+                else:
+                    _DECODE_PROFILE_LOCAL.sample = previous_profile
         if mtp_capture and output.hidden_states:
             output.hidden_states = [output.hidden_states[0]]
+        if profile is not None:
+            _log_decode_profile(profile, total_ns)
         return output
 
     def mtp_forward(
