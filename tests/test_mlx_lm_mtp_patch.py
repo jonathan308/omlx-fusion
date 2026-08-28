@@ -1925,6 +1925,7 @@ class TestBatchGeneratorDispatch:
                 model=_MtpModel(),
                 uids=[1, 2],
                 logits_processors=[],
+                _omlx_wants_logprobs=False,
                 _omlx_mtp_activation_safe=True,
                 prompt_cache=[],
             )
@@ -1964,6 +1965,7 @@ class TestBatchGeneratorDispatch:
                 model=_MtpModel(),
                 uids=[1, 2],
                 logits_processors=[],
+                _omlx_wants_logprobs=False,
                 _omlx_mtp_activation_safe=True,
                 prompt_cache=[],
             )
@@ -1975,6 +1977,118 @@ class TestBatchGeneratorDispatch:
             assert batch_generator._is_mtp_batch_eligible(batch) is True
         finally:
             set_mtp_active(prior_active)
+
+    def test_qwen4_b2_rowwise_is_default_but_generic_models_are_unchanged(
+        self, monkeypatch
+    ):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.delenv(batch_generator._ROWWISE_BATCH_MTP_ENV, raising=False)
+
+        class _Model:
+            def __init__(self, model_type):
+                self.model_type = model_type
+                self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
+
+            def mtp_forward(self, *_):
+                pass
+
+        def batch(model_type, uids=(1, 2)):
+            return SimpleNamespace(
+                model=_Model(model_type),
+                uids=list(uids),
+                logits_processors=[[] for _ in uids],
+                _omlx_wants_logprobs=False,
+                _omlx_mtp_activation_safe=True,
+                prompt_cache=[],
+            )
+
+        assert batch_generator._is_mtp_batch_eligible(
+            batch("qwen4_exp_text")
+        )
+        assert not batch_generator._is_mtp_batch_eligible(
+            batch("qwen3_5_moe")
+        )
+        assert not batch_generator._is_mtp_batch_eligible(
+            batch("qwen4_exp_text", uids=(1, 2, 3))
+        )
+
+    def test_qwen4_b2_rowwise_honors_explicit_disable_and_generic_force(
+        self, monkeypatch
+    ):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        class _Model:
+            def __init__(self, model_type):
+                self.model_type = model_type
+                self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
+
+            def mtp_forward(self, *_):
+                pass
+
+        def batch(model_type):
+            return SimpleNamespace(
+                model=_Model(model_type),
+                uids=[1, 2],
+                logits_processors=[[], []],
+                _omlx_wants_logprobs=False,
+                _omlx_mtp_activation_safe=True,
+                prompt_cache=[],
+            )
+
+        monkeypatch.setenv(batch_generator._ROWWISE_BATCH_MTP_ENV, "0")
+        assert not batch_generator._is_mtp_batch_eligible(
+            batch("qwen4_exp_text")
+        )
+
+        monkeypatch.setenv(batch_generator._ROWWISE_BATCH_MTP_ENV, "1")
+        assert batch_generator._is_mtp_batch_eligible(
+            batch("qwen3_5_moe")
+        )
+
+    def test_qwen4_b2_rowwise_rejects_logprobs_grammar_and_ineligible_model(
+        self, monkeypatch
+    ):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.delenv(batch_generator._ROWWISE_BATCH_MTP_ENV, raising=False)
+
+        model = SimpleNamespace(
+            model_type="qwen4_exp_text",
+            mtp=object(),
+            mtp_forward=lambda *_: None,
+            _omlx_mtp_decode_enabled=True,
+        )
+        batch = SimpleNamespace(
+            model=model,
+            uids=[1, 2],
+            logits_processors=[[], []],
+            _omlx_wants_logprobs=False,
+            _omlx_mtp_activation_safe=True,
+            prompt_cache=[],
+        )
+        assert batch_generator._is_mtp_batch_eligible(batch)
+
+        batch._omlx_wants_logprobs = True
+        assert not batch_generator._is_mtp_batch_eligible(batch)
+        batch._omlx_wants_logprobs = False
+
+        monkeypatch.setattr(
+            batch_generator,
+            "_has_grammar_processors",
+            lambda _: True,
+        )
+        assert not batch_generator._is_mtp_batch_eligible(batch)
+        monkeypatch.setattr(
+            batch_generator,
+            "_has_grammar_processors",
+            lambda _: False,
+        )
+
+        model._omlx_mtp_decode_enabled = False
+        assert not batch_generator._is_mtp_batch_eligible(batch)
 
     def test_rowwise_batch_new_activation_allows_ragged_offsets(self, monkeypatch):
         # Continuous batching admits rows at different times, so per-row
@@ -2008,6 +2122,7 @@ class TestBatchGeneratorDispatch:
                 model=_MtpModel(),
                 uids=[1, 2],
                 logits_processors=[],
+                _omlx_wants_logprobs=False,
                 _omlx_mtp_activation_safe=True,
                 prompt_cache=[SimpleNamespace(offset=_Offset([8, 5]))],
             )
@@ -2042,6 +2157,7 @@ class TestBatchGeneratorDispatch:
                 model=_MtpModel(),
                 uids=[1, 2],
                 logits_processors=[],
+                _omlx_wants_logprobs=False,
                 _omlx_mtp_activation_safe=True,
                 _omlx_mtp_saw_standard_multirow_decode=True,
                 prompt_cache=[],

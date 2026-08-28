@@ -632,8 +632,65 @@ def _lockstep_depth_enabled() -> bool:
     )
 
 
-def _rowwise_batch_mtp_enabled() -> bool:
-    """Opt-in for row-wise MTP on multi-row batches (default off).
+def _rowwise_batch_mtp_override() -> Optional[bool]:
+    """Return an explicit row-wise policy override, or ``None`` when unset."""
+
+    raw = os.environ.get(_ROWWISE_BATCH_MTP_ENV, "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def _is_qwen4_exp_model(model: Any) -> bool:
+    """Recognize only the native Qwen4-Exp family through common wrappers."""
+
+    pending = [model]
+    seen = set()
+    while pending:
+        candidate = pending.pop()
+        if candidate is None or id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        values = [
+            getattr(candidate, "model_type", None),
+            getattr(getattr(candidate, "args", None), "model_type", None),
+            getattr(getattr(candidate, "config", None), "model_type", None),
+            getattr(
+                getattr(getattr(candidate, "config", None), "text_config", None),
+                "model_type",
+                None,
+            ),
+        ]
+        if any(str(value or "").startswith("qwen4_exp") for value in values):
+            return True
+        module_name = str(getattr(type(candidate), "__module__", ""))
+        if ".qwen4_exp" in module_name:
+            return True
+        for name in ("language_model", "_language_model", "model"):
+            child = getattr(candidate, name, None)
+            if child is not None and child is not candidate:
+                pending.append(child)
+    return False
+
+
+def _batch_wants_api_logprobs(gen_batch: Any) -> bool:
+    """Fail closed when row-wise MTP cannot prove API logprobs are unrequested."""
+
+    explicit = getattr(gen_batch, "_omlx_wants_logprobs", None)
+    if explicit is not None:
+        return bool(explicit)
+    try:
+        from omlx.scheduler import _omlx_batch_wants_logprobs
+
+        return bool(_omlx_batch_wants_logprobs(gen_batch))
+    except Exception:
+        return True
+
+
+def _rowwise_batch_mtp_enabled(gen_batch: Any = None) -> bool:
+    """Choose row-wise MTP using an override plus one measured Qwen4 B2 policy.
 
     The row-wise path runs one backbone forward per row per cycle, so its
     aggregate throughput is roughly single-stream MTP throughput regardless
@@ -641,14 +698,26 @@ def _rowwise_batch_mtp_enabled() -> bool:
     all rows. Measured on Qwen3.6-27B-oQ4e-mtp / M3 Ultra (pp1024/tg128):
     row-wise 53.3 / 52.5 tok/s aggregate at batch 2 / 4 versus 65.2 / 86.5
     for standard batched decode — despite 83-93% draft acceptance. It only
-    pays off when tokens-per-cycle exceeds the row count, so it stays off
-    unless explicitly requested.
+    pays off when tokens-per-cycle exceeds the row count.  Generic models keep
+    that opt-in policy.  Qwen4-Exp is the narrow measured exception: on the M3
+    Ultra, exact row-wise depth-5 B2 delivered 48.72 aggregate tok/s with only
+    1.13 s finish skew, versus 25.55 tok/s and 18 s skew for standard B2.
+
+    ``OMLX_MTP_ROWWISE_BATCH=1`` remains an explicit force and ``=0`` an
+    explicit disable.  With no override, only eligible Qwen4-Exp B2 requests
+    that did not ask for API logprobs select row-wise MTP.
     """
-    return os.environ.get(_ROWWISE_BATCH_MTP_ENV, "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
+
+    override = _rowwise_batch_mtp_override()
+    if override is not None:
+        return override
+    if gen_batch is None:
+        return False
+    uids = getattr(gen_batch, "uids", None) or ()
+    return bool(
+        len(uids) == 2
+        and _is_qwen4_exp_model(getattr(gen_batch, "model", None))
+        and not _batch_wants_api_logprobs(gen_batch)
     )
 
 
@@ -734,7 +803,7 @@ def _log_multirow_mtp_inactive_once(gen_batch: Any) -> None:
     if not _mtp_common_eligible(gen_batch):
         return
     gen_batch._omlx_mtp_inactive_logged = True
-    if not _rowwise_batch_mtp_enabled():
+    if not _rowwise_batch_mtp_enabled(gen_batch):
         logger.info(
             "MTP inactive for %d-row batch: standard batched decode is faster "
             "at this batch size (set %s=1 to force row-wise MTP)",
@@ -830,7 +899,7 @@ def _is_mtp_batch_eligible(gen_batch: Any) -> bool:
         return False
     if getattr(
         gen_batch, "_omlx_mtp_batch_state", None
-    ) is None and not _rowwise_batch_mtp_enabled():
+    ) is None and not _rowwise_batch_mtp_enabled(gen_batch):
         return False
     # No cache-position alignment requirement: activation seeds each row from
     # its own extract_cache(idx) view and steady-state row cycles diverge the
@@ -867,12 +936,20 @@ def _ineligibility_reason(gen_batch: Any) -> str:
     if len(uids) != 1:
         if not _allows_new_mtp_activation(gen_batch, "_omlx_mtp_batch_state"):
             return "pending prompt work may still merge into this batch"
+        if (
+            _rowwise_batch_mtp_override() is None
+            and len(uids) == 2
+            and _is_qwen4_exp_model(getattr(gen_batch, "model", None))
+            and _batch_wants_api_logprobs(gen_batch)
+        ):
+            return "row-wise batch MTP does not serve API logprobs requests"
         if getattr(
             gen_batch, "_omlx_mtp_batch_state", None
-        ) is None and not _rowwise_batch_mtp_enabled():
+        ) is None and not _rowwise_batch_mtp_enabled(gen_batch):
             return (
-                f"row-wise batch MTP is opt-in ({_ROWWISE_BATCH_MTP_ENV}=1); "
-                "standard batched decode is faster at batch >= 2"
+                f"row-wise batch MTP is disabled by policy "
+                f"(set {_ROWWISE_BATCH_MTP_ENV}=1 to force); "
+                "generic models use standard batched decode"
             )
         return ""
     if not _allows_new_mtp_activation(gen_batch, "_omlx_mtp_state"):
