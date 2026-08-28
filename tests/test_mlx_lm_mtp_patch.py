@@ -1703,6 +1703,172 @@ class TestBatchGeneratorDispatch:
         assert batch._omlx_mtp_state is state
         assert batch._next_tokens.tolist() == [999]
 
+    def test_qwen4_late_join_promotes_qsa_then_both_rows_finish_standard(
+        self, monkeypatch
+    ):
+        """Regression for the QSA late-join recovery loop seen on hardware.
+
+        The active MTP row hands off exactly at a one-token queue boundary.
+        Extending it with the newly-prefilled row must promote both singleton
+        QSA caches through ``to_batch`` before standard B2 decode.  In
+        particular, this must never call a nonexistent ``QSAKVCache.extend``
+        or re-enter singleton MTP while two rows are alive.
+        """
+        from collections import deque
+
+        import mlx.core as mx
+        from mlx_lm.generate import GenerationBatch, SequenceStateMachine
+        from mlx_lm.models.cache import TokenBuffer
+
+        from omlx.patches.mlx_lm_mtp import (
+            apply_mlx_lm_mtp_patch,
+            batch_generator as bg,
+        )
+        from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+            apply_mlx_vlm_qwen4_exp_compat_patch,
+        )
+
+        apply_mlx_vlm_qwen4_exp_compat_patch()
+        import omlx.scheduler  # noqa: F401  (cache promotion hooks)
+
+        apply_mlx_lm_mtp_patch()
+        from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache, QSAKVCache
+
+        monkeypatch.delenv("OMLX_MTP_ROWWISE_BATCH", raising=False)
+        monkeypatch.setattr(
+            bg,
+            "_post_init_mtp",
+            lambda *_: pytest.fail("multi-row late join re-entered singleton MTP"),
+        )
+
+        def make_qsa(length, base):
+            cache = QSAKVCache()
+            cache.state = (
+                mx.arange(base, base + 8 * length, dtype=mx.float32).reshape(
+                    1, 2, length, 4
+                ),
+                mx.arange(
+                    base + 1000,
+                    base + 1000 + 8 * length,
+                    dtype=mx.float32,
+                ).reshape(1, 2, length, 4),
+                mx.arange(
+                    base + 2000,
+                    base + 2000 + 3 * length,
+                    dtype=mx.float32,
+                ).reshape(1, length, 3),
+                mx.stack(
+                    [
+                        mx.arange(
+                            base + 3000 + 100 * i,
+                            base + 3000 + 100 * i + length,
+                        )
+                        for i in range(3)
+                    ],
+                    axis=0,
+                )[:, None, :].astype(mx.int32),
+            )
+            return cache
+
+        class Model:
+            mtp = object()
+            _omlx_mtp_decode_enabled = True
+
+            @staticmethod
+            def mtp_forward(*_args, **_kwargs):
+                raise AssertionError("standard B2 must not call the MTP head")
+
+            def __call__(self, inputs, cache):
+                qsa = cache[0]
+                assert isinstance(qsa, BatchQSAKVCache)
+                batch_size = int(inputs.shape[0])
+                qsa.update_and_fetch(
+                    mx.zeros((batch_size, 2, 1, 4), dtype=mx.float32),
+                    mx.zeros((batch_size, 2, 1, 4), dtype=mx.float32),
+                )
+                qsa.update_indexer(
+                    mx.zeros((batch_size, 1, 3), dtype=mx.float32),
+                    mx.zeros((batch_size, 1), dtype=mx.int32),
+                )
+                logits = mx.full((batch_size, 1, 64), -100.0)
+                logits[:, :, 7] = 0.0
+                return logits
+
+        model = Model()
+        matcher_a = SequenceStateMachine()
+        matcher_b = SequenceStateMachine()
+        logprobs = mx.zeros((64,))
+
+        def greedy(values):
+            return mx.argmax(values, axis=-1).astype(mx.uint32)
+
+        host = GenerationBatch.__new__(GenerationBatch)
+        host.model = model
+        host.uids = [1]
+        host.prompt_cache = [make_qsa(4, 10)]
+        host.tokens = [[10, 11, 12, 13]]
+        host.samplers = [None]
+        host.fallback_sampler = greedy
+        host.logits_processors = [[]]
+        host.state_machines = [matcher_a]
+        host.max_tokens = [1]
+        host._current_tokens = None
+        host._current_logprobs = []
+        host._next_tokens = mx.array([999], dtype=mx.uint32)
+        host._next_logprobs = []
+        host._token_context = [TokenBuffer(host.tokens[0])]
+        host._num_tokens = [0]
+        host._matcher_states = [matcher_a.make_state()]
+        host._omlx_mtp_activation_safe = False
+        host._omlx_mtp_state = bg._MtpState(
+            uid=1,
+            chain=True,
+            depth=5,
+            queue=deque([(42, logprobs, "draft")]),
+        )
+
+        donor = GenerationBatch.__new__(GenerationBatch)
+        donor.model = model
+        donor.uids = [2]
+        donor.prompt_cache = [make_qsa(2, 50)]
+        donor.tokens = [[20, 21]]
+        donor.samplers = [None]
+        donor.fallback_sampler = greedy
+        donor.logits_processors = [[]]
+        donor.state_machines = [matcher_b]
+        donor.max_tokens = [1]
+        donor._current_tokens = None
+        donor._current_logprobs = []
+        donor._next_tokens = mx.array([24], dtype=mx.uint32)
+        donor._next_logprobs = [logprobs]
+        donor._token_context = [TokenBuffer(donor.tokens[0])]
+        donor._num_tokens = [0]
+        donor._matcher_states = [matcher_b.make_state()]
+
+        state = host._omlx_mtp_state
+        assert bg._handoff_mtp_for_late_join(host, state) is True
+        assert host._next_tokens.tolist() == [42]
+        assert not hasattr(host, "_omlx_mtp_state")
+
+        GenerationBatch.extend(host, donor)
+        assert host.uids == [1, 2]
+        assert isinstance(host.prompt_cache[0], BatchQSAKVCache)
+        assert host.prompt_cache[0].offset.tolist() == [4, 2]
+        assert host.prompt_cache[0].left_padding.tolist() == [0, 2]
+
+        responses = GenerationBatch.next(host)
+        assert [(r.uid, r.token, r.finish_reason) for r in responses] == [
+            (1, 42, "length"),
+            (2, 24, "length"),
+        ]
+        finished_qsa = [response.prompt_cache[0] for response in responses]
+        mx.eval(*(cache.state for cache in finished_qsa))
+        assert [cache.offset for cache in finished_qsa] == [5, 3]
+        assert [cache.index_keys.shape[1] for cache in finished_qsa] == [5, 3]
+        assert [cache.index_position_ids.ndim for cache in finished_qsa] == [3, 3]
+        assert host.uids == []
+        assert host.prompt_cache == []
+
     def test_performance_park_starts_reentry_cooldown(self, monkeypatch):
         import mlx.core as mx
 

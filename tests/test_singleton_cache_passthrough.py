@@ -35,6 +35,37 @@ def _tq_cache(length: int) -> TurboQuantKVCache:
     return cache
 
 
+def _qsa_cache(length: int, base: int = 0):
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+        apply_mlx_vlm_qwen4_exp_compat_patch,
+    )
+
+    apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+
+    cache = QSAKVCache()
+    cache.state = (
+        mx.arange(base, base + 8 * length, dtype=mx.float32).reshape(
+            1, 2, length, 4
+        ),
+        mx.arange(base + 1000, base + 1000 + 8 * length, dtype=mx.float32).reshape(
+            1, 2, length, 4
+        ),
+        mx.arange(base + 2000, base + 2000 + 3 * length, dtype=mx.float32).reshape(
+            1, length, 3
+        ),
+        mx.stack(
+            [
+                mx.arange(base + 3000 + axis * 100, base + 3000 + axis * 100 + length)
+                for axis in range(3)
+            ],
+            axis=0,
+        )[:, None, :].astype(mx.int32),
+    )
+    mx.eval(cache.state)
+    return cache
+
+
 def test_singleton_merge_preserves_regular_cache_objects():
     gen = importlib.import_module("mlx_lm.generate")
     arrays = _arrays_cache()
@@ -81,6 +112,58 @@ def test_extend_converts_plain_turboquant_to_batched_cache():
     assert isinstance(batch_tq, BatchTurboQuantKVCache)
     assert batch_tq.offset.tolist() == [4, 2]
     assert batch_tq.left_padding.tolist() == [0, 2]
+
+
+def test_extend_promotes_model_owned_qsa_cache_without_losing_mrope_state():
+    """A second request must use QSA's model-owned batch conversion hook."""
+    gen = importlib.import_module("mlx_lm.generate")
+    host = _qsa_cache(4, base=10)
+    donor = _qsa_cache(2, base=50)
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache
+
+    host_state = host.state
+    donor_state = donor.state
+
+    # The one-row optimization intentionally leaves QSA in its native
+    # singleton representation until a real late join arrives.
+    assert gen._merge_caches([[host]])[0] is host
+
+    batch = gen._extend_cache([host], [donor])[0]
+    mx.eval(batch.state)
+
+    assert isinstance(batch, BatchQSAKVCache)
+    assert batch.offset.tolist() == [4, 2]
+    assert batch.left_padding.tolist() == [0, 2]
+    assert batch.index_offset == 4
+
+    restored_host = batch.extract(0)
+    restored_donor = batch.extract(1)
+    mx.eval(restored_host.state, restored_donor.state)
+    for actual, expected in zip(restored_host.state, host_state):
+        assert mx.array_equal(actual, expected).item()
+    for actual, expected in zip(restored_donor.state, donor_state):
+        assert mx.array_equal(actual, expected).item()
+
+
+def test_qsa_direct_merge_round_trips_unequal_rows_and_mrope_positions():
+    first = _qsa_cache(3, base=100)
+    second = _qsa_cache(5, base=200)
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache
+
+    first_state = first.state
+    second_state = second.state
+
+    batch = BatchQSAKVCache.merge([first, second])
+    mx.eval(batch.state)
+    assert batch.offset.tolist() == [3, 5]
+    assert batch.left_padding.tolist() == [2, 0]
+
+    round_tripped = [batch.extract(0), batch.extract(1)]
+    mx.eval(*(cache.state for cache in round_tripped))
+    for actual, expected in zip(round_tripped[0].state, first_state):
+        assert mx.array_equal(actual, expected).item()
+    for actual, expected in zip(round_tripped[1].state, second_state):
+        assert mx.array_equal(actual, expected).item()
 
 
 def test_extend_keeps_arrays_cache_in_place():

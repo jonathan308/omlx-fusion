@@ -1186,6 +1186,15 @@ def _to_batched_cache_layer(cache_obj: Any) -> Any:
         if all(a is b for a, b in zip(sub_caches, converted)):
             return cache_obj
         return type(cache_obj)(*converted)
+    # Model-owned caches can deliberately stay in their faster singleton
+    # representation while only one request is active.  Honor the same
+    # conversion hook used by ``_patched_make_cache`` when a late join turns
+    # that singleton into a real batch.  Qwen4's QSA cache is the motivating
+    # case: the singleton owns additional indexer keys/MRoPE positions and
+    # only ``to_batch`` can carry those into BatchQSAKVCache losslessly.
+    to_batch = getattr(cache_obj, "to_batch", None)
+    if callable(to_batch):
+        return to_batch([0])
     if isinstance(cache_obj, _REGULAR_SINGLETON_CACHE_TYPES):
         return cache_obj.merge([cache_obj])
     if (
