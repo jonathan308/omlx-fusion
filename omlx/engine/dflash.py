@@ -1438,6 +1438,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         queue: asyncio.Queue,
         loop: asyncio.AbstractEventLoop,
         stop_event: threading.Event,
+        activity_id: str,
     ) -> None:
         """Run dflash generation with streaming on MLX executor thread.
 
@@ -1532,6 +1533,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     detokenizer.reset()
 
             for event in event_iter:
+                # Prefill/cycle events are real forward progress even when no
+                # output token is ready yet. Keep the admin activity heartbeat
+                # fresh so long DFlash prefill is not painted amber/red as a
+                # stalled request.
+                self._update_activity(activity_id)
                 if stop_event.is_set():
                     logger.info("DFlash generation aborted by client")
                     break
@@ -1774,6 +1780,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 parser_final = None
                 parser_output_text = ""
                 for event in event_iter:
+                    # DFlash emits prefill and cycle events between tokens.
+                    # Treat every event as activity so the dashboard's
+                    # last-progress indicator reflects compute, not token gaps.
+                    self._update_activity(activity_id)
                     if stop_event.is_set():
                         logger.info("DFlash generation aborted by client")
                         break
@@ -2032,6 +2042,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             queue,
             loop,
             stop_event,
+            activity_id,
         )
 
         total_text = ""

@@ -1727,6 +1727,7 @@ class TestDFlashOutputParserWiring:
         )
         queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
+        engine._update_activity = MagicMock()
 
         await asyncio.to_thread(
             engine._run_generate_streaming,
@@ -1743,6 +1744,7 @@ class TestDFlashOutputParserWiring:
             queue,
             loop,
             threading.Event(),
+            "activity-id",
         )
         queued = []
         while True:
@@ -1763,6 +1765,8 @@ class TestDFlashOutputParserWiring:
         parser.finalize.assert_called_once_with()
         assert event_iter.close_calls == 1
         engine._end_runtime_cache_request.assert_called_once_with(cache_manager)
+        assert engine._update_activity.call_count == 2
+        engine._update_activity.assert_called_with("activity-id")
 
     @pytest.mark.asyncio
     async def test_streaming_without_parser_keeps_token_and_summary_behavior(
