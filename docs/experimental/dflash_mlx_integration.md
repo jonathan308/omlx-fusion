@@ -129,7 +129,9 @@ DSA `CacheList(KVCache, PoolingCache)`. Image/video requests retain the normal
 evict-and-VLM-fallback behavior. DDTree, target KV quantization, specialized
 verify linears, and DFlash L1/L2 prefix snapshots are disabled for this target
 until their GLM composite-cache and numerical-parity suites pass. Adaptive
-linear DFlash verification remains available. The published checkpoint is
+linear DFlash verification remains available. Cold prefill still follows the
+runtime `prefill_step_size`; chunking is kept independent from snapshot
+hydration or publication for this target. The published checkpoint is
 CC BY-NC-ND 4.0; oMLX neither bundles nor automatically downloads its weights.
 
 ### Per-model settings

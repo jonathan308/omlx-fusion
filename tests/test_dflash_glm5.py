@@ -236,11 +236,15 @@ def test_backend_install_is_idempotent_and_registers_before_resolution():
     from omlx.patches.dflash_glm5 import (
         _BACKEND_PATH,
         install_dflash_glm5_backend,
+        restore_glm5_dflash_class_patches,
     )
 
-    install_dflash_glm5_backend()
-    install_dflash_glm5_backend()
-    assert target_ops.TARGET_BACKENDS.count(_BACKEND_PATH) == 1
+    try:
+        install_dflash_glm5_backend()
+        install_dflash_glm5_backend()
+        assert target_ops.TARGET_BACKENDS.count(_BACKEND_PATH) == 1
+    finally:
+        restore_glm5_dflash_class_patches()
 
 
 def test_verify_block_scopes_pooling_undo_gate_even_on_error(monkeypatch):
@@ -264,7 +268,12 @@ def test_verify_block_scopes_pooling_undo_gate_even_on_error(monkeypatch):
 
 
 def test_shared_lifecycle_restore_removes_glm_hook_without_qwen_backups():
-    from omlx.patches.dflash_glm5 import _install_glm5_recurrent_hook
+    from dflash_mlx.engine.spec_epoch import SpeculativeSession
+
+    from omlx.patches.dflash_glm5 import (
+        _install_glm5_prefill_chunking_bridge,
+        _install_glm5_recurrent_hook,
+    )
     from omlx.patches.dflash_lifecycle import restore_dflash_class_patches
 
     class Attention:
@@ -272,10 +281,230 @@ def test_shared_lifecycle_restore_removes_glm_hook_without_qwen_backups():
             return inputs
 
     original = Attention.__call__
+    original_prefill = SpeculativeSession._run_prefill_events
     _install_glm5_recurrent_hook(Attention())
+    _install_glm5_prefill_chunking_bridge()
     assert Attention.__call__ is not original
+    assert SpeculativeSession._run_prefill_events is not original_prefill
     restore_dflash_class_patches()
     assert Attention.__call__ is original
+    assert SpeculativeSession._run_prefill_events is original_prefill
+
+
+def _run_fake_prefill(*, backend_name: str, prompt_len: int = 11):
+    from dflash_mlx.engine.spec_epoch import (
+        SpeculativeSession,
+        _RequestState,
+        _SessionRequest,
+        _YieldPauseTracker,
+    )
+
+    calls = []
+
+    class TargetOps:
+        def __init__(self):
+            self.backend_name = backend_name
+
+        def forward_with_hidden_capture(
+            self,
+            target_model,
+            *,
+            input_ids,
+            cache,
+            capture_layer_ids,
+            logits_last_only,
+        ):
+            del target_model, cache, capture_layer_ids, logits_last_only
+            width = int(input_ids.shape[1])
+            calls.append(width)
+            return (
+                mx.zeros((1, 1, 16), dtype=mx.float32),
+                {1: mx.zeros((1, width, 2), dtype=mx.float32)},
+            )
+
+        def extract_context_feature(self, captured, target_layer_ids):
+            del target_layer_ids
+            return captured[1]
+
+    class Draft:
+        @staticmethod
+        def project_target_hidden(features):
+            return features
+
+    class SnapshotTrap:
+        active = True
+
+        def should_publish_frontier(self, *_args, **_kwargs):
+            raise AssertionError("GLM prefill must not consult snapshot publication")
+
+        def publish(self, *_args, **_kwargs):
+            raise AssertionError("GLM prefill must not publish a snapshot")
+
+    session = SpeculativeSession(
+        target_model=object(),
+        draft_model=Draft(),
+        target_ops=TargetOps(),
+        target_cache=[],
+        draft_cache=[],
+        draft_backend=object(),
+        runtime_config=SimpleNamespace(prefill_step_size=4),
+        quantize_kv_cache=False,
+        snap_prefix_len=0,
+        supports_prefix_snapshot=False,
+        allow_full_context_draft_layers=False,
+        draft_sink_size=0,
+        draft_window_size=0,
+        target_layer_id_list=[0],
+        capture_layer_ids={1},
+        profile_cycles=False,
+        memory_waterfall=False,
+        clear_cache_boundaries=False,
+        target_fa_window=0,
+        copyspec_index=object(),
+        copyspec_mode="off",
+    )
+    request = _SessionRequest.from_tokens(
+        prompt_tokens=list(range(prompt_len)),
+        max_new_tokens=0,
+        block_tokens=1,
+        stop_token_ids=None,
+        suppress_token_ids=None,
+        prefix_snapshot=object(),
+        snapshot_service=SnapshotTrap(),
+        stable_prefix_len=5,
+        prefix_cache_active=True,
+        publish_generation_snapshot=True,
+    )
+    generator = session._run_prefill_events(
+        request=request,
+        state=_RequestState(),
+        yield_pause=_YieldPauseTracker(enabled=False),
+    )
+    while True:
+        try:
+            next(generator)
+        except StopIteration as stopped:
+            return calls, stopped.value, session
+
+
+def test_glm_prefill_chunks_without_enabling_snapshots():
+    from omlx.patches.dflash_glm5 import (
+        _install_glm5_prefill_chunking_bridge,
+        restore_glm5_dflash_class_patches,
+    )
+
+    _install_glm5_prefill_chunking_bridge()
+    try:
+        calls, result, session = _run_fake_prefill(backend_name="glm5_next")
+        assert calls == [4, 4, 2, 1]
+        assert result.supports_prefix_snapshot is False
+        assert session.supports_prefix_snapshot is False
+    finally:
+        restore_glm5_dflash_class_patches()
+
+
+def test_glm_prefill_bridge_never_enables_snapshot_hydration(monkeypatch):
+    from dflash_mlx.engine import spec_epoch
+    from dflash_mlx.engine.spec_epoch import SpeculativeSession
+    from dflash_mlx.runtime.context import build_offline_runtime_context
+
+    from omlx.patches.dflash_glm5 import (
+        _install_glm5_prefill_chunking_bridge,
+        restore_glm5_dflash_class_patches,
+    )
+
+    class TargetOps:
+        @staticmethod
+        def make_cache(*_args, **_kwargs):
+            return []
+
+    class DraftBackend:
+        @staticmethod
+        def make_cache(**_kwargs):
+            return []
+
+    draft = SimpleNamespace(
+        args=SimpleNamespace(sliding_window=0, layer_types=()),
+        target_layer_ids=[0],
+    )
+    snapshot = SimpleNamespace(prefix_len=1, token_ids=(7,))
+    monkeypatch.setattr(
+        spec_epoch,
+        "hydrate_target_cache",
+        lambda *_args, **_kwargs: pytest.fail("GLM snapshots must never hydrate"),
+    )
+
+    _install_glm5_prefill_chunking_bridge()
+    try:
+        session = SpeculativeSession.open(
+            target_model=object(),
+            draft_model=draft,
+            draft_backend=DraftBackend(),
+            target_ops=TargetOps(),
+            supports_prefix_snapshot=False,
+            allow_full_context_draft_layers=False,
+            prompt_tokens=[7, 8],
+            max_new_tokens=1,
+            prefix_snapshot=snapshot,
+            quantize_kv_cache=False,
+            target_fa_window=0,
+            runtime_context=build_offline_runtime_context(),
+        )
+        assert session.snap_prefix_len == 0
+        assert session.supports_prefix_snapshot is False
+    finally:
+        restore_glm5_dflash_class_patches()
+
+
+def test_glm_prefill_bridge_leaves_non_glm_behavior_unchanged():
+    from omlx.patches.dflash_glm5 import (
+        _install_glm5_prefill_chunking_bridge,
+        restore_glm5_dflash_class_patches,
+    )
+
+    _install_glm5_prefill_chunking_bridge()
+    try:
+        calls, result, session = _run_fake_prefill(backend_name="qwen_gdn")
+        assert calls == [11]
+        assert result.supports_prefix_snapshot is False
+        assert session.supports_prefix_snapshot is False
+    finally:
+        restore_glm5_dflash_class_patches()
+
+
+def test_fully_accepted_cycle_clears_pooling_undo_without_changing_state():
+    from mlx_lm.models.cache import CacheList, KVCache
+
+    from omlx.patches.deepseek_v4 import apply_pooling_cache_support
+    from omlx.patches.dflash_glm5 import Glm5NextTargetOps
+    from omlx.patches.mlx_lm_mtp import cache_rollback
+
+    apply_pooling_cache_support()
+    from mlx_lm.models.cache import PoolingCache
+
+    cache = CacheList(KVCache(), PoolingCache(4))
+    keys = mx.ones((1, 1, 1, 3), dtype=mx.float32)
+    values = mx.zeros((1, 1, 1, 0), dtype=mx.float32)
+    cache[0].update_and_fetch(keys, values)
+    cache_rollback.set_undo_armed(True)
+    try:
+        kv = mx.ones((1, 1, 3), dtype=mx.float32)
+        gate = mx.ones((1, 1, 1), dtype=mx.float32)
+        cache[1].accumulate_windows(kv, gate, 0)
+    finally:
+        cache_rollback.set_undo_armed(False)
+    state_before = cache.state
+    assert cache[1]._undo is not None
+    assert cache[1]._undo_chain is True
+
+    Glm5NextTargetOps().restore_after_acceptance(
+        [cache], target_len=1, acceptance_length=0, drafted_tokens=0
+    )
+    assert cache[1]._undo is None
+    assert cache[1]._undo_chain is False
+    assert cache[0].offset == 1
+    for before, after in zip(state_before[0], cache[0].state, strict=True):
+        assert mx.array_equal(before, after).item()
 
 
 def test_glm_target_loader_prefers_omlx_custom_vlm_loader(tmp_path, monkeypatch):
