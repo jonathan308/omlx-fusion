@@ -1132,12 +1132,21 @@ def _parsed_plan(deployment: ClusterDeployment, tmp_path):
 
 
 def test_prompt_cache_ssd_reaches_the_rank_and_scopes_its_directory(tmp_path):
+    from dataclasses import replace
+
     from omlx.cluster.inference_worker import _prompt_cache_ssd_dir
 
-    deployment = _deployment()
+    # Off by default: the flag only rides the one argv every host runs when
+    # the plan opted in (OMLX_CLUSTER_PROMPT_CACHE_SSD at plan time).
+    plain_argv = _worker_argv(_deployment(), tmp_path)
+    assert "--prompt-cache-ssd" not in plain_argv
+
+    deployment = replace(
+        _deployment(),
+        execution=replace(_deployment().execution, prompt_cache_ssd=True),
+    )
     args, _plan_hash, _assignments = _parsed_plan(deployment, tmp_path)
 
-    # On by default: the flag rides the one argv every host runs.
     assert "--prompt-cache-ssd" in _worker_argv(deployment, tmp_path)
     assert args.prompt_cache_ssd is True
 

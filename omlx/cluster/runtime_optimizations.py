@@ -767,6 +767,16 @@ def install_runtime_optimizations(
             active=rank_zero_logits_active,
             reason=rank_zero_logits_reason,
         ),
+        "prefill_skip_logits": _capability(
+            enabled=rank_zero_logits_supported,
+            active=prefill_active and rank_zero_logits_active,
+            reason=(
+                "staggered prefill skips the discarded vocabulary projection "
+                "on every chunk"
+                if rank_zero_logits_supported
+                else rank_zero_logits_reason
+            ),
+        ),
         "async_overlap": _capability(
             enabled=execution.async_overlap,
             active=execution.async_overlap and native_async,
@@ -1065,10 +1075,23 @@ def install_runtime_optimizations(
                         mx.async_eval(pending_cancel)
                     local_state.queue_prefill_sends = True
                     try:
-                        instance.model(
-                            tokens_array[:, slot.start : slot.end],
-                            cache=instance.prompt_cache,
-                        )
+                        # The prompt loop never consumes the returned logits
+                        # (the first sampled token comes from the generation
+                        # step that follows), so a model declaring the
+                        # rank-zero logits contract skips the vocabulary
+                        # projection on every chunk, not just on worker-rank
+                        # decode steps.
+                        if rank_zero_logits_active:
+                            instance.model(
+                                tokens_array[:, slot.start : slot.end],
+                                cache=instance.prompt_cache,
+                                skip_logits=True,
+                            )
+                        else:
+                            instance.model(
+                                tokens_array[:, slot.start : slot.end],
+                                cache=instance.prompt_cache,
+                            )
                     finally:
                         local_state.queue_prefill_sends = False
                     flush_prefill_sends()

@@ -228,6 +228,68 @@ def test_kv_tier_is_a_plan_field_and_rejects_byte_budget_eviction(monkeypatch):
         replace(tuned, prompt_cache_bytes=8 * 1024**3)
 
 
+# --- SSD boundary-snapshot cache: plan-level opt-in, default off -------------
+
+
+def test_prompt_cache_ssd_defaults_off_and_opts_in_through_the_plan(monkeypatch):
+    monkeypatch.delenv("OMLX_CLUSTER_PROMPT_CACHE_SSD", raising=False)
+    assignments = [SimpleNamespace(headroom_bytes=40 * 1024**3)]
+
+    # The dataclass default is off too: the synchronous per-boundary extract
+    # and safetensors write run on the serving thread mid-prefill.
+    assert execution_profile("balanced").prompt_cache_ssd is False
+
+    tuned = tune_execution_settings(
+        execution_profile("balanced"), assignments, backend="jaccl"
+    )
+    assert tuned.prompt_cache_ssd is False
+    assert "SSD boundary-snapshot" not in tuned.tuning_reason
+
+    # The untuned branch resolves the same env, so a plan cannot drift rank
+    # to rank — the boundary restore vote is a collective.
+    untuned = tune_execution_settings(
+        execution_profile("balanced", auto_tune=False),
+        assignments,
+        backend="jaccl",
+    )
+    assert untuned.prompt_cache_ssd is False
+
+    monkeypatch.setenv("OMLX_CLUSTER_PROMPT_CACHE_SSD", "1")
+    enabled = tune_execution_settings(
+        execution_profile("balanced"), assignments, backend="jaccl"
+    )
+    assert enabled.prompt_cache_ssd is True
+    assert "SSD boundary-snapshot cache" in enabled.tuning_reason
+    assert ExecutionSettings.from_dict(enabled.to_dict()).prompt_cache_ssd is True
+
+
+def test_prompt_cache_ssd_explicit_env_off_beats_the_settings_field(monkeypatch):
+    monkeypatch.setenv("OMLX_CLUSTER_PROMPT_CACHE_SSD", "off")
+    requested = replace(execution_profile("balanced"), prompt_cache_ssd=True)
+
+    tuned = tune_execution_settings(
+        requested,
+        [SimpleNamespace(headroom_bytes=40 * 1024**3)],
+        backend="jaccl",
+    )
+
+    assert tuned.prompt_cache_ssd is False
+
+
+def test_prompt_cache_ssd_signed_plan_payload_stays_authoritative():
+    # A plan dict is deserialized verbatim: an older signed plan that opted in
+    # still opts in, a missing key falls back to the (off) profile default.
+    assert (
+        ExecutionSettings.from_dict(
+            {"profile": "balanced", "prompt_cache_ssd": True}
+        ).prompt_cache_ssd
+        is True
+    )
+    assert ExecutionSettings.from_dict({"profile": "balanced"}).prompt_cache_ssd is (
+        False
+    )
+
+
 def test_performance_profiles_reject_nonfinite_measurements():
     payload = _profile("node", 0, 10).to_dict()
     payload["decode_weight_bytes_per_second"] = float("nan")
@@ -668,6 +730,109 @@ def test_staggered_prompt_matches_stock_chunking_padding_and_cache_lifecycle(
     assert [len(chunk[0]) for chunk in patched.model.seen] == [8, 1]
     assert patched.tokens == stock.tokens == prompts
     assert patched.prompt_cache[0].events == stock.prompt_cache[0].events
+
+
+def test_staggered_prompt_skips_discarded_logits_when_adapter_allows(monkeypatch):
+    """The prompt loop never samples from its return value, so a model
+    declaring the rank-zero logits contract skips the vocabulary projection
+    on every prefill chunk."""
+
+    monkeypatch.setattr(mx.distributed, "send", lambda value, *_a, **_k: value)
+    monkeypatch.setattr(mx.distributed, "all_gather", lambda value, **_k: value)
+    monkeypatch.setattr(mx.distributed, "all_sum", lambda value, group=None: value)
+    monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
+
+    class Cache:
+        state = mx.array([0])
+
+    class SkipLogitsModel:
+        _omlx_supports_rank_zero_logits = True
+        _omlx_output_vocab_size = 32
+
+        def __init__(self):
+            self.model = _ValidatedPipeline()
+            self.model.pipeline_rank = 1
+            self.calls = []
+
+        def __call__(self, value, cache=None, skip_logits=False):
+            self.calls.append(skip_logits)
+            return self.model(value, cache=cache)
+
+    class Batch:
+        uids = ["request"]
+        tokens = [[]]
+        prompt_cache = [Cache()]
+        prefill_step_size = 8
+
+        def __init__(self, model):
+            self.model = model
+
+    model = SkipLogitsModel()
+    settings = replace(
+        execution_profile("balanced"),
+        sampling_rank_only=True,
+        async_overlap=True,
+        prefill_step_size=8,
+    )
+
+    with install_runtime_optimizations(
+        model,
+        _Group(),
+        settings,
+        batchable=True,
+    ) as capabilities:
+        assert capabilities["prefill_skip_logits"]["active"] is True
+        mlx_generate.PromptProcessingBatch.prompt(
+            Batch(model),
+            [list(range(9))],
+        )
+
+    # Nine tokens at an eight-token step: two chunks, both skip the head.
+    assert model.calls == [True, True]
+
+
+def test_staggered_prompt_keeps_the_head_without_adapter_contract(monkeypatch):
+    """No rank-zero logits contract, no skip_logits kwarg: an adapter whose
+    forward rejects the keyword must run exactly as before."""
+
+    monkeypatch.setattr(mx.distributed, "send", lambda value, *_a, **_k: value)
+    monkeypatch.setattr(mx.distributed, "all_gather", lambda value, **_k: value)
+    monkeypatch.setattr(mx.distributed, "all_sum", lambda value, group=None: value)
+    monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
+
+    class Cache:
+        state = mx.array([0])
+
+    class Batch:
+        uids = ["request"]
+        tokens = [[]]
+        prompt_cache = [Cache()]
+        prefill_step_size = 8
+
+        def __init__(self):
+            # _ValidatedPipeline.__call__ takes no skip_logits kwarg, so a
+            # wrongful pass would raise TypeError here.
+            self.model = _ValidatedPipeline()
+            self.model.pipeline_rank = 1
+
+    batch = Batch()
+    settings = replace(
+        execution_profile("balanced"),
+        sampling_rank_only=True,
+        async_overlap=True,
+        prefill_step_size=8,
+    )
+
+    with install_runtime_optimizations(
+        SimpleNamespace(model=_ValidatedPipeline()),
+        _Group(),
+        settings,
+        batchable=True,
+    ) as capabilities:
+        assert capabilities["prefill_skip_logits"]["active"] is False
+        mlx_generate.PromptProcessingBatch.prompt(batch, [list(range(9))])
+
+    assert [len(chunk[0]) for chunk in batch.model.seen] == [8, 1]
 
 
 def _run_staggered_prompt(monkeypatch, cache_memory_bytes, memory_limit_bytes=0):

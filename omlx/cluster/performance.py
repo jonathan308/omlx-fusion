@@ -28,6 +28,7 @@ _GIB = 1024**3
 # omlx/cluster/kv_tier.py and omlx/cluster/inference_worker.py.
 PROMPT_CACHE_SIZE_ENV = "OMLX_CLUSTER_PROMPT_CACHE_SIZE"
 KV_TIER_ENV = "OMLX_CLUSTER_KV_TIER"
+PROMPT_CACHE_SSD_ENV = "OMLX_CLUSTER_PROMPT_CACHE_SSD"
 
 # The prompt-cache slot count is the cluster's only cache-capacity bound (byte
 # budgets diverge unequal ranks — see tune_execution_settings), so an override
@@ -61,6 +62,24 @@ def _plan_kv_tier_enabled() -> bool:
     """Whether the plan opts into the durable rank-local KV tier."""
 
     return os.environ.get(KV_TIER_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _plan_prompt_cache_ssd_enabled() -> bool:
+    """Whether the plan opts into the SSD boundary-snapshot prompt cache.
+
+    Default off: the snapshot store extracts and writes its boundary files
+    synchronously on the serving thread at every prefill step boundary, which
+    measurably stalls a long distributed prefill. An operator who wants the
+    reuse for non-sliceable models opts the whole plan in here; read once at
+    plan time, so every rank's signed argv agrees.
+    """
+
+    return os.environ.get(PROMPT_CACHE_SSD_ENV, "").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -215,8 +234,12 @@ class ExecutionSettings:
     cache_affinity: bool = True
     # Snapshot the prompt cache to SSD at prefill boundaries so a model whose
     # per-layer state cannot be sliced (rotating window, gated-delta-net) still
-    # reuses a long prefix across requests instead of recomputing it.
-    prompt_cache_ssd: bool = True
+    # reuses a long prefix across requests instead of recomputing it. Default
+    # off: the boundary extract and safetensors write run synchronously on the
+    # serving thread at every prefill step boundary, which stalls a long
+    # distributed prefill far more than the recomputation it saves. Opt the
+    # plan in with OMLX_CLUSTER_PROMPT_CACHE_SSD (see tune_execution_settings).
+    prompt_cache_ssd: bool = False
     sampling_rank_only: bool = True
     async_overlap: bool = True
     ring_connections_per_ip: int = 2
@@ -385,10 +408,18 @@ def tune_execution_settings(
     and eviction there stay rank-local and collective-free, reconciled by a
     min-prefix vote between requests — never inside the decode/pipeline
     collectives.
+
+    ``OMLX_CLUSTER_PROMPT_CACHE_SSD`` opts the plan into the boundary-snapshot
+    prompt cache (omlx/cluster/prompt_snapshot_cache.py). It defaults off —
+    its per-boundary extract and write run on the serving thread mid-prefill —
+    and is resolved here, at plan time, so every rank's argv agrees: the
+    boundary restore vote is a collective and would hang on a rank whose store
+    was configured differently.
     """
 
     cache_size_override = _plan_prompt_cache_size()
     kv_tier = _plan_kv_tier_enabled()
+    prompt_cache_ssd = _plan_prompt_cache_ssd_enabled()
 
     def cache_reason(size: int) -> str:
         if size <= 1:
@@ -402,9 +433,11 @@ def tune_execution_settings(
             prompt_cache_size=cache_size,
             prompt_cache_bytes=None,
             kv_tier=kv_tier,
+            prompt_cache_ssd=prompt_cache_ssd,
             tuning_reason=(
                 f"{settings.tuning_reason}; {cache_reason(cache_size)}"
                 + ("; rank-local KV tier" if kv_tier else "")
+                + ("; SSD boundary-snapshot cache" if prompt_cache_ssd else "")
             ),
         )
     minimum_headroom = min(
@@ -446,6 +479,7 @@ def tune_execution_settings(
         prompt_cache_size=cache_size,
         prompt_cache_bytes=None,
         kv_tier=kv_tier,
+        prompt_cache_ssd=prompt_cache_ssd,
         pipeline_microbatch_size=microbatch,
         ring_connections_per_ip=connections,
         tuning_reason=(
@@ -453,6 +487,7 @@ def tune_execution_settings(
             f"minimum stage headroom {minimum_headroom / _GIB:.2f} GiB; "
             f"{cache_reason(cache_size)}"
             + ("; rank-local KV tier" if kv_tier else "")
+            + ("; SSD boundary-snapshot cache" if prompt_cache_ssd else "")
         ),
     )
 
