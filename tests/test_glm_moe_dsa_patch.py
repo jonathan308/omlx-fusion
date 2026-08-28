@@ -232,6 +232,51 @@ def test_glm_adaptive_prefill_config_defaults_and_gates(monkeypatch):
     assert _glm_dsa_adaptive_prefill_config(model, 2048) is None
 
 
+def test_glm5_adaptive_prefill_requires_complete_native_sparse_route(monkeypatch):
+    from omlx.patches.glm_moe_dsa import generate_patch
+
+    model = SimpleNamespace(model_type="glm5_next")
+    monkeypatch.setattr(
+        generate_patch, "_glm5_native_sparse_available", lambda _model: False
+    )
+    monkeypatch.setenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP", "1")
+    assert generate_patch._glm_dsa_adaptive_prefill_config(model, 2048) is None
+
+    monkeypatch.setattr(
+        generate_patch, "_glm5_native_sparse_available", lambda _model: True
+    )
+    cfg = generate_patch._glm_dsa_adaptive_prefill_config(model, 2048)
+    assert cfg is not None
+    assert cfg.step_size == 8192
+
+    monkeypatch.delenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP")
+    assert generate_patch._glm_dsa_adaptive_prefill_config(model, 2048) is None
+
+
+def test_glm5_wide_prefill_requires_published_native_geometry():
+    from omlx.patches.glm_moe_dsa.generate_patch import (
+        _glm5_native_prefill_geometry,
+    )
+
+    text_config = SimpleNamespace(
+        num_attention_heads=64,
+        kv_lora_rank=512,
+        index_topk=2048,
+        index_n_heads=32,
+        index_head_dim=128,
+        index_kpool=4,
+        linear_num_heads=64,
+        linear_head_dim=128,
+        mla_use_nope=True,
+        qk_rope_head_dim=0,
+    )
+    model = SimpleNamespace(config=SimpleNamespace(text_config=text_config))
+    assert _glm5_native_prefill_geometry(model)
+
+    text_config.num_attention_heads = 32
+    assert not _glm5_native_prefill_geometry(model)
+
+
 def test_glm_adaptive_prefill_config_env_overrides(monkeypatch):
     from omlx.patches.glm_moe_dsa.generate_patch import (
         _glm_dsa_adaptive_prefill_config,
