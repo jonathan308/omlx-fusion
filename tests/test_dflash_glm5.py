@@ -199,6 +199,69 @@ def test_native_cache_probe_is_opt_in_and_preserves_default(monkeypatch):
         )
 
 
+def test_final_capture_probe_preserves_logits_and_replaces_only_draft_features(
+    monkeypatch,
+):
+    import mlx_vlm.models.base as vlm_base
+    from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
+
+    from omlx.patches.dflash_glm5 import Glm5NextTargetOps
+
+    class Layer:
+        is_linear = True
+        mlp = SimpleNamespace()
+
+        def __call__(self, hidden, mask=None, cache=None):
+            del mask, cache
+            return hidden + 1
+
+    inner = SimpleNamespace(
+        layers=[Layer()],
+        fa_idx=0,
+        ssm_idx=0,
+        hc_mult=2,
+        embed_tokens=lambda ids: mx.broadcast_to(
+            ids.astype(mx.float32)[..., None], ids.shape + (3,)
+        ),
+        norm=lambda hidden: hidden * 2,
+    )
+    target = SimpleNamespace(language_model=SimpleNamespace(model=inner))
+    ops = Glm5NextTargetOps()
+    monkeypatch.setattr(ops, "logits_from_hidden", lambda _target, hidden: hidden)
+    monkeypatch.setattr(vlm_base, "create_attention_mask", lambda *a, **k: None)
+    monkeypatch.setattr(vlm_base, "create_ssm_mask", lambda *a, **k: None)
+    monkeypatch.delenv("OMLX_DFLASH_PROFILE_GLM_LAYERS", raising=False)
+
+    cache = RecurrentRollbackCache(size=2, conv_kernel_size=4)
+    cache.arm_rollback(prefix_len=0)
+    input_ids = mx.array([[1, 2]], dtype=mx.int32)
+    monkeypatch.delenv("OMLX_DFLASH_GLM_FINAL_CAPTURE_PROBE", raising=False)
+    expected_logits, expected_captured = ops.forward_with_hidden_capture(
+        target,
+        input_ids=input_ids,
+        cache=[cache],
+        capture_layer_ids={0, 1},
+    )
+
+    monkeypatch.setenv("OMLX_DFLASH_GLM_FINAL_CAPTURE_PROBE", "1")
+    actual_logits, actual_captured = ops.forward_with_hidden_capture(
+        target,
+        input_ids=input_ids,
+        cache=[cache],
+        capture_layer_ids={0, 1},
+    )
+    mx.eval(
+        expected_logits,
+        actual_logits,
+        *expected_captured.values(),
+        *actual_captured.values(),
+    )
+    assert mx.array_equal(actual_logits, expected_logits).item()
+    assert not mx.array_equal(expected_captured[0], expected_captured[1]).item()
+    assert mx.array_equal(actual_captured[0], actual_captured[1]).item()
+    assert actual_captured[0].shape == (1, 2, 3)
+
+
 def test_composite_dsa_cache_rollback_uses_kv_offset_and_checks_trim():
     from omlx.patches.dflash_glm5 import Glm5NextTargetOps
 

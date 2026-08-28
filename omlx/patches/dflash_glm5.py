@@ -73,6 +73,29 @@ def _glm_native_cache_probe_enabled() -> bool:
     )
 
 
+def _glm_final_capture_probe_enabled() -> bool:
+    return os.getenv("OMLX_DFLASH_GLM_FINAL_CAPTURE_PROBE", "").strip().lower() in (
+        "1",
+        "true",
+        "on",
+        "yes",
+    )
+
+
+def _glm_final_capture_probe_active(cache: list[Any] | None) -> bool:
+    """Diagnostic capture bypass, restricted to an armed verify forward."""
+    if not _glm_final_capture_probe_enabled():
+        return False
+    return bool(
+        cache
+        and any(
+            isinstance(entry, RecurrentRollbackCache)
+            and bool(getattr(entry, "_armed", False))
+            for entry in cache
+        )
+    )
+
+
 def _eval_profile_values(*values: Any) -> None:
     arrays = [value for value in values if isinstance(value, mx.array)]
     if arrays:
@@ -422,6 +445,7 @@ class Glm5NextTargetOps:
 
         inner = self.text_model(target_model)
         profile_layers = _should_profile_glm_verify_layers(cache)
+        final_capture_probe = _glm_final_capture_probe_active(cache)
         profile_started = time.perf_counter_ns() if profile_layers else 0
         profile_stages: dict[str, float] = {}
         layer_timings: list[tuple[int, bool, bool, float]] = []
@@ -470,10 +494,14 @@ class Glm5NextTargetOps:
 
         capture_all = capture_layer_ids is None
         if capture_all:
-            captured: list[mx.array] | dict[int, mx.array] = [_contract_mhc_hidden(h)]
+            captured: list[mx.array] | dict[int, mx.array] = []
+            if not final_capture_probe:
+                captured.append(_contract_mhc_hidden(h))
         else:
             capture_layer_ids = set(capture_layer_ids)
-            captured = {0: _contract_mhc_hidden(h)} if 0 in capture_layer_ids else {}
+            captured = {}
+            if not final_capture_probe and 0 in capture_layer_ids:
+                captured[0] = _contract_mhc_hidden(h)
 
         for layer_index, (layer, layer_cache) in enumerate(
             zip(inner.layers, cache, strict=True)
@@ -494,16 +522,32 @@ class Glm5NextTargetOps:
                     )
                 )
             capture_key = layer_index + 1
-            if capture_all:
+            if capture_all and not final_capture_probe:
                 captured.append(_contract_mhc_hidden(h))
-            elif capture_layer_ids is not None and capture_key in capture_layer_ids:
+            elif (
+                not final_capture_probe
+                and capture_layer_ids is not None
+                and capture_key in capture_layer_ids
+            ):
                 captured[capture_key] = _contract_mhc_hidden(h)
 
         stage_started = time.perf_counter_ns() if profile_layers else 0
-        normalized = inner.norm(_contract_mhc_hidden(h))
+        final_hidden = _contract_mhc_hidden(h)
+        normalized = inner.norm(final_hidden)
         if profile_layers:
             _eval_profile_values(normalized)
             profile_stages["norm"] = (time.perf_counter_ns() - stage_started) / 1e6
+        if final_capture_probe:
+            # Diagnostic isolation only: target logits remain exact, while
+            # draft features are deliberately unusable. DFlashEngine permits
+            # this only at block size 1, where no draft token is generated.
+            if capture_all:
+                captured = [final_hidden] * (len(inner.layers) + 1)
+            elif capture_layer_ids is not None:
+                captured = {key: final_hidden for key in capture_layer_ids}
+            logger.warning(
+                "GLM DFlash final-capture probe active; draft features are invalid"
+            )
         if logits_last_only and isinstance(captured, dict):
             captured[-1] = normalized
         logits_hidden = normalized[:, -1:, :] if logits_last_only else normalized

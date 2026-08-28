@@ -1218,11 +1218,19 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
 
         if getattr(self._target_ops, "backend_name", "") == "glm5_next":
-            from ..patches.dflash_glm5 import _glm_native_cache_probe_enabled
+            from ..patches.dflash_glm5 import (
+                _glm_final_capture_probe_enabled,
+                _glm_native_cache_probe_enabled,
+            )
 
             if _glm_native_cache_probe_enabled() and self._block_size != 1:
                 raise RuntimeError(
                     "OMLX_DFLASH_GLM_NATIVE_CACHE_PROBE requires the explicit "
+                    "model setting dflash_block_size=1"
+                )
+            if _glm_final_capture_probe_enabled() and self._block_size != 1:
+                raise RuntimeError(
+                    "OMLX_DFLASH_GLM_FINAL_CAPTURE_PROBE requires the explicit "
                     "model setting dflash_block_size=1"
                 )
 
