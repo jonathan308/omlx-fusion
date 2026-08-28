@@ -3,7 +3,7 @@
 
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -169,6 +169,147 @@ class TestDFlashModelSettings:
 
 class TestDFlashEngineInit:
     """Test DFlashEngine initialization and configuration."""
+
+    def test_wired_limit_uses_recommended_working_set_and_is_idempotent(
+        self, monkeypatch
+    ):
+        from omlx.engine import dflash as dflash_mod
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine("target", "draft")
+        calls = []
+        synchronized = []
+        monkeypatch.setattr(dflash_mod.mx.metal, "is_available", lambda: True)
+        monkeypatch.setattr(
+            dflash_mod.mx,
+            "device_info",
+            lambda: {
+                "max_recommended_working_set_size": 96,
+                "memory_size": 256,
+            },
+        )
+
+        def set_wired_limit(value):
+            calls.append(value)
+            return 41
+
+        monkeypatch.setattr(dflash_mod.mx, "set_wired_limit", set_wired_limit)
+        monkeypatch.setattr(
+            dflash_mod.mx,
+            "synchronize",
+            lambda: synchronized.append(True),
+        )
+
+        engine._acquire_wired_limit()
+        engine._acquire_wired_limit()
+        assert calls == [96]
+        assert engine._old_wired_limit == 41
+        assert engine._wired_limit_owned is True
+
+        assert engine._restore_wired_limit() is True
+        assert engine._restore_wired_limit() is False
+        assert calls == [96, 41]
+        assert synchronized == [True]
+
+    def test_wired_limit_restores_when_start_loader_fails(self, monkeypatch):
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine("target", "draft")
+        events = []
+
+        def acquire():
+            engine._wired_limit_owned = True
+            events.append("acquire")
+
+        def restore():
+            engine._wired_limit_owned = False
+            events.append("restore")
+            return True
+
+        monkeypatch.setattr(engine, "_acquire_wired_limit", acquire)
+        monkeypatch.setattr(engine, "_restore_wired_limit", restore)
+
+        def fail_load():
+            events.append("load")
+            raise RuntimeError("load failed")
+
+        with pytest.raises(RuntimeError, match="load failed"):
+            engine._load_with_wired_limit(fail_load)
+        assert events == ["acquire", "load", "restore"]
+
+    @pytest.mark.asyncio
+    async def test_start_restores_wired_limit_after_finalize_failure(
+        self, monkeypatch
+    ):
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine("target", "draft")
+        monkeypatch.setattr(
+            engine,
+            "_start_impl",
+            AsyncMock(side_effect=RuntimeError("finalize failed")),
+        )
+        restore = AsyncMock(return_value=True)
+        monkeypatch.setattr(engine, "_restore_wired_limit_async", restore)
+
+        with pytest.raises(RuntimeError, match="finalize failed"):
+            await engine.start()
+        restore.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_wired_limit_restores_before_fallback_teardown(self, monkeypatch):
+        from dflash_mlx.cache import manager as cache_manager
+
+        from omlx.engine import dflash as dflash_mod
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine("target", "draft")
+        restore = AsyncMock(return_value=True)
+        monkeypatch.setattr(engine, "_restore_wired_limit_async", restore)
+        monkeypatch.setattr(dflash_mod.mx, "get_active_memory", lambda: 0)
+
+        def stop_after_restore():
+            raise RuntimeError("stop after restore")
+
+        monkeypatch.setattr(
+            cache_manager,
+            "shutdown_runtime_cache_manager",
+            stop_after_restore,
+        )
+
+        with pytest.raises(RuntimeError, match="stop after restore"):
+            await engine._evict_dflash_and_start_fallback()
+        restore.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_double_stop_restores_wired_limit_once(self, monkeypatch):
+        from dflash_mlx.cache import manager as cache_manager
+
+        from omlx import engine_core
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine("target", "draft")
+        engine._wired_limit_owned = True
+        restores = []
+
+        def restore():
+            if not engine._wired_limit_owned:
+                return False
+            engine._wired_limit_owned = False
+            restores.append(True)
+            return True
+
+        monkeypatch.setattr(engine, "_restore_wired_limit", restore)
+        monkeypatch.setattr(engine_core, "get_mlx_executor", lambda: None)
+        monkeypatch.setattr(
+            cache_manager,
+            "shutdown_runtime_cache_manager",
+            lambda: None,
+        )
+
+        await engine.stop()
+        await engine.stop()
+        assert restores == [True]
 
     def test_import_without_dflash_mlx(self):
         from omlx.engine import DFlashEngine  # noqa: F401

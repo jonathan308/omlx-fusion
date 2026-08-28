@@ -374,6 +374,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._prefill_guard: _DFlashPrefillGuard | None = None
         self._runtime_context: Any | None = None
         self._dflash_prefix_cache: Any | None = None
+        # DFlash bypasses mlx-lm's BatchGenerator, which normally owns the
+        # process Metal wired-limit raise/restore lifecycle.
+        self._old_wired_limit: int | None = None
+        self._wired_limit_owned = False
         self._suppress_token_ids: set[int] = set()
         # Protocol-specific output parser factory (gemma4 / harmony).
         # Detected once in start() after the target model is loaded; None means
@@ -458,6 +462,57 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
     @property
     def model_type(self) -> str | None:
         return self._model_type_str
+
+    def _acquire_wired_limit(self) -> None:
+        """Mirror BatchGenerator's recommended working-set wired limit."""
+        if self._wired_limit_owned or not mx.metal.is_available():
+            return
+        recommended = int(
+            mx.device_info().get("max_recommended_working_set_size", 0) or 0
+        )
+        if recommended <= 0:
+            raise RuntimeError("MLX did not report a recommended working set size")
+        self._old_wired_limit = mx.set_wired_limit(recommended)
+        self._wired_limit_owned = True
+
+    def _restore_wired_limit(self) -> bool:
+        """Restore the pre-DFlash limit once, on the owning MLX thread."""
+        if not self._wired_limit_owned:
+            return False
+        previous = self._old_wired_limit
+        self._wired_limit_owned = False
+        self._old_wired_limit = None
+        try:
+            mx.synchronize()
+        finally:
+            if previous is not None:
+                mx.set_wired_limit(previous)
+        return True
+
+    def _load_with_wired_limit(self, loader):
+        """Acquire before loading and restore without masking load failures."""
+        try:
+            self._acquire_wired_limit()
+            return loader()
+        except BaseException:
+            try:
+                self._restore_wired_limit()
+            except Exception:
+                logger.warning(
+                    "DFlash wired-limit restore failed after load error",
+                    exc_info=True,
+                )
+            raise
+
+    async def _restore_wired_limit_async(self) -> bool:
+        if not self._wired_limit_owned:
+            return False
+        from ..engine_core import get_mlx_executor
+
+        loop = asyncio.get_running_loop()
+        return bool(
+            await loop.run_in_executor(get_mlx_executor(), self._restore_wired_limit)
+        )
 
     @staticmethod
     def _build_quant_spec(
@@ -550,13 +605,28 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
     async def start(self) -> None:
         if self._loaded:
             return
+        try:
+            await self._start_impl()
+        except BaseException:
+            try:
+                await asyncio.shield(self._restore_wired_limit_async())
+            except Exception:
+                logger.warning(
+                    "DFlash wired-limit restore failed after start error",
+                    exc_info=True,
+                )
+            raise
+
+    async def _start_impl(self) -> None:
+        if self._loaded:
+            return
 
         from ..engine_core import get_mlx_executor
 
         loop = asyncio.get_running_loop()
         runtime_context = self._build_runtime_context()
 
-        def _load_models():
+        def _load_models_owned():
             # Register oMLX-owned target extensions before importing the
             # dflash loader functions below. GLM-5.3 is mlx-vlm-only, so its
             # installer wraps ``load_target_bundle`` with a scoped VLM loader.
@@ -650,7 +720,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             draft_backend = EagerDraftBackend()
             return target_bundle, draft, draft_backend, draft_meta
 
-        result = await loop.run_in_executor(get_mlx_executor(), _load_models)
+        result = await loop.run_in_executor(
+            get_mlx_executor(),
+            self._load_with_wired_limit,
+            _load_models_owned,
+        )
         target_bundle, self._draft_model, self._draft_backend, draft_meta = result
         self._draft_window_size = self._resolve_draft_window_size(draft_meta)
         capabilities_for = getattr(target_bundle.target_ops, "capabilities_for", None)
@@ -822,6 +896,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         loop = asyncio.get_running_loop()
         pre_active = mx.get_active_memory()
 
+        # BatchGenerator would restore this in close(); DFlash owns the same
+        # lifecycle explicitly before its target allocations are released.
+        await self._restore_wired_limit_async()
+
         # Release dflash model and cache references
         shutdown_runtime_cache_manager()
         self._dflash_prefix_cache = None
@@ -903,6 +981,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         if self._fallback_engine is not None:
             await self._fallback_engine.stop()
             self._fallback_engine = None
+        await self._restore_wired_limit_async()
         try:
             shutdown_runtime_cache_manager()
         except Exception as exc:
