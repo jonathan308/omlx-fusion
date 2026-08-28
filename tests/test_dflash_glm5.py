@@ -262,6 +262,72 @@ def test_final_capture_probe_preserves_logits_and_replaces_only_draft_features(
     assert actual_captured[0].shape == (1, 2, 3)
 
 
+def test_native_forward_probe_bypasses_adapter_and_preserves_native_logits(
+    monkeypatch,
+):
+    from omlx.patches.dflash_glm5 import Glm5NextTargetOps
+
+    calls = []
+    embed_tokens = SimpleNamespace(weight=mx.zeros((8, 3), dtype=mx.float32))
+    inner = SimpleNamespace(layers=[object(), object()], embed_tokens=embed_tokens)
+
+    class LanguageModel:
+        args = SimpleNamespace(hidden_size=3)
+        model = inner
+
+        def __call__(self, *, inputs, cache):
+            calls.append((inputs, cache))
+            return SimpleNamespace(logits=inputs.astype(mx.float32)[..., None] + 7)
+
+    target = SimpleNamespace(language_model=LanguageModel())
+    verify_ids = mx.array([[2, 4]], dtype=mx.int32)
+    target_cache = [object()]
+    ops = Glm5NextTargetOps()
+    monkeypatch.setenv("OMLX_DFLASH_GLM_NATIVE_FORWARD_PROBE", "1")
+    monkeypatch.setattr(
+        ops,
+        "forward_with_hidden_capture",
+        lambda *a, **k: pytest.fail("adapter forward must be bypassed"),
+    )
+
+    logits, captured = ops.verify_block(
+        target_model=target,
+        verify_ids=verify_ids,
+        target_cache=target_cache,
+        capture_layer_ids={1, 2},
+    )
+    expected = verify_ids.astype(mx.float32)[..., None] + 7
+    mx.eval(logits, expected, *captured.values())
+    assert calls == [(verify_ids, target_cache)]
+    assert mx.array_equal(logits, expected).item()
+    assert set(captured) == {1, 2}
+    assert captured[1].shape == captured[2].shape == (1, 2, 3)
+    assert mx.array_equal(captured[1], mx.zeros_like(captured[1])).item()
+
+
+def test_native_forward_probe_is_off_by_default(monkeypatch):
+    from omlx.patches.dflash_glm5 import Glm5NextTargetOps
+
+    expected_logits = mx.ones((1, 1, 2), dtype=mx.float32)
+    expected_capture = {1: mx.ones((1, 1, 3), dtype=mx.float32)}
+    ops = Glm5NextTargetOps()
+    monkeypatch.delenv("OMLX_DFLASH_GLM_NATIVE_FORWARD_PROBE", raising=False)
+    monkeypatch.setattr(
+        ops,
+        "forward_with_hidden_capture",
+        lambda *a, **k: (expected_logits, expected_capture),
+    )
+
+    logits, captured = ops.verify_block(
+        target_model=object(),
+        verify_ids=mx.ones((1, 1), dtype=mx.int32),
+        target_cache=[],
+        capture_layer_ids={1},
+    )
+    assert logits is expected_logits
+    assert captured is expected_capture
+
+
 def test_composite_dsa_cache_rollback_uses_kv_offset_and_checks_trim():
     from omlx.patches.dflash_glm5 import Glm5NextTargetOps
 

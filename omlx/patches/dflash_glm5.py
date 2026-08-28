@@ -96,6 +96,39 @@ def _glm_final_capture_probe_active(cache: list[Any] | None) -> bool:
     )
 
 
+def _glm_native_forward_probe_enabled() -> bool:
+    return os.getenv("OMLX_DFLASH_GLM_NATIVE_FORWARD_PROBE", "").strip().lower() in (
+        "1",
+        "true",
+        "on",
+        "yes",
+    )
+
+
+def _native_forward_probe_captures(
+    target_model: Any,
+    verify_ids: mx.array,
+    capture_layer_ids: set[int] | None,
+) -> list[mx.array] | dict[int, mx.array]:
+    """Build shape-correct, deliberately invalid draft features."""
+    wrapper = getattr(target_model, "language_model", None)
+    inner = getattr(wrapper, "model", None)
+    args = getattr(wrapper, "args", None)
+    hidden_size = int(getattr(args, "hidden_size", 0) or 0)
+    layers = getattr(inner, "layers", None)
+    if hidden_size <= 0 or layers is None:
+        raise RuntimeError("GLM native-forward probe target metadata is incomplete")
+    embed_weight = getattr(getattr(inner, "embed_tokens", None), "weight", None)
+    dtype = getattr(embed_weight, "dtype", mx.bfloat16)
+    fake = mx.zeros(
+        (int(verify_ids.shape[0]), int(verify_ids.shape[1]), hidden_size),
+        dtype=dtype,
+    )
+    if capture_layer_ids is None:
+        return [fake] * (len(layers) + 1)
+    return {int(key): fake for key in capture_layer_ids}
+
+
 def _eval_profile_values(*values: Any) -> None:
     arrays = [value for value in values if isinstance(value, mx.array)]
     if arrays:
@@ -628,6 +661,26 @@ class Glm5NextTargetOps:
         cache_rollback.apply()
         cache_rollback.set_undo_armed(True)
         try:
+            if _glm_native_forward_probe_enabled():
+                language_model = getattr(target_model, "language_model", None)
+                if not callable(language_model):
+                    raise RuntimeError(
+                        "GLM native-forward probe requires a callable language model"
+                    )
+                output = language_model(inputs=verify_ids, cache=target_cache)
+                logits = getattr(output, "logits", None)
+                if not isinstance(logits, mx.array):
+                    raise RuntimeError(
+                        "GLM native-forward probe did not receive target logits"
+                    )
+                logger.warning(
+                    "GLM DFlash native-forward probe active; draft features are invalid"
+                )
+                return logits, _native_forward_probe_captures(
+                    target_model,
+                    verify_ids,
+                    capture_layer_ids,
+                )
             return self.forward_with_hidden_capture(
                 target_model,
                 input_ids=verify_ids,

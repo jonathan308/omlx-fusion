@@ -1221,6 +1221,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             from ..patches.dflash_glm5 import (
                 _glm_final_capture_probe_enabled,
                 _glm_native_cache_probe_enabled,
+                _glm_native_forward_probe_enabled,
             )
 
             if _glm_native_cache_probe_enabled() and self._block_size != 1:
@@ -1231,6 +1232,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             if _glm_final_capture_probe_enabled() and self._block_size != 1:
                 raise RuntimeError(
                     "OMLX_DFLASH_GLM_FINAL_CAPTURE_PROBE requires the explicit "
+                    "model setting dflash_block_size=1"
+                )
+            if _glm_native_forward_probe_enabled() and self._block_size != 1:
+                raise RuntimeError(
+                    "OMLX_DFLASH_GLM_NATIVE_FORWARD_PROBE requires the explicit "
                     "model setting dflash_block_size=1"
                 )
 
