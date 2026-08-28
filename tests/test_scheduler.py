@@ -3224,6 +3224,29 @@ class TestSchedulerArraysCacheBlockAlignment:
         finally:
             scheduler.shutdown()
 
+    def test_qwen4_wide_prefill_aligns_block_size_to_4096(
+        self, mock_tokenizer, tmp_path
+    ):
+        with (
+            patch("omlx.settings.get_system_memory", return_value=256 * 1024**3),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=False),
+        ):
+            scheduler = Scheduler(
+                model=self._hybrid_model(model_type="qwen4_exp_text"),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        try:
+            assert scheduler._qwen35_prefill_floor == 4096
+            assert scheduler._prefill_step_size_for_progress(0, 4096) == 4096
+            assert scheduler.config.paged_cache_block_size == 4096
+        finally:
+            scheduler.shutdown()
+
     def test_qwen35_nax_host_keeps_2048_block(self, mock_tokenizer, tmp_path):
         with (
             patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),

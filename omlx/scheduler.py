@@ -2975,22 +2975,24 @@ class Scheduler:
             self.config.paged_cache_block_size = target_block_size
 
     def _detect_qwen35_prefill_floor(self) -> int:
-        """Return the wide-prefill floor for the Qwen3.5 architecture family."""
+        """Return the wide-prefill floor for Qwen hybrid architectures."""
         try:
             model_type = str(getattr(self.model, "model_type", "") or "")
             if not model_type:
                 model_type = str(
                     getattr(getattr(self.model, "config", None), "model_type", "") or ""
                 )
-            if model_type.startswith("qwen3_5"):
+            if model_type.startswith(("qwen3_5", "qwen4_exp")):
                 from .custom_kernels.nax import is_nax_available
                 from .settings import get_system_memory
 
                 if get_system_memory() >= 64 * 1024**3 and not is_nax_available():
                     # Measured on the 27B (M3 Ultra, 2026-08-17): chunk 4096
                     # beats the 2048 default +3.2% at 4k prompts / +1.0% at
-                    # 16k; 8192 is flat versus 4096. Keep 2048 on NAX/M5,
-                    # where wider prefill regresses throughput (#2880).
+                    # 16k; 8192 is flat versus 4096. Qwen4's direct-index QSA
+                    # likewise removes the selected-K/V memory reason for
+                    # 2048-row tiles. Keep 2048 on NAX/M5, where wider Qwen
+                    # prefill regresses throughput (#2880).
                     return 4096
         except Exception:
             logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
