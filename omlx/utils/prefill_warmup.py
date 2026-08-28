@@ -10,6 +10,10 @@ from typing import Any
 MAX_PREFILL_SHAPE_WARMUP_TOKENS = 4096
 _LOCAL_PREFILL_SHAPE_WARMUP_ENV = "OMLX_PREFILL_SHAPE_WARMUP"
 _DS4_PREFILL_SHAPE_WARMUP_TOKENS = 1024
+# GLM-5.3's first text request otherwise pays to compile the KDA, dense-MLA,
+# hyper-connection, and affine-QMM pipelines. Their Metal specializations do
+# not depend on the prompt width, so a small disposable forward is sufficient.
+_GLM5_NEXT_PREFILL_SHAPE_WARMUP_TOKENS = 256
 
 
 def _enabled(value: str) -> bool:
@@ -34,6 +38,8 @@ def planned_local_prefill_shape_warmup_tokens(
         return 0
     if isinstance(model_type, str) and model_type.startswith("deepseek_v4"):
         return _DS4_PREFILL_SHAPE_WARMUP_TOKENS
+    if model_type == "glm5_next":
+        return _GLM5_NEXT_PREFILL_SHAPE_WARMUP_TOKENS
     return 0
 
 

@@ -16,11 +16,21 @@ def test_local_ds4_shape_warmup_is_enabled_by_default(model_type):
     assert planned_local_prefill_shape_warmup_tokens(model_type, environ={}) == 1024
 
 
+def test_local_glm5_next_shape_warmup_is_small_and_enabled_by_default():
+    assert planned_local_prefill_shape_warmup_tokens("glm5_next", environ={}) == 256
+
+
 def test_local_shape_warmup_is_gated_and_operator_can_disable_it():
     assert planned_local_prefill_shape_warmup_tokens("llama", environ={}) == 0
     assert (
         planned_local_prefill_shape_warmup_tokens(
             "deepseek_v4", environ={"OMLX_PREFILL_SHAPE_WARMUP": "0"}
+        )
+        == 0
+    )
+    assert (
+        planned_local_prefill_shape_warmup_tokens(
+            "glm5_next", environ={"OMLX_PREFILL_SHAPE_WARMUP": "false"}
         )
         == 0
     )

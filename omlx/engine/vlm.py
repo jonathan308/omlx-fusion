@@ -2131,6 +2131,52 @@ class VLMBatchedEngine(BaseEngine):
                 apply_qwen35_ragged_decode_patch()
             except Exception:
                 logger.debug("qwen3_5 ragged decode patch not applied", exc_info=True)
+
+        # Qualified VLM text backbones can compile their fixed Metal pipelines
+        # on a tiny, disposable cache before the first user prompt. Keep this
+        # on the engine's serialized executor/stream so it cannot race
+        # inference. The shared helper evaluates and releases every temporary
+        # GLM composite cache; only Metal pipeline state survives.
+        from ..utils.prefill_warmup import (
+            planned_local_prefill_shape_warmup_tokens,
+            run_prefill_shape_warmup,
+        )
+
+        warmup_tokens = planned_local_prefill_shape_warmup_tokens(self.model_type)
+        if warmup_tokens:
+
+            def _warmup_vlm_prefill_shape():
+                import mlx.core as mx
+
+                with mx.stream(self._engine.engine._mlx_stream):
+                    return run_prefill_shape_warmup(
+                        mx,
+                        self._adapter,
+                        tokens=warmup_tokens,
+                        max_kv_size=None,
+                    )
+
+            try:
+                self._prefill_shape_warmup = await loop.run_in_executor(
+                    self._engine.engine._mlx_executor,
+                    _warmup_vlm_prefill_shape,
+                )
+                logger.info(
+                    "VLM prefill shape warmup completed: model_type=%s tokens=%d "
+                    "elapsed=%.2fs",
+                    self.model_type,
+                    warmup_tokens,
+                    self._prefill_shape_warmup["elapsed_seconds"],
+                )
+            except Exception as exc:
+                self._prefill_shape_warmup = {
+                    "active": False,
+                    "tokens": warmup_tokens,
+                    "reason": str(exc),
+                }
+                logger.warning(
+                    "VLM prefill shape warmup skipped after failure: %s", exc
+                )
         scheduler.refresh_ssd_layer_signature()
 
         # SpecPrefill: load draft model and pass to scheduler
