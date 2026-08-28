@@ -447,7 +447,9 @@ class EnginePool:
             the `_get_final_ceiling` callback set by `server.init_server()`.
             When that reads 0 (memory guard disabled), the pool falls back
             to `enforcer.get_admission_ceiling()` via `_get_admission_ceiling`
-            for best-effort LRU eviction (#2290). Idle-model eviction
+            for process-safe admission and LRU eviction (#2290). Disabling
+            request-time memory throttling must not permit concurrent model
+            weights to exceed the physical residency budget. Idle-model eviction
             starts at `enforcer.get_admission_soft_target()` via
             `_get_admission_soft_target` so the old model is unloaded
             before the new weights allocate (#2319). Until the callbacks
@@ -652,7 +654,7 @@ class EnginePool:
             return 0
 
     def _fallback_admission_ceiling(self) -> int:
-        """Best-effort admission ceiling used when `_current_ceiling()` is 0.
+        """Process-safe admission ceiling when `_current_ceiling()` is 0.
 
         Wired to `enforcer.get_admission_ceiling`, which keeps returning
         the static ceiling while the memory guard is disabled so a model
@@ -1869,10 +1871,11 @@ class EnginePool:
             #
             # ceiling == 0 means the guard is disabled or the enforcer is
             # not wired up. Eviction on model swap must not die with the
-            # guard (#2290): fall back to the best-effort admission
-            # ceiling (static, guard-independent) and keep evicting, but
-            # never refuse the load under it — with the guard off the
-            # user opted out of hard limits.
+            # guard (#2290): fall back to the static, guard-independent
+            # admission ceiling and keep evicting. This fallback remains a
+            # hard *model residency* limit: the optional guard controls
+            # request-time throttling, not whether two large checkpoints may
+            # overcommit physical memory and crash the host.
             # A distributed coordinator admits only rank zero's planned shard,
             # not the complete model. A local VLM-shaped checkpoint served by
             # the text engine (force_lm or a model_type_override that flipped
@@ -1899,10 +1902,8 @@ class EnginePool:
             )
             admission_kind = "local shard" if deployment is not None else "model"
             ceiling = self._current_ceiling()
-            best_effort = False
             if ceiling <= 0:
                 ceiling = self._fallback_admission_ceiling()
-                best_effort = ceiling > 0
             if ceiling > 0:
                 soft_target = self._admission_soft_target()
                 evict_target = min(soft_target, ceiling) if soft_target > 0 else ceiling
@@ -1988,21 +1989,6 @@ class EnginePool:
                         failure_current = committed
                         failure_projected = committed_projected
                         failure_label = "committed"
-
-                    if best_effort:
-                        # Memory guard is off: evicting was all we could
-                        # do. Admit over the static ceiling instead of
-                        # refusing, matching the unguarded no-hard-limit
-                        # contract.
-                        logger.warning(
-                            f"Loading '{model_id}' past the static memory "
-                            f"ceiling with the memory guard disabled "
-                            f"(projected {format_size(failure_projected)} > "
-                            f"ceiling {format_size(ceiling)}, "
-                            f"{failure_label} baseline) and nothing left to "
-                            f"evict; the system may swap heavily."
-                        )
-                        break
 
                     # Still over budget under the applicable baseline. Use
                     # ModelTooLargeError when the model alone exceeds the
