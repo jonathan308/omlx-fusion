@@ -541,8 +541,17 @@ def _activation_bytes_per_token(model_path: Path) -> int:
         0,
     )
     # Pipeline activations in the pinned MLX-LM path are floating point even
-    # when weights are quantized. Two bytes is the conservative common case.
-    return hidden_size * 2
+    # when weights are quantized. GLM-5.3 carries all MHC residual streams
+    # between stages: [B, T, hc_mult, hidden], not a contracted [B, T, hidden]
+    # tensor. Pricing only one stream under-reserves 24 KiB/token on hc_mult=4.
+    model_type = str(config.get("model_type") or "")
+    text_config = config.get("text_config")
+    hc_mult = 1
+    if model_type == "glm5_next" and isinstance(text_config, dict):
+        candidate = text_config.get("hc_mult", 1)
+        if isinstance(candidate, int) and not isinstance(candidate, bool):
+            hc_mult = max(1, min(candidate, 64))
+    return hidden_size * hc_mult * 2
 
 
 def _model_config(model_path: Path) -> dict[str, Any]:

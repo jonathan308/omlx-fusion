@@ -676,6 +676,15 @@ def maybe_apply_pre_load_patches(
             mtp_enabled=mtp_active,
         )
 
+    if not for_vlm and model_type == "glm5_next":
+        from ..patches.mlx_lm_glm5_next import apply_mlx_lm_glm5_next_patch
+
+        if apply_mlx_lm_glm5_next_patch():
+            logger.info(
+                "GLM-5.3 mlx-lm pipeline registration applied for %s",
+                model_name,
+            )
+
     if for_vlm and model_type == "glm5_next":
         from ..patches.mlx_vlm_glm5_next_compat import (
             apply_mlx_vlm_glm5_next_compat_patch,
