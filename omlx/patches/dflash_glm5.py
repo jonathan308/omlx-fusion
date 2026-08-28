@@ -610,7 +610,10 @@ def _load_glm5_target_bundle(
     from dflash_mlx.runtime.loading import LoadedTargetBundle
     from mlx_vlm.utils import load as vlm_load
 
-    from ..utils.model_loading import maybe_load_custom_quantization
+    from ..utils.model_loading import (
+        materialize_lazy_state,
+        maybe_load_custom_quantization,
+    )
     from .mlx_vlm_glm5_next_compat import apply_mlx_vlm_glm5_next_compat_patch
 
     apply_mlx_vlm_glm5_next_compat_patch()
@@ -619,6 +622,14 @@ def _load_glm5_target_bundle(
         model, processor = custom_loaded
     else:
         model, processor = vlm_load(str(model_ref), lazy=lazy, strict=True)
+    # The custom oQ loader intentionally leaves the target tree lazy. Normal
+    # VLMEngine startup materializes it before serving, but DFlash owns a
+    # separate loader and previously skipped that lifecycle step. The result
+    # looked like a 1-second/~200 MB load and every target verification paid
+    # the mmap/lazy-transform cost again. Force the exact same bounded model
+    # materialization here, on DFlash's loader/MLX-executor thread, before any
+    # speculative hook or request can observe the model.
+    materialize_lazy_state(model)
     target_ops = resolve_target_ops(model)
     target_ops.install_speculative_hooks(model)
     config_path = Path(model_ref) / "config.json"
