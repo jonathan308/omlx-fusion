@@ -8389,6 +8389,32 @@ class Scheduler:
             # No paged SSD cache configured - process all tokens
             request.remaining_tokens = request.prompt_token_ids
 
+        # Lightning-MTP has a small prompt-history cache separate from the
+        # backbone KV restored above.  Bind an exact full-block sidecar (when
+        # one exists) to this singleton timeline before any uncached suffix is
+        # forwarded.  The hook is intentionally best-effort/fail-closed:
+        # ordinary inference and prefix reuse stay valid if MTP is disabled,
+        # the sidecar was evicted, or this model family does not support it.
+        try:
+            from .patches.mlx_lm_mtp import prompt_priming
+
+            prompt_priming.prepare_prefix_context(
+                self.model,
+                request_id=request.request_id,
+                prompt_tokens=request.prompt_token_ids,
+                cached_tokens=request.cached_tokens,
+                prefix_cache=self.block_aware_cache,
+                extra_keys=request.vlm_extra_keys_for_cache,
+                extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+                extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+            )
+        except Exception as exc:
+            logger.debug(
+                "MTP prefix-history preparation failed closed for %s: %s",
+                request.request_id,
+                exc,
+            )
+
         # Trace where this prompt diverges from recently stored cache
         # sequences: one INFO line for large re-prefills (#2333/#2349
         # triage), decoded token context at DEBUG (issue #1003).
