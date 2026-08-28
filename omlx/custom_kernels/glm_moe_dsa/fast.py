@@ -147,6 +147,7 @@ NATIVE_SYMBOLS = (
     "dsa_indexer_scores",
     "qwen4_qsa_indexer_scores",
     "qwen4_qsa_topk_indices",
+    "qwen4_qsa_sparse_gqa_attention",
     "dsa_topk_indices",
     "dspark_fp32_topk_indices",
     "ds4_router_topk_indices",
@@ -399,6 +400,42 @@ def qwen4_qsa_topk_indices(
     return _ext.qwen4_qsa_topk_indices(
         scores,
         topk,
+        **_native_stream_kwargs(stream),
+    )
+
+
+def qwen4_qsa_sparse_gqa_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    selected_blocks: mx.array,
+    scale: float,
+    q_offset: int,
+    *,
+    key_tile: int = 128,
+    dimension_tile: int = 32,
+    stream=None,
+) -> mx.array:
+    """Exact Qwen4 main GQA over query-specific selected cache rows.
+
+    The narrow native ABI consumes 512 chronological uint32 block IDs directly,
+    expands each to four tokens, appends the causal tail in-kernel, and
+    keeps QK scores, online softmax state, and the weighted output in fp32.
+    It supports only Qwen3.8-Flash-Next's batch-one ``24q/2kv/D256`` geometry;
+    callers own the portable gathered fallback for every other shape.
+    """
+
+    if _ext is None or not hasattr(_ext, "qwen4_qsa_sparse_gqa_attention"):
+        raise RuntimeError("Qwen4 QSA sparse GQA kernel is unavailable")
+    return _ext.qwen4_qsa_sparse_gqa_attention(
+        queries,
+        keys,
+        values,
+        selected_blocks,
+        scale,
+        q_offset,
+        key_tile,
+        dimension_tile,
         **_native_stream_kwargs(stream),
     )
 

@@ -1,9 +1,10 @@
 """Exact gathered QSA prefill for contiguous batch-one text prompts.
 
-This is the portable MLX path proven by Fusion's native Qwen4-Exp bring-up.
-It never constructs the full ``[query_tokens, key_tokens]`` main-attention
-matrix: QSA selects complete four-token micro-blocks, then main attention
-gathers only the selected K/V rows (plus the incomplete causal tail).
+This is the exact path proven by Fusion's native Qwen4-Exp bring-up. It never
+constructs the full ``[query_tokens, key_tokens]`` main-attention matrix: QSA
+selects complete four-token micro-blocks, then the production native kernel
+reads those rows directly from K/V. Portable MLX gathers only the selected
+rows (plus the incomplete causal tail) when that narrow ABI is unavailable.
 
 The caller owns eligibility.  In particular, this module is only used for a
 single contiguous text prompt.  Batched, padded, multimodal and target-verify
@@ -26,6 +27,8 @@ _NATIVE_QSA_SCORE_DISABLED = False
 _NATIVE_QSA_SCORE_PROVEN = False
 _NATIVE_QSA_TOPK_DISABLED = False
 _NATIVE_QSA_TOPK_PROVEN = False
+_NATIVE_QSA_MAIN_DISABLED = False
+_NATIVE_QSA_MAIN_PROVEN = False
 
 
 def contiguous_causal_query_chunk(key_tokens: int) -> int:
@@ -209,6 +212,68 @@ def _native_topk_indices(scores: mx.array, topk: int) -> mx.array | None:
         return indices
     except Exception:
         _NATIVE_QSA_TOPK_DISABLED = True
+        return None
+
+
+def _native_sparse_gqa_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    selected_blocks: mx.array,
+    *,
+    q_offset: int,
+) -> mx.array | None:
+    """Consume Qwen's selected rows directly in the exact native GQA kernel."""
+
+    global _NATIVE_QSA_MAIN_DISABLED, _NATIVE_QSA_MAIN_PROVEN
+    if _NATIVE_QSA_MAIN_DISABLED:
+        return None
+    if (
+        queries.ndim != 4
+        or queries.shape[0] != 1
+        or queries.shape[1] != 24
+        or queries.shape[-1] != 256
+        or keys.ndim != 4
+        or values.shape != keys.shape
+        or keys.shape[0] != 1
+        or keys.shape[1] != 2
+        or keys.shape[-1] != 256
+        or queries.dtype != keys.dtype
+        or queries.dtype != values.dtype
+        or queries.dtype not in {mx.float16, mx.bfloat16}
+        or selected_blocks.ndim != 3
+        or selected_blocks.shape != (1, queries.shape[2], 512)
+        or q_offset < 0
+        or q_offset + queries.shape[2] > keys.shape[2]
+    ):
+        return None
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        if not fast.is_native_available() or not fast.has_symbol(
+            "qwen4_qsa_sparse_gqa_attention"
+        ):
+            _NATIVE_QSA_MAIN_DISABLED = True
+            return None
+        native_blocks = mx.contiguous(selected_blocks.astype(mx.uint32)[:, None])
+        output = fast.qwen4_qsa_sparse_gqa_attention(
+            queries,
+            keys,
+            values,
+            native_blocks,
+            queries.shape[-1] ** -0.5,
+            q_offset,
+            key_tile=64,
+            dimension_tile=64,
+        )
+        if not _NATIVE_QSA_MAIN_PROVEN:
+            # Prove the rebuilt extension and Metal pipeline before the lazy
+            # graph advances cache state past a point where fallback is safe.
+            mx.eval(output)
+            _NATIVE_QSA_MAIN_PROVEN = True
+        return output.transpose(0, 2, 1, 3)
+    except Exception:
+        _NATIVE_QSA_MAIN_DISABLED = True
         return None
 
 
@@ -432,6 +497,25 @@ def contiguous_causal_gathered_qsa(
 
     if query_chunk is None:
         query_chunk = contiguous_causal_query_chunk(key_tokens)
+        # The direct-index main-attention kernel carries no per-query gathered
+        # K/V tensor, so a 256-row score tile stays comfortably bounded and
+        # halves Python/Metal dispatch overhead. Preserve the smaller portable
+        # tiles whenever the exact production ABI is absent.
+        if (
+            queries.shape[1:] == (24, query_tokens, 256)
+            and keys.shape[1] == 2
+            and queries.dtype in {mx.float16, mx.bfloat16}
+            and not _NATIVE_QSA_MAIN_DISABLED
+        ):
+            try:
+                from omlx.custom_kernels.glm_moe_dsa import fast
+
+                if fast.is_native_available() and fast.has_symbol(
+                    "qwen4_qsa_sparse_gqa_attention"
+                ):
+                    query_chunk = max(query_chunk, 256)
+            except Exception:
+                pass
     if query_chunk <= 0:
         raise ValueError("QSA query chunk must be positive")
 
@@ -524,7 +608,24 @@ def contiguous_causal_gathered_qsa(
             else:
                 selected_block_rows = canonical
 
+            # The top-k set is unordered. Restore checkpoint/dense-mask token
+            # order before either the portable gathered SDPA or the direct
+            # native kernel performs its FP32 online-softmax reduction.
+            selected_block_rows = mx.sort(selected_block_rows, axis=-1)
+
             selected_count = mx.minimum(complete_counts, block_budget)
+
+            native_output = _native_sparse_gqa_attention(
+                queries[:, :, start:stop],
+                keys,
+                values,
+                selected_block_rows,
+                q_offset=query_start + start,
+            )
+            if native_output is not None:
+                outputs.append(native_output)
+                continue
+
             selected_indices = (
                 selected_block_rows[..., None] * ratio
                 + mx.arange(ratio, dtype=mx.int32)
@@ -551,6 +652,7 @@ def contiguous_causal_gathered_qsa(
         tail_valid = tail < visible_counts[..., None]
         selected_indices = mx.concatenate((selected_indices, tail), axis=-1)
         selected_valid = mx.concatenate((selected_valid, tail_valid), axis=-1)
+
         safe_selected = mx.where(selected_valid, selected_indices, 0).astype(mx.int32)
 
         selected_keys = _batch_gather_tokens(key_rows, safe_selected).transpose(
