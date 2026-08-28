@@ -74,6 +74,26 @@ def _get_dflash_stop_token_ids(tokenizer: Any) -> list[int]:
     return stop_ids
 
 
+def _process_output_parser_token(result: Any) -> tuple[str, str, bool, bool]:
+    """Normalize the scheduler-facing parser token contract."""
+    is_stop = bool(getattr(result, "is_stop", False))
+    record_token = getattr(result, "record_token", None)
+    should_record = bool(record_token) if record_token is not None else not is_stop
+    return result.stream_text, result.visible_text, is_stop, should_record
+
+
+def _finalize_output_parser(
+    parser_session: Any,
+    visible_parts: list[str],
+) -> tuple[Any, str]:
+    """Finalize once and return Scheduler-compatible cumulative output text."""
+    final = parser_session.finalize()
+    if final.visible_text:
+        visible_parts.append(final.visible_text)
+    prefix = getattr(final, "output_text_prefix", "") or ""
+    return final, prefix + "".join(visible_parts)
+
+
 def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     """Decide whether ``model_path`` can run on the current dflash backend.
 
@@ -1388,6 +1408,54 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
         event_iter = None
         cache_manager = None
+        prefix_flow = None
+        parser_session = None
+        parser_final = None
+        parser_output_text = ""
+        parser_finalized = False
+        final_enqueued = False
+        recorded_completion = 0
+        parsed_visible_parts: list[str] = []
+        last_acceptance_ratio = 0.0
+        last_cycles_completed = 0
+
+        def enqueue(item: tuple[str, list[int], bool, dict[str, Any] | None]) -> None:
+            asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+
+        def finalize_parser_once():
+            nonlocal parser_final, parser_finalized, parser_output_text
+            if parser_session is None or parser_finalized:
+                return parser_final
+            # Mark first so a failing parser finalizer is never invoked twice
+            # from the error/finally cleanup paths.
+            parser_finalized = True
+            parser_final, parser_output_text = _finalize_output_parser(
+                parser_session, parsed_visible_parts
+            )
+            return parser_final
+
+        def add_parser_final_metrics(metrics: dict[str, Any]) -> str:
+            final = finalize_parser_once()
+            if final is None:
+                return ""
+            metrics["output_text"] = parser_output_text
+            if final.tool_calls:
+                metrics["tool_calls"] = final.tool_calls
+            if final.finish_reason:
+                metrics["finish_reason"] = final.finish_reason
+            return final.stream_text or ""
+
+        def enqueue_final(
+            metrics: dict[str, Any],
+            *,
+            new_text: str = "",
+        ) -> None:
+            nonlocal final_enqueued
+            if final_enqueued:
+                return
+            final_enqueued = True
+            enqueue((new_text, [], True, metrics))
+
         try:
             self._record_prefill_guard_active_memory()
             if seed is not None:
@@ -1428,40 +1496,52 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
                 if isinstance(event, TokenEvent):
                     token_id = int(event.token_id)
+                    last_acceptance_ratio = float(event.acceptance_ratio)
+                    last_cycles_completed = int(event.cycles_completed)
                     # Skip EOS/stop tokens from output
                     if token_id in stop_ids:
                         continue
                     if parser_session is not None:
                         result = parser_session.process_token(token_id)
-                        text = result.stream_text
+                        (
+                            text,
+                            visible_text,
+                            is_parser_stop,
+                            should_record_token,
+                        ) = _process_output_parser_token(result)
+                        if visible_text:
+                            parsed_visible_parts.append(visible_text)
+                        if should_record_token:
+                            recorded_completion += 1
+                        chunk_tokens = (
+                            [token_id]
+                            if should_record_token and not is_parser_stop
+                            else []
+                        )
                     elif detokenizer is not None:
+                        recorded_completion += 1
                         detokenizer.add_token(token_id)
                         text = detokenizer.last_segment
+                        chunk_tokens = [token_id]
                     else:
+                        recorded_completion += 1
                         text = self._executor_tokenizer.decode([token_id])
+                        chunk_tokens = [token_id]
                     # Parser sessions can emit empty stream_text on protocol
                     # marker tokens — skip the chunk so clients don't see a
                     # flood of empty deltas.
-                    if not text:
-                        continue
-                    asyncio.run_coroutine_threadsafe(
-                        queue.put((text, [token_id], False, None)), loop
-                    )
+                    if text:
+                        enqueue((text, chunk_tokens, False, None))
+                    if parser_session is not None and is_parser_stop:
+                        logger.info(
+                            "DFlash streaming generation stopped by output parser "
+                            "after %d recorded token(s)",
+                            recorded_completion,
+                        )
+                        break
 
                 elif isinstance(event, SummaryEvent):
                     self._record_speculation_summary(event)
-                    # Flush any buffered tail from the parser (e.g. close an
-                    # unterminated <think> block) before the metrics chunk so
-                    # the client sees a well-formed final delta.
-                    parser_final = None
-                    if parser_session is not None:
-                        parser_final = parser_session.finalize()
-                        tail = parser_final.stream_text
-                        if tail:
-                            asyncio.run_coroutine_threadsafe(
-                                queue.put((tail, [], False, None)), loop
-                            )
-
                     gen_tokens = int(event.generation_tokens)
                     accept_ratio = float(event.acceptance_ratio)
                     cycles = int(event.cycles_completed)
@@ -1483,31 +1563,42 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     )
                     metrics: dict[str, Any] = {
                         "prompt_tokens": int(event.prompt_token_count),
-                        "completion_tokens": gen_tokens,
+                        "completion_tokens": (
+                            recorded_completion
+                            if parser_session is not None
+                            else gen_tokens
+                        ),
                         "acceptance_ratio": accept_ratio,
                         "cycles_completed": cycles,
                         # Prefix-snapshot hit count, surfaced on the final
                         # (usage) chunk so the API reports cached_tokens (#1441).
                         "cached_tokens": self._cached_tokens_from_flow(prefix_flow),
                     }
-                    if parser_final is not None:
-                        if parser_final.tool_calls:
-                            metrics["tool_calls"] = parser_final.tool_calls
-                        if parser_final.finish_reason:
-                            metrics["finish_reason"] = parser_final.finish_reason
-                    asyncio.run_coroutine_threadsafe(
-                        queue.put(("", [], True, metrics)), loop
-                    )
+                    tail = add_parser_final_metrics(metrics)
+                    enqueue_final(metrics, new_text=tail)
+                    break
 
                 # Cycle, memory, prefill, and snapshot events are consumed by the
                 # runtime cache manager and metrics layers — omlx does not surface
                 # them so all other event types are intentionally ignored.
 
+            if not final_enqueued:
+                metrics = {
+                    "prompt_tokens": len(prompt_tokens),
+                    "completion_tokens": recorded_completion,
+                    "acceptance_ratio": last_acceptance_ratio,
+                    "cycles_completed": last_cycles_completed,
+                    "cached_tokens": self._cached_tokens_from_flow(prefix_flow),
+                    "aborted": stop_event.is_set(),
+                }
+                tail = ""
+                if not stop_event.is_set():
+                    tail = add_parser_final_metrics(metrics)
+                enqueue_final(metrics, new_text=tail)
+
         except Exception as e:
             logger.error(f"DFlash streaming generation error: {e}")
-            asyncio.run_coroutine_threadsafe(
-                queue.put(("", [], True, {"error": str(e)})), loop
-            )
+            enqueue_final({"error": str(e), "completion_tokens": recorded_completion})
         finally:
             # Closing the dflash generator throws GeneratorExit on its next
             # yield, releasing kernel state and any draft cache it holds.
@@ -1520,11 +1611,14 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     except Exception as exc:
                         logger.debug(f"event_iter.close() raised: {exc}")
             self._end_runtime_cache_request(cache_manager)
-            # Always send a sentinel so the async consumer doesn't deadlock
-            # when an abort happened before the dflash summary was emitted.
-            asyncio.run_coroutine_threadsafe(
-                queue.put(("", [], True, {"aborted": stop_event.is_set()})),
-                loop,
+            # Exactly one terminal queue item is required: the async consumer
+            # otherwise either deadlocks (no SummaryEvent after parser stop) or
+            # observes two finals (SummaryEvent plus an unconditional sentinel).
+            enqueue_final(
+                {
+                    "completion_tokens": recorded_completion,
+                    "aborted": stop_event.is_set(),
+                }
             )
             self._active_request = False
 
@@ -1636,37 +1730,59 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 summary: SummaryEvent | None = None
                 first_token_at: float | None = None
                 parser_final = None
+                parser_output_text = ""
                 for event in event_iter:
                     if stop_event.is_set():
                         logger.info("DFlash generation aborted by client")
                         break
                     if isinstance(event, TokenEvent):
-                        if first_token_at is None:
-                            first_token_at = time.perf_counter()
                         token_id = int(event.token_id)
                         if token_id in stop_ids:
                             continue
-                        tokens.append(token_id)
-                        self._update_activity(activity_id, token_count=len(tokens))
                         if parser_session is not None:
                             result = parser_session.process_token(token_id)
-                            if result.visible_text:
-                                parsed_visible_parts.append(result.visible_text)
+                            (
+                                _,
+                                visible_text,
+                                is_parser_stop,
+                                should_record_token,
+                            ) = _process_output_parser_token(result)
+                            if visible_text:
+                                parsed_visible_parts.append(visible_text)
+                            if should_record_token:
+                                if first_token_at is None:
+                                    first_token_at = time.perf_counter()
+                                tokens.append(token_id)
+                                self._update_activity(
+                                    activity_id, token_count=len(tokens)
+                                )
+                            if is_parser_stop:
+                                logger.info(
+                                    "DFlash generation stopped by output parser "
+                                    "after %d recorded token(s)",
+                                    len(tokens),
+                                )
+                                break
+                        else:
+                            if first_token_at is None:
+                                first_token_at = time.perf_counter()
+                            tokens.append(token_id)
+                            self._update_activity(activity_id, token_count=len(tokens))
                     elif isinstance(event, SummaryEvent):
                         summary = event
                         self._record_speculation_summary(event)
                 if parser_session is not None:
-                    parser_final = parser_session.finalize()
-                    if parser_final.visible_text:
-                        parsed_visible_parts.append(parser_final.visible_text)
+                    parser_final, parser_output_text = _finalize_output_parser(
+                        parser_session, parsed_visible_parts
+                    )
                 return (
                     summary,
                     tokens,
                     parser_session,
                     parser_final,
-                    parsed_visible_parts,
                     prefix_flow,
                     first_token_at,
+                    parser_output_text,
                 )
             finally:
                 self._record_prefill_guard_active_memory()
@@ -1689,9 +1805,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     generated,
                     parser_session,
                     parser_final,
-                    parsed_visible_parts,
                     prefix_flow,
                     first_token_at,
+                    parser_output_text,
                 ) = await asyncio.shield(asyncio.wrap_future(future))
             except asyncio.CancelledError:
                 stop_event.set()
@@ -1713,7 +1829,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             # and stripped channel marker tokens, so just join the visible
             # segments. Don't re-decode the raw token list — that would
             # reintroduce the raw markers and double-buffer detokenization.
-            text = "".join(parsed_visible_parts)
+            text = parser_output_text
         else:
             text = self._tokenizer_obj.decode(generated, skip_special_tokens=True)
             text = clean_special_tokens(text)
@@ -1735,8 +1851,19 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             if summary is not None
             else len(prompt_tokens)
         )
+        # Parser sessions decide whether a protocol/control token belongs to
+        # completion accounting.  Once a parser stop closes the DFlash event
+        # iterator there is no SummaryEvent, so the recorded token list is the
+        # scheduler-compatible source of truth.  Preserve the historical
+        # summary accounting for ordinary, parser-free generation.
         completion_token_count = (
-            int(summary.generation_tokens) if summary is not None else len(generated)
+            len(generated)
+            if parser_session is not None
+            else (
+                int(summary.generation_tokens)
+                if summary is not None
+                else len(generated)
+            )
         )
         return GenerationOutput(
             text=text,
@@ -1885,6 +2012,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 if finished:
                     if metrics and metrics.get("completion_tokens") is not None:
                         total_completion = int(metrics["completion_tokens"])
+                    if metrics and metrics.get("output_text") is not None:
+                        # Protocol parsers maintain a visible-output channel
+                        # distinct from their streamed control/reasoning text.
+                        # Match Scheduler by exposing prefix + visible text as
+                        # the final cumulative GenerationOutput.text.
+                        total_text = str(metrics["output_text"])
                     if metrics and metrics.get("error"):
                         finish_reason = "error"
                     else:

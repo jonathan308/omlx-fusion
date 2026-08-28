@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for DFlash engine integration."""
 
+import asyncio
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1475,6 +1477,120 @@ class TestDFlashOutputParserWiring:
         ]
         return engine, create_with_tools, tools, tool_calls
 
+    def _parser_stop_engine(self):
+        events = pytest.importorskip("dflash_mlx.engine.events")
+
+        from omlx.engine.dflash import DFlashEngine
+
+        class TrackingIterator:
+            def __init__(self, values):
+                self._values = iter(values)
+                self.next_calls = 0
+                self.close_calls = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.next_calls += 1
+                return next(self._values)
+
+            def close(self):
+                self.close_calls += 1
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(),
+        )
+        engine._loaded = True
+        engine._tokenizer_obj = SimpleNamespace(
+            encode=lambda text: [1, 2],
+            decode=lambda tokens, **kwargs: "".join(str(token) for token in tokens),
+        )
+        engine._executor_tokenizer = engine._tokenizer_obj
+        engine._should_fallback = lambda tokens: False
+        engine._detect_needs_think_prefix = lambda tokens: False
+
+        tool_calls = [
+            {
+                "name": "internal_search",
+                "arguments": '{"query":"maintenance contract"}',
+            }
+        ]
+        parser_session = MagicMock()
+
+        def process_token(token_id):
+            if token_id == 7:
+                return SimpleNamespace(
+                    stream_text="<think>streamed",
+                    visible_text="visible",
+                    is_stop=False,
+                    record_token=True,
+                )
+            if token_id == 8:
+                return SimpleNamespace(
+                    stream_text="",
+                    visible_text="",
+                    is_stop=True,
+                    record_token=False,
+                )
+            pytest.fail(f"parser processed token after stop: {token_id}")
+
+        parser_session.process_token.side_effect = process_token
+        parser_session.finalize.return_value = SimpleNamespace(
+            stream_text="</think>",
+            visible_text="-tail",
+            output_text_prefix="PREFIX:",
+            tool_calls=tool_calls,
+            finish_reason="tool_calls",
+        )
+        engine._output_parser_factory = SimpleNamespace(
+            create_session=MagicMock(return_value=parser_session),
+            create_session_with_tools=None,
+        )
+
+        token_1 = events.TokenEvent(
+            token_id=7,
+            generated_tokens=1,
+            acceptance_ratio=0.5,
+            cycles_completed=1,
+        )
+        stop_token = events.TokenEvent(
+            token_id=8,
+            generated_tokens=2,
+            acceptance_ratio=0.5,
+            cycles_completed=2,
+        )
+        forbidden_token = events.TokenEvent(
+            token_id=9,
+            generated_tokens=3,
+            acceptance_ratio=0.5,
+            cycles_completed=3,
+        )
+        summary = events.SummaryEvent(
+            elapsed_us=1000,
+            prompt_token_count=2,
+            generated_token_ids=(7, 8, 9),
+            generation_tokens=3,
+            accepted_from_draft=0,
+            acceptance_ratio=0.5,
+            cycles_completed=3,
+            phase_timings_us={},
+        )
+        event_iter = TrackingIterator([token_1, stop_token, forbidden_token, summary])
+        engine._stream_dflash_events = MagicMock(
+            return_value=(
+                event_iter,
+                SimpleNamespace(hit_tokens=0),
+                [],
+            )
+        )
+        cache_manager = object()
+        engine._begin_runtime_cache_request = MagicMock(return_value=cache_manager)
+        engine._end_runtime_cache_request = MagicMock()
+        return engine, parser_session, event_iter, cache_manager, tool_calls
+
     @pytest.mark.asyncio
     async def test_non_streaming_propagates_parser_tool_calls(self):
         engine, create_with_tools, tools, tool_calls = self._tool_parser_engine()
@@ -1504,6 +1620,151 @@ class TestDFlashOutputParserWiring:
         assert outputs[0].tool_calls == tool_calls
         assert outputs[0].finish_reason == "tool_calls"
         assert outputs[0].completion_tokens == 1
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_parser_stop_closes_iterator_and_keeps_clean_output(
+        self,
+    ):
+        engine, parser, event_iter, cache_manager, tool_calls = (
+            self._parser_stop_engine()
+        )
+
+        output = await engine.generate([1, 2])
+
+        assert parser.process_token.call_args_list == [((7,),), ((8,),)]
+        parser.finalize.assert_called_once_with()
+        assert event_iter.next_calls == 2
+        assert event_iter.close_calls == 1
+        engine._end_runtime_cache_request.assert_called_once_with(cache_manager)
+        assert output.tokens == [7]
+        assert output.completion_tokens == 1
+        assert output.text == "PREFIX:visible-tail"
+        assert output.tool_calls == tool_calls
+        assert output.finish_reason == "tool_calls"
+
+    @pytest.mark.asyncio
+    async def test_streaming_parser_stop_has_one_final_and_no_late_tokens(self):
+        engine, parser, event_iter, cache_manager, tool_calls = (
+            self._parser_stop_engine()
+        )
+
+        outputs = [output async for output in engine.stream_generate([1, 2])]
+
+        assert parser.process_token.call_args_list == [((7,),), ((8,),)]
+        parser.finalize.assert_called_once_with()
+        assert event_iter.next_calls == 2
+        assert event_iter.close_calls == 1
+        engine._end_runtime_cache_request.assert_called_once_with(cache_manager)
+        assert sum(output.finished for output in outputs) == 1
+        assert outputs[-1].finished is True
+        assert outputs[-1].new_text == "</think>"
+        assert outputs[-1].text == "PREFIX:visible-tail"
+        assert outputs[-1].completion_tokens == 1
+        assert outputs[-1].tool_calls == tool_calls
+        assert outputs[-1].finish_reason == "tool_calls"
+
+    @pytest.mark.asyncio
+    async def test_streaming_worker_enqueues_exactly_one_terminal_item(self):
+        engine, parser, event_iter, cache_manager, tool_calls = (
+            self._parser_stop_engine()
+        )
+        queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        await asyncio.to_thread(
+            engine._run_generate_streaming,
+            [1, 2],
+            32,
+            0.0,
+            1.0,
+            0,
+            0.0,
+            1.0,
+            20,
+            None,
+            None,
+            queue,
+            loop,
+            threading.Event(),
+        )
+        queued = []
+        while True:
+            item = await asyncio.wait_for(queue.get(), timeout=1.0)
+            queued.append(item)
+            if item[2]:
+                break
+        await asyncio.sleep(0)
+        while not queue.empty():
+            queued.append(queue.get_nowait())
+
+        finals = [item for item in queued if item[2]]
+        assert len(finals) == 1
+        assert finals[0][0] == "</think>"
+        assert finals[0][3]["output_text"] == "PREFIX:visible-tail"
+        assert finals[0][3]["completion_tokens"] == 1
+        assert finals[0][3]["tool_calls"] == tool_calls
+        parser.finalize.assert_called_once_with()
+        assert event_iter.close_calls == 1
+        engine._end_runtime_cache_request.assert_called_once_with(cache_manager)
+
+    @pytest.mark.asyncio
+    async def test_streaming_without_parser_keeps_token_and_summary_behavior(
+        self, monkeypatch
+    ):
+        events = pytest.importorskip("dflash_mlx.engine.events")
+        from omlx.engine import dflash as dflash_mod
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine("target", "draft")
+        engine._loaded = True
+        engine._tokenizer_obj = SimpleNamespace(
+            encode=lambda text: [1, 2],
+            decode=lambda tokens, **kwargs: "".join(
+                {7: "A", 8: "B"}[token] for token in tokens
+            ),
+        )
+        engine._executor_tokenizer = engine._tokenizer_obj
+        engine._should_fallback = lambda tokens: False
+        engine._detect_needs_think_prefix = lambda tokens: False
+        engine._output_parser_factory = None
+        monkeypatch.setattr(
+            dflash_mod, "create_streaming_detokenizer", lambda *a, **k: None
+        )
+
+        token_1 = events.TokenEvent(
+            token_id=7,
+            generated_tokens=1,
+            acceptance_ratio=1.0,
+            cycles_completed=1,
+        )
+        token_2 = events.TokenEvent(
+            token_id=8,
+            generated_tokens=2,
+            acceptance_ratio=1.0,
+            cycles_completed=2,
+        )
+        summary = events.SummaryEvent(
+            elapsed_us=1000,
+            prompt_token_count=2,
+            generated_token_ids=(7, 8),
+            generation_tokens=2,
+            accepted_from_draft=2,
+            acceptance_ratio=1.0,
+            cycles_completed=2,
+            phase_timings_us={},
+        )
+        engine._stream_dflash_events = MagicMock(
+            return_value=(iter([token_1, token_2, summary]), SimpleNamespace(), [])
+        )
+
+        outputs = [output async for output in engine.stream_generate([1, 2])]
+
+        assert [output.new_text for output in outputs] == ["A", "B", ""]
+        assert [output.tokens for output in outputs] == [[7], [8], []]
+        assert outputs[-1].text == "AB"
+        assert outputs[-1].completion_tokens == 2
+        assert outputs[-1].finish_reason == "stop"
+        assert sum(output.finished for output in outputs) == 1
 
 
 class TestDFlashCachedTokens:
