@@ -199,6 +199,88 @@ def test_single_node_mtp_keeps_lazy_hidden_overlap():
     assert calls == []
 
 
+def test_distributed_mtp_activation_safe_requires_all_rank_votes():
+    from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+    class Model:
+        mtp = object()
+        _omlx_mtp_decode_enabled = True
+
+        @staticmethod
+        def mtp_forward(*_args):
+            return None
+
+    class Group:
+        @staticmethod
+        def size():
+            return 2
+
+    class Result:
+        def __init__(self, value):
+            self.value = value
+
+        def item(self):
+            return self.value
+
+    batch = SimpleNamespace(
+        model=Model(),
+        uids=[1],
+        logits_processors=[],
+    )
+
+    def fake_mx(total):
+        return SimpleNamespace(
+            int32=object(),
+            array=lambda values, dtype: values[0],
+            distributed=SimpleNamespace(
+                init=lambda: Group(),
+                all_sum=lambda vote, group: Result(total),
+            ),
+        )
+
+    assert bg._synchronize_mtp_activation_safe(
+        batch, True, mx_module=fake_mx(2)
+    ) is True
+    assert bg._synchronize_mtp_activation_safe(
+        batch, True, mx_module=fake_mx(1)
+    ) is False
+
+
+def test_distributed_mtp_deep_queue_skips_admission_collective():
+    from collections import deque
+
+    from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+    class Model:
+        mtp = object()
+        _omlx_mtp_decode_enabled = True
+
+        @staticmethod
+        def mtp_forward(*_args):
+            return None
+
+    batch = SimpleNamespace(
+        model=Model(),
+        uids=[1],
+        logits_processors=[],
+        _omlx_mtp_state=bg._MtpState(
+            uid=1,
+            queue=deque([(1, None, "draft"), (2, None, "bonus")]),
+        ),
+    )
+    fake_mx = SimpleNamespace(
+        distributed=SimpleNamespace(
+            init=lambda: (_ for _ in ()).throw(
+                AssertionError("deep queue must not vote")
+            )
+        )
+    )
+
+    assert bg._synchronize_mtp_activation_safe(
+        batch, True, mx_module=fake_mx
+    ) is True
+
+
 class TestMtpBoundaryCommit:
     @staticmethod
     def _run_full_accept_cycle(monkeypatch, *, emitted, drafts, clamp=None):
@@ -263,6 +345,11 @@ class TestMtpBoundaryCommit:
         monkeypatch.setattr(bg, "_chain_rollback", fake_rollback)
         monkeypatch.setattr(bg, "_chain_next_drafts", lambda *args, **kwargs: None)
         monkeypatch.setattr(bg, "_clear_rollback", lambda _cache: None)
+        monkeypatch.setattr(
+            bg,
+            "_materialize_distributed_hidden_sibling",
+            lambda *_args, **_kwargs: False,
+        )
 
         bg._run_verify_cycle_chain(batch, state)
         return batch, state, cache

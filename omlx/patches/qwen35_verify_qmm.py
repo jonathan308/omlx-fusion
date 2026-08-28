@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 
 _KERNEL_CACHE: dict = {}
 _ROUTE_ARMED = threading.local()
+_ROUTE_EXACT = threading.local()
 
 _MSG_NSG = 8  # simdgroups per threadgroup for the msg (lm_head) kernel
 
@@ -64,13 +65,18 @@ _MSG_NSG = 8  # simdgroups per threadgroup for the msg (lm_head) kernel
 _MIN_ROUTE_N = 16384
 
 
-def set_verify_qmm_armed(flag: bool) -> None:
+def set_verify_qmm_armed(flag: bool, *, exact: bool = False) -> None:
     """Arm/disarm verify-qmm routing (MTP verify forwards only)."""
     _ROUTE_ARMED.value = bool(flag)
+    _ROUTE_EXACT.value = bool(flag and exact)
 
 
 def _is_armed() -> bool:
     return getattr(_ROUTE_ARMED, "value", False)
+
+
+def _is_exact() -> bool:
+    return getattr(_ROUTE_EXACT, "value", False)
 
 
 # ---------------------------------------------------------------------------

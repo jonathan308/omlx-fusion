@@ -339,8 +339,12 @@ def apply() -> bool:
         def patched_bg_next(self, *args, **kwargs):
             gen_batch = getattr(self, "_generation_batch", None)
             if gen_batch is not None:
+                local_safe = _batch_generator_allows_mtp_activation(self)
                 gen_batch._omlx_mtp_activation_safe = (
-                    _batch_generator_allows_mtp_activation(self)
+                    _synchronize_mtp_activation_safe(
+                        gen_batch,
+                        local_safe,
+                    )
                 )
             if _generation_batch_has_active_mtp(
                 gen_batch
@@ -401,6 +405,42 @@ def _model_mtp_decode_enabled(model: Any) -> bool:
     )
 
 
+def _model_mtp_tokenwise_verify_enabled(model: Any) -> bool:
+    """Whether this loaded model requires decode-consistent verify rows."""
+
+    candidates = [model]
+    for attr in ("language_model", "_language_model", "model"):
+        candidate = getattr(model, attr, None)
+        if candidate is not None and candidate not in candidates:
+            candidates.append(candidate)
+    for wrapper in list(candidates):
+        inner = getattr(wrapper, "model", None)
+        if inner is not None and inner not in candidates:
+            candidates.append(inner)
+    return any(
+        bool(getattr(candidate, "_omlx_mtp_tokenwise_backbone", False))
+        for candidate in candidates
+    )
+
+
+def _model_mtp_replay_reject_enabled(model: Any) -> bool:
+    """Whether rejected verify windows rebuild via one exact decode row."""
+
+    candidates = [model]
+    for attr in ("language_model", "_language_model", "model"):
+        candidate = getattr(model, attr, None)
+        if candidate is not None and candidate not in candidates:
+            candidates.append(candidate)
+    for wrapper in list(candidates):
+        inner = getattr(wrapper, "model", None)
+        if inner is not None and inner not in candidates:
+            candidates.append(inner)
+    return any(
+        bool(getattr(candidate, "_omlx_mtp_replay_reject", False))
+        for candidate in candidates
+    )
+
+
 def _batch_generator_allows_mtp_activation(batch_gen: Any) -> bool:
     """True when lazy MTP activation cannot race with a pending batch merge."""
     try:
@@ -419,6 +459,52 @@ def _batch_generator_allows_mtp_activation(batch_gen: Any) -> bool:
         return len(getattr(batch_gen, "_unprocessed_sequences", [])) == 0
     except Exception:
         return False
+
+
+def _synchronize_mtp_activation_safe(
+    gen_batch: Any,
+    local_safe: bool,
+    *,
+    mx_module: Any = None,
+) -> bool:
+    """Rank-agree activation and drained-queue late-join decisions.
+
+    Request ingress can become visible to rank zero one scheduler turn before
+    a peer. A rank-local ``activation_safe`` decision would then send one rank
+    through the standard late-join handoff while another enters a speculative
+    verify collective. Vote only where that decision can change: before a new
+    singleton MTP state is created, or when an active state's emit queue has at
+    most one token left. Deep queues remain pinned without an extra control
+    collective.
+    """
+
+    if gen_batch is None or not _mtp_common_eligible(gen_batch):
+        return bool(local_safe)
+    state = getattr(gen_batch, "_omlx_mtp_state", None)
+    if state is not None and len(getattr(state, "queue", ())) > 1:
+        return bool(local_safe)
+    if mx_module is None:
+        import mlx.core as mx_module
+    try:
+        group = mx_module.distributed.init()
+        world_size = int(group.size())
+        if world_size <= 1:
+            return bool(local_safe)
+        vote = mx_module.array(
+            [1 if local_safe else 0],
+            dtype=mx_module.int32,
+        )
+        agreed = mx_module.distributed.all_sum(vote, group=group)
+        return int(agreed.item()) == world_size
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        # Fail closed: a distributed MTP rank that cannot agree must not
+        # activate or cross a handoff boundary independently.
+        try:
+            if int(mx_module.distributed.init().size()) > 1:
+                return False
+        except Exception:
+            pass
+        return bool(local_safe)
 
 
 def _generation_batch_has_active_mtp(gen_batch: Any) -> bool:
@@ -1451,7 +1537,11 @@ def _mtp_prepare_logits(gen_batch: Any, local_logits: Any) -> Any:
 
 def _mtp_logprobs(gen_batch: Any, logits: Any) -> Any:
     adapter = _mtp_vocab_coordinator(gen_batch)
-    if adapter is not None and not adapter.is_coordinator:
+    if (
+        adapter is not None
+        and not adapter.is_coordinator
+        and not getattr(adapter, "replicated_logits", False)
+    ):
         import mlx.core as mx
 
         return mx.broadcast_to(mx.zeros((), dtype=mx.float32), logits.shape)
@@ -1460,7 +1550,11 @@ def _mtp_logprobs(gen_batch: Any, logits: Any) -> Any:
 
 def _mtp_accept_lp(gen_batch: Any, sampler: Any, logprobs: Any) -> Any:
     adapter = _mtp_vocab_coordinator(gen_batch)
-    if adapter is not None and not adapter.is_coordinator:
+    if (
+        adapter is not None
+        and not adapter.is_coordinator
+        and not getattr(adapter, "replicated_logits", False)
+    ):
         return logprobs
     return _accept_lp_for(sampler, logprobs)
 
@@ -1625,7 +1719,7 @@ def _rollback_after_reject(
         model.rollback_speculative_cache(prompt_cache, gdn_states, accepted, block_size)
         return True
     partial_rollback = getattr(model, "mtp_partial_rollback", None)
-    if callable(partial_rollback):
+    if callable(partial_rollback) and not _model_mtp_tokenwise_verify_enabled(model):
         try:
             return bool(
                 partial_rollback(
@@ -1638,6 +1732,58 @@ def _rollback_after_reject(
             logger.debug("mtp_partial_rollback failed: %s", exc)
             return False
     return _restore_or_trim_caches(prompt_cache)
+
+
+def _rollback_and_replay_confirmed(
+    gen_batch: Any,
+    state: _MtpState,
+    *,
+    verify_width: int,
+) -> bool:
+    """Restore the pre-window state, then commit one ordinary decode row.
+
+    Qwen's recurrent verify path projects the confirmed and draft rows as one
+    skinny matrix. Replaying the confirmed row from those width-2 projections
+    is close but not bit-identical to ordinary L=1 decode. On a rejection,
+    restore the exact pre-window recurrent state, trim every KV row from the
+    window, and feed ``next_main`` once through the regular decode shape.
+    Accepted windows pay none of this cost.
+    """
+
+    import mlx.core as mx
+
+    if state.next_main is None or verify_width <= 0:
+        return False
+    prompt_cache = gen_batch.prompt_cache
+    for cache in prompt_cache:
+        if getattr(cache, "rollback_state", None) is not None:
+            continue
+        if hasattr(cache, "is_trimmable") and cache.is_trimmable():
+            continue
+        return False
+
+    try:
+        for cache in prompt_cache:
+            rollback = getattr(cache, "rollback_state", None)
+            if rollback is not None:
+                cache[0], cache[1] = rollback
+                cache.rollback_state = None
+                if getattr(cache, "_mtp_draft_stash", None) is not None:
+                    cache._mtp_draft_stash = None
+            else:
+                cache.trim(verify_width)
+
+        logits, _, _ = _call_backbone(
+            gen_batch.model,
+            state.next_main[:, None],
+            prompt_cache,
+        )
+        mx.eval(logits, [cache.state for cache in prompt_cache])
+        _clear_rollback(prompt_cache)
+        return True
+    except Exception as exc:
+        logger.debug("MTP confirmed-row replay failed: %s", exc)
+        return False
 
 
 def _call_backbone(
@@ -3574,7 +3720,6 @@ def _run_verify_cycle_legacy(gen_batch: Any, state: _MtpState) -> None:
     draft_id = state.draft_id
     verify_id = int(verify_tok.tolist()[0])
     bonus_id = int(bonus_tok.tolist()[0])
-
     # Filtered logprobs — distribution the sampler actually drew from.
     # Used for acceptance ratio + residual sampling so they match the
     # sampling distribution rather than raw softmax (PR 990 alignment).
@@ -3639,13 +3784,21 @@ def _run_verify_cycle_legacy(gen_batch: Any, state: _MtpState) -> None:
         _restore_snapshotable(procs, verify_snap)
     # accepted=0 means only the confirmed token (verify position) is kept;
     # block_size=2 covers both the confirmed and the rejected draft.
-    if not _rollback_after_reject(
-        gen_batch.model,
-        gen_batch.prompt_cache,
-        gdn_states,
-        accepted=0,
-        block_size=2,
-    ):
+    if _model_mtp_replay_reject_enabled(gen_batch.model):
+        rollback_ok = _rollback_and_replay_confirmed(
+            gen_batch,
+            state,
+            verify_width=2,
+        )
+    else:
+        rollback_ok = _rollback_after_reject(
+            gen_batch.model,
+            gen_batch.prompt_cache,
+            gdn_states,
+            accepted=0,
+            block_size=2,
+        )
+    if not rollback_ok:
         if procs is not None:
             _trim_token_buffer(gen_batch, 1)
         raise _MtpStepFallback("cache layer rejects rollback")

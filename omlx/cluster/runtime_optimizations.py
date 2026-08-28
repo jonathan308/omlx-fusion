@@ -720,15 +720,25 @@ def _supports_vocab_parallel_sampling(
 class _MTPVocabCoordinator:
     """Point-to-point vocab reconstruction plus tiny decision collectives."""
 
-    def __init__(self, mx: Any, group: Any, output_size: int) -> None:
+    def __init__(
+        self,
+        mx: Any,
+        group: Any,
+        output_size: int,
+        *,
+        replicated_logits: bool = False,
+    ) -> None:
         self.mx = mx
         self.group = group
         self.rank = int(group.rank())
         self.world_size = int(group.size())
         self.output_size = int(output_size)
         self.is_coordinator = self.rank == 0
+        self.replicated_logits = bool(replicated_logits)
 
     def gather_logits(self, local_logits: Any) -> Any | None:
+        if self.replicated_logits:
+            return local_logits
         if self.is_coordinator:
             parts = [local_logits]
             for source in range(1, self.world_size):
@@ -1243,7 +1253,27 @@ def install_runtime_optimizations(
         if shape_warmup_enabled and adaptive_prefill_active and skip_logits_active
         else 0
     )
-    if not sampling_active and not skip_logits_active:
+    mtp_decision_model = next(
+        (
+            candidate
+            for candidate in (
+                model,
+                getattr(model, "language_model", None),
+                getattr(model, "_language_model", None),
+            )
+            if candidate is not None
+            and bool(getattr(candidate, "_omlx_mtp_decode_enabled", False))
+        ),
+        None,
+    )
+    mtp_decision_required = bool(
+        mtp_decision_model is not None and world_size > 1
+    )
+    if (
+        not sampling_active
+        and not skip_logits_active
+        and not mtp_decision_required
+    ):
         yield capabilities
         return
 
@@ -1264,19 +1294,7 @@ def install_runtime_optimizations(
         if vocab_sampling_active
         else None
     )
-    mtp_vocab_model = next(
-        (
-            candidate
-            for candidate in (
-                model,
-                getattr(model, "language_model", None),
-                getattr(model, "_language_model", None),
-            )
-            if candidate is not None
-            and bool(getattr(candidate, "_omlx_mtp_decode_enabled", False))
-        ),
-        None,
-    )
+    mtp_vocab_model = mtp_decision_model
     mtp_auxiliary_heads = tuple(
         getattr(mtp_vocab_model, "_omlx_vocab_parallel_aux_heads", ()) or ()
     )
@@ -1300,9 +1318,15 @@ def install_runtime_optimizations(
     previous_mtp_coordinator = getattr(
         model, "_omlx_mtp_vocab_coordinator", missing_mtp_coordinator
     )
+    mtp_decision_active = mtp_decision_required
     mtp_vocab_coordinator = (
-        _MTPVocabCoordinator(mx, group, vocab_output_size)
-        if mtp_vocab_active
+        _MTPVocabCoordinator(
+            mx,
+            group,
+            vocab_output_size if mtp_vocab_active else 0,
+            replicated_logits=not mtp_vocab_active,
+        )
+        if mtp_decision_active
         else None
     )
     local_state = threading.local()

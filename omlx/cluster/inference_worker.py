@@ -757,12 +757,22 @@ def _configure_distributed_qwen_mtp_runtime(
         if candidate is None:
             continue
         if bool(getattr(candidate, "_omlx_mtp_decode_enabled", False)):
-            candidate._omlx_mtp_chain = False
-            candidate._omlx_mtp_depth = 1
+            candidate._omlx_mtp_chain = True
+            candidate._omlx_mtp_depth = 4
+            candidate._omlx_mtp_tokenwise_backbone = False
+            candidate._omlx_mtp_tokenwise_head = False
+            candidate._omlx_mtp_replay_reject = False
+            backbone = getattr(candidate, "model", None)
+            if backbone is not None:
+                backbone._omlx_mtp_tokenwise_backbone = False
+                backbone._omlx_mtp_replay_reject = False
+                for layer in getattr(backbone, "layers", ()):
+                    layer._omlx_mtp_tokenwise_layer = False
             configured = True
     if not configured:
         raise RuntimeError("Qwen distributed MTP head was not attached")
-    return 1
+    os.environ["OMLX_MTP_FIXED_DEPTH"] = "4"
+    return 4
 
 
 def _configure_tensor_shard_weights(
