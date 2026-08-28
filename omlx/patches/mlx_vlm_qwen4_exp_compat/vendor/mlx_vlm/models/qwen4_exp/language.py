@@ -1878,6 +1878,10 @@ class ShardedEmbedding(nn.Module):
         self.dims = dims
 
     def __call__(self, indices: mx.array) -> mx.array:
+        fused = getattr(self, "fused", None)
+        if fused is not None:
+            return fused(indices) * self.weight_scale
+
         flat = indices.reshape(-1)
         # One tiny host sync avoids scheduling gathers against all 128 giant
         # PLE shards for every token.
@@ -1911,6 +1915,92 @@ class ShardedEmbedding(nn.Module):
                 result = mx.zeros((len(host_indices), self.dims), dtype=values.dtype)
             result = result.at[positions].add(values)
         return result.reshape(*indices.shape, self.dims)
+
+    def fuse_quantized_shards(self) -> bool:
+        """Join compatible packed shards without dequantizing the PLE table.
+
+        Resident Qwen4 PLE otherwise synchronizes token IDs to the host before
+        every lookup so it can choose among 128 enormous shard buffers.  A
+        single packed embedding keeps exactly the same affine rows while making
+        the lookup a normal device-side gather.  The caller owns the temporary
+        peak-memory admission check required while old and joined buffers
+        coexist.
+        """
+
+        if getattr(self, "fused", None) is not None:
+            return False
+        shards = list(self.shards)
+        if not shards or not all(
+            type(shard) is nn.QuantizedEmbedding for shard in shards
+        ):
+            return False
+        first = shards[0]
+        if not all(
+            shard.dims == first.dims
+            and shard.group_size == first.group_size
+            and shard.bits == first.bits
+            and shard.mode == first.mode
+            and shard.weight.dtype == first.weight.dtype
+            and shard.scales.dtype == first.scales.dtype
+            and (shard.biases is None) == (first.biases is None)
+            and (shard.biases is None or shard.biases.dtype == first.biases.dtype)
+            for shard in shards
+        ):
+            return False
+
+        total_rows = sum(int(shard.weight.shape[0]) for shard in shards)
+        if total_rows != self.shard_offsets[-1] or first.dims != self.dims:
+            return False
+
+        fused = nn.QuantizedEmbedding(
+            1,
+            self.dims,
+            group_size=first.group_size,
+            bits=first.bits,
+            mode=first.mode,
+        )
+        fused.weight = mx.concatenate([shard.weight for shard in shards], axis=0)
+        fused.scales = mx.concatenate([shard.scales for shard in shards], axis=0)
+        if first.biases is None:
+            fused.biases = None
+        else:
+            fused.biases = mx.concatenate([shard.biases for shard in shards], axis=0)
+        fused.num_embeddings = total_rows
+        arrays = [fused.weight, fused.scales]
+        if fused.biases is not None:
+            arrays.append(fused.biases)
+        mx.eval(*arrays)
+        self.fused = fused
+        self.shards = []
+        return True
+
+
+def fuse_resident_ple_embeddings(
+    model: nn.Module,
+    *,
+    minimum_physical_memory: int = 192 * 1024**3,
+) -> int:
+    """Fuse resident affine PLE shards only where the temporary peak is safe."""
+
+    if get_ple_runtime_mode() != "resident":
+        return 0
+    physical_memory = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    if physical_memory < minimum_physical_memory:
+        return 0
+
+    fused = 0
+    language_model = getattr(model, "language_model", None)
+    layers = getattr(getattr(language_model, "model", None), "layers", ())
+    for layer in layers:
+        ple = getattr(layer, "ple", None)
+        embedding = getattr(
+            getattr(ple, "ple_embedding", None),
+            "ngram_embedding",
+            None,
+        )
+        if type(embedding) is ShardedEmbedding and embedding.fuse_quantized_shards():
+            fused += 1
+    return fused
 
 
 class Qwen4ExpNGramEmbedding(nn.Module):

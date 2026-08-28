@@ -225,6 +225,38 @@ def test_qwen4_hyper_connection_compile_covers_uncombined_mixer():
     assert mx.allclose(eager, compiled, rtol=1e-5, atol=1e-6).item()
 
 
+def test_qwen4_resident_ple_fuses_packed_shards_exactly():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    import mlx.nn as nn
+    from mlx_vlm.models.qwen4_exp.language import ShardedEmbedding
+
+    mx.random.seed(43)
+    embedding = ShardedEmbedding(32, 64, 4)
+    embedding.shards = [
+        nn.QuantizedEmbedding.from_embedding(
+            shard,
+            group_size=32,
+            bits=4,
+            mode="affine",
+        )
+        for shard in embedding.shards
+    ]
+    indices = mx.array([[0, 9, 17, 31, 9]], dtype=mx.int32)
+    expected = embedding(indices)
+    mx.eval(expected)
+
+    assert embedding.fuse_quantized_shards() is True
+    assert embedding.fuse_quantized_shards() is False
+    assert embedding.shards == []
+    # The fused arm performs one device gather and no longer consults the host
+    # shard boundaries after load.
+    embedding.shard_offsets = ()
+    actual = embedding(indices)
+    mx.eval(actual)
+
+    assert mx.array_equal(actual, expected).item()
+
+
 def test_qwen4_exp_load_enables_hyper_connection_optimizations(monkeypatch, caplog):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     import mlx.nn as nn
@@ -235,9 +267,11 @@ def test_qwen4_exp_load_enables_hyper_connection_optimizations(monkeypatch, capl
     nn.Module.__init__(model)
     base_load = MagicMock(return_value="loaded")
     fuse = MagicMock(return_value=96)
+    fuse_ple = MagicMock(return_value=1)
     compile_connections = MagicMock(return_value=97)
     monkeypatch.setattr(Qwen3_5Model, "load_weights", base_load)
     monkeypatch.setattr(model_module, "fuse_hyper_connection_projections", fuse)
+    monkeypatch.setattr(model_module, "fuse_resident_ple_embeddings", fuse_ple)
     monkeypatch.setattr(model_module, "compile_hyper_connections", compile_connections)
     monkeypatch.setattr(
         model_module,
@@ -252,8 +286,10 @@ def test_qwen4_exp_load_enables_hyper_connection_optimizations(monkeypatch, capl
     assert result == "loaded"
     base_load.assert_called_once_with(weights, strict=False)
     fuse.assert_called_once_with(model)
+    fuse_ple.assert_called_once_with(model)
     compile_connections.assert_called_once_with(model)
     assert "96 fused projection pairs, 97 compiled decode paths" in caplog.text
+    assert "Fused 1 resident Qwen4-Exp PLE table" in caplog.text
 
 
 def test_qwen4_exp_load_skips_projection_fusion_during_mtp_verify(
@@ -268,9 +304,11 @@ def test_qwen4_exp_load_skips_projection_fusion_during_mtp_verify(
     nn.Module.__init__(model)
     base_load = MagicMock(return_value=model)
     fuse = MagicMock(return_value=96)
+    fuse_ple = MagicMock(return_value=1)
     compile_connections = MagicMock(return_value=100)
     monkeypatch.setattr(Qwen3_5Model, "load_weights", base_load)
     monkeypatch.setattr(model_module, "fuse_hyper_connection_projections", fuse)
+    monkeypatch.setattr(model_module, "fuse_resident_ple_embeddings", fuse_ple)
     monkeypatch.setattr(model_module, "compile_hyper_connections", compile_connections)
     monkeypatch.setattr(
         model_module,
@@ -282,6 +320,7 @@ def test_qwen4_exp_load_skips_projection_fusion_during_mtp_verify(
     assert model.load_weights([], strict=False) is model
 
     fuse.assert_not_called()
+    fuse_ple.assert_called_once_with(model)
     compile_connections.assert_called_once_with(model)
     assert "Skipped Qwen4-Exp hyper-connection projection fusion" in caplog.text
     assert "0 fused projection pairs, 100 compiled decode paths" in caplog.text

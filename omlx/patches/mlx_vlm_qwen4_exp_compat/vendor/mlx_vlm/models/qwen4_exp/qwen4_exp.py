@@ -15,6 +15,7 @@ from .language import (
     Qwen4ExpRMSNorm,
     compile_hyper_connections,
     fuse_hyper_connection_projections,
+    fuse_resident_ple_embeddings,
     get_mtp_runtime,
     get_ple_runtime_mode,
 )
@@ -261,6 +262,7 @@ class Model(Qwen3_5Model):
         result = super().load_weights(weights, strict=strict)
         mtp_enabled = get_mtp_runtime().enabled
         fused = 0 if mtp_enabled else fuse_hyper_connection_projections(self)
+        fused_ple = fuse_resident_ple_embeddings(self)
         compiled = compile_hyper_connections(self)
         if mtp_enabled:
             logger.info(
@@ -273,6 +275,12 @@ class Model(Qwen3_5Model):
             fused,
             compiled,
         )
+        if fused_ple:
+            logger.info(
+                "Fused %d resident Qwen4-Exp PLE table into one packed "
+                "device-side embedding",
+                fused_ple,
+            )
         return result
 
     def close(self):
