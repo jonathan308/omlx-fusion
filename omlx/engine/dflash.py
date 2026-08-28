@@ -3,8 +3,9 @@
 DFlash engine for block diffusion speculative decoding.
 
 This engine wraps dflash-mlx (>= 0.1.5) to provide faster decoding on Apple
-Silicon for Qwen, Gemma4, and Laguna model families. By default it serves all
-requests through dflash; setting ``model_settings.dflash_max_ctx`` opts into
+Silicon for Qwen, Gemma4, Laguna, Muse Glimmer, and GLM-5.3 model families. By
+default it serves all requests through dflash; setting
+``model_settings.dflash_max_ctx`` opts into
 evicting the dflash models and delegating long-context requests to omlx's
 BatchedEngine/VLMBatchedEngine (paged cache, SSD cache, continuous batching).
 """
@@ -92,9 +93,11 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     is_gemma4 = model_type in ("gemma4", "gemma4_text", "gemma4_unified")
     is_laguna = model_type == "laguna"
     is_muse = model_type in ("muse_glimmer", "muse_glimmer_text")
-    if not (is_qwen or is_gemma4 or is_laguna or is_muse):
+    is_glm5 = model_type == "glm5_next"
+    if not (is_qwen or is_gemma4 or is_laguna or is_muse or is_glm5):
         return False, (
-            f"DFlash supports only Qwen, Gemma4, Laguna, and Muse Glimmer "
+            f"DFlash supports only Qwen, Gemma4, Laguna, Muse Glimmer, and "
+            f"GLM-5.3 "
             f"models (model_type='{cfg.get('model_type', '')}')"
         )
     return True, ""
@@ -529,6 +532,15 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         runtime_context = self._build_runtime_context()
 
         def _load_models():
+            # Register oMLX-owned target extensions before importing the
+            # dflash loader functions below. GLM-5.3 is mlx-vlm-only, so its
+            # installer wraps ``load_target_bundle`` with a scoped VLM loader.
+            from ..patches.dflash_glm5 import install_dflash_glm5_backend
+            from ..patches.dflash_laguna import install_dflash_laguna_backend
+
+            install_dflash_laguna_backend()
+            install_dflash_glm5_backend()
+
             from dflash_mlx.draft_backend import EagerDraftBackend
             from dflash_mlx.engine.target_ops import bind_draft_to_target
             from dflash_mlx.runtime.loading import (
@@ -545,13 +557,6 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             maybe_apply_pre_load_patches(
                 self._model_name, model_settings=self._model_settings
             )
-
-            # dflash-mlx 0.1.10 has no Laguna backend. Register oMLX's strict
-            # TargetOps plus the official gated Laguna drafter specialization
-            # before load_target_bundle resolves either architecture.
-            from ..patches.dflash_laguna import install_dflash_laguna_backend
-
-            install_dflash_laguna_backend()
 
             # Wrap dflash's hook installers so we can revert the class-level
             # __call__ patches when this engine stops. Without this, a later
@@ -605,6 +610,13 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     else None
                 ),
             )
+            from ..patches.dflash_glm5 import validate_glm5_dflash_pair
+
+            validate_glm5_dflash_pair(
+                target_bundle.model,
+                draft,
+                draft_meta,
+            )
             bind_draft_to_target(
                 draft,
                 target_bundle.model,
@@ -616,6 +628,27 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         result = await loop.run_in_executor(get_mlx_executor(), _load_models)
         target_bundle, self._draft_model, self._draft_backend, draft_meta = result
         self._draft_window_size = self._resolve_draft_window_size(draft_meta)
+        capabilities_for = getattr(target_bundle.target_ops, "capabilities_for", None)
+        target_capabilities = (
+            capabilities_for(target_bundle.model)
+            if callable(capabilities_for)
+            else None
+        )
+        if (
+            self._in_memory_cache_enabled
+            and target_capabilities is not None
+            and not target_capabilities.supports_prefix_snapshot
+        ):
+            # Do not advertise or initialize an inert cache. GLM-5.3's DSA
+            # layers use CacheList(KVCache, PoolingCache), which the pinned
+            # dflash snapshot codec cannot serialize yet.
+            logger.warning(
+                "DFlash prefix snapshots are not supported by target backend %s; "
+                "disabling DFlash L1/L2 cache for this load",
+                getattr(target_bundle.target_ops, "backend_name", "unknown"),
+            )
+            self._in_memory_cache_enabled = False
+            self._ssd_cache_requested = False
         runtime_context = self._build_runtime_context()
         self._runtime_context = runtime_context
         self._target_model = target_bundle.model

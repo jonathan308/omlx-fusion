@@ -64,16 +64,17 @@ DFlashEngine is a `BaseEngine` implementation that:
 | `omlx/admin/benchmark.py` | Batch test skip guard for DFlashEngine |
 | `tests/test_dflash_engine.py` | DFlash engine and routing tests |
 | `tests/test_dflash_laguna.py` | Laguna adapter parity, cache rollback, config, and checkpoint-layout tests |
+| `tests/test_dflash_glm5.py` | GLM-5.3 MHC capture, KDA/DSA rollback, loader, and lifecycle tests |
 
 ### Dependency
 
-- `dflash-mlx` pinned to `jundot/dflash-mlx` (v0.1.10+omlx.4)
+- `dflash-mlx` pinned to `jundot/dflash-mlx` (v0.1.10+omlx.7)
 - Listed as required dependency in `pyproject.toml`; the mac-app release
   lockfiles are regenerated from it by the packaging pipeline
 
 ### Supported models
 
-DFlash registers `QwenGdnTargetOps`, `Gemma4TargetOps`, and `MuseGlimmerTargetOps`. oMLX also registers a Laguna backend and the `DFlashLagunaForCausalLM` drafter used by Poolside's official checkpoints:
+DFlash registers `QwenGdnTargetOps`, `Gemma4TargetOps`, and `MuseGlimmerTargetOps`. oMLX also registers Laguna and GLM-5.3 target backends. The pinned runtime already contains the generic `DFlash2DraftModel` required by GLM-5.3:
 
 | Target model | Draft checkpoint |
 |--------------|-----------------|
@@ -95,6 +96,7 @@ DFlash registers `QwenGdnTargetOps`, `Gemma4TargetOps`, and `MuseGlimmerTargetOp
 | poolside/Laguna-S-2.1 | poolside/Laguna-S-2.1-DFlash |
 | poolside/Laguna-S-2.1-NVFP4-mlx | poolside/Laguna-S-2.1-DFlash-NVFP4 |
 | meta-models/Muse-Glimmer-30B | meta-models/Muse-Glimmer-30B-assistant |
+| zai-org/GLM-5.3-Flash (and matched MLX quantizations) | incoai/GLM-5.3-Flash-DFlash2 |
 
 Other model families (Llama, Gemma3, etc.) are not supported — they require both a trained DFlash draft checkpoint and a compatible target adapter in dflash-mlx.
 
@@ -119,6 +121,16 @@ numerical-parity coverage; ordinary adaptive DFlash verification remains
 available.
 
 Note: the `-DFlash` suffix is specific to DFlash draft checkpoints. Gemma4 also ships an `-assistant` variant (e.g. `gemma-4-26B-A4B-it-assistant`) that targets MTP speculative decoding via mlx-vlm — do not mix these in the DFlash toggle. Meta breaks this naming convention: `Muse-Glimmer-30B-assistant` IS a DFlash drafter (block-diffusion, `block_size` 16), not an MTP checkpoint. Drafter routing therefore keys on `config_model_type` (`muse_glimmer_assistant` is in the dashboard's DFlash drafter set), not on the checkpoint name. The Muse Glimmer target is a VLM: DFlash drives its text backbone through dflash-mlx's bundled text-only mlx-lm module, and image requests divert to the VLM fallback engine as usual.
+
+GLM-5.3 uses the text backbone for speculative generation. Its MHC hidden
+streams are contracted before the five configured target-layer captures, and
+rejected verify tokens are rolled back across both recurrent KDA state and the
+DSA `CacheList(KVCache, PoolingCache)`. Image/video requests retain the normal
+evict-and-VLM-fallback behavior. DDTree, target KV quantization, specialized
+verify linears, and DFlash L1/L2 prefix snapshots are disabled for this target
+until their GLM composite-cache and numerical-parity suites pass. Adaptive
+linear DFlash verification remains available. The published checkpoint is
+CC BY-NC-ND 4.0; oMLX neither bundles nor automatically downloads its weights.
 
 ### Per-model settings
 
@@ -215,7 +227,7 @@ DFlash effectiveness degrades with long contexts:
 
 ### 3. Model support
 
-Qwen, Gemma4, and Laguna have compatible target adapters and published draft checkpoints. Each additional model family still requires:
+Qwen, Gemma4, Laguna, Muse Glimmer, and GLM-5.3 have compatible target adapters and published draft checkpoints. Each additional model family still requires:
 - A trained DFlash draft checkpoint (block diffusion model matching target hidden dimensions)
 - Support in dflash-mlx's target model handling (hidden state extraction, cache rollback)
 
@@ -310,6 +322,7 @@ DFlash context fallback: 5120 >= 4096, evicting dflash models and switching to v
 - DFlashEngine: properties, stats, cache stats
 - EnginePool routing: disabled/enabled/draft model checks
 - Laguna: native-forward parity, hidden-state capture, full/rotating-cache rollback, gated draft forward, target binding, and fused-QKV checkpoint loading
+- GLM-5.3: MHC-contracted capture, repeated KDA rejection replay, DSA pooling-boundary rollback, VLM/oQ loader routing, and lifecycle cleanup
 
 ### Manual testing
 
