@@ -323,7 +323,12 @@ class TestDFlashEngineInit:
         snapshot = object()
         engine._target_model = target_model
         engine._target_ops = target_ops
-        engine._executor_tokenizer = object()
+        # GLM tokenizers expose eos_token_ids as a scalar; the oMLX boundary
+        # normalizes it without mutating the tokenizer.
+        engine._executor_tokenizer = SimpleNamespace(
+            eos_token_ids=2,
+            eos_token_id=3,
+        )
         engine._draft_model = object()
         engine._draft_backend = object()
         engine._runtime_context = object()
@@ -347,8 +352,6 @@ class TestDFlashEngineInit:
         monkeypatch.setattr(
             PrefixCacheFlow, "for_request", classmethod(fake_for_request)
         )
-        monkeypatch.setattr(dflash_runtime, "get_stop_token_ids", lambda tokenizer: [2])
-
         def fake_stream_dflash_generate(**kwargs):
             captured.update(kwargs)
             return iter(())
@@ -371,7 +374,7 @@ class TestDFlashEngineInit:
         )
 
         assert list(event_iter) == []
-        assert stop_ids == [2]
+        assert stop_ids == [2, 3]
         assert captured["suppress_token_ids"] == [258882, 258883]
         assert captured["prefix_snapshot"] is snapshot
         assert captured["prefix_hit_kind"] == "l2_prefix"
