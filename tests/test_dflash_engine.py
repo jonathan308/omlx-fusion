@@ -1766,7 +1766,9 @@ class TestDFlashOutputParserWiring:
         assert event_iter.close_calls == 1
         engine._end_runtime_cache_request.assert_called_once_with(cache_manager)
         assert engine._update_activity.call_count == 2
-        engine._update_activity.assert_called_with("activity-id")
+        engine._update_activity.assert_called_with(
+            "activity-id", detail="generating", phase="decode"
+        )
 
     @pytest.mark.asyncio
     async def test_streaming_without_parser_keeps_token_and_summary_behavior(
@@ -2071,7 +2073,20 @@ class TestDFlashActivityTracking:
         assert engine.has_active_requests() is True
 
         engine._update_activity(activity_id, token_count=42)
-        assert engine.get_activity_snapshot()["activities"][0]["token_count"] == 42
+        activity = engine.get_activity_snapshot()["activities"][0]
+        assert activity["token_count"] == 42
+        engine._update_activity(
+            activity_id,
+            detail="prefilling",
+            phase="prefill",
+            processed=2048,
+            total=4096,
+        )
+        activity = engine.get_activity_snapshot()["activities"][0]
+        assert activity["detail"] == "prefilling"
+        assert activity["phase"] == "prefill"
+        assert activity["processed"] == 2048
+        assert activity["total"] == 4096
 
         engine._end_activity(activity_id)
         assert engine.get_activity_snapshot()["active_requests"] == 0

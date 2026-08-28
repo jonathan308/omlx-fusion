@@ -523,11 +523,17 @@ class ActivityTrackingMixin:
 
     def _update_activity(self, activity_id: str, **updates: Any) -> None:
         """Update tracked non-streaming operation metadata."""
+        # ``detail`` is tracker-owned at creation time but legitimately changes
+        # as engines move from prefill to decode. Keep arbitrary metadata from
+        # overwriting reserved fields while allowing this explicit phase label.
+        detail = updates.pop("detail", None)
         with self._active_lock:
             activity = self._activities.get(activity_id)
             if activity is None:
                 return
             activity.update(self._sanitize_activity_metadata(updates))
+            if detail is not None:
+                activity["detail"] = str(detail)
             activity["last_activity_at"] = time.monotonic()
 
     def _end_activity(self, activity_id: str) -> None:

@@ -137,7 +137,7 @@ def test_capabilities_fail_closed_for_unproven_paths():
     assert caps.supports_dflash is True
     assert caps.supports_recurrent_rollback is True
     assert caps.supports_kv_trim is True
-    assert caps.supports_prefix_snapshot is False
+    assert caps.supports_prefix_snapshot is True
     assert caps.supports_verify_linear is False
     assert caps.supports_tree_verify is False
 
@@ -228,6 +228,74 @@ def test_actual_cache_list_rollback_crosses_pooling_boundary_exactly():
             assert lhs is rhs
         else:
             assert mx.array_equal(lhs, rhs).item()
+
+
+def test_glm_composite_prefix_snapshot_round_trips_exactly():
+    from dflash_mlx.cache import codecs
+    from dflash_mlx.cache.fingerprints import DFlashPrefixKey
+    from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
+    from mlx_lm.models.cache import CacheList, KVCache
+
+    from omlx.patches.deepseek_v4 import apply_pooling_cache_support
+    from omlx.patches.dflash_glm5 import _install_glm5_prefix_snapshot_codec
+
+    apply_pooling_cache_support()
+    from mlx_lm.models.cache import PoolingCache
+
+    _install_glm5_prefix_snapshot_codec()
+    kv_cache = KVCache()
+    keys = mx.arange(20, dtype=mx.float32).reshape(1, 1, 5, 4)
+    values = mx.arange(15, dtype=mx.float32).reshape(1, 1, 5, 3)
+    kv_cache.update_and_fetch(keys, values)
+    pooling_cache = PoolingCache(4)
+    pooled = mx.arange(6, dtype=mx.float32).reshape(1, 2, 3)
+    pooling_cache.pooled = pooled
+    pooling_cache.buf_kv = mx.ones((1, 4, 3), dtype=mx.float32)
+    pooling_cache.buf_gate = mx.ones((1, 4, 1), dtype=mx.float32) * 2
+    pooling_cache.remainder = 1
+    composite = CacheList(kv_cache, pooling_cache)
+
+    fa_states, gdn_states = codecs.serialize_target_cache([composite])
+    snapshot = DFlashPrefixSnapshot(
+        token_ids=(1, 2, 3, 4, 5),
+        fa_states=fa_states,
+        gdn_states=gdn_states,
+        target_hidden_chunks=(mx.zeros((1, 5, 2)),),
+        target_hidden_chunk_spans=((0, 5),),
+        target_hidden_total_len=5,
+        last_logits=mx.zeros((1, 1, 8)),
+        key=DFlashPrefixKey(
+            target_model_id="target",
+            draft_model_id="draft",
+            capture_layer_ids=(5, 14, 24, 33, 42),
+            draft_sink_size=0,
+            draft_window_size=2048,
+            template_hash="template",
+            prompt_policy_hash="policy",
+        ),
+    )
+    restored = codecs.hydrate_target_cache(
+        snapshot,
+        [CacheList(KVCache(), PoolingCache(4))],
+    )[0]
+    mx.eval(
+        restored[0].keys,
+        restored[0].values,
+        restored[1].pooled,
+        restored[1].buf_kv,
+        restored[1].buf_gate,
+    )
+
+    assert restored[0].offset == 5
+    assert mx.array_equal(restored[0].keys, keys).item()
+    assert mx.array_equal(restored[0].values, values).item()
+    assert restored[1].ratio == 4
+    assert restored[1].remainder == 1
+    assert mx.array_equal(restored[1].pooled, pooled).item()
+    assert mx.array_equal(restored[1].buf_kv[:, :1], pooling_cache.buf_kv[:, :1]).item()
+    assert mx.array_equal(
+        restored[1].buf_gate[:, :1], pooling_cache.buf_gate[:, :1]
+    ).item()
 
 
 def test_backend_install_is_idempotent_and_registers_before_resolution():

@@ -42,6 +42,8 @@ _BACKEND_PATH = "omlx.patches.dflash_glm5:Glm5NextTargetOps"
 _ORIGINAL_TARGET_LOADER: Any | None = None
 _ORIGINAL_LINEAR_CALLS: dict[type, Any] = {}
 _ORIGINAL_PREFILL_RUNNER: Any | None = None
+_ORIGINAL_SERIALIZE_TARGET_CACHE: Any | None = None
+_ORIGINAL_HYDRATE_TARGET_CACHE: Any | None = None
 
 
 def _config_value(config: Any, name: str, default: Any = None) -> Any:
@@ -191,6 +193,7 @@ def _install_glm5_prefill_chunking_bridge() -> bool:
         if (
             getattr(getattr(self, "target_ops", None), "backend_name", "")
             != "glm5_next"
+            or bool(getattr(self, "supports_prefix_snapshot", False))
         ):
             return current(
                 self,
@@ -231,6 +234,143 @@ def _install_glm5_prefill_chunking_bridge() -> bool:
     run_prefill_chunked._omlx_glm5_chunk_bridge = True  # type: ignore[attr-defined]
     run_prefill_chunked._omlx_original = current  # type: ignore[attr-defined]
     SpeculativeSession._run_prefill_events = run_prefill_chunked
+    return True
+
+
+def _install_glm5_prefix_snapshot_codec() -> bool:
+    """Teach dflash's snapshot codec about GLM's composite DSA cache.
+
+    DFlash already stores one full-attention state and one recurrent-state
+    tuple per layer.  A GLM sparse-attention layer is
+    ``CacheList(KVCache, PoolingCache)``: the ordinary KV component fits the
+    existing FA slot, while the pooling remainder/pool fits the existing GDN
+    tuple slot.  Reusing those two typed slots keeps L1/L2 accounting and the
+    safetensors format correct without inventing an opaque side channel.
+    """
+    global _ORIGINAL_HYDRATE_TARGET_CACHE, _ORIGINAL_SERIALIZE_TARGET_CACHE
+
+    from dflash_mlx.cache import codecs
+    from dflash_mlx.engine import spec_epoch
+
+    from .deepseek_v4 import apply_pooling_cache_support
+
+    apply_pooling_cache_support()
+    from mlx_lm.models.cache import CacheList, KVCache, PoolingCache
+
+    current_serialize = codecs.serialize_target_cache
+    if getattr(current_serialize, "_omlx_glm5_composite", False):
+        return False
+
+    current_hydrate = codecs.hydrate_target_cache
+    _ORIGINAL_SERIALIZE_TARGET_CACHE = current_serialize
+    _ORIGINAL_HYDRATE_TARGET_CACHE = current_hydrate
+
+    def clone_array(value: mx.array | None, *, clone: bool) -> mx.array | None:
+        if value is None or not clone:
+            return value
+        copied = mx.array(value)
+        mx.eval(copied)
+        return copied
+
+    def is_glm_composite(entry: Any) -> bool:
+        return (
+            isinstance(entry, CacheList)
+            and len(getattr(entry, "caches", ())) == 2
+            and isinstance(entry[0], KVCache)
+            and isinstance(entry[1], PoolingCache)
+        )
+
+    def serialize_target_cache(target_cache: list[Any], *, clone: bool = True):
+        if not any(is_glm_composite(entry) for entry in target_cache):
+            return current_serialize(target_cache, clone=clone)
+
+        fa_states = []
+        recurrent_states = []
+        for entry in target_cache:
+            if not is_glm_composite(entry):
+                fa, recurrent = current_serialize([entry], clone=clone)
+                fa_states.append(fa[0])
+                recurrent_states.append(recurrent[0])
+                continue
+
+            kv_cache, pooling_cache = entry[0], entry[1]
+            kv_state = kv_cache.state
+            if kv_state is None or kv_state[0] is None:
+                fa_states.append(None)
+            else:
+                keys, values = kv_state
+                fa_states.append(
+                    (
+                        clone_array(keys, clone=clone),
+                        clone_array(values, clone=clone),
+                        int(kv_cache.offset),
+                    )
+                )
+            recurrent_states.append(
+                tuple(
+                    clone_array(value, clone=clone)
+                    for value in pooling_cache.state
+                )
+            )
+        return tuple(fa_states), tuple(recurrent_states)
+
+    def hydrate_target_cache(snapshot: Any, template_cache: list[Any]):
+        if not any(is_glm_composite(entry) for entry in template_cache):
+            return current_hydrate(snapshot, template_cache)
+        if len(template_cache) != len(snapshot.fa_states):
+            raise ValueError(
+                f"Template cache length {len(template_cache)} != "
+                f"snapshot layer count {len(snapshot.fa_states)}"
+            )
+        codecs._validate_snapshot_cache_prefix_len(
+            snapshot.fa_states,
+            prefix_len=snapshot.prefix_len,
+        )
+
+        restored = []
+        for index, template in enumerate(template_cache):
+            if not is_glm_composite(template):
+                one_layer = replace(
+                    snapshot,
+                    fa_states=(snapshot.fa_states[index],),
+                    gdn_states=(snapshot.gdn_states[index],),
+                )
+                restored.append(current_hydrate(one_layer, [template])[0])
+                continue
+
+            fa_state = snapshot.fa_states[index]
+            pooling_state = snapshot.gdn_states[index]
+            if fa_state is None:
+                raise ValueError(f"Snapshot missing GLM DSA KV state at layer {index}")
+            if pooling_state is None or len(pooling_state) not in (3, 5):
+                raise ValueError(
+                    f"Snapshot missing GLM pooling state at layer {index}"
+                )
+            keys, values, offset = fa_state[:3]
+            if int(keys.shape[2]) != int(offset) or int(values.shape[2]) != int(
+                offset
+            ):
+                raise ValueError(
+                    f"Snapshot GLM DSA arrays at layer {index} are not "
+                    f"exact-length (keys={int(keys.shape[2])}, "
+                    f"values={int(values.shape[2])}, offset={int(offset)})"
+                )
+            kv_cache = KVCache()
+            kv_cache.keys = keys
+            kv_cache.values = values
+            kv_cache.offset = int(offset)
+            pooling_cache = PoolingCache(int(template[1].ratio))
+            pooling_cache.state = tuple(pooling_state)
+            restored.append(CacheList(kv_cache, pooling_cache))
+        return restored
+
+    serialize_target_cache._omlx_glm5_composite = True  # type: ignore[attr-defined]
+    hydrate_target_cache._omlx_glm5_composite = True  # type: ignore[attr-defined]
+    codecs.serialize_target_cache = serialize_target_cache
+    codecs.hydrate_target_cache = hydrate_target_cache
+    # spec_epoch imports hydrate_target_cache by value, so update its bound
+    # reference as well as the source module.
+    spec_epoch.hydrate_target_cache = hydrate_target_cache
     return True
 
 
@@ -289,9 +429,9 @@ class Glm5NextTargetOps:
             supports_dflash=True,
             supports_recurrent_rollback=True,
             supports_kv_trim=True,
-            # dflash-mlx's snapshot codec only supports bare KVCache and its
-            # own recurrent cache. GLM DSA uses CacheList(KV, Pooling).
-            supports_prefix_snapshot=False,
+            # oMLX extends dflash's typed FA/GDN snapshot slots to encode
+            # CacheList(KVCache, PoolingCache) exactly.
+            supports_prefix_snapshot=True,
             supports_rotating_cache_snapshot=False,
             supports_shared_kv=False,
             supports_target_hidden_capture=True,
@@ -667,6 +807,7 @@ def install_dflash_glm5_backend() -> bool:
     from dflash_mlx.runtime import loading
 
     changed = False
+    changed |= _install_glm5_prefix_snapshot_codec()
     changed |= _install_glm5_prefill_chunking_bridge()
     if _BACKEND_PATH not in target_ops.TARGET_BACKENDS:
         target_ops.TARGET_BACKENDS.append(_BACKEND_PATH)
@@ -698,6 +839,7 @@ def install_dflash_glm5_backend() -> bool:
 
 __all__ = [
     "Glm5NextTargetOps",
+    "_install_glm5_prefix_snapshot_codec",
     "install_dflash_glm5_backend",
     "restore_glm5_dflash_class_patches",
     "validate_glm5_dflash_pair",

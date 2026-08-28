@@ -1547,7 +1547,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         return promptly so the single MLX executor thread is freed for the
         next request.
         """
-        from dflash_mlx.engine.events import SummaryEvent, TokenEvent
+        from dflash_mlx.engine.events import (
+            PrefillProgressEvent,
+            SummaryEvent,
+            TokenEvent,
+        )
 
         event_iter = None
         cache_manager = None
@@ -1637,7 +1641,22 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 # output token is ready yet. Keep the admin activity heartbeat
                 # fresh so long DFlash prefill is not painted amber/red as a
                 # stalled request.
-                self._update_activity(activity_id)
+                if isinstance(event, PrefillProgressEvent):
+                    self._update_activity(
+                        activity_id,
+                        detail="prefilling",
+                        phase="prefill",
+                        processed=int(event.tokens_processed),
+                        total=int(event.tokens_total),
+                    )
+                elif isinstance(event, TokenEvent):
+                    self._update_activity(
+                        activity_id,
+                        detail="generating",
+                        phase="decode",
+                    )
+                else:
+                    self._update_activity(activity_id)
                 if stop_event.is_set():
                     logger.info("DFlash generation aborted by client")
                     break
@@ -1847,7 +1866,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         activity_id = self._begin_activity("generate", detail="generating")
 
         def _run():
-            from dflash_mlx.engine.events import SummaryEvent, TokenEvent
+            from dflash_mlx.engine.events import (
+                PrefillProgressEvent,
+                SummaryEvent,
+                TokenEvent,
+            )
 
             event_iter = None
             cache_manager = None
@@ -1883,7 +1906,22 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     # DFlash emits prefill and cycle events between tokens.
                     # Treat every event as activity so the dashboard's
                     # last-progress indicator reflects compute, not token gaps.
-                    self._update_activity(activity_id)
+                    if isinstance(event, PrefillProgressEvent):
+                        self._update_activity(
+                            activity_id,
+                            detail="prefilling",
+                            phase="prefill",
+                            processed=int(event.tokens_processed),
+                            total=int(event.tokens_total),
+                        )
+                    elif isinstance(event, TokenEvent):
+                        self._update_activity(
+                            activity_id,
+                            detail="generating",
+                            phase="decode",
+                        )
+                    else:
+                        self._update_activity(activity_id)
                     if stop_event.is_set():
                         logger.info("DFlash generation aborted by client")
                         break
