@@ -885,6 +885,179 @@ def test_qwen4_gathered_qsa_fails_closed_for_batched_prefill(monkeypatch):
     assert output.shape == hidden.shape
 
 
+@pytest.mark.parametrize("prefix_lengths", [(10, 10), (10, 13)])
+@pytest.mark.parametrize("position_kind", ["text", "mrope"])
+def test_qwen4_b2_qsa_matches_independent_rows_past_budget(
+    monkeypatch,
+    prefix_lengths,
+    position_kind,
+):
+    """B2 QSA selection is row-local across equal and unequal histories."""
+    config = _tiny_config().text_config
+    config.ple_layer_ids = []
+    import mlx_vlm.models.qwen4_exp.language as language
+
+    mx.random.seed(421)
+    attention = language.Qwen4ExpAttention(config)
+    lm_head = mx.random.normal((64, config.hidden_size))
+    mx.eval(attention.parameters(), lm_head)
+    monkeypatch.setattr(
+        language.Qwen4ExpAttention,
+        "_gathered_text_prefill_eligible",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        language.Qwen4ExpAttention,
+        "_gathered_text_decode_eligible",
+        lambda *args, **kwargs: False,
+    )
+
+    def positions(length):
+        text = mx.arange(length, dtype=mx.int32)
+        if position_kind == "text":
+            return text[None]
+        return mx.stack(
+            [text, text // 2, (text + 1) // 3],
+            axis=0,
+        )[:, None, :]
+
+    def batch_decode_positions():
+        rows = [positions(length + 1)[..., -1:] for length in prefix_lengths]
+        return mx.concatenate(rows, axis=0 if position_kind == "text" else 1)
+
+    def clone(cache):
+        cloned = language.QSAKVCache()
+        cloned.state = cache.state
+        return cloned
+
+    prefix_caches = []
+    decode_rows = []
+    for length in prefix_lengths:
+        cache = language.QSAKVCache()
+        prefix = mx.random.normal((1, length, config.hidden_size))
+        decode_rows.append(mx.random.normal((1, 1, config.hidden_size)))
+        prefix_output = attention(
+            prefix,
+            mask="causal",
+            cache=cache,
+            position_ids=positions(length),
+        )
+        mx.eval(prefix_output, cache.state)
+        prefix_caches.append(cache)
+
+    decode_hidden = mx.concatenate(decode_rows, axis=0)
+    decode_positions = batch_decode_positions()
+
+    # First compare the discrete selector itself.  The batched mask is on the
+    # physical, right-aligned KV axis; removing each row's left pad must yield
+    # the exact singleton logical mask and no padding column may be selected.
+    batch_selector_cache = language.BatchQSAKVCache.merge(
+        [clone(cache) for cache in prefix_caches]
+    )
+    single_selector_caches = [clone(cache) for cache in prefix_caches]
+    projected = attention.indexer.index_qk_proj(decode_hidden)
+    batch_mask = attention.indexer.from_projected(
+        projected,
+        batch_selector_cache,
+        decode_positions,
+    )
+    single_masks = [
+        attention.indexer.from_projected(
+            projected[index : index + 1],
+            cache,
+            positions(length + 1)[..., -1:],
+        )
+        for index, (cache, length) in enumerate(
+            zip(single_selector_caches, prefix_lengths)
+        )
+    ]
+    mx.eval(batch_mask, *single_masks, batch_selector_cache.state)
+    paddings = batch_selector_cache.left_padding.tolist()
+    for index, (padding, single_mask) in enumerate(zip(paddings, single_masks)):
+        if padding:
+            assert not mx.any(batch_mask[index, ..., :padding]).item()
+        assert mx.array_equal(
+            batch_mask[index : index + 1, ..., padding:],
+            single_mask,
+        ).item()
+        extracted = batch_selector_cache.extract(index)
+        mx.eval(extracted.state, single_selector_caches[index].state)
+        assert mx.array_equal(
+            extracted.index_keys,
+            single_selector_caches[index].index_keys,
+        ).item()
+        assert mx.array_equal(
+            extracted.index_position_ids,
+            single_selector_caches[index].index_position_ids,
+        ).item()
+
+    # Then compare the actual attention result and a shared vocabulary
+    # projection.  Floating matrix kernels may differ by a final ULP between
+    # B2 and two B1 calls, while selected tokens and position state above are
+    # required to be bit-exact.
+    batch_cache = language.BatchQSAKVCache.merge(
+        [clone(cache) for cache in prefix_caches]
+    )
+    batch_output = attention(
+        decode_hidden,
+        mask=batch_cache.make_mask(1),
+        cache=batch_cache,
+        position_ids=decode_positions,
+    )
+    mx.eval(batch_output, batch_cache.state)
+
+    singleton_outputs = []
+    singleton_caches = []
+    for decode_row, prefix_cache, length in zip(
+        decode_rows,
+        prefix_caches,
+        prefix_lengths,
+    ):
+        cache = clone(prefix_cache)
+        singleton_outputs.append(
+            attention(
+                decode_row,
+                cache=cache,
+                position_ids=positions(length + 1)[..., -1:],
+            )
+        )
+        singleton_caches.append(cache)
+    singleton_output = mx.concatenate(singleton_outputs, axis=0)
+    batch_logits = batch_output @ lm_head.T
+    singleton_logits = singleton_output @ lm_head.T
+    mx.eval(batch_logits, singleton_logits)
+
+    assert mx.allclose(batch_logits, singleton_logits, rtol=2e-5, atol=2e-5).item()
+    assert mx.array_equal(
+        mx.argmax(batch_logits, axis=-1),
+        mx.argmax(singleton_logits, axis=-1),
+    ).item()
+    for index, singleton_cache in enumerate(singleton_caches):
+        extracted = batch_cache.extract(index)
+        mx.eval(extracted.state, singleton_cache.state)
+        for actual, expected in zip(extracted.state[:3], singleton_cache.state[:3]):
+            assert mx.allclose(actual, expected, rtol=2e-5, atol=2e-5).item()
+        assert mx.array_equal(
+            extracted.index_position_ids,
+            singleton_cache.index_position_ids,
+        ).item()
+
+
+def test_qwen4_qsa_default_positions_honor_vector_batch_offsets():
+    config = _tiny_config().text_config
+    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpQSAIndexer
+
+    indexer = Qwen4ExpQSAIndexer(config, rotary_emb=SimpleNamespace())
+    positions = indexer._default_position_ids(
+        2,
+        mx.array([10, 13], dtype=mx.int32),
+        3,
+    )
+    mx.eval(positions)
+
+    assert positions.tolist() == [[10, 11, 12], [13, 14, 15]]
+
+
 def test_qwen4_gathered_qsa_keeps_official_path_at_sparse_budget(monkeypatch):
     config = _tiny_config()
     import mlx_vlm.models.qwen4_exp.language as language

@@ -1104,8 +1104,16 @@ class Qwen4ExpQSAIndexer(nn.Module):
 
     @staticmethod
     def _default_position_ids(batch: int, start: int, length: int):
-        positions = mx.arange(start, start + length, dtype=mx.int32)
-        return mx.broadcast_to(positions[None], (batch, length))
+        steps = mx.arange(length, dtype=mx.int32)
+        if isinstance(start, mx.array):
+            starts = start.astype(mx.int32)
+        else:
+            starts = mx.array(start, dtype=mx.int32)
+        if starts.ndim == 0:
+            starts = mx.broadcast_to(starts, (batch,))
+        else:
+            starts = starts.reshape(-1)[:batch]
+        return starts[:, None] + steps[None, :]
 
     def _apply_rope(self, x: mx.array, position_ids: mx.array) -> mx.array:
         # MRoPE's helper applies the same partial rotary transform to both
@@ -1133,6 +1141,7 @@ class Qwen4ExpQSAIndexer(nn.Module):
     ) -> Optional[mx.array]:
         batch, seq_len, _ = qk.shape
         past_len = cache.offset if cache is not None else 0
+        batched_offsets = isinstance(past_len, mx.array) and past_len.ndim > 0
         if position_ids is None:
             position_ids = self._default_position_ids(batch, past_len, seq_len)
 
@@ -1147,6 +1156,53 @@ class Qwen4ExpQSAIndexer(nn.Module):
             full_position_ids = position_ids
 
         key_len = raw_keys.shape[1]
+        left_padding = None
+        pooled_raw_keys = raw_keys
+        pooled_position_ids = full_position_ids
+        if batched_offsets:
+            # BatchKVCache stores unequal histories right-aligned.  QSA block
+            # boundaries, however, are defined from each sequence's logical
+            # token zero, not from physical column zero.  Compact each row
+            # virtually before four-token pooling so a left pad of 1..3 does
+            # not shift every micro-block or let padding participate in top-k.
+            left_padding = getattr(cache, "left_padding", None)
+            if not (
+                isinstance(left_padding, mx.array)
+                and left_padding.ndim > 0
+                and left_padding.size >= batch
+            ):
+                # The auxiliary selector cannot prove row alignment.  The
+                # caller will retain the ordinary dense attention mask.
+                return None
+            left_padding = left_padding.reshape(-1)[:batch].astype(mx.int32)
+            logical_indices = mx.arange(key_len, dtype=mx.int32)[None, :]
+            physical_indices = left_padding[:, None] + logical_indices
+            physical_indices = mx.minimum(physical_indices, key_len - 1)
+            key_gather = mx.broadcast_to(
+                physical_indices[..., None],
+                (batch, key_len, raw_keys.shape[-1]),
+            )
+            pooled_raw_keys = mx.take_along_axis(
+                raw_keys,
+                key_gather,
+                axis=1,
+            )
+            if full_position_ids.ndim == 3:
+                position_gather = mx.broadcast_to(
+                    physical_indices[None],
+                    (full_position_ids.shape[0], batch, key_len),
+                )
+                pooled_position_ids = mx.take_along_axis(
+                    full_position_ids,
+                    position_gather,
+                    axis=2,
+                )
+            else:
+                pooled_position_ids = mx.take_along_axis(
+                    full_position_ids,
+                    physical_indices,
+                    axis=1,
+                )
         max_complete_blocks = key_len // self.compress_ratio
         if max_complete_blocks <= self.block_topk:
             return None
@@ -1162,8 +1218,8 @@ class Qwen4ExpQSAIndexer(nn.Module):
             )
         else:
             pooled_keys = pool_completed_index_keys(
-                raw_keys,
-                full_position_ids,
+                pooled_raw_keys,
+                pooled_position_ids,
                 compress_ratio=self.compress_ratio,
                 index_key_norm=self.k_layernorm,
                 apply_index_rope=self._apply_rope,
@@ -1178,11 +1234,22 @@ class Qwen4ExpQSAIndexer(nn.Module):
         scores = mx.sum(mx.maximum(scores, 0), axis=1)
         scores = scores / math.sqrt(self.head_dim)
 
-        query_ends = past_len + mx.arange(seq_len) + 1
+        query_steps = mx.arange(seq_len, dtype=mx.int32)
+        if batched_offsets:
+            query_ends = (
+                past_len.reshape(-1)[:batch, None].astype(mx.int32)
+                + query_steps[None, :]
+                + 1
+            )
+        else:
+            query_ends = mx.broadcast_to(
+                (past_len + query_steps + 1)[None],
+                (batch, seq_len),
+            )
         complete_counts = query_ends // self.compress_ratio
         valid_blocks = (
             mx.arange(max_complete_blocks)[None, None, :]
-            < complete_counts[None, :, None]
+            < complete_counts[..., None]
         )
         scores = mx.where(valid_blocks, scores, -mx.inf)
         selected_blocks = mx.argpartition(scores, kth=-self.block_topk, axis=-1)[
@@ -1213,14 +1280,31 @@ class Qwen4ExpQSAIndexer(nn.Module):
 
         token_indices = mx.arange(key_len)
         tail_starts = complete_counts * self.compress_ratio
-        tail = (token_indices[None, None, :] >= tail_starts[None, :, None]) & (
-            token_indices[None, None, :] < query_ends[None, :, None]
+        tail = (token_indices[None, None, :] >= tail_starts[..., None]) & (
+            token_indices[None, None, :] < query_ends[..., None]
         )
-        causal = token_indices[None, None, :] < query_ends[None, :, None]
+        causal = token_indices[None, None, :] < query_ends[..., None]
         use_sparse = complete_counts > self.block_topk
         selected_tokens = mx.where(
-            use_sparse[None, :, None], selected_tokens | tail, causal
+            use_sparse[..., None], selected_tokens | tail, causal
         )
+        if left_padding is not None:
+            # Convert the logical selector mask back to the physical,
+            # right-aligned BatchKVCache columns consumed by attention.
+            physical_indices = mx.arange(key_len, dtype=mx.int32)[None, :]
+            logical_indices = physical_indices - left_padding[:, None]
+            valid_physical = logical_indices >= 0
+            logical_indices = mx.maximum(logical_indices, 0)
+            token_gather = mx.broadcast_to(
+                logical_indices[:, None, :],
+                (batch, seq_len, key_len),
+            )
+            selected_tokens = mx.take_along_axis(
+                selected_tokens,
+                token_gather,
+                axis=-1,
+            )
+            selected_tokens = selected_tokens & valid_physical[:, None, :]
         return selected_tokens[:, None]
 
 
