@@ -54,6 +54,25 @@ async def test_idle_model_unload_returns_completed():
 
 
 @pytest.mark.asyncio
+async def test_dflash_helper_cannot_be_loaded_directly():
+    entry = MagicMock()
+    entry.is_helper = True
+    entry.engine = None
+    pool = MagicMock()
+    pool.get_entry.return_value = entry
+
+    with (
+        patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await admin_routes.load_model("glm-dflash-helper", is_admin=True)
+
+    assert exc_info.value.status_code == 400
+    assert "load automatically with their target" in exc_info.value.detail
+    pool.get_engine.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_lease_rejected_during_manual_unload_uses_unload_error():
     pool = MagicMock()
     pool.get_abort_requested_reason.return_value = "manual admin unload"

@@ -880,6 +880,19 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 logger.warning(f"DFlash prefill guard init failed: {exc}")
                 self._prefill_guard = None
 
+        # GLM-5.3's first DFlash request compiles the target prefill, recurrent
+        # rollback, draft, and block-verification graphs.  That cold compile can
+        # take long enough that an OpenAI client sees only keepalives and the
+        # admin UI paints the request as stalled, even though model loading was
+        # already reported complete.  Compile against a disposable request
+        # before publishing readiness so the first real request behaves like
+        # every subsequent one.
+        if self._requires_load_warmup():
+            await loop.run_in_executor(
+                get_mlx_executor(),
+                self._warmup_dflash_sync,
+            )
+
         self._loaded = True
         self._in_fallback_mode = False
         max_ctx_display = (
@@ -1327,6 +1340,87 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         tag = getattr(self._tokenizer_obj, "think_start", "<think>")
         return f"{tag}\n"
 
+    def _requires_load_warmup(self) -> bool:
+        """Return whether this backend needs a readiness-gated cold compile."""
+        return getattr(self._target_ops, "backend_name", "") == "glm5_next"
+
+    def _build_load_warmup_prompt_tokens(self, prompt_len: int = 64) -> list[int]:
+        """Build a non-stop-token prompt for the disposable GLM warmup."""
+        tokenizer = self._executor_tokenizer
+        try:
+            encoded = tokenizer.encode(
+                "oMLX DFlash readiness warmup. Reply with ready.",
+                add_special_tokens=False,
+            )
+        except TypeError:
+            encoded = tokenizer.encode(
+                "oMLX DFlash readiness warmup. Reply with ready."
+            )
+
+        stop_ids = set(
+            _get_dflash_stop_token_ids(tokenizer, self._generation_config_eos)
+        )
+        usable = [
+            int(token_id)
+            for token_id in encoded
+            if int(token_id) not in stop_ids
+            and int(token_id) not in self._suppress_token_ids
+        ]
+        if not usable:
+            vocab_size = int(getattr(tokenizer, "vocab_size", 0) or 0)
+            search_limit = vocab_size if vocab_size > 0 else 4096
+            usable = [
+                token_id
+                for token_id in range(search_limit)
+                if token_id not in stop_ids and token_id not in self._suppress_token_ids
+            ][:1]
+        if not usable:
+            raise RuntimeError("DFlash load warmup could not find a safe prompt token")
+        repeats = (prompt_len + len(usable) - 1) // len(usable)
+        return (usable * repeats)[:prompt_len]
+
+    def _warmup_dflash_sync(self) -> None:
+        """Compile GLM DFlash before the engine is advertised as ready."""
+        from dflash_mlx.engine.events import SummaryEvent
+
+        prompt_tokens = self._build_load_warmup_prompt_tokens()
+        max_tokens = max(8, int(self._block_size or 8))
+        started = time.perf_counter()
+        event_iter = None
+        summary = None
+        try:
+            event_iter, _, _ = self._stream_dflash_events(
+                prompt_tokens=prompt_tokens,
+                max_tokens=max_tokens,
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                min_p=0.0,
+                repetition_penalty=1.0,
+                repetition_context_size=20,
+                use_prefix_cache=False,
+            )
+            for event in event_iter:
+                if isinstance(event, SummaryEvent):
+                    summary = event
+        finally:
+            close = getattr(event_iter, "close", None)
+            if callable(close):
+                close()
+
+        if summary is None:
+            raise RuntimeError("GLM DFlash load warmup ended without a summary")
+        if int(summary.cycles_completed) < 1:
+            raise RuntimeError("GLM DFlash load warmup completed no verify cycles")
+        logger.info(
+            "GLM DFlash load warmup completed: prompt=%d tokens=%d "
+            "elapsed=%.2fs acceptance=%.1f%%",
+            len(prompt_tokens),
+            int(summary.generation_tokens),
+            time.perf_counter() - started,
+            float(summary.acceptance_ratio) * 100.0,
+        )
+
     def _stream_dflash_events(
         self,
         prompt_tokens: list[int],
@@ -1337,6 +1431,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         min_p: float = 0.0,
         repetition_penalty: float = 1.0,
         repetition_context_size: int = 20,
+        use_prefix_cache: bool = True,
     ):
         """Build the dflash event iterator with prefix cache plumbed in."""
         from dflash_mlx.runtime import stream_dflash_generate
@@ -1360,14 +1455,19 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             tokenizer = self._executor_tokenizer
             cli_args = None
 
-        prefix_flow = PrefixCacheFlow.for_request(
-            model_provider=_ModelProviderShim(),
-            draft_model=self._draft_model,
-            tokenizer=self._executor_tokenizer,
-            prompt=prompt_tokens,
-            max_new_tokens=max_tokens,
-            runtime_context=self._runtime_context,
-        )
+        if use_prefix_cache:
+            prefix_flow = PrefixCacheFlow.for_request(
+                model_provider=_ModelProviderShim(),
+                draft_model=self._draft_model,
+                tokenizer=self._executor_tokenizer,
+                prompt=prompt_tokens,
+                max_new_tokens=max_tokens,
+                runtime_context=self._runtime_context,
+            )
+        else:
+            # Load warmups must not become user-visible prefix snapshots or
+            # affect cache hit/miss telemetry.
+            prefix_flow = PrefixCacheFlow(cache_manager=None)
 
         event_iter = stream_dflash_generate(
             target_model=self._target_model,

@@ -1960,6 +1960,94 @@ class TestDFlashPretokenizedPrompt:
         engine._tokenizer_obj.encode.assert_called_once_with("hello")
 
 
+class TestDFlashLoadWarmup:
+    def _engine(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(dflash_block_size=8),
+        )
+        engine._target_ops = SimpleNamespace(backend_name="glm5_next")
+        engine._executor_tokenizer = SimpleNamespace(
+            encode=lambda text, add_special_tokens=False: [2, 11, 12],
+            eos_token_id=2,
+            eos_token_ids=None,
+            eot_token_id=None,
+            vocab_size=100,
+        )
+        engine._generation_config_eos = set()
+        engine._suppress_token_ids = {12}
+        return engine
+
+    def test_only_glm_backend_requires_load_warmup(self):
+        engine = self._engine()
+        assert engine._requires_load_warmup() is True
+        engine._target_ops.backend_name = "qwen"
+        assert engine._requires_load_warmup() is False
+
+    def test_warmup_prompt_excludes_stop_and_suppress_tokens(self):
+        engine = self._engine()
+        prompt = engine._build_load_warmup_prompt_tokens(prompt_len=6)
+        assert prompt == [11] * 6
+
+    def test_warmup_consumes_summary_closes_iterator_and_disables_cache(self):
+        from dflash_mlx.engine.events import SummaryEvent
+
+        engine = self._engine()
+        summary = SummaryEvent(
+            elapsed_us=1000,
+            prompt_token_count=64,
+            generated_token_ids=(5,),
+            generation_tokens=1,
+            accepted_from_draft=1,
+            acceptance_ratio=1.0,
+            cycles_completed=1,
+            phase_timings_us={},
+        )
+
+        class TrackingIterator:
+            def __init__(self):
+                self.closed = False
+
+            def __iter__(self):
+                return iter([summary])
+
+            def close(self):
+                self.closed = True
+
+        events = TrackingIterator()
+        engine._stream_dflash_events = MagicMock(return_value=(events, None, []))
+
+        engine._warmup_dflash_sync()
+
+        assert events.closed is True
+        kwargs = engine._stream_dflash_events.call_args.kwargs
+        assert kwargs["use_prefix_cache"] is False
+        assert kwargs["max_tokens"] == 8
+
+    def test_warmup_fails_closed_without_summary_and_closes_iterator(self):
+        engine = self._engine()
+
+        class TrackingIterator:
+            def __init__(self):
+                self.closed = False
+
+            def __iter__(self):
+                return iter(())
+
+            def close(self):
+                self.closed = True
+
+        events = TrackingIterator()
+        engine._stream_dflash_events = MagicMock(return_value=(events, None, []))
+
+        with pytest.raises(RuntimeError, match="without a summary"):
+            engine._warmup_dflash_sync()
+        assert events.closed is True
+
+
 class TestDFlashActivityTracking:
     """DFlash bypasses the scheduler, so the admin Active Models card reads
     the engine's own activity snapshot (#2396)."""
