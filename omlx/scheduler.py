@@ -410,6 +410,13 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_PREFILL_STEP_TRACE = os.environ.get("OMLX_PREFILL_STEP_TRACE", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
 
 class _PrefillAbortedError(Exception):
     """Raised when prefill is interrupted by a pending abort."""
@@ -3704,7 +3711,7 @@ class Scheduler:
             and self.block_aware_cache is not None
             and _prompt_cache_needs_snapshots(prompt_cache)
         )
-        if getattr(request, "benchmark_trace", False):
+        if _PREFILL_STEP_TRACE or getattr(request, "benchmark_trace", False):
             request.benchmark_boundary_enabled = boundary_enabled
             request.benchmark_cache_block_size = block_size if boundary_enabled else 0
         base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
@@ -3816,7 +3823,7 @@ class Scheduler:
                 loop_label="external",
                 request_id=request.request_id,
             )
-            if getattr(request, "benchmark_trace", False):
+            if _PREFILL_STEP_TRACE or getattr(request, "benchmark_trace", False):
                 request.benchmark_prefill_chunks.append(int(n_to_process))
                 request.benchmark_requested_steps.append(int(prefill_step_size))
 
@@ -3987,7 +3994,7 @@ class Scheduler:
 
             # Reclaim Metal intermediates between prefill chunks.
             _sync_and_clear_cache(self._stream)
-            if getattr(request, "benchmark_trace", False):
+            if _PREFILL_STEP_TRACE or getattr(request, "benchmark_trace", False):
                 _trace_total_ms = (
                     time.perf_counter() - _trace_chunk_start
                 ) * 1000.0
@@ -5353,7 +5360,7 @@ class Scheduler:
             and self.block_aware_cache is not None
             and _prompt_cache_needs_snapshots(prompt_cache)
         )
-        if getattr(request, "benchmark_trace", False):
+        if _PREFILL_STEP_TRACE or getattr(request, "benchmark_trace", False):
             request.benchmark_boundary_enabled = boundary_enabled
             request.benchmark_cache_block_size = block_size if boundary_enabled else 0
         base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
@@ -5447,7 +5454,7 @@ class Scheduler:
             loop_label="chunked_step",
             request_id=state.request.request_id,
         )
-        if getattr(state.request, "benchmark_trace", False):
+        if _PREFILL_STEP_TRACE or getattr(state.request, "benchmark_trace", False):
             state.request.benchmark_prefill_chunks.append(int(n))
             state.request.benchmark_requested_steps.append(int(prefill_step_size))
 
@@ -5573,7 +5580,7 @@ class Scheduler:
         if self._should_clear_after_chunk():
             _sync_and_clear_cache(self._stream)
         chunk_dt = time.perf_counter() - _t_chunk_start
-        if getattr(state.request, "benchmark_trace", False):
+        if _PREFILL_STEP_TRACE or getattr(state.request, "benchmark_trace", False):
             _ane_sequence = int(
                 getattr(state.request, "benchmark_ane_sequence_length", 0) or 0
             )

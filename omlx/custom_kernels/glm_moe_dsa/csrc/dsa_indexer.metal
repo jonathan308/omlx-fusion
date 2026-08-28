@@ -66,7 +66,19 @@ instantiate_kernel(
     "dspark_fp32_topk_indices_topk512_t256",
     dspark_fp32_topk_indices,
     512,
-    256);
+    256,
+    false);
+
+// Qwen4's fixed 2048-token budget selects 512 complete four-token blocks.
+// This shares DSpark's O(1)-workspace FP32 radix selector, but reverses the
+// deterministic traversal so cutoff ties match mx.argpartition's highest-index
+// membership exactly.
+instantiate_kernel(
+    "qwen4_qsa_fp32_topk_indices_topk512_t256",
+    dspark_fp32_topk_indices,
+    512,
+    256,
+    true);
 
 // ── DC-1: fused decode indexer scan ──────────────────────────────────────────
 // One thread per key position: score(key) = sum_h w_h * relu(q_h · k_key), fp32

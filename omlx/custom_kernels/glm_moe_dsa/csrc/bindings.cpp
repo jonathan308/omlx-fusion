@@ -74,6 +74,12 @@ NB_MODULE(_ext, m) {
       "mask_q_offset"_a = 0,
       "stream"_a = nb::none());
   m.def(
+      "qwen4_qsa_topk_indices",
+      &omlx::glm_kernels::qwen4_qsa_topk_indices,
+      "scores"_a,
+      "topk"_a = 512,
+      "stream"_a = nb::none());
+  m.def(
       "dsa_topk_indices",
       &omlx::glm_kernels::dsa_topk_indices,
       "scores"_a,

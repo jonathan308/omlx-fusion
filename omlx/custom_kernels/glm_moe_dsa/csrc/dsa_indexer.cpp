@@ -823,6 +823,58 @@ class DSparkFP32TopKIndicesPrimitive : public Primitive {
   }
 };
 
+class Qwen4QSAFP32TopKIndicesPrimitive : public Primitive {
+ public:
+  explicit Qwen4QSAFP32TopKIndicesPrimitive(Stream stream)
+      : Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<array>& /* inputs */,
+      std::vector<array>& /* outputs */) override {
+    throw std::runtime_error("Qwen4 QSA FP32 top-k has no CPU path.");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    const auto& scores = inputs[0];
+    auto& out = outputs[0];
+    out.set_data(allocator::malloc(out.nbytes()));
+
+    constexpr int topk = 512;
+    constexpr int threads = 256;
+    const int rows = scores.shape(1);
+    DSATopKParams params{
+        /* int rows = */ rows,
+        /* int L = */ rows,
+        /* int K = */ scores.shape(2),
+        /* int topk = */ topk,
+        /* bool causal_valid_prefix = */ false};
+
+    auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
+    auto kernel =
+        d.get_kernel("qwen4_qsa_fp32_topk_indices_topk512_t256", lib);
+    auto& encoder = metal::get_command_encoder(s);
+    encoder.set_compute_pipeline_state(kernel);
+    encoder.set_input_array(scores, 0);
+    encoder.set_output_array(out, 1);
+    encoder.set_bytes(params, 2);
+    encoder.dispatch_threadgroups(
+        MTL::Size(rows, 1, 1), MTL::Size(threads, 1, 1));
+  }
+
+  DEFINE_NAME(OMLXQwen4QSAFP32TopKIndices)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive& /* other */) const override {
+    return true;
+  }
+  auto state() const {
+    return std::make_tuple(nullptr);
+  }
+};
+
 class DS4RouterTopKIndicesPrimitive : public Primitive {
  public:
   explicit DS4RouterTopKIndicesPrimitive(Stream stream) : Primitive(stream) {}
@@ -1285,6 +1337,32 @@ array dspark_fp32_topk_indices(
       std::move(out_shape),
       uint32,
       std::make_shared<DSparkFP32TopKIndicesPrimitive>(stream),
+      std::vector<array>{contiguous_scores});
+}
+
+array qwen4_qsa_topk_indices(
+    const array& scores,
+    int topk,
+    StreamOrDevice s) {
+  if (scores.ndim() != 3 || scores.shape(0) != 1 ||
+      scores.shape(1) < 1 || scores.dtype() != float32 || topk != 512 ||
+      scores.shape(2) < topk) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.qwen4_qsa_topk_indices] expected FP32 "
+        << "scores [1, M>=1, N>=512] and topk=512, got " << scores.shape()
+        << ", topk=" << topk << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  auto stream = to_stream(s);
+  if (stream.device == Device::cpu) {
+    throw std::invalid_argument("Qwen4 QSA FP32 top-k requires Metal.");
+  }
+  auto contiguous_scores = ensure_row_contiguous(scores, stream);
+  Shape out_shape{1, contiguous_scores.shape(1), topk};
+  return array(
+      std::move(out_shape),
+      uint32,
+      std::make_shared<Qwen4QSAFP32TopKIndicesPrimitive>(stream),
       std::vector<array>{contiguous_scores});
 }
 

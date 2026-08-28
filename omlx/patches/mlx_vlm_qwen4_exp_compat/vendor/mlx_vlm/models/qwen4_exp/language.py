@@ -28,7 +28,7 @@ from ..qwen3_5.language import (
 )
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from .config import ModelConfig, TextConfig
-from .qsa_fast import contiguous_causal_gathered_qsa
+from .qsa_fast import contiguous_causal_gathered_qsa, pool_completed_index_keys
 
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
@@ -145,29 +145,245 @@ def _append_indexer_positions(
     return mx.concatenate([cached, position_ids], axis=-1)
 
 
-class QSAKVCache(KVCache):
+class _QSAIndexerCache:
+    """Capacity-backed raw and completed-block state shared by QSA caches.
+
+    Raw keys and positions remain part of the public/persisted cache state.
+    The normalized, RoPE-rotated block bank is deliberately ephemeral: state
+    restore, row extraction/filtering, and rollback can rebuild it exactly from
+    those raw tensors without changing the serialized cache schema.
+    """
+
+    index_step = 8192
+
+    def _init_indexer_cache(self):
+        self._index_keys = None
+        self._index_position_ids = None
+        self._index_offset = 0
+        self._index_capacity_managed = True
+        self._invalidate_pooled_indexer()
+
+    @property
+    def index_keys(self):
+        if self._index_keys is None:
+            return None
+        return self._index_keys[:, : self._index_offset]
+
+    @index_keys.setter
+    def index_keys(self, value):
+        self._index_keys = value
+        self._index_offset = 0 if value is None else int(value.shape[1])
+        self._index_capacity_managed = False
+        self._invalidate_pooled_indexer()
+
+    @property
+    def index_position_ids(self):
+        if self._index_position_ids is None:
+            return None
+        return self._index_position_ids[..., : self._index_offset]
+
+    @index_position_ids.setter
+    def index_position_ids(self, value):
+        self._index_position_ids = value
+        self._invalidate_pooled_indexer()
+
+    def _restore_indexer_state(self, keys, position_ids):
+        if (keys is None) != (position_ids is None):
+            raise ValueError("QSA raw keys and positions must be restored together")
+        if keys is not None and (
+            keys.ndim != 3
+            or position_ids.ndim not in {2, 3}
+            or keys.shape[1] != position_ids.shape[-1]
+        ):
+            raise ValueError("Restored QSA raw keys and positions are misaligned")
+        self._index_keys = keys
+        self._index_position_ids = position_ids
+        self._index_offset = 0 if keys is None else int(keys.shape[1])
+        self._index_capacity_managed = False
+        self._invalidate_pooled_indexer()
+
+    @staticmethod
+    def _growth_capacity(current: int, needed: int, step: int) -> int:
+        stepped = ((needed + step - 1) // step) * step
+        return max(stepped, 2 * current if current else step)
+
+    def _ensure_indexer_capacity(
+        self,
+        sample_keys: mx.array,
+        sample_positions: mx.array,
+        needed: int,
+    ) -> None:
+        if self._index_keys is None:
+            current = 0
+        else:
+            current = min(
+                int(self._index_keys.shape[1]),
+                int(self._index_position_ids.shape[-1]),
+            )
+        if needed <= current:
+            return
+        capacity = ((needed + self.index_step - 1) // self.index_step) * self.index_step
+        if current and self._index_capacity_managed:
+            capacity = max(capacity, 2 * current)
+        new_keys = mx.zeros(
+            (sample_keys.shape[0], capacity, sample_keys.shape[-1]),
+            dtype=sample_keys.dtype,
+        )
+        if sample_positions.ndim == 3:
+            position_shape = (
+                sample_positions.shape[0],
+                sample_positions.shape[1],
+                capacity,
+            )
+        else:
+            position_shape = (sample_positions.shape[0], capacity)
+        new_positions = mx.zeros(position_shape, dtype=sample_positions.dtype)
+        if self._index_keys is not None and self._index_offset:
+            new_keys[:, : self._index_offset] = self._index_keys[
+                :, : self._index_offset
+            ]
+            new_positions[..., : self._index_offset] = self._index_position_ids[
+                ..., : self._index_offset
+            ]
+        self._index_keys = new_keys
+        self._index_position_ids = new_positions
+        self._index_capacity_managed = True
+
+    def update_indexer(self, keys: mx.array, position_ids: mx.array):
+        if keys.ndim != 3 or position_ids.ndim not in {2, 3}:
+            raise ValueError("QSA index updates require [B,S,D] keys and positions")
+        length = int(keys.shape[1])
+        if position_ids.shape[-1] != length:
+            raise ValueError("QSA index update keys and positions are misaligned")
+
+        if self._index_position_ids is not None:
+            if self._index_position_ids.ndim == 3 and position_ids.ndim == 2:
+                position_ids = mx.broadcast_to(
+                    position_ids[None],
+                    (self._index_position_ids.shape[0], *position_ids.shape),
+                )
+            elif self._index_position_ids.ndim == 2 and position_ids.ndim == 3:
+                # MRoPE promotion is rare. Collapse the old position backing to
+                # its logical prefix so the capacity grow below creates a
+                # writable three-coordinate allocation.
+                old_positions = self._index_position_ids[
+                    ..., : self._index_offset
+                ]
+                self._index_position_ids = mx.broadcast_to(
+                    old_positions[None],
+                    (position_ids.shape[0], *old_positions.shape),
+                )
+                self._index_capacity_managed = False
+            elif self._index_position_ids.ndim != position_ids.ndim:
+                raise ValueError("QSA position rank changed incompatibly")
+
+        end = self._index_offset + length
+        self._ensure_indexer_capacity(keys, position_ids, end)
+        self._index_keys[:, self._index_offset : end] = keys
+        self._index_position_ids[..., self._index_offset : end] = position_ids
+        self._index_offset = end
+        return self.index_keys, self.index_position_ids
+
+    def _invalidate_pooled_indexer(self):
+        self._pooled_index_keys = None
+        self._pooled_index_offset = 0
+        self._pooled_index_ratio = None
+        self._pooled_index_tag = None
+
+    def pooled_indexer_keys(
+        self,
+        compress_ratio: int,
+        index_key_norm,
+        apply_index_rope,
+        *,
+        cache_tag=None,
+    ) -> mx.array:
+        """Return the completed block bank, computing only its new suffix."""
+
+        if self._index_keys is None or self._index_position_ids is None:
+            raise ValueError("QSA pooled keys require raw indexer state")
+        complete_blocks = self._index_offset // compress_ratio
+        if (
+            self._pooled_index_ratio != compress_ratio
+            or self._pooled_index_tag is not cache_tag
+            or self._pooled_index_offset > complete_blocks
+        ):
+            self._invalidate_pooled_indexer()
+            self._pooled_index_ratio = compress_ratio
+            self._pooled_index_tag = cache_tag
+
+        start_block = self._pooled_index_offset
+        if start_block < complete_blocks:
+            new_pooled = pool_completed_index_keys(
+                self.index_keys,
+                self.index_position_ids,
+                compress_ratio=compress_ratio,
+                index_key_norm=index_key_norm,
+                apply_index_rope=apply_index_rope,
+                start_block=start_block,
+                stop_block=complete_blocks,
+            )
+            current_capacity = (
+                0
+                if self._pooled_index_keys is None
+                else int(self._pooled_index_keys.shape[1])
+            )
+            if complete_blocks > current_capacity:
+                block_step = max(1, self.index_step // compress_ratio)
+                capacity = self._growth_capacity(
+                    current_capacity,
+                    complete_blocks,
+                    block_step,
+                )
+                new_buffer = mx.zeros(
+                    (new_pooled.shape[0], capacity, new_pooled.shape[-1]),
+                    dtype=new_pooled.dtype,
+                )
+                if self._pooled_index_keys is not None and start_block:
+                    new_buffer[:, :start_block] = self._pooled_index_keys[
+                        :, :start_block
+                    ]
+                self._pooled_index_keys = new_buffer
+            self._pooled_index_keys[:, start_block:complete_blocks] = new_pooled
+            self._pooled_index_offset = complete_blocks
+
+        if self._pooled_index_keys is None:
+            return mx.zeros(
+                (self._index_keys.shape[0], 0, self._index_keys.shape[-1]),
+                dtype=self._index_keys.dtype,
+            )
+        return self._pooled_index_keys[:, : self._pooled_index_offset]
+
+    def _trim_indexer(self, length: int):
+        self._index_offset = min(self._index_offset, max(0, int(length)))
+        self._invalidate_pooled_indexer()
+
+    @property
+    def indexer_nbytes(self):
+        size = 0
+        for array in (
+            self._index_keys,
+            self._index_position_ids,
+            self._pooled_index_keys,
+        ):
+            if array is not None:
+                size += array.nbytes
+        return size
+
+
+class QSAKVCache(_QSAIndexerCache, KVCache):
     """KV cache with the raw indexer keys and multimodal positions used by QSA."""
 
     # Hybrid/TurboQuant caches do not currently expose a way to carry the
     # indexer's unprojected keys. Uniform quantization uses the specialized
     # QSAQuantizedKVCache below; other schemes leave this cache in float.
     preserve_auxiliary_kv_state = True
+    step = 8192
+    geometric_growth = True
 
     def __init__(self):
         super().__init__()
-        self.index_keys = None
-        self.index_position_ids = None
-
-    def update_indexer(self, keys: mx.array, position_ids: mx.array):
-        if self.index_keys is None:
-            self.index_keys = keys
-            self.index_position_ids = position_ids
-        else:
-            self.index_keys = mx.concatenate([self.index_keys, keys], axis=1)
-            self.index_position_ids = _append_indexer_positions(
-                self.index_position_ids, position_ids
-            )
-        return self.index_keys, self.index_position_ids
+        self._init_indexer_cache()
 
     @property
     def state(self):
@@ -182,33 +398,39 @@ class QSAKVCache(KVCache):
 
     @state.setter
     def state(self, value):
-        self.keys, self.values, self.index_keys, self.index_position_ids = value
+        self.keys, self.values, index_keys, index_position_ids = value
         self.offset = 0 if self.keys is None else self.keys.shape[2]
+        self._geometric_capacity_managed = False
+        self._restore_indexer_state(index_keys, index_position_ids)
 
     def trim(self, n):
         n = min(self.offset, n)
         super().trim(n)
-        if self.index_keys is not None:
-            self.index_keys = self.index_keys[:, : self.offset]
-            self.index_position_ids = self.index_position_ids[..., : self.offset]
+        self._trim_indexer(self.offset)
         return n
 
     def extract(self, idx):
         cache = QSAKVCache()
         if self.keys is not None:
-            cache.keys = mx.contiguous(self.keys[idx : idx + 1])
-            cache.values = mx.contiguous(self.values[idx : idx + 1])
+            cache.keys = mx.contiguous(
+                self.keys[idx : idx + 1, :, : self.offset, :]
+            )
+            cache.values = mx.contiguous(
+                self.values[idx : idx + 1, :, : self.offset, :]
+            )
             cache.offset = self.offset
+            cache._geometric_capacity_managed = False
         if self.index_keys is not None:
-            cache.index_keys = mx.contiguous(self.index_keys[idx : idx + 1])
+            index_keys = mx.contiguous(self.index_keys[idx : idx + 1])
             if self.index_position_ids.ndim == 3:
-                cache.index_position_ids = mx.contiguous(
+                index_position_ids = mx.contiguous(
                     self.index_position_ids[:, idx : idx + 1]
                 )
             else:
-                cache.index_position_ids = mx.contiguous(
+                index_position_ids = mx.contiguous(
                     self.index_position_ids[idx : idx + 1]
                 )
+            cache._restore_indexer_state(index_keys, index_position_ids)
         return cache
 
     def filter(self, batch_indices):
@@ -280,10 +502,7 @@ class QSAKVCache(KVCache):
 
     @property
     def nbytes(self):
-        size = super().nbytes
-        if self.index_keys is not None:
-            size += self.index_keys.nbytes + self.index_position_ids.nbytes
-        return size
+        return super().nbytes + self.indexer_nbytes
 
 
 class BatchQSAKVCache:
@@ -509,26 +728,16 @@ class BatchQSAKVCache:
         return self.kv_cache.nbytes + extra
 
 
-class QSAQuantizedKVCache(QuantizedKVCache):
+class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
     """Uniformly quantized QSA cache that retains float indexer state."""
 
     preserve_auxiliary_kv_state = True
+    step = 8192
+    geometric_growth = True
 
     def __init__(self, group_size: int = 64, bits: int = 8):
         super().__init__(group_size=group_size, bits=bits)
-        self.index_keys = None
-        self.index_position_ids = None
-
-    def update_indexer(self, keys: mx.array, position_ids: mx.array):
-        if self.index_keys is None:
-            self.index_keys = keys
-            self.index_position_ids = position_ids
-        else:
-            self.index_keys = mx.concatenate([self.index_keys, keys], axis=1)
-            self.index_position_ids = _append_indexer_positions(
-                self.index_position_ids, position_ids
-            )
-        return self.index_keys, self.index_position_ids
+        self._init_indexer_cache()
 
     @property
     def state(self):
@@ -540,33 +749,41 @@ class QSAQuantizedKVCache(QuantizedKVCache):
 
     @state.setter
     def state(self, value):
-        self.keys, self.values, self.index_keys, self.index_position_ids = value
+        self.keys, self.values, index_keys, index_position_ids = value
         self.offset = 0 if self.keys is None else self.keys[0].shape[2]
+        self._geometric_capacity_managed = False
+        self._restore_indexer_state(index_keys, index_position_ids)
 
     def trim(self, n):
         n = min(self.offset, n)
         super().trim(n)
-        if self.index_keys is not None:
-            self.index_keys = self.index_keys[:, : self.offset]
-            self.index_position_ids = self.index_position_ids[..., : self.offset]
+        self._trim_indexer(self.offset)
         return n
 
     def extract(self, idx):
         cache = QSAQuantizedKVCache(self.group_size, self.bits)
         if self.keys is not None:
-            cache.keys = tuple(mx.contiguous(x[idx : idx + 1]) for x in self.keys)
-            cache.values = tuple(mx.contiguous(x[idx : idx + 1]) for x in self.values)
+            cache.keys = tuple(
+                mx.contiguous(x[idx : idx + 1, :, : self.offset, :])
+                for x in self.keys
+            )
+            cache.values = tuple(
+                mx.contiguous(x[idx : idx + 1, :, : self.offset, :])
+                for x in self.values
+            )
             cache.offset = self.offset
+            cache._geometric_capacity_managed = False
         if self.index_keys is not None:
-            cache.index_keys = mx.contiguous(self.index_keys[idx : idx + 1])
+            index_keys = mx.contiguous(self.index_keys[idx : idx + 1])
             if self.index_position_ids.ndim == 3:
-                cache.index_position_ids = mx.contiguous(
+                index_position_ids = mx.contiguous(
                     self.index_position_ids[:, idx : idx + 1]
                 )
             else:
-                cache.index_position_ids = mx.contiguous(
+                index_position_ids = mx.contiguous(
                     self.index_position_ids[idx : idx + 1]
                 )
+            cache._restore_indexer_state(index_keys, index_position_ids)
         return cache
 
     def filter(self, batch_indices):
@@ -583,9 +800,7 @@ class QSAQuantizedKVCache(QuantizedKVCache):
     @property
     def nbytes(self):
         size = 0 if self.keys is None else super().nbytes
-        if self.index_keys is not None:
-            size += self.index_keys.nbytes + self.index_position_ids.nbytes
-        return size
+        return size + self.indexer_nbytes
 
 
 class Qwen4ExpRMSNorm(nn.Module):
@@ -719,19 +934,22 @@ class Qwen4ExpQSAIndexer(nn.Module):
 
         query = self._apply_rope(query, position_ids)
         complete_key_len = max_complete_blocks * self.compress_ratio
-        pooled_keys = raw_keys[:, :complete_key_len].reshape(
-            batch, max_complete_blocks, self.compress_ratio, self.head_dim
-        )
-        pooled_keys = mx.expand_dims(
-            self.k_layernorm(
-                mx.mean(pooled_keys.astype(mx.float32), axis=2).astype(raw_keys.dtype)
-            ),
-            axis=1,
-        )
-
-        block_starts = mx.arange(max_complete_blocks) * self.compress_ratio
-        block_position_ids = full_position_ids[..., block_starts]
-        pooled_keys = self._apply_rope(pooled_keys, block_position_ids)
+        if cache is not None and hasattr(cache, "pooled_indexer_keys"):
+            pooled_keys = cache.pooled_indexer_keys(
+                self.compress_ratio,
+                self.k_layernorm,
+                self._apply_rope,
+                cache_tag=self,
+            )
+        else:
+            pooled_keys = pool_completed_index_keys(
+                raw_keys,
+                full_position_ids,
+                compress_ratio=self.compress_ratio,
+                index_key_norm=self.k_layernorm,
+                apply_index_rope=self._apply_rope,
+            )
+        pooled_keys = mx.expand_dims(pooled_keys, axis=1)
 
         # Score in float32, as the reference does: which blocks win is a discrete
         # choice, and rounding the products flips the ones near the cut-off.
@@ -876,6 +1094,12 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             raw_index_keys,
             text_position_ids,
         )
+        pooled_index_keys = cache.pooled_indexer_keys(
+            self.indexer.compress_ratio,
+            self.indexer.k_layernorm,
+            self.indexer._apply_rope,
+            cache_tag=self.indexer,
+        )
         index_queries = self.indexer._apply_rope(
             index_queries,
             text_position_ids,
@@ -896,6 +1120,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             token_budget=self.indexer.token_budget,
             index_key_norm=self.indexer.k_layernorm,
             apply_index_rope=self.indexer._apply_rope,
+            pooled_index_keys=pooled_index_keys,
         )
         output = output.reshape(batch, length, -1)
         return self.o_proj(output * mx.sigmoid(gate))

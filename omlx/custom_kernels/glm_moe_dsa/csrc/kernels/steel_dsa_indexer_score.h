@@ -349,15 +349,27 @@ qwen4_qsa_indexer_score(
   }
 }
 
+template <bool NUMERIC_ZERO_TIES>
 METAL_FUNC uint dsa_ordered_key_32(float x) {
-  const uint bits = as_type<uint>(x);
+  uint bits = as_type<uint>(x);
+  if (NUMERIC_ZERO_TIES && (bits & 0x7fffffffu) == 0u) {
+    bits = 0u;
+  }
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
-// Exact FP32 selection for DSpark's decode-consistent index scores. Four
-// byte-wise radix passes identify the cutoff, then a deterministic segmented
-// scan writes the selected set directly in temporal order.
-template <int TOPK, int THREADS>
+// Exact FP32 selection for DSpark's decode-consistent index scores and Qwen4
+// QSA block scores. Four byte-wise radix passes identify the cutoff, then a
+// deterministic segmented scan writes the selected set without materializing
+// an O(K) index sheet. DSpark keeps the historical lowest-index-first cutoff
+// tie policy. Qwen4 uses HIGHEST_INDEX_TIES because
+//
+//   mx.argpartition(scores, kth=-TOPK)[..., -TOPK:]
+//
+// retains the highest-index members when an exact tie straddles the cutoff.
+// Reversing both segment ownership and each segment's scan makes that policy
+// deterministic without another row pass or a score perturbation.
+template <int TOPK, int THREADS, bool HIGHEST_INDEX_TIES>
 [[kernel, max_total_threads_per_threadgroup(THREADS)]] void
 dspark_fp32_topk_indices(
     const device float* scores [[buffer(0)]],
@@ -383,8 +395,10 @@ dspark_fp32_topk_indices(
 
   const uint K = uint(params->K);
   const uint segment = (K + THREADS - 1) / THREADS;
-  const uint start = tid * segment;
+  const uint logical_tid = HIGHEST_INDEX_TIES ? THREADS - 1 - tid : tid;
+  const uint start = logical_tid * segment;
   const uint stop = metal::min(start + segment, K);
+  const uint count = start < K ? stop - start : 0u;
   const device float* row_scores = scores + size_t(row) * K;
 
   for (int shift = 24; shift >= 0; shift -= 8) {
@@ -394,8 +408,10 @@ dspark_fp32_topk_indices(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint prefix = state[0];
-    for (uint index = start; index < stop; ++index) {
-      const uint key = dsa_ordered_key_32(row_scores[index]);
+    for (uint step = 0; step < count; ++step) {
+      const uint index = HIGHEST_INDEX_TIES ? stop - 1 - step : start + step;
+      const uint key =
+          dsa_ordered_key_32<HIGHEST_INDEX_TIES>(row_scores[index]);
       const bool prefix_match = shift == 24 ||
           (key >> uint(shift + 8)) == (prefix >> uint(shift + 8));
       if (prefix_match) {
@@ -427,8 +443,10 @@ dspark_fp32_topk_indices(
   const uint greater_total = state[1];
   uint local_greater = 0;
   uint local_ties = 0;
-  for (uint index = start; index < stop; ++index) {
-    const uint key = dsa_ordered_key_32(row_scores[index]);
+  for (uint step = 0; step < count; ++step) {
+    const uint index = HIGHEST_INDEX_TIES ? stop - 1 - step : start + step;
+    const uint key =
+        dsa_ordered_key_32<HIGHEST_INDEX_TIES>(row_scores[index]);
     local_greater += key > threshold ? 1u : 0u;
     local_ties += key == threshold ? 1u : 0u;
   }
@@ -481,8 +499,10 @@ dspark_fp32_topk_indices(
   uint output_pos = partial_a[simd] + pre_selected;
   uint ties_seen = pre_ties;
   device uint* row_out = out + size_t(row) * TOPK;
-  for (uint index = start; index < stop; ++index) {
-    const uint key = dsa_ordered_key_32(row_scores[index]);
+  for (uint step = 0; step < count; ++step) {
+    const uint index = HIGHEST_INDEX_TIES ? stop - 1 - step : start + step;
+    const uint key =
+        dsa_ordered_key_32<HIGHEST_INDEX_TIES>(row_scores[index]);
     bool selected = key > threshold;
     if (key == threshold) {
       selected = ties_seen < tie_budget;
