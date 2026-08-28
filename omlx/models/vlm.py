@@ -70,12 +70,56 @@ class VLMModelAdapter(nn.Module):
 
     def release_resources(self) -> None:
         """Drop references to VLM-owned MLX arrays before engine teardown reclaim."""
+        close = getattr(self._vlm_model, "close", None)
+        if callable(close):
+            close()
         self._pending_embeds = None
         self._pending_kwargs = {}
         self._uid_rope_deltas.clear()
         self._batch_rope_deltas = None
         self._language_model = None
         self._vlm_model = None
+
+    @property
+    def mtp(self):
+        """Expose an attached Lightning MTP head, when the model provides one."""
+        language_model = self._language_model
+        getter = getattr(language_model, "get_mtp_module", None)
+        if callable(getter):
+            return getter()
+        return getattr(language_model, "mtp", None)
+
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        return_hidden: bool = False,
+        logits_keep: int = 0,
+    ):
+        return self._language_model.mtp_forward(
+            hidden_states,
+            next_token_ids,
+            mtp_cache,
+            return_hidden=return_hidden,
+            logits_keep=logits_keep,
+        )
+
+    def make_mtp_cache(self):
+        make_cache = getattr(self._language_model, "make_mtp_cache", None)
+        return make_cache() if callable(make_cache) else []
+
+    def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
+        return self._language_model.rollback_speculative_cache(
+            caches,
+            gdn_states,
+            accepted,
+            block_size,
+        )
+
+    # Runtime family patches use this marker to avoid installing an older,
+    # model-specific copy of the same adapter plumbing.
+    _omlx_mtp_adapter_patched = True
 
     @property
     def layers(self):
@@ -103,6 +147,11 @@ class VLMModelAdapter(nn.Module):
         if hasattr(self._vlm_model, "config") and hasattr(self._vlm_model.config, "model_type"):
             return self._vlm_model.config.model_type
         return "vlm"
+
+    @property
+    def supports_skip_lm_head(self) -> bool:
+        """Whether the wrapped official language model has a cache-only pass."""
+        return self.model_type in {"qwen4_exp", "glm5_next"}
 
     @property
     def config(self):
@@ -294,6 +343,7 @@ class VLMModelAdapter(nn.Module):
         self,
         input_ids: mx.array,
         cache: Optional[List[Any]] = None,
+        skip_lm_head: bool = False,
         **kwargs,
     ) -> Any:
         """
@@ -315,6 +365,15 @@ class VLMModelAdapter(nn.Module):
             Model output (logits as mx.array)
         """
         return_hidden = bool(kwargs.get("return_hidden", False))
+        if skip_lm_head:
+            # Scheduler prefill chunks discard their logits. Translate the
+            # shared cache-only contract into the official Qwen/GLM model
+            # hook so those chunks do not project every token over the full
+            # vocabulary. Other VLM families keep their stock call unchanged.
+            if self.model_type == "qwen4_exp":
+                kwargs["skip_logits"] = True
+            elif self.model_type == "glm5_next":
+                kwargs["skip_lm_head"] = True
         inputs_embeds = kwargs.pop("inputs_embeds", None)
         vlm_extra = kwargs.pop("vlm_extra_kwargs", None) or {}
         vlm_extra.pop("_captured_rope_deltas", None)

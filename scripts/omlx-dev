@@ -5,15 +5,15 @@
 set -eu
 
 script_path=${0:A}
-repo_root=${OMLX_DEV_REPO:-${script_path:h:h}}
-venv_root=${OMLX_DEV_VENV:-${HOME}/omlx-v2-build}
-state_root=${OMLX_DEV_STATE_DIR:-${HOME}/.omlx/run}
 env_file=${OMLX_DEV_ENV_FILE:-${HOME}/.omlx/dev-server.env}
 if [[ -f "${env_file}" ]]; then
   set -a
   source "${env_file}"
   set +a
 fi
+repo_root=${OMLX_DEV_REPO:-${script_path:h:h}}
+venv_root=${OMLX_DEV_VENV:-${HOME}/omlx-v2-build}
+state_root=${OMLX_DEV_STATE_DIR:-${HOME}/.omlx/run}
 log_file=${OMLX_DEV_LOG:-${venv_root}/serve.log}
 host=${OMLX_DEV_HOST:-0.0.0.0}
 port=${OMLX_DEV_PORT:-8000}
@@ -45,6 +45,26 @@ server_pid() {
 verify_worktree() {
   [[ -d "${repo_root}" ]] || die "repo is missing: ${repo_root}"
   [[ -x "${venv_root}/bin/omlx" ]] || die "venv CLI is missing: ${venv_root}/bin/omlx"
+  [[ -z "${PYTHONPATH:-}" ]] || die "PYTHONPATH must be unset; use the editable dev venv"
+  [[ -z "${PYTHONHOME:-}" ]] || die "PYTHONHOME must be unset for the dev server"
+  local local_head
+  local_head=$(tracked_head)
+  if [[ -n "${OMLX_DEV_EXPECTED_HEAD:-}" ]]; then
+    [[ "${local_head}" == "${OMLX_DEV_EXPECTED_HEAD}" ]] ||
+      die "HEAD ${local_head[1,12]} does not match OMLX_DEV_EXPECTED_HEAD ${OMLX_DEV_EXPECTED_HEAD[1,12]}"
+  fi
+  "${venv_root}/bin/python" -I - "${repo_root}" <<'PY'
+from pathlib import Path
+import sys
+import omlx
+
+expected = Path(sys.argv[1]).resolve()
+actual = Path(omlx.__file__).resolve().parents[1]
+if actual != expected:
+    raise SystemExit(
+        f"omlx-dev: editable import mismatch: expected {expected}, imported {actual}"
+    )
+PY
   [[ -z "$(git -C "${repo_root}" status --porcelain)" ]] || {
     [[ "${OMLX_DEV_ALLOW_DIRTY:-0}" == "1" ]] ||
       die "worktree is dirty; commit/stash it or set OMLX_DEV_ALLOW_DIRTY=1"
@@ -52,8 +72,7 @@ verify_worktree() {
   local upstream
   upstream=$(git -C "${repo_root}" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null || true)
   if [[ -n "${upstream}" ]]; then
-    local local_head upstream_head
-    local_head=$(tracked_head)
+    local upstream_head
     upstream_head=$(git -C "${repo_root}" rev-parse '@{upstream}')
     [[ "${local_head}" == "${upstream_head}" ]] || {
       [[ "${OMLX_DEV_ALLOW_UNPUSHED:-0}" == "1" ]] ||
@@ -81,6 +100,11 @@ write_launch_agent() {
   </array>
   <key>WorkingDirectory</key>
   <string>${repo_root}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>OMLX_DEV_ENV_FILE</key>
+    <string>${env_file}</string>
+  </dict>
   <key>RunAtLoad</key>
   ${run_at_load}
   <key>KeepAlive</key>
@@ -99,6 +123,7 @@ PLIST
 }
 
 run_server() {
+  verify_worktree
   cd "${repo_root}"
   exec "${venv_root}/bin/omlx" serve --host "${host}" --port "${port}"
 }

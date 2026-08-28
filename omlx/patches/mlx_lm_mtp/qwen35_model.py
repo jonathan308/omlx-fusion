@@ -296,6 +296,7 @@ def _patch_gated_delta_net(q35: Any) -> None:
         mask: Optional[Any] = None,
         cache: Optional[Any] = None,
         n_confirmed: int = 0,
+        defer_all_sum: bool = False,
     ):
         B, S, _ = inputs.shape
 
@@ -349,7 +350,7 @@ def _patch_gated_delta_net(q35: Any) -> None:
         out = self.norm(out, z)
         out = self.out_proj(out.reshape(B, S, -1))
 
-        if self.sharding_group is not None:
+        if self.sharding_group is not None and not defer_all_sum:
             out = mx.distributed.all_sum(out, group=self.sharding_group)
 
         return out
@@ -368,7 +369,171 @@ def _patch_decoder_layer(q35: Any) -> None:
     if _is_our_method(cls, "__call__", "_omlx_mtp_call_marker"):
         return
 
+    from mlx_lm.models.activations import swiglu
+    from mlx_lm.models.base import scaled_dot_product_attention
+
+    def local_sharded_to_all(module, inputs):
+        group = getattr(module, "group", None)
+        kind = type(module).__name__
+        if group is None or kind not in {
+            "QuantizedShardedToAllLinear",
+            "ShardedToAllLinear",
+        }:
+            return None
+        if kind == "QuantizedShardedToAllLinear":
+            local = q35.mx.quantized_matmul(
+                inputs,
+                module["weight"],
+                scales=module["scales"],
+                biases=module.get("biases"),
+                transpose=True,
+                group_size=module.group_size,
+                bits=module.bits,
+                mode=module.mode,
+            )
+        else:
+            local = inputs @ module["weight"].T
+        return local, group, module.get("bias")
+
+    def full_attention_local(attention, inputs, cache):
+        batch, length, _ = inputs.shape
+        q_proj = attention.q_proj(inputs)
+        queries, gate = q35.mx.split(
+            q_proj.reshape(
+                batch,
+                length,
+                attention.num_attention_heads,
+                -1,
+            ),
+            2,
+            axis=-1,
+        )
+        gate = gate.reshape(batch, length, -1)
+        keys = attention.k_proj(inputs)
+        values = attention.v_proj(inputs)
+        queries = attention.q_norm(queries).transpose(0, 2, 1, 3)
+        keys = attention.k_norm(
+            keys.reshape(
+                batch,
+                length,
+                attention.num_key_value_heads,
+                -1,
+            )
+        ).transpose(0, 2, 1, 3)
+        values = values.reshape(
+            batch,
+            length,
+            attention.num_key_value_heads,
+            -1,
+        ).transpose(0, 2, 1, 3)
+        queries = attention.rope(queries, offset=cache.offset)
+        keys = attention.rope(keys, offset=cache.offset)
+        keys, values = cache.update_and_fetch(keys, values)
+        output = scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            cache=cache,
+            scale=attention.scale,
+            mask=None,
+        )
+        output = output.transpose(0, 2, 1, 3).reshape(
+            batch,
+            length,
+            -1,
+        )
+        return local_sharded_to_all(
+            attention.o_proj,
+            output * q35.mx.sigmoid(gate),
+        )
+
+    def rowwise_mlp_with_one_collective(self, hidden):
+        down = getattr(self.mlp, "down_proj", None)
+        if getattr(down, "group", None) is None or type(down).__name__ not in {
+            "QuantizedShardedToAllLinear",
+            "ShardedToAllLinear",
+        }:
+            return q35.mx.concatenate(
+                [
+                    self.mlp(
+                        self.post_attention_layernorm(
+                            hidden[:, index : index + 1]
+                        )
+                    )
+                    for index in range(hidden.shape[1])
+                ],
+                axis=1,
+            )
+
+        local_rows = []
+        for index in range(hidden.shape[1]):
+            row = self.post_attention_layernorm(
+                hidden[:, index : index + 1]
+            )
+            activated = swiglu(
+                self.mlp.gate_proj(row),
+                self.mlp.up_proj(row),
+            )
+            local, group, bias = local_sharded_to_all(down, activated)
+            local_rows.append(local)
+
+        output = q35.mx.distributed.all_sum(
+            q35.mx.concatenate(local_rows, axis=1),
+            group=group,
+        )
+        if bias is not None:
+            output = output + bias
+        return output
+
     def __call__(self, x, mask=None, cache=None, n_confirmed: int = 0):
+        if (
+            n_confirmed
+            and bool(getattr(self, "_omlx_mtp_tokenwise_layer", False))
+            and x.shape[1] > 1
+        ):
+            if self.is_linear and cache is not None:
+                # Rejection replay restores this pre-window state, trims all
+                # KV rows, then commits the confirmed token through L=1.
+                cache.rollback_state = (cache[0], cache[1])
+                cache._mtp_draft_stash = None
+            rows = []
+            attention_group = None
+            attention_bias = None
+            attention = self.linear_attn if self.is_linear else self.self_attn
+            for index in range(x.shape[1]):
+                row = x[:, index : index + 1]
+                normed = self.input_layernorm(row)
+                if self.is_linear and attention.sharding_group is not None:
+                    local = attention(
+                        normed,
+                        None,
+                        cache,
+                        defer_all_sum=True,
+                    )
+                    attention_group = attention.sharding_group
+                elif not self.is_linear:
+                    local_result = full_attention_local(
+                        attention,
+                        normed,
+                        cache,
+                    )
+                    if local_result is not None:
+                        local, attention_group, attention_bias = local_result
+                    else:
+                        local = attention(normed, None, cache)
+                else:
+                    local = attention(normed, None, cache)
+                rows.append(local)
+            residual = q35.mx.concatenate(rows, axis=1)
+            if attention_group is not None:
+                residual = q35.mx.distributed.all_sum(
+                    residual,
+                    group=attention_group,
+                )
+                if attention_bias is not None:
+                    residual = residual + attention_bias
+            hidden = x + residual
+            return hidden + rowwise_mlp_with_one_collective(self, hidden)
         if self.is_linear:
             h_in = self.input_layernorm(x)
             # n_confirmed is an MTP draft/verify concern and is always 0 on
@@ -410,6 +575,36 @@ def _patch_qwen3_5_text_model(q35: Any) -> None:
         input_embeddings=None,
         n_confirmed: int = 0,
     ):
+        if (
+            n_confirmed
+            and inputs.shape[1] > 1
+            and input_embeddings is None
+            and cache is not None
+            and bool(getattr(self, "_omlx_mtp_tokenwise_backbone", False))
+        ):
+            rows = []
+            for i in range(inputs.shape[1]):
+                rows.append(
+                    self(
+                        inputs[:, i : i + 1],
+                        cache=cache,
+                        n_confirmed=0,
+                    )
+                )
+                if i + 1 == n_confirmed:
+                    snapshots = []
+                    for layer, layer_cache in zip(self.layers, cache):
+                        if layer.is_linear and layer_cache is not None:
+                            conv_snapshot = layer_cache[0] + 0
+                            ssm_snapshot = layer_cache[1] + 0
+                            layer_cache.rollback_state = (
+                                conv_snapshot,
+                                ssm_snapshot,
+                            )
+                            layer_cache._mtp_draft_stash = None
+                            snapshots.extend((conv_snapshot, ssm_snapshot))
+                    q35.mx.async_eval(rows[-1], snapshots)
+            return q35.mx.concatenate(rows, axis=1)
         if input_embeddings is not None:
             hidden_states = input_embeddings
         else:
@@ -492,7 +687,21 @@ def _patch_text_model(q35: Any) -> None:
             input_embeddings=input_embeddings,
             n_confirmed=n_confirmed,
         )
-        normed = self.model.norm(hidden)
+        tokenwise_verify = bool(
+            n_confirmed
+            and hidden.shape[1] > 1
+            and getattr(self, "_omlx_mtp_tokenwise_head", False)
+        )
+        if tokenwise_verify:
+            normed = q35.mx.concatenate(
+                [
+                    self.model.norm(hidden[:, i : i + 1])
+                    for i in range(hidden.shape[1])
+                ],
+                axis=1,
+            )
+        else:
+            normed = self.model.norm(hidden)
         if not return_hidden and not n_confirmed and input_embeddings is None:
             # Prompt-priming capture rides prefill/decode forwards; verify
             # cycles (return_hidden) and confirmed-split forwards are the MTP
@@ -508,10 +717,18 @@ def _patch_text_model(q35: Any) -> None:
             # prompt-priming side effects above, but do not project [B,T,H]
             # through Qwen3.8's 248k-token head on every 2K chunk.
             return None
-        if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(normed)
+        projection = (
+            self.model.embed_tokens.as_linear
+            if self.args.tie_word_embeddings
+            else self.lm_head
+        )
+        if tokenwise_verify:
+            out = q35.mx.concatenate(
+                [projection(normed[:, i : i + 1]) for i in range(normed.shape[1])],
+                axis=1,
+            )
         else:
-            out = self.lm_head(normed)
+            out = projection(normed)
         if return_hidden:
             return out, hidden
         return out

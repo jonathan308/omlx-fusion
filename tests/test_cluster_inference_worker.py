@@ -338,7 +338,7 @@ def test_distributed_qwen_mtp_defaults_to_coordinated_adaptive_depth(
     assert "OMLX_MTP_FIXED_DEPTH" not in os.environ
 
 
-def test_distributed_qwen_mtp_uses_synchronous_depth_one_protocol():
+def test_distributed_qwen_mtp_uses_coordinated_depth_four_protocol():
     inner = SimpleNamespace(
         _omlx_mtp_decode_enabled=True,
         _omlx_mtp_chain=True,
@@ -352,9 +352,11 @@ def test_distributed_qwen_mtp_uses_synchronous_depth_one_protocol():
         enabled=True,
     )
 
-    assert depth == 1
-    assert inner._omlx_mtp_chain is False
-    assert inner._omlx_mtp_depth == 1
+    assert depth == 4
+    assert inner._omlx_mtp_chain is True
+    assert inner._omlx_mtp_depth == 4
+    assert inner._omlx_mtp_tokenwise_backbone is False
+    assert inner._omlx_mtp_tokenwise_head is False
 
 
 def test_distributed_qwen_mtp_requires_an_attached_head():

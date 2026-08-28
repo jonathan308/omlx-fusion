@@ -103,6 +103,35 @@ class TestVLMModelAdapter:
 
         assert adapter.model_type == "qwen3_5_moe"
 
+    def test_cache_only_prefill_capability_is_limited_to_official_qwen4_glm5(self):
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mock_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+        assert adapter.supports_skip_lm_head is False
+
+        vlm.config.model_type = "qwen4_exp"
+        assert adapter.supports_skip_lm_head is True
+        vlm.config.model_type = "glm5_next"
+        assert adapter.supports_skip_lm_head is True
+
+    def test_cache_only_prefill_translates_official_model_contracts(self):
+        from omlx.models.vlm import VLMModelAdapter
+
+        for model_type, expected_key in (
+            ("qwen4_exp", "skip_logits"),
+            ("glm5_next", "skip_lm_head"),
+        ):
+            vlm = self._make_mock_vlm_model()
+            vlm.config.model_type = model_type
+            adapter = VLMModelAdapter(vlm)
+            input_ids = MockMXArray(shape=(1, 8))
+            vlm.language_model.__call__ = MagicMock(return_value=MagicMock())
+
+            adapter(input_ids, cache=[], skip_lm_head=True)
+
+            assert vlm.language_model.call_args.kwargs[expected_key] is True
+
     def test_args_property(self):
         """Test args property delegates to language_model."""
         from omlx.models.vlm import VLMModelAdapter

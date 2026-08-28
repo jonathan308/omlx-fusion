@@ -416,15 +416,22 @@ class EngineCore:
     def _admit_request(self, request: Request) -> None:
         """Warm after a long idle gap, then insert on the same MLX lane."""
 
+        keepwarm = getattr(self, "_keepwarm", None)
+        has_requests = getattr(self.scheduler, "has_requests", None)
+        if keepwarm is None or not callable(has_requests):
+            # Compatibility for lightweight embedders/test doubles that
+            # construct EngineCore without the optional keepwarm controller.
+            self.scheduler.add_request(request)
+            return
         pending = self._pending_admission_count()
-        if pending == 1 and not self.scheduler.has_requests():
-            action = self._keepwarm.request_start_action()
+        if pending == 1 and not has_requests():
+            action = keepwarm.request_start_action()
             if action is not None:
                 self._run_keepwarm_action(action)
         else:
-            self._keepwarm.observe_request_state(True)
+            keepwarm.observe_request_state(True)
             if self.config.keepwarm_config.enabled:
-                self._keepwarm.skip("concurrent admission or scheduler busy")
+                keepwarm.skip("concurrent admission or scheduler busy")
         self.scheduler.add_request(request)
 
     def _idle_keepwarm_if_due(self) -> None:
@@ -709,6 +716,13 @@ class EngineCore:
         # asyncio.Event per refused request. Re-raise after cleanup so
         # the typed exception still reaches the FastAPI 400 handler.
         loop = asyncio.get_running_loop()
+        # Some embedders and focused tests construct a minimal EngineCore via
+        # __new__ instead of __init__. Lazily establish the admission counter
+        # rather than turning an otherwise valid request into an attribute
+        # error; normal engines already create both fields during __init__.
+        if not hasattr(self, "_pending_admissions_lock"):
+            self._pending_admissions_lock = threading.Lock()
+            self._pending_admissions = 0
         with self._pending_admissions_lock:
             self._pending_admissions += 1
         try:
@@ -972,7 +986,9 @@ class EngineCore:
             collector.clear()
         self._stream_states.pop(request_id, None)
         self._finished_events.pop(request_id, None)
-        self._finished_at.pop(request_id, None)
+        finished_at = getattr(self, "_finished_at", None)
+        if finished_at is not None:
+            finished_at.pop(request_id, None)
 
     async def _delayed_cleanup(self, request_id: str, delay: float = 5.0) -> None:
         """

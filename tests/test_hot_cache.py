@@ -1694,6 +1694,26 @@ class TestHotCacheWriteThrough:
         finally:
             mgr.close()
 
+    def test_clear_hot_cache_skips_flush_when_writer_dead(self, tmp_path):
+        """A dead writer cannot drain pending buffers; clear drops instead."""
+        mgr = self._make_manager(tmp_path, name="deadwriter", write_through=False)
+        try:
+            block_hash = b"wt_dead_writer_test"
+            assert self._save_block(mgr, block_hash) is True
+
+            mgr._writer_shutdown.set()
+            mgr._write_queue.put_nowait(None)
+            mgr._writer_thread.join(timeout=10)
+            assert not mgr._writer_thread.is_alive()
+
+            assert mgr.clear_hot_cache() == 1
+            assert mgr._hot_cache_get(block_hash) is None
+            assert not mgr._index.contains(block_hash)
+            with mgr._pending_write_hashes_lock:
+                assert block_hash not in mgr._pending_write_buffers
+        finally:
+            mgr.close()
+
     def test_settings_round_trip_and_scheduler_mapping(self):
         """The flag must survive settings.json serialization and reach
         SchedulerConfig via GlobalSettings.to_scheduler_config()."""

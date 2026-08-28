@@ -52,6 +52,11 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     /// True when the model is structurally compatible with native MTP.
     let mtpCompatible: Bool?
     let mtpCompatibilityReason: String?
+    /// Qwen4-Exp PLE mmap capability and server-side forced residency decision.
+    let qwen4PleSsdOffloadSupported: Bool?
+    let qwen4PleSsdOffloadForced: Bool?
+    let qwen4PleResidentBytes: Int64?
+    let qwen4PleMmapBytes: Int64?
     /// True for builtin virtual entries (e.g. the MarkItDown document
     /// converter) that have no real load/unload lifecycle.
     let virtual: Bool?
@@ -83,6 +88,7 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let forceSampling: Bool?
     let maxToolResultTokens: Int?
     let enableThinking: Bool?
+    let qwen4PleSsdOffload: Bool?
     let thinkingBudgetEnabled: Bool?
     let thinkingBudgetTokens: Int?
     let reasoningParser: String?
@@ -105,7 +111,9 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
     let qwen35AnePrefillEnabled: Bool?
     let qwen35AnePrefillSequenceLength: Int?
+    let qwen35AnePrefillTailPaddingMinTokens: Int?
     let qwen35AnePrefillFraction: Double?
+    let qwen35AnePrefillFusedDown: Bool?
     let qwen35AnePrefillMaxLayers: Int?
     let qwen35AnePrefillDualAne: Bool?
     let qwen35AnePrefillGdn: Bool?
@@ -167,6 +175,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var repetitionPenalty: Double? = nil
     var ttlSeconds: Int? = nil
     var enableThinking: Bool? = nil
+    var qwen4PleSsdOffload: Bool? = nil
     var thinkingBudgetEnabled: Bool? = nil
     var thinkingBudgetTokens: Int? = nil
     var maxToolResultTokens: Int? = nil
@@ -185,7 +194,9 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
     var qwen35AnePrefillEnabled: Bool? = nil
     var qwen35AnePrefillSequenceLength: Int? = nil
+    var qwen35AnePrefillTailPaddingMinTokens: Int? = nil
     var qwen35AnePrefillFraction: Double? = nil
+    var qwen35AnePrefillFusedDown: Bool? = nil
     var qwen35AnePrefillMaxLayers: Int? = nil
     var qwen35AnePrefillDualAne: Bool? = nil
     var qwen35AnePrefillGdn: Bool? = nil

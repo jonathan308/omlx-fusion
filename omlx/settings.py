@@ -176,6 +176,15 @@ class ServerSettings:
     burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
     preserve_mid_system_cache: bool = True
     distributed_inference_enabled: bool = False
+    # Human-readable size, same grammar as cache limits ("100MB", "1GB").
+    max_audio_upload_size: str = "100MB"
+
+    def max_audio_upload_bytes(self) -> int:
+        """Configured audio upload limit in bytes. Non-positive sizes raise ValueError."""
+        size = parse_size(self.max_audio_upload_size)
+        if size <= 0:
+            raise ValueError("max_audio_upload_size must be positive")
+        return size
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -199,6 +208,7 @@ class ServerSettings:
                 "distributed_inference_enabled",
                 False,
             ),
+            max_audio_upload_size=data.get("max_audio_upload_size", "100MB"),
         )
 
 
@@ -327,6 +337,10 @@ class CacheSettings:
     # RAM AND persisted to SSD immediately — RAM-speed resume for recent
     # sessions without losing SSD durability for old ones.
     hot_cache_write_through: bool = False
+    # Reuse Apple's AOT-compiled ANE programs across server restarts. The
+    # native gate reads this setting when the first ANE program is compiled,
+    # so a change takes effect on the next server start.
+    ane_compile_cache: bool = False
     initial_cache_blocks: int = 256  # Starting blocks (grows dynamically)
     # None selects the policy automatically: use an SSD sidecar when the SSD
     # cache is enabled, otherwise keep GDN state embedded with the main cache.
@@ -423,6 +437,7 @@ class CacheSettings:
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
             "hot_cache_write_through": self.hot_cache_write_through,
+            "ane_compile_cache": self.ane_compile_cache,
             "initial_cache_blocks": self.initial_cache_blocks,
         }
 
@@ -472,6 +487,7 @@ class CacheSettings:
             hot_cache_write_through=bool(
                 data.get("hot_cache_write_through", False)
             ),
+            ane_compile_cache=bool(data.get("ane_compile_cache", False)),
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
         )
 
@@ -1081,6 +1097,8 @@ class GlobalSettings:
             self.server.preserve_mid_system_cache = (
                 preserve_mid_system_cache.strip().lower() in {"1", "true", "yes", "on"}
             )
+        if max_audio_upload_size := os.getenv("OMLX_MAX_AUDIO_UPLOAD_SIZE"):
+            self.server.max_audio_upload_size = max_audio_upload_size
 
         # Model settings
         if model_dir := os.getenv("OMLX_MODEL_DIR"):
@@ -1218,6 +1236,11 @@ class GlobalSettings:
             self.server.log_level = args.log_level
         if hasattr(args, "sse_keepalive_mode") and args.sse_keepalive_mode is not None:
             self.server.sse_keepalive_mode = args.sse_keepalive_mode
+        if (
+            hasattr(args, "max_audio_upload_size")
+            and args.max_audio_upload_size is not None
+        ):
+            self.server.max_audio_upload_size = args.max_audio_upload_size
 
         # Model settings
         if hasattr(args, "model_dir") and args.model_dir is not None:
@@ -1480,6 +1503,13 @@ class GlobalSettings:
                 f"Invalid sse_keepalive_mode: {self.server.sse_keepalive_mode} "
                 f"(must be one of {valid_keepalive_modes})"
             )
+
+        try:
+            audio_upload_size = parse_size(self.server.max_audio_upload_size)
+            if audio_upload_size <= 0:
+                errors.append("max_audio_upload_size must be positive")
+        except (AttributeError, TypeError, ValueError) as e:
+            errors.append(f"Invalid max_audio_upload_size: {e}")
 
         # Memory guard tier validation
         if self.memory.memory_guard_tier not in VALID_MEMORY_GUARD_TIERS:

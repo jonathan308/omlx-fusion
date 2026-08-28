@@ -292,7 +292,7 @@ class BatchedEngine(BaseEngine):
             get_mlx_executor(), materialize_lazy_state, self._model
         )
 
-        # Qwen3.5/3.6 MoE gate+up regroup: concatenate the routed experts'
+        # Supported MoE gate+up regroup: concatenate the routed experts'
         # gate and up projections so decode runs 2 gather_qmm launches per
         # MoE layer instead of 3 (issue #2238). Bit-exact; runs on the MLX
         # executor because it rewrites weights in place.
@@ -311,7 +311,7 @@ class BatchedEngine(BaseEngine):
                     self._model,
                 )
             except Exception:
-                logger.debug("Qwen MoE gate+up fusion not applied", exc_info=True)
+                logger.debug("MoE gate+up fusion not applied", exc_info=True)
 
         # Qwen MoE decode router: fuse the top-k select + renormalize chain
         # into one launch (the composed argpartition chain is ~2 ms/token on
@@ -411,6 +411,14 @@ class BatchedEngine(BaseEngine):
                     return enable_qwen35_ane_prefill(
                         self._model,
                         sequence_length=requested_ane_sequence_length,
+                        tail_padding_min_tokens=int(
+                            getattr(
+                                self._model_settings,
+                                "qwen35_ane_prefill_tail_padding_min_tokens",
+                                0,
+                            )
+                            or 0
+                        ),
                         fraction=getattr(
                             self._model_settings,
                             "qwen35_ane_prefill_fraction",
@@ -440,6 +448,24 @@ class BatchedEngine(BaseEngine):
                             self._model_settings,
                             "qwen35_ane_prefill_dual_ane",
                             True,
+                        ),
+                        ane_down_fraction=(
+                            getattr(
+                                self._model_settings,
+                                "qwen35_ane_prefill_fraction",
+                                0.53,
+                            )
+                            if getattr(
+                                self._model_settings,
+                                "qwen35_ane_prefill_fused_down",
+                                False,
+                            )
+                            else 0.0
+                        ),
+                        fused_down=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_fused_down",
+                            False,
                         ),
                         cpu_fraction=getattr(
                             self._model_settings,
@@ -1003,6 +1029,7 @@ class BatchedEngine(BaseEngine):
             xtc_probability=kwargs.get("xtc_probability", 0.0),
             xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
+            repetition_context_size=kwargs.get("repetition_context_size"),
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
@@ -1080,6 +1107,7 @@ class BatchedEngine(BaseEngine):
             xtc_probability=kwargs.get("xtc_probability", 0.0),
             xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
+            repetition_context_size=kwargs.get("repetition_context_size"),
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],

@@ -38,6 +38,13 @@ public:
   Ticket begin(MTL::CommandBuffer *command_buffer);
   void execute(Ticket ticket);
   void wait(Ticket ticket);
+  // Retire a ticket whose producer command buffer failed before execute()
+  // was called. This balances submission counters without latching a
+  // per-program fault for an ordinary request cancellation.
+  void cancel_ticket(Ticket ticket);
+  // A failed/timed-out program is latched so callers can fail over before
+  // constructing another graph against a wedged ANE program.
+  bool has_error();
   bool completed(Ticket ticket) const;
   // Run one throwaway evaluation to pay the first-run compilation cost at
   // load time instead of inside the first user request. Input contents are
@@ -51,6 +58,7 @@ private:
   std::unique_ptr<Impl> impl_;
 
   friend class AneLinearBankBuilder;
+  friend class AneFusedBankBuilder;
   friend std::shared_ptr<AneLinearModel>
   qwen35_ane_compile_linear(const mlx::core::array &, int, int, int);
   friend std::vector<std::shared_ptr<AneLinearModel>>
@@ -63,7 +71,12 @@ private:
   qwen35_ane_compile_fp16_linear(const mlx::core::array &, int);
   friend std::shared_ptr<AneLinearModel> qwen35_ane_compile_swiglu_down(
       const mlx::core::array &, const mlx::core::array &,
-      const mlx::core::array &, int);
+      const mlx::core::array &, int, int);
+  friend std::vector<std::shared_ptr<AneLinearModel>>
+  qwen35_ane_compile_swiglu_down_bank(
+      const std::vector<mlx::core::array> &,
+      const std::vector<mlx::core::array> &,
+      const std::vector<mlx::core::array> &, int, int);
 };
 
 // Incremental builder for one instance-pinned procedure bank. add() converts
@@ -89,7 +102,27 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
+class AneFusedBankBuilder {
+public:
+  explicit AneFusedBankBuilder(int sequence_length);
+  ~AneFusedBankBuilder();
+  AneFusedBankBuilder(const AneFusedBankBuilder &) = delete;
+  AneFusedBankBuilder &operator=(const AneFusedBankBuilder &) = delete;
+
+  void add(const mlx::core::array &gate_weight,
+           const mlx::core::array &up_weight,
+           const mlx::core::array &down_weight);
+  int size() const;
+  std::vector<std::shared_ptr<AneLinearModel>>
+  compile(int ane_instance, int start, int stop);
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
 bool qwen35_ane_available();
+bool qwen35_ane_hybrid_nax_enabled();
 bool qwen35_cpu_shared_resource_available();
 int qwen35_ane_profile_category_count();
 void qwen35_ane_profile_set_enabled(bool enabled);
@@ -142,7 +175,14 @@ std::shared_ptr<AneLinearModel> qwen35_ane_compile_swiglu_down(
     const mlx::core::array &gate_weight,
     const mlx::core::array &up_weight,
     const mlx::core::array &down_weight,
-    int sequence_length);
+    int sequence_length, int ane_instance = 0);
+
+std::vector<std::shared_ptr<AneLinearModel>>
+qwen35_ane_compile_swiglu_down_bank(
+    const std::vector<mlx::core::array> &gate_weights,
+    const std::vector<mlx::core::array> &up_weights,
+    const std::vector<mlx::core::array> &down_weights,
+    int sequence_length, int ane_instance);
 
 mlx::core::array qwen35_ane_q4_affine_qmm_t(
     const mlx::core::array &x, const mlx::core::array &gpu_weight,
@@ -252,5 +292,33 @@ mlx::core::array qwen35_ane_q4_swiglu_down_t(
     const mlx::core::array &gpu_down_biases,
     const std::shared_ptr<AneLinearModel> &ane_model, int variant = 8,
     int group_size = 128, mlx::core::StreamOrDevice s = {});
+
+mlx::core::array qwen35_ane_dual_q4_swiglu_down_t(
+    const mlx::core::array &x,
+    const mlx::core::array &gpu_gate_up_weight,
+    const mlx::core::array &gpu_gate_up_scales,
+    const mlx::core::array &gpu_gate_up_biases,
+    const mlx::core::array &gpu_down_weight,
+    const mlx::core::array &gpu_down_scales,
+    const mlx::core::array &gpu_down_biases,
+    const std::shared_ptr<AneLinearModel> &ane_model0,
+    const std::shared_ptr<AneLinearModel> &ane_model1, int variant = 8,
+    int group_size = 128, mlx::core::StreamOrDevice s = {});
+
+mlx::core::array qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t(
+    const mlx::core::array &x,
+    const mlx::core::array &cpu_gate_up_weight,
+    const mlx::core::array &cpu_down_weight,
+    const mlx::core::array &gpu_gate_up_weight,
+    const mlx::core::array &gpu_gate_up_scales,
+    const mlx::core::array &gpu_gate_up_biases,
+    const mlx::core::array &gpu_down_weight,
+    const mlx::core::array &gpu_down_scales,
+    const mlx::core::array &gpu_down_biases,
+    const std::shared_ptr<AneLinearModel> &ane_model0,
+    const std::shared_ptr<AneLinearModel> &ane_model1, int variant = 8,
+    int group_size = 128, int cpu_threads = 0,
+    bool cpu_shared_resource = false,
+    mlx::core::StreamOrDevice s = {});
 
 } // namespace omlx::qwen35_prefill_kernels

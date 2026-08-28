@@ -29,7 +29,6 @@ import struct
 import threading
 import time
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -851,6 +850,29 @@ def _restore_tensor_from_bytes(
     return arr.reshape(shape)
 
 
+def _fsync_parent_dir(path: str | Path) -> None:
+    """Fsync the containing directory after a rename/replace into it.
+
+    POSIX doesn't guarantee a rename survives a crash until the directory
+    entry itself is flushed -- the renamed file can revert to its prior
+    name (or the new name can point at nothing) even though the rename
+    call returned success. Cheap relative to the write itself (one flush
+    of already-cached directory metadata, no data to flush), so applied
+    at every writer that promotes a temp file into place.
+    """
+    dir_path = os.path.dirname(str(path)) or "."
+    try:
+        dir_fd = os.open(dir_path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
 def _write_safetensors_no_mx(
     path: str,
     tensors_raw: dict[str, tuple[bytes, str, list[int]]],
@@ -901,6 +923,15 @@ def _write_safetensors_no_mx(
         f.write(header_json)
         for d in all_data:
             f.write(d)
+        # Durable before any caller renames this file into place (all four
+        # call sites across paged_ssd_cache.py and boundary_snapshot_store.py
+        # write to a *_tmp.safetensors path and rename/replace it into the
+        # final name right after this returns). Without this, a crash or
+        # power loss between close() and the rename can leave the temp file's
+        # data only in the OS page cache -- the rename still lands, but the
+        # file it points at can read back as truncated/zero-filled garbage.
+        f.flush()
+        os.fsync(f.fileno())
 
     return 8 + len(header_json) + offset
 
@@ -2388,6 +2419,7 @@ class PagedSSDCacheManager(CacheManager):
                     # is restored below and its file remains intact.
                     self._enforce_size_limit_for_new_block(staged_stat.st_size)
                     os.replace(staged_path, final_path)
+                    _fsync_parent_dir(final_path)
                     committed_at = time.time()
                     # os.replace preserves the staging file's timestamps. Stamp
                     # the actual commit/access time so a restart reconstructs LRU
@@ -2963,6 +2995,7 @@ class PagedSSDCacheManager(CacheManager):
             )
 
             os.rename(str(temp_path), str(file_path))
+            _fsync_parent_dir(file_path)
 
             # The block is now durable on disk; bump the persist counter
             # before any cleanup so ``saves_persisted`` reflects rename
@@ -4159,11 +4192,8 @@ class PagedSSDCacheManager(CacheManager):
         if len(to_load) < 4:
             return 0
 
-        # Cap workers to limit peak memory (each load allocates ~122-275MB).
-        # 8 workers ≈ 1.4GB peak, vs 2.8GB at 16. CPD-accepted (G1/Q3).
         start = time.perf_counter()
         loaded_count = 0
-        max_workers = min(8, len(to_load))
 
         def _load_one(block_hash: bytes, metadata: PagedSSDBlockMetadata) -> bool:
             file_path = metadata.file_path
@@ -4184,14 +4214,16 @@ class PagedSSDCacheManager(CacheManager):
                 logger.warning(f"Preload failed for block {block_hash.hex()[:16]}: {e}")
                 return False
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_load_one, bh, meta): bh for bh, meta in to_load}
-            for future in as_completed(futures):
-                try:
-                    if future.result():
-                        loaded_count += 1
-                except Exception:
-                    pass
+        # Serialized, matching load_block's discipline (see the comment at
+        # the top of this file's single-block load path, ~3773-3778): a
+        # ThreadPoolExecutor running mx.load() in worker threads previously
+        # caused deadlocks when it contested Metal GPU resources with the
+        # calling thread's own inference work (MLX #978 #1040 #1106 #1437
+        # #1558). preload_matched_blocks runs inline on that same calling
+        # thread, so it is exposed to exactly that contention.
+        for block_hash, metadata in to_load:
+            if _load_one(block_hash, metadata):
+                loaded_count += 1
 
         elapsed_ms = (time.perf_counter() - start) * 1000
         self._stats["preload_calls"] += 1
@@ -4201,7 +4233,7 @@ class PagedSSDCacheManager(CacheManager):
         if loaded_count > 0:
             logger.info(
                 f"Preloaded {loaded_count}/{len(to_load)} blocks into hot cache "
-                f"(workers={max_workers}, time={elapsed_ms:.1f}ms)"
+                f"(time={elapsed_ms:.1f}ms)"
             )
         return loaded_count
 
@@ -4680,7 +4712,15 @@ class PagedSSDCacheManager(CacheManager):
         if self._hot_cache_budget is not None:
             self._hot_cache_budget.forget_owner(self)
         flushed = 0
-        for block_hash, entry in entries:
+        for index, (block_hash, entry) in enumerate(entries):
+            if self._writer_thread and not self._writer_thread.is_alive():
+                # A dead writer never drains the queue, so enqueued entries
+                # would remain pinned in pending-write buffers forever.
+                logger.warning(
+                    "Writer thread dead during hot cache clear, dropping "
+                    f"{len(entries) - index} remaining entries unflushed"
+                )
+                break
             if entry.get("dirty", True) and self._enqueue_ssd_write(
                 block_hash, entry
             ):

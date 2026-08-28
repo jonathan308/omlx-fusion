@@ -1,10 +1,10 @@
 class Omlx < Formula
-  CUSTOM_KERNELS = %w[bonsai glm_moe_dsa minimax_m3 qwen35_prefill].freeze
+  CUSTOM_KERNELS = %w[bonsai decode_fast glm_moe_dsa minimax_m3 qwen35_prefill].freeze
 
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jundot/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.6.3rc1.tar.gz"
-  sha256 "1aae9e4cf64422b7e86fb7bc9ac2d0cf5e6ef5858a4afab47d1011c1498b58bc"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.6.3.tar.gz"
+  sha256 "3a5588c09b086c5064604165ca23c4d61eb94c2003cd236f3febd8a53cc045cb"
   license "Apache-2.0"
 
   head "https://github.com/jundot/omlx.git", branch: "main"

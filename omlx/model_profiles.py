@@ -47,7 +47,9 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "turboquant_skip_last",
     "qwen35_ane_prefill_enabled",
     "qwen35_ane_prefill_sequence_length",
+    "qwen35_ane_prefill_tail_padding_min_tokens",
     "qwen35_ane_prefill_fraction",
+    "qwen35_ane_prefill_fused_down",
     "qwen35_ane_prefill_max_layers",
     "qwen35_ane_prefill_dual_ane",
     "qwen35_ane_prefill_gdn",
@@ -111,6 +113,8 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "model_type_override",
         "active_profile_name",
         "ttl_seconds",
+        # Hardware-specific residency choice; never propagate across models.
+        "qwen4_ple_ssd_offload",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
     }

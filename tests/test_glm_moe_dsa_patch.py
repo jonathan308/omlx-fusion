@@ -232,6 +232,19 @@ def test_glm_adaptive_prefill_config_defaults_and_gates(monkeypatch):
     assert _glm_dsa_adaptive_prefill_config(model, 2048) is None
 
 
+def test_glm5_adaptive_prefill_requires_complete_native_sparse_route(monkeypatch):
+    from omlx.patches.glm_moe_dsa import generate_patch
+
+    model = SimpleNamespace(model_type="glm5_next")
+    monkeypatch.setattr(generate_patch, "_glm5_native_sparse_available", lambda: False)
+    assert generate_patch._glm_dsa_adaptive_prefill_config(model, 2048) is None
+
+    monkeypatch.setattr(generate_patch, "_glm5_native_sparse_available", lambda: True)
+    cfg = generate_patch._glm_dsa_adaptive_prefill_config(model, 2048)
+    assert cfg is not None
+    assert cfg.step_size == 8192
+
+
 def test_glm_adaptive_prefill_config_env_overrides(monkeypatch):
     from omlx.patches.glm_moe_dsa.generate_patch import (
         _glm_dsa_adaptive_prefill_config,

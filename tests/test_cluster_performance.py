@@ -531,6 +531,19 @@ def test_mtp_decision_packet_uses_point_to_point_transport(monkeypatch):
     assert observed == [(1, mx.int32, [3, 42, 7])]
 
 
+def test_replicated_mtp_coordinator_keeps_rank_local_logits():
+    logits = mx.array([[1.0, 2.0]])
+    coordinator = _MTPVocabCoordinator(
+        mx,
+        _WorkerGroup(),
+        output_size=0,
+        replicated_logits=True,
+    )
+
+    assert coordinator.replicated_logits is True
+    assert coordinator.gather_logits(logits) is logits
+
+
 def test_asymmetric_tensor_capability_reports_the_local_fraction(monkeypatch):
     monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "3,5")
     with install_runtime_optimizations(
@@ -2221,6 +2234,28 @@ def test_tensor_vocab_sampling_installs_validated_mtp_coordinator():
     assert not hasattr(model, "_omlx_mtp_vocab_coordinator")
     assert head._omlx_gather_vocab_logits is True
     assert auxiliary._omlx_gather_vocab_logits is True
+
+
+def test_replicated_vocab_mtp_still_installs_decision_coordinator():
+    model = SimpleNamespace(
+        model=SimpleNamespace(),
+        _omlx_mtp_decode_enabled=True,
+        _omlx_mtp_chain=True,
+    )
+
+    with install_runtime_optimizations(
+        model,
+        _Group(),
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=False,
+    ):
+        coordinator = model._omlx_mtp_vocab_coordinator
+        assert coordinator.is_coordinator is True
+        assert coordinator.replicated_logits is True
+        assert coordinator.output_size == 0
+
+    assert not hasattr(model, "_omlx_mtp_vocab_coordinator")
 
 
 def test_non_batchable_model_never_reports_continuous_batching_active():

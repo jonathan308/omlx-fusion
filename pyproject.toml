@@ -54,11 +54,13 @@ dependencies = [
     # dev wheel first with --no-deps (ops/install_mlx_variant.sh) so the
     # resolver keeps it.
     "mlx>=0.32.2.dev0,<0.33",
-    # mlx-lm from commit (ab1806e, v0.31.3) - transformers 5.13+
+    # mlx-lm v0.31.3 plus the Fusion decode_fast wiring for Qwen3/Qwen3-MoE.
+    # This is the exact source already qualified on both cluster nodes; using
+    # upstream ab1806e here silently drops the fused decode path.
     # NewlineTokenizer registration compatibility, DeepSeek/GLM DSA indexer
     # RoPE fix, trust_remote_code load gate, transformers 5.7.0
     # compatibility, and prior BatchGenerator/cache fixes.
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ab1806e8f5d6aa035973af194a1b9198ab4754dc",
+    "mlx-lm @ git+https://github.com/jonathan308/mlx-lm@043b43d5d0a61124895cded127bfe18b559f2849",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
     # mlx-embeddings from latest commit (32981fa)
@@ -109,7 +111,7 @@ dependencies = [
     # cutoff (2026-04-23), and the last with the minimal dep tree
     # (click/primp/lxml only; 9.14.2+ adds fake-useragent and httpx
     # extras). Bump together with the cutoff.
-    "ddgs==9.14.4",
+    "ddgs==9.15.0",
     "tabulate>=0.9.0",
     # Resource monitoring
     "psutil>=5.9.0",
@@ -131,7 +133,7 @@ dependencies = [
     # omlx.patches.mlx_vlm_minimax_m3_compat because upstream removed it.
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@78b96eb5462141447b9a6b4943ef553891da56dd",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.10+omlx.6 (b7f6255) - jundot fork of bstnxbt 0.1.10 (9ca0028).
+    # dflash-mlx v0.1.10+omlx.7 (c55324c) - jundot fork of bstnxbt 0.1.10 (9ca0028).
     # Carries the trimmed-sidecar prefix cache fix (repeat-prompt L1 hits never
     # fired upstream), the single-host-sync decode cycle (one D2H transfer
     # per cycle instead of four syncs plus a hard eval), Gemma 4 unified
@@ -139,8 +141,9 @@ dependencies = [
     # text-only mlx-lm module + MuseGlimmerAssistantModel dispatch), plus
     # FP32 Muse Glimmer query scaling parity with mlx-vlm, DFlash 2 runtime
     # support (sampling params + candidate selector, PR 6), min_p with the
-    # mlx-lm sampler filter order, and the sink=0 empty-chunk L2 write fix.
-    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@b7f625504a733216d9e06caa3f7847a048241d94",
+    # mlx-lm sampler filter order, the sink=0 empty-chunk L2 write fix, and
+    # repetition penalty support across speculative and fallback sampling.
+    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@c55324c86540c369f6818a0f47eae544d405475b",
     "markitdown[pdf,docx,pptx]==0.1.7",
 ]
 
@@ -287,7 +290,7 @@ include = ["omlx*"]
 # (e.g. mlx-audio -> mlx-lm==0.31.1) so the resolver accepts them.
 override-dependencies = [
     "mlx>=0.32.2.dev0,<0.33",
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ab1806e8f5d6aa035973af194a1b9198ab4754dc",
+    "mlx-lm @ git+https://github.com/jonathan308/mlx-lm@043b43d5d0a61124895cded127bfe18b559f2849",
 ]
 
 [tool.black]
