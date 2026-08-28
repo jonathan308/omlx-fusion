@@ -595,6 +595,113 @@ def test_glm_target_loader_forces_eager_mlx_vlm_fallback(tmp_path, monkeypatch):
     }
 
 
+@pytest.mark.parametrize("use_custom_loader", [True, False])
+def test_glm_target_loader_scopes_prequant_sanitize_around_both_loaders(
+    tmp_path, monkeypatch, use_custom_loader
+):
+    from contextlib import contextmanager
+
+    import mlx_vlm.utils as vlm_utils
+
+    from omlx.engine import vlm as vlm_engine
+    from omlx.patches import dflash_glm5
+    from omlx.patches.dflash_glm5 import (
+        _load_glm5_target_bundle,
+        install_dflash_glm5_backend,
+    )
+    from omlx.utils import model_loading
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "glm5_next"}), encoding="utf-8"
+    )
+    target = _fake_target()
+    processor = SimpleNamespace(tokenizer=object())
+    events = []
+
+    @contextmanager
+    def sanitize_scope(model_dir):
+        assert model_dir == tmp_path
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    def custom_loader(*_args, **_kwargs):
+        events.append("custom")
+        return (target, processor) if use_custom_loader else None
+
+    def fallback_loader(*_args, **_kwargs):
+        events.append("fallback")
+        return target, processor
+
+    monkeypatch.setattr(
+        vlm_engine,
+        "_force_qwen4_exp_sanitize_on_load",
+        sanitize_scope,
+    )
+    monkeypatch.setattr(model_loading, "maybe_load_custom_quantization", custom_loader)
+    monkeypatch.setattr(
+        model_loading,
+        "materialize_lazy_state",
+        lambda _model: events.append("materialize"),
+    )
+    monkeypatch.setattr(vlm_utils, "load", fallback_loader)
+    monkeypatch.setattr(
+        dflash_glm5.Glm5NextTargetOps,
+        "install_speculative_hooks",
+        lambda self, model: events.append("hooks"),
+    )
+    install_dflash_glm5_backend()
+
+    _load_glm5_target_bundle(tmp_path)
+    load_events = ["custom"] if use_custom_loader else ["custom", "fallback"]
+    assert events == ["enter", *load_events, "exit", "materialize", "hooks"]
+
+
+def test_glm_target_loader_restores_prequant_sanitize_after_load_error(
+    tmp_path, monkeypatch
+):
+    from contextlib import contextmanager
+
+    from omlx.engine import vlm as vlm_engine
+    from omlx.patches.dflash_glm5 import _load_glm5_target_bundle
+    from omlx.utils import model_loading
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "glm5_next"}), encoding="utf-8"
+    )
+    events = []
+
+    @contextmanager
+    def sanitize_scope(_model_dir):
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    def fail_load(*_args, **_kwargs):
+        events.append("load")
+        raise RuntimeError("load failed")
+
+    monkeypatch.setattr(
+        vlm_engine,
+        "_force_qwen4_exp_sanitize_on_load",
+        sanitize_scope,
+    )
+    monkeypatch.setattr(model_loading, "maybe_load_custom_quantization", fail_load)
+    monkeypatch.setattr(
+        model_loading,
+        "materialize_lazy_state",
+        lambda _model: pytest.fail("materialize must not run after load failure"),
+    )
+
+    with pytest.raises(RuntimeError, match="load failed"):
+        _load_glm5_target_bundle(tmp_path)
+    assert events == ["enter", "load", "exit"]
+
+
 def test_glm_target_loader_fails_before_hooks_if_materialization_fails(
     tmp_path, monkeypatch
 ):

@@ -604,7 +604,8 @@ def _load_glm5_target_bundle(
     The pinned DFlash loader requests lazy targets by default. GLM must follow
     the regular VLMEngine contract instead: mlx-vlm constructs the fallback
     target eagerly, then oMLX performs its bounded whole-tree materialization.
-    Custom oQ loading owns its own load policy and is deliberately unchanged.
+    Both routes run inside VLMEngine's pre-quantization sanitize scope; custom
+    oQ loading otherwise owns its existing load policy unchanged.
     """
     del lazy, verify_config
     if quantize_kv_cache:
@@ -616,6 +617,7 @@ def _load_glm5_target_bundle(
     from dflash_mlx.runtime.loading import LoadedTargetBundle
     from mlx_vlm.utils import load as vlm_load
 
+    from ..engine.vlm import _force_qwen4_exp_sanitize_on_load
     from ..utils.model_loading import (
         materialize_lazy_state,
         maybe_load_custom_quantization,
@@ -623,11 +625,12 @@ def _load_glm5_target_bundle(
     from .mlx_vlm_glm5_next_compat import apply_mlx_vlm_glm5_next_compat_patch
 
     apply_mlx_vlm_glm5_next_compat_patch()
-    custom_loaded = maybe_load_custom_quantization(str(model_ref), is_vlm=True)
-    if custom_loaded is not None:
-        model, processor = custom_loaded
-    else:
-        model, processor = vlm_load(str(model_ref), lazy=False, strict=True)
+    with _force_qwen4_exp_sanitize_on_load(Path(model_ref)):
+        custom_loaded = maybe_load_custom_quantization(str(model_ref), is_vlm=True)
+        if custom_loaded is not None:
+            model, processor = custom_loaded
+        else:
+            model, processor = vlm_load(str(model_ref), lazy=False, strict=True)
     # The custom oQ loader intentionally leaves the target tree lazy. Normal
     # VLMEngine startup materializes it before serving, but DFlash owns a
     # separate loader and previously skipped that lifecycle step. The result
