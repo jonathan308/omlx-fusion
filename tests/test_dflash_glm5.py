@@ -555,6 +555,46 @@ def test_glm_target_loader_prefers_omlx_custom_vlm_loader(tmp_path, monkeypatch)
     ]
 
 
+def test_glm_target_loader_forces_eager_mlx_vlm_fallback(tmp_path, monkeypatch):
+    import mlx_vlm.utils as vlm_utils
+
+    from omlx.patches import dflash_glm5
+    from omlx.patches.dflash_glm5 import _load_glm5_target_bundle
+    from omlx.utils import model_loading
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "glm5_next"}), encoding="utf-8"
+    )
+    target = _fake_target()
+    processor = SimpleNamespace(tokenizer=object())
+    seen = {}
+
+    def vlm_loader(model_ref, **kwargs):
+        seen.update(model_ref=model_ref, **kwargs)
+        return target, processor
+
+    monkeypatch.setattr(
+        model_loading,
+        "maybe_load_custom_quantization",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(model_loading, "materialize_lazy_state", lambda _model: None)
+    monkeypatch.setattr(vlm_utils, "load", vlm_loader)
+    monkeypatch.setattr(
+        dflash_glm5.Glm5NextTargetOps,
+        "install_speculative_hooks",
+        lambda self, model: None,
+    )
+
+    bundle = _load_glm5_target_bundle(tmp_path, lazy=True)
+    assert bundle.model is target
+    assert seen == {
+        "model_ref": str(tmp_path),
+        "lazy": False,
+        "strict": True,
+    }
+
+
 def test_glm_target_loader_fails_before_hooks_if_materialization_fails(
     tmp_path, monkeypatch
 ):

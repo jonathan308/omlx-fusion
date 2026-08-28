@@ -599,8 +599,14 @@ def _load_glm5_target_bundle(
     quantize_kv_cache: bool = False,
     verify_config: Any | None = None,
 ) -> Any:
-    """Load GLM through mlx-vlm while returning dflash-mlx's bundle type."""
-    del verify_config
+    """Load GLM through mlx-vlm while returning dflash-mlx's bundle type.
+
+    The pinned DFlash loader requests lazy targets by default. GLM must follow
+    the regular VLMEngine contract instead: mlx-vlm constructs the fallback
+    target eagerly, then oMLX performs its bounded whole-tree materialization.
+    Custom oQ loading owns its own load policy and is deliberately unchanged.
+    """
+    del lazy, verify_config
     if quantize_kv_cache:
         raise ValueError("GLM-5.3 DFlash target KV quantization is unproven")
     if model_ref is None:
@@ -621,7 +627,7 @@ def _load_glm5_target_bundle(
     if custom_loaded is not None:
         model, processor = custom_loaded
     else:
-        model, processor = vlm_load(str(model_ref), lazy=lazy, strict=True)
+        model, processor = vlm_load(str(model_ref), lazy=False, strict=True)
     # The custom oQ loader intentionally leaves the target tree lazy. Normal
     # VLMEngine startup materializes it before serving, but DFlash owns a
     # separate loader and previously skipped that lifecycle step. The result
