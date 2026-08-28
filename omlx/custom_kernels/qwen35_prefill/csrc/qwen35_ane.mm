@@ -370,7 +370,7 @@ load_or_compile_ane_model(id model, NSString *identifier, int ane_instance,
         model, @selector(compileWithQoS:options:error:), 21,
         execution_options, &error);
     if (!ok) {
-      [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
+      [[NSFileManager defaultManager] removeItemAtPath:directory_ error:nil];
       throw std::runtime_error(error_text(
           [compile_what stringByAppendingString:@" compilation failed"],
           error));
