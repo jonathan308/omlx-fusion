@@ -142,6 +142,22 @@ def test_capabilities_fail_closed_for_unproven_paths():
     assert caps.supports_tree_verify is False
 
 
+def test_layer_profiler_is_opt_in_and_verify_only(monkeypatch):
+    from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
+
+    from omlx.patches.dflash_glm5 import _should_profile_glm_verify_layers
+
+    cache = RecurrentRollbackCache(size=2, conv_kernel_size=4)
+    cache.arm_rollback(prefix_len=0)
+    monkeypatch.delenv("OMLX_DFLASH_PROFILE_GLM_LAYERS", raising=False)
+    assert _should_profile_glm_verify_layers([cache]) is False
+
+    monkeypatch.setenv("OMLX_DFLASH_PROFILE_GLM_LAYERS", "1")
+    assert _should_profile_glm_verify_layers([cache]) is True
+    cache._armed = False
+    assert _should_profile_glm_verify_layers([cache]) is False
+
+
 def test_composite_dsa_cache_rollback_uses_kv_offset_and_checks_trim():
     from omlx.patches.dflash_glm5 import Glm5NextTargetOps
 

@@ -29,6 +29,8 @@ class hooks.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -38,10 +40,33 @@ import mlx.core as mx
 from dflash_mlx.engine.target_ops import TargetCapabilities
 from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
 
+logger = logging.getLogger(__name__)
+
 _BACKEND_PATH = "omlx.patches.dflash_glm5:Glm5NextTargetOps"
 _ORIGINAL_TARGET_LOADER: Any | None = None
 _ORIGINAL_LINEAR_CALLS: dict[type, Any] = {}
 _ORIGINAL_PREFILL_RUNNER: Any | None = None
+
+
+def _should_profile_glm_verify_layers(cache: list[Any] | None) -> bool:
+    """Return true only for an explicitly profiled, armed verify forward."""
+    enabled = os.getenv("OMLX_DFLASH_PROFILE_GLM_LAYERS", "").strip().lower()
+    if enabled not in ("1", "true", "on", "yes"):
+        return False
+    return bool(
+        cache
+        and any(
+            isinstance(entry, RecurrentRollbackCache)
+            and bool(getattr(entry, "_armed", False))
+            for entry in cache
+        )
+    )
+
+
+def _eval_profile_values(*values: Any) -> None:
+    arrays = [value for value in values if isinstance(value, mx.array)]
+    if arrays:
+        mx.eval(*arrays)
 
 
 def _config_value(config: Any, name: str, default: Any = None) -> Any:
@@ -376,16 +401,31 @@ class Glm5NextTargetOps:
         from mlx_vlm.models.base import create_attention_mask, create_ssm_mask
 
         inner = self.text_model(target_model)
+        profile_layers = _should_profile_glm_verify_layers(cache)
+        profile_started = time.perf_counter_ns() if profile_layers else 0
+        profile_stages: dict[str, float] = {}
+        layer_timings: list[tuple[int, bool, bool, float]] = []
+        ffn_compiled_before = (
+            sum(getattr(layer, "_ffn_c", None) is not None for layer in inner.layers)
+            if profile_layers
+            else 0
+        )
+
+        stage_started = time.perf_counter_ns() if profile_layers else 0
         h = (
             input_embeddings
             if input_embeddings is not None
             else inner.embed_tokens(input_ids)
         )
+        if profile_layers:
+            _eval_profile_values(h)
+            profile_stages["embed"] = (time.perf_counter_ns() - stage_started) / 1e6
         if cache is None:
             cache = [None] * len(inner.layers)
         elif len(cache) != len(inner.layers):
             raise ValueError("GLM-5.3 cache/layer count mismatch")
 
+        stage_started = time.perf_counter_ns() if profile_layers else 0
         fa_cache = cache[inner.fa_idx]
         fa_mask = create_attention_mask(
             h,
@@ -393,12 +433,20 @@ class Glm5NextTargetOps:
             return_array=True,
         )
         ssm_mask = create_ssm_mask(h, cache[inner.ssm_idx])
+        if profile_layers:
+            _eval_profile_values(fa_mask, ssm_mask)
+            profile_stages["mask"] = (time.perf_counter_ns() - stage_started) / 1e6
+
+        stage_started = time.perf_counter_ns() if profile_layers else 0
         h = mx.contiguous(
             mx.broadcast_to(
                 h[:, :, None, :],
                 (h.shape[0], h.shape[1], inner.hc_mult, h.shape[2]),
             )
         )
+        if profile_layers:
+            _eval_profile_values(h)
+            profile_stages["mhc"] = (time.perf_counter_ns() - stage_started) / 1e6
 
         capture_all = capture_layer_ids is None
         if capture_all:
@@ -410,19 +458,94 @@ class Glm5NextTargetOps:
         for layer_index, (layer, layer_cache) in enumerate(
             zip(inner.layers, cache, strict=True)
         ):
-            mask = ssm_mask if getattr(layer, "is_linear", False) else fa_mask
+            is_linear = bool(getattr(layer, "is_linear", False))
+            is_moe = hasattr(getattr(layer, "mlp", None), "switch_mlp")
+            mask = ssm_mask if is_linear else fa_mask
+            layer_started = time.perf_counter_ns() if profile_layers else 0
             h = layer(h, mask=mask, cache=layer_cache)
+            if profile_layers:
+                _eval_profile_values(h)
+                layer_timings.append(
+                    (
+                        layer_index,
+                        is_linear,
+                        is_moe,
+                        (time.perf_counter_ns() - layer_started) / 1e6,
+                    )
+                )
             capture_key = layer_index + 1
             if capture_all:
                 captured.append(_contract_mhc_hidden(h))
             elif capture_layer_ids is not None and capture_key in capture_layer_ids:
                 captured[capture_key] = _contract_mhc_hidden(h)
 
+        stage_started = time.perf_counter_ns() if profile_layers else 0
         normalized = inner.norm(_contract_mhc_hidden(h))
+        if profile_layers:
+            _eval_profile_values(normalized)
+            profile_stages["norm"] = (time.perf_counter_ns() - stage_started) / 1e6
         if logits_last_only and isinstance(captured, dict):
             captured[-1] = normalized
         logits_hidden = normalized[:, -1:, :] if logits_last_only else normalized
-        return self.logits_from_hidden(target_model, logits_hidden), captured
+
+        stage_started = time.perf_counter_ns() if profile_layers else 0
+        logits = self.logits_from_hidden(target_model, logits_hidden)
+        if profile_layers:
+            _eval_profile_values(logits)
+            profile_stages["lm_head"] = (
+                time.perf_counter_ns() - stage_started
+            ) / 1e6
+
+            stage_started = time.perf_counter_ns()
+            captured_values = (
+                list(captured.values()) if isinstance(captured, dict) else captured
+            )
+            _eval_profile_values(*captured_values)
+            profile_stages["capture"] = (
+                time.perf_counter_ns() - stage_started
+            ) / 1e6
+
+            ffn_compiled_after = sum(
+                getattr(layer, "_ffn_c", None) is not None for layer in inner.layers
+            )
+            layer_total = sum(record[3] for record in layer_timings)
+            linear_total = sum(
+                record[3] for record in layer_timings if record[1]
+            )
+            dsa_total = layer_total - linear_total
+            moe_total = sum(record[3] for record in layer_timings if record[2])
+            dense_total = layer_total - moe_total
+            per_layer = ",".join(
+                f"{index}{'K' if is_linear else 'A'}"
+                f"{'M' if is_moe else 'F'}:{elapsed:.1f}"
+                for index, is_linear, is_moe, elapsed in layer_timings
+            )
+            width = int(h.shape[1])
+            total_ms = (time.perf_counter_ns() - profile_started) / 1e6
+            logger.warning(
+                "GLM DFlash verify layer profile: width=%d total=%.1fms "
+                "embed=%.1f mask=%.1f mhc=%.1f layers=%.1f "
+                "(linear=%.1f dsa=%.1f dense=%.1f moe=%.1f) "
+                "norm=%.1f lm_head=%.1f capture=%.1f ffn_compiled=%d->%d "
+                "layer_ms=[%s]",
+                width,
+                total_ms,
+                profile_stages["embed"],
+                profile_stages["mask"],
+                profile_stages["mhc"],
+                layer_total,
+                linear_total,
+                dsa_total,
+                dense_total,
+                moe_total,
+                profile_stages["norm"],
+                profile_stages["lm_head"],
+                profile_stages["capture"],
+                ffn_compiled_before,
+                ffn_compiled_after,
+                per_layer,
+            )
+        return logits, captured
 
     def verify_block(
         self,
