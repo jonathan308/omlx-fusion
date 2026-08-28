@@ -188,3 +188,60 @@ def test_runtime_accepts_rank_zero_logits_contract():
     assert supported is True
     assert vocab_size == 128
     assert "skip" in reason
+
+
+def test_official_shape_performance_plan_uses_executable_19_26_split():
+    from omlx.cluster.performance import NodePerformanceProfile
+    from omlx.cluster.planner import ModelLayout, NodeBudget, plan_unequal_pipeline
+
+    gib = 1024**3
+
+    def performance(node_id: str, rank: int, rate: float):
+        return NodePerformanceProfile(
+            node_id=node_id,
+            rank=rank,
+            decode_weight_bytes_per_second=rate,
+            prefill_weight_bytes_per_second=rate,
+            collective_latency_seconds=0.001,
+            collective_bandwidth_bytes_per_second=6.5e9,
+            backend="jaccl",
+            measured_at="2026-08-28T00:00:00Z",
+            samples=3,
+        )
+
+    model = ModelLayout(
+        source="glm5-next-official-shape",
+        fixed_weight_bytes=int(1.55 * gib),
+        layer_weight_bytes=(int(0.32 * gib),) * 3 + (int(3.95 * gib),) * 42,
+        activation_bytes_per_token=4096 * 4 * 2,
+        kv_bytes_per_token_per_layer=266,
+        supports_pipeline=True,
+    )
+    nodes = (
+        NodeBudget(
+            node_id="m3-ultra",
+            capacity_bytes=256 * gib,
+            reserve_bytes=129 * gib,
+            rank=0,
+            role="workstation",
+            performance=performance("m3-ultra", 0, 819e9),
+        ),
+        NodeBudget(
+            node_id="m5-max",
+            capacity_bytes=128 * gib,
+            reserve_bytes=17 * gib,
+            rank=1,
+            role="headless",
+            performance=performance("m5-max", 1, 546e9),
+        ),
+    )
+    plan = plan_unequal_pipeline(
+        model,
+        nodes,
+        context_tokens=1_048_576,
+    )
+    assert [(item.start_layer, item.end_layer) for item in plan.assignments] == [
+        (19, 45),
+        (0, 19),
+    ]
+    assert all(item.headroom_bytes > 0 for item in plan.assignments)
