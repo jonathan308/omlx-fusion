@@ -9,7 +9,6 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 
-
 _MODULE_PATH = (
     Path(__file__).parents[1]
     / "omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/"

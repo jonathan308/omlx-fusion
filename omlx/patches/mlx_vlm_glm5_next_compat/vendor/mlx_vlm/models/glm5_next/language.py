@@ -351,6 +351,31 @@ class Glm5NextIndexer(nn.Module):
         try:
             from omlx.custom_kernels.glm_moe_dsa import fast
 
+            # Decode has exactly one query row.  Route it through the exact
+            # M=1 specialization of the same Steel MMA score kernel used by
+            # prefill.  This preserves the historical row-0 dot/reduction
+            # order bit-for-bit while avoiding both the 64-row input/output
+            # padding and 63 unused MMA rows.  Older extension builds safely
+            # accept M=1 with the historical BM64 implementation, so this is
+            # also an exact compatibility path rather than a new ABI.
+            if (
+                q.shape[1] == 1
+                and fast.has_symbol("dsa_indexer_scores")
+            ):
+                qt = q.transpose(0, 2, 1, 3)
+                try:
+                    scores = fast.dsa_indexer_scores(
+                        qt,
+                        pool_keys[:, None],
+                        weights,
+                        causal=False,
+                    )
+                    return scores[:, 0]
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    # Preserve availability through the historical padded
+                    # route below if a packaged extension rejects M=1.
+                    pass
+
             if not fast.has_symbol("dsa_indexer_scores"):
                 return None
             qt = q.transpose(0, 2, 1, 3)
