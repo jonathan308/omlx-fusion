@@ -123,16 +123,7 @@ def _feed_pool(cache, token_count: int) -> None:
     cache.update_and_fetch(pooled)
 
 
-def _glm5_index_score_reference(q, pool_keys, weights):
-    """Reference the GLM-5.3 pooled-index expression in model layout."""
-    qt = q.transpose(0, 2, 1, 3)
-    scores = qt @ pool_keys[:, None].swapaxes(-1, -2)
-    scores = mx.maximum(scores, mx.array(0, scores.dtype))
-    scores = scores * weights.transpose(0, 2, 1)[..., None]
-    return scores.sum(axis=1, keepdims=True).astype(q.dtype)
-
-
-def test_glm5_decode_indexer_uses_single_row_native_scan_with_exact_contract(
+def test_glm5_decode_indexer_uses_single_row_exact_mma_contract(
     monkeypatch,
 ):
     """The L=1 route must not pad one decode query into 64 prefill rows."""
@@ -145,18 +136,14 @@ def test_glm5_decode_indexer_uses_single_row_native_scan_with_exact_contract(
     q = mx.random.normal((1, 1, 32, 128), dtype=mx.bfloat16)
     pool_keys = mx.random.normal((1, 4096, 128), dtype=mx.bfloat16)
     weights = mx.random.normal((1, 1, 32), dtype=mx.bfloat16)
-    calls = {"decode": 0, "prefill": 0}
+    calls = []
 
-    def fake_decode(qt, keys, w):
-        calls["decode"] += 1
+    def fake_indexer(qt, keys, w, **kwargs):
+        calls.append(qt.shape[2])
         assert qt.shape == (1, 32, 1, 128)
         assert keys.shape == (1, 1, 4096, 128)
-        assert w.shape == (1, 32)
-        return _glm5_index_score_reference(q, pool_keys, weights)
-
-    def fake_prefill(qt, keys, w, **kwargs):
-        del kwargs
-        calls["prefill"] += 1
+        assert w.shape == (1, 1, 32)
+        assert kwargs == {"causal": False}
         scores = qt @ keys.swapaxes(-1, -2)
         scores = mx.maximum(scores, mx.array(0, scores.dtype))
         return (
@@ -168,25 +155,18 @@ def test_glm5_decode_indexer_uses_single_row_native_scan_with_exact_contract(
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name in {"dsa_decode_scores", "dsa_indexer_scores"},
+        lambda name: name == "dsa_indexer_scores",
     )
-    monkeypatch.setattr(fast, "dsa_decode_scores", fake_decode)
-    monkeypatch.setattr(fast, "dsa_indexer_scores", fake_prefill)
+    monkeypatch.setattr(fast, "dsa_indexer_scores", fake_indexer)
     direct = Glm5NextIndexer._native_scores(indexer, q, pool_keys, weights)
+    mx.eval(direct)
 
-    # Disable only the decode symbol to evaluate the historical padded route
-    # on the same tensors.  Its retained row must be bit-identical.
-    monkeypatch.setattr(fast, "has_symbol", lambda name: name == "dsa_indexer_scores")
-    legacy = Glm5NextIndexer._native_scores(indexer, q, pool_keys, weights)
-    mx.eval(direct, legacy)
-
-    assert calls == {"decode": 1, "prefill": 1}
-    assert direct.shape == legacy.shape == (1, 1, 4096)
-    assert mx.array_equal(direct, legacy).item()
+    assert calls == [1]
+    assert direct.shape == (1, 1, 4096)
 
 
-def test_glm5_decode_indexer_native_error_falls_back_to_prefill_abi(monkeypatch):
-    """A stale native decode ABI must retain the exact supported route."""
+def test_glm5_decode_indexer_m1_error_falls_back_to_padded_abi(monkeypatch):
+    """A stale M=1 implementation must retain the exact padded route."""
     from mlx_vlm.models.glm5_next.language import Glm5NextIndexer
 
     from omlx.custom_kernels.glm_moe_dsa import fast
@@ -199,65 +179,56 @@ def test_glm5_decode_indexer_native_error_falls_back_to_prefill_abi(monkeypatch)
 
     monkeypatch.setattr(fast, "has_symbol", lambda _name: True)
 
-    def reject_decode(*_args, **_kwargs):
-        calls.append("decode")
-        raise RuntimeError("stale ABI")
-
-    def supported_prefill(qt, keys, w, **_kwargs):
-        calls.append("prefill")
-        assert qt.shape[2] == 64  # historical decode-to-prefill padding
+    def m1_then_padded(qt, keys, w, **_kwargs):
+        calls.append(qt.shape[2])
+        if qt.shape[2] == 1:
+            raise RuntimeError("stale M=1 implementation")
+        assert qt.shape[2] == 64
         return mx.zeros((1, 1, 64, keys.shape[2]), dtype=w.dtype)
 
-    monkeypatch.setattr(fast, "dsa_decode_scores", reject_decode)
-    monkeypatch.setattr(fast, "dsa_indexer_scores", supported_prefill)
+    monkeypatch.setattr(fast, "dsa_indexer_scores", m1_then_padded)
     scores = Glm5NextIndexer._native_scores(indexer, q, pool_keys, weights)
     mx.eval(scores)
 
-    assert calls == ["decode", "prefill"]
+    assert calls == [1, 64]
     assert scores.shape == (1, 1, 4096)
 
 
-@pytest.mark.parametrize("query_rows,pool_length", [(2, 4096), (1, 4095)])
-def test_glm5_decode_indexer_strict_guards_keep_existing_route(
-    monkeypatch, query_rows, pool_length
-):
+def test_glm5_multirow_indexer_keeps_existing_padded_route(monkeypatch):
     from mlx_vlm.models.glm5_next.language import Glm5NextIndexer
 
     from omlx.custom_kernels.glm_moe_dsa import fast
 
     indexer = SimpleNamespace(n_heads=32, head_dim=128)
+    query_rows = 2
+    pool_length = 4096
     q = mx.zeros((1, query_rows, 32, 128), dtype=mx.bfloat16)
     pool_keys = mx.zeros((1, pool_length, 128), dtype=mx.bfloat16)
     weights = mx.zeros((1, query_rows, 32), dtype=mx.bfloat16)
     calls = []
 
     monkeypatch.setattr(fast, "has_symbol", lambda _name: True)
-    monkeypatch.setattr(
-        fast,
-        "dsa_decode_scores",
-        lambda *_args, **_kwargs: calls.append("decode"),
-    )
 
     def fake_prefill(qt, keys, w, **_kwargs):
-        calls.append("prefill")
+        calls.append(qt.shape[2])
         return mx.zeros((1, 1, qt.shape[2], keys.shape[2]), dtype=w.dtype)
 
     monkeypatch.setattr(fast, "dsa_indexer_scores", fake_prefill)
     scores = Glm5NextIndexer._native_scores(indexer, q, pool_keys, weights)
     mx.eval(scores)
 
-    assert calls == ["prefill"]
+    assert calls == [64]
     assert scores.shape == (1, query_rows, pool_length)
 
 
-@pytest.mark.parametrize("pool_length", [4096, 8192])
-def test_glm5_native_decode_scan_preserves_exact_topk(monkeypatch, pool_length):
-    """Packaged-kernel gate: score rounding must not change selected blocks."""
+@pytest.mark.parametrize("pool_length", [513, 1024, 4095, 4096, 8191])
+def test_glm5_native_m1_mma_is_bit_exact_to_legacy_padded_row(pool_length):
+    """The BM8 decode specialization must preserve the deployed score sheet."""
     from mlx_vlm.models.glm5_next.language import Glm5NextIndexer
 
     from omlx.custom_kernels.glm_moe_dsa import fast
 
-    required = ("dsa_decode_scores", "dsa_indexer_scores", "dsa_topk_indices")
+    required = ("dsa_indexer_scores", "dsa_topk_indices")
     if not fast.is_native_available() or any(
         not fast.has_symbol(name) for name in required
     ):
@@ -270,24 +241,24 @@ def test_glm5_native_decode_scan_preserves_exact_topk(monkeypatch, pool_length):
     weights = mx.random.normal((1, 1, 32), dtype=mx.bfloat16)
 
     direct = Glm5NextIndexer._native_scores(indexer, q, pool_keys, weights)
-    original_has_symbol = fast.has_symbol
-    monkeypatch.setattr(
-        fast,
-        "has_symbol",
-        lambda name: name != "dsa_decode_scores" and original_has_symbol(name),
-    )
-    legacy = Glm5NextIndexer._native_scores(indexer, q, pool_keys, weights)
+    qt = q.transpose(0, 2, 1, 3)
+    keys = pool_keys[:, None]
+    q_pad = mx.pad(qt, [(0, 0), (0, 0), (0, 63), (0, 0)])
+    w_pad = mx.pad(weights, [(0, 0), (0, 63), (0, 0)])
+    k_pad = (-pool_length) % 64
+    if k_pad:
+        keys = mx.pad(keys, [(0, 0), (0, 0), (0, k_pad), (0, 0)])
+    legacy = fast.dsa_indexer_scores(
+        q_pad,
+        keys,
+        w_pad,
+        causal=False,
+    )[:, 0, :1, :pool_length]
     direct_topk = fast.dsa_topk_indices(direct[:, None], 512)[:, 0]
     legacy_topk = fast.dsa_topk_indices(legacy[:, None], 512)[:, 0]
     mx.eval(direct, legacy, direct_topk, legacy_topk)
 
-    # Both kernels accumulate in FP32 and cast their score sheet to BF16.
-    # At long pools a final-ULP score difference is allowed only when the
-    # unchanged radix selector returns the exact same ordered block list.
-    max_score_diff = mx.max(
-        mx.abs(direct.astype(mx.float32) - legacy.astype(mx.float32))
-    ).item()
-    assert max_score_diff <= 1 / 256
+    assert mx.array_equal(direct, legacy).item()
     assert mx.array_equal(direct_topk, legacy_topk).item()
 
 
