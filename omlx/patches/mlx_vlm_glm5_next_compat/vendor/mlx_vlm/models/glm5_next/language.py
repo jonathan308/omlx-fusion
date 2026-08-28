@@ -379,6 +379,39 @@ class Glm5NextIndexer(nn.Module):
         try:
             from omlx.custom_kernels.glm_moe_dsa import fast
 
+            # Decode has exactly one query row.  Sending it through the
+            # prefill score kernel below pads that row to 64 and computes 63
+            # results which are immediately sliced away.  Reuse the qualified
+            # H32/D128 decode scan already used by the DeepSeek DSA path: it
+            # streams the pooled keys once, accumulates the same
+            # ``sum_h relu(q_h @ k) * w_h`` expression in FP32, and returns
+            # the same BF16 score contract consumed by the unchanged top-k.
+            # Keep the long-pool floor and every geometry/dtype guard strict;
+            # unsupported or packaged builds without the symbol retain the
+            # historical prefill-kernel fallback below.
+            if (
+                q.shape[1] == 1
+                and pool_keys.shape[1] >= 4096
+                and fast.has_symbol("dsa_decode_scores")
+            ):
+                qt = q.transpose(0, 2, 1, 3)
+                try:
+                    scores = fast.dsa_decode_scores(
+                        qt,
+                        pool_keys[:, None],
+                        weights[:, 0],
+                    )
+                    # dsa_decode_scores follows the shared DSA ABI and
+                    # returns [B, 1, 1, P]; this model's indexer contract is
+                    # [B, S, P], matching the prefill route's slice below.
+                    return scores[:, 0]
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    # A stale packaged extension can expose the symbol but
+                    # reject the newer call contract.  Preserve correctness
+                    # and availability by trying the already-supported
+                    # prefill score ABI before the portable caller fallback.
+                    pass
+
             if not fast.has_symbol("dsa_indexer_scores"):
                 return None
             qt = q.transpose(0, 2, 1, 3)
