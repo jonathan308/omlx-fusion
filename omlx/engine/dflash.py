@@ -16,6 +16,7 @@ import gc
 import json
 import logging
 import math
+import os
 import re
 import threading
 import time
@@ -500,6 +501,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         return self._omlx_ssd_cache_dir / "dflash_l2"
 
     def _build_runtime_context(self) -> Any:
+        from dflash_mlx.diagnostics import DiagnosticsConfig, TraceConfig
         from dflash_mlx.runtime.config import runtime_config_from_defaults
         from dflash_mlx.runtime.context import build_runtime_context
 
@@ -520,7 +522,18 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             draft_sink_size=self._draft_sink_size,
             verify_mode=self._verify_mode,
         )
-        return build_runtime_context(cfg)
+        diagnostics = None
+        if os.environ.get("OMLX_DFLASH_PROFILE_CYCLES", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            diagnostics = DiagnosticsConfig(
+                mode="full",
+                trace=TraceConfig(cycle_events=True),
+            )
+        return build_runtime_context(cfg, diagnostics_config=diagnostics)
 
     @staticmethod
     def _checkpoint_draft_window_size(draft_meta: Any) -> int | None:
