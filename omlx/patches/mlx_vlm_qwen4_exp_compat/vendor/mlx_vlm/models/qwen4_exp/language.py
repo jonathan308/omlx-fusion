@@ -40,6 +40,7 @@ from .qsa_fast import (
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
 _HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
+_HC_FUSED_VERIFY_WIDTHS = frozenset({2, 3, 4, 5, 6})
 _DECODE_PROFILE_LOCAL = threading.local()
 _DECODE_PROFILE_LOCK = threading.Lock()
 _DECODE_PROFILE_CALLS = 0
@@ -1590,20 +1591,38 @@ class Qwen4ExpGatedResidual(nn.Module):
             and hyper_input.ndim == 3
             and hyper_input.shape[:2] == (1, 1)
             and hyper_input.dtype == mx.bfloat16
-            and not get_mtp_runtime().enabled
         ):
             return compiled_forward(hyper_input)
         return self._forward(hyper_input, target_verify=target_verify)
 
     def _forward(self, hyper_input: mx.array, target_verify: bool = False):
         normed = self.hc_norm(hyper_input)
+        verified_fused = None
+        fused_projection = getattr(
+            self,
+            "_omlx_exact_verify_fused_projection",
+            None,
+        )
+        if (
+            fused_projection is not None
+            and hyper_input.ndim == 3
+            and hyper_input.shape[0] == 1
+            and hyper_input.shape[-1] == 10240
+            and hyper_input.shape[1] in _HC_FUSED_VERIFY_WIDTHS
+            and hyper_input.dtype == mx.bfloat16
+        ):
+            # Actual q4/q5/q6/q8 banks are raw-array equal to the canonical
+            # split projections only for the explicitly qualified MTP widths.
+            # Width one belongs to the hybrid kernel; every other width keeps
+            # the raw two-bank fallback (long prefill included).
+            verified_fused = fused_projection(normed)
         hybrid = None
         if (
-            getattr(self, "_omlx_exact_hybrid_projection", False)
+            verified_fused is None
+            and getattr(self, "_omlx_exact_hybrid_projection", False)
             and not target_verify
             and hyper_input.shape == (1, 1, 10240)
             and hyper_input.dtype == mx.bfloat16
-            and not get_mtp_runtime().enabled
         ):
             from .hc_projection import hybrid_projection
 
@@ -1613,7 +1632,12 @@ class Qwen4ExpGatedResidual(nn.Module):
                 self.block_inject_weight,
             )
         input_inject_weight = getattr(self, "input_inject_weight", None)
-        if hybrid is not None:
+        if verified_fused is not None:
+            mix = verified_fused[..., : self.hc_lowrank]
+            block_injection = verified_fused[
+                ..., self.hc_lowrank : self.hc_lowrank + self.hc_count
+            ]
+        elif hybrid is not None:
             mix = hybrid[..., : self.hc_lowrank]
             block_injection = hybrid[
                 ..., self.hc_lowrank : self.hc_lowrank + self.hc_count
@@ -1738,6 +1762,41 @@ def _can_prepare_exact_hybrid(module: Qwen4ExpGatedResidual) -> bool:
     )
 
 
+def _build_exact_verify_fused_projection(module: Qwen4ExpGatedResidual):
+    """Create a separate N=324 bank while retaining both checkpoint banks."""
+
+    down = module.input_mix_weight_down
+    injection = module.block_inject_weight
+    fused = nn.QuantizedLinear.__new__(nn.QuantizedLinear)
+    nn.Module.__init__(fused)
+    fused.group_size = down.group_size
+    fused.bits = down.bits
+    fused.mode = down.mode
+    fused.weight = mx.concatenate([down.weight, injection.weight], axis=0)
+    fused.scales = mx.concatenate([down.scales, injection.scales], axis=0)
+    fused.biases = mx.concatenate([down.biases, injection.biases], axis=0)
+    fused.freeze()
+    mx.eval(fused.weight, fused.scales, fused.biases)
+    return fused
+
+
+def hyper_connection_fused_copy_nbytes(model: nn.Module) -> int:
+    """Return retained verify-copy bytes without double-counting modules."""
+
+    total = 0
+    seen = set()
+    for module in _unique_hyper_connections(model):
+        fused = getattr(module, "_omlx_exact_verify_fused_projection", None)
+        if fused is None or id(fused) in seen:
+            continue
+        seen.add(id(fused))
+        total += sum(
+            value.nbytes
+            for value in (fused.weight, fused.scales, fused.biases)
+        )
+    return int(total)
+
+
 def _unique_hyper_connections(model: nn.Module):
     modules = [model]
     modules.extend(module for _, module in model.named_modules() if module is not model)
@@ -1751,12 +1810,12 @@ def _unique_hyper_connections(model: nn.Module):
 
 
 def fuse_hyper_connection_projections(model: nn.Module) -> int:
-    """Prepare the lossless one-dispatch Qwen4 decode projection.
+    """Prepare exact scalar-decode and bounded MTP-verify projections.
 
-    The tempting 324-row concatenation was rejected because MLX changes its
-    QMV traversal at that width and can change raw BF16 outputs.  The raw
-    320-row low-rank and four-row injection banks deliberately remain separate
-    so every fallback retains the checkpoint's canonical two projections.
+    The raw 320-row low-rank and four-row injection banks remain authoritative.
+    Scalar decode uses their exact hybrid kernel. A separate concatenated copy
+    is retained only for raw-array-qualified sequence widths 2..6; all other
+    widths, including long prefill, execute the canonical split banks.
     """
     targets = [
         module
@@ -1766,6 +1825,9 @@ def fuse_hyper_connection_projections(model: nn.Module) -> int:
     ]
     for module in targets:
         module._omlx_exact_hybrid_projection = True
+        module._omlx_exact_verify_fused_projection = (
+            _build_exact_verify_fused_projection(module)
+        )
     return len(targets)
 
 

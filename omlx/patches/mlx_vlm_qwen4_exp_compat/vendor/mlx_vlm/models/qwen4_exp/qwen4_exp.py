@@ -17,6 +17,7 @@ from .language import (
     fuse_hyper_connection_projections,
     fuse_resident_ple_embeddings,
     get_mtp_runtime,
+    hyper_connection_fused_copy_nbytes,
     get_ple_runtime_mode,
 )
 from .vision import VisionModel
@@ -261,13 +262,14 @@ class Model(Qwen3_5Model):
     def load_weights(self, weights, strict=True):
         result = super().load_weights(weights, strict=strict)
         mtp_enabled = get_mtp_runtime().enabled
-        hybrid = 0 if mtp_enabled else fuse_hyper_connection_projections(self)
+        hybrid = fuse_hyper_connection_projections(self)
+        fused_hc_bytes = hyper_connection_fused_copy_nbytes(self)
         fused_ple = fuse_resident_ple_embeddings(self)
         compiled = compile_hyper_connections(self)
         if mtp_enabled:
             logger.info(
-                "Skipped Qwen4-Exp exact hybrid projections while "
-                "Lightning MTP target verification is enabled"
+                "Prepared Qwen4-Exp exact HC projections for Lightning MTP: "
+                "scalar hybrid plus strict fused widths 2..6"
             )
         logger.info(
             "Enabled Qwen4-Exp hyper-connection optimizations: "
@@ -275,6 +277,13 @@ class Model(Qwen3_5Model):
             hybrid,
             compiled,
         )
+        if fused_hc_bytes:
+            logger.info(
+                "Retained canonical Qwen4 HC banks plus bounded verify copies: "
+                "%.1f MiB extra across %d exact HC pairs",
+                fused_hc_bytes / 2**20,
+                hybrid,
+            )
         if fused_ple:
             logger.info(
                 "Fused %d resident Qwen4-Exp PLE table into one packed "

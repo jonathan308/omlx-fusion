@@ -437,10 +437,16 @@ def test_qwen4_exp_load_enables_hyper_connection_optimizations(monkeypatch, capl
     fuse = MagicMock(return_value=96)
     fuse_ple = MagicMock(return_value=1)
     compile_connections = MagicMock(return_value=97)
+    fused_hc_bytes = MagicMock(return_value=194_301_952)
     monkeypatch.setattr(Qwen3_5Model, "load_weights", base_load)
     monkeypatch.setattr(model_module, "fuse_hyper_connection_projections", fuse)
     monkeypatch.setattr(model_module, "fuse_resident_ple_embeddings", fuse_ple)
     monkeypatch.setattr(model_module, "compile_hyper_connections", compile_connections)
+    monkeypatch.setattr(
+        model_module,
+        "hyper_connection_fused_copy_nbytes",
+        fused_hc_bytes,
+    )
     monkeypatch.setattr(
         model_module,
         "get_mtp_runtime",
@@ -456,14 +462,16 @@ def test_qwen4_exp_load_enables_hyper_connection_optimizations(monkeypatch, capl
     fuse.assert_called_once_with(model)
     fuse_ple.assert_called_once_with(model)
     compile_connections.assert_called_once_with(model)
+    fused_hc_bytes.assert_called_once_with(model)
     assert (
         "96 exact hybrid projection pairs, 97 compiled decode paths"
         in caplog.text
     )
     assert "Fused 1 resident Qwen4-Exp PLE table" in caplog.text
+    assert "185.3 MiB extra" in caplog.text
 
 
-def test_qwen4_exp_load_skips_projection_fusion_during_mtp_verify(
+def test_qwen4_exp_load_prepares_exact_projection_paths_during_mtp_verify(
     monkeypatch, caplog
 ):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
@@ -477,10 +485,16 @@ def test_qwen4_exp_load_skips_projection_fusion_during_mtp_verify(
     fuse = MagicMock(return_value=96)
     fuse_ple = MagicMock(return_value=1)
     compile_connections = MagicMock(return_value=100)
+    fused_hc_bytes = MagicMock(return_value=194_301_952)
     monkeypatch.setattr(Qwen3_5Model, "load_weights", base_load)
     monkeypatch.setattr(model_module, "fuse_hyper_connection_projections", fuse)
     monkeypatch.setattr(model_module, "fuse_resident_ple_embeddings", fuse_ple)
     monkeypatch.setattr(model_module, "compile_hyper_connections", compile_connections)
+    monkeypatch.setattr(
+        model_module,
+        "hyper_connection_fused_copy_nbytes",
+        fused_hc_bytes,
+    )
     monkeypatch.setattr(
         model_module,
         "get_mtp_runtime",
@@ -490,12 +504,13 @@ def test_qwen4_exp_load_skips_projection_fusion_during_mtp_verify(
 
     assert model.load_weights([], strict=False) is model
 
-    fuse.assert_not_called()
+    fuse.assert_called_once_with(model)
+    fused_hc_bytes.assert_called_once_with(model)
     fuse_ple.assert_called_once_with(model)
     compile_connections.assert_called_once_with(model)
-    assert "Skipped Qwen4-Exp exact hybrid projections" in caplog.text
+    assert "Prepared Qwen4-Exp exact HC projections for Lightning MTP" in caplog.text
     assert (
-        "0 exact hybrid projection pairs, 100 compiled decode paths"
+        "96 exact hybrid projection pairs, 100 compiled decode paths"
         in caplog.text
     )
 
