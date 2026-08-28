@@ -510,6 +510,7 @@ def test_fully_accepted_cycle_clears_pooling_undo_without_changing_state():
 def test_glm_target_loader_prefers_omlx_custom_vlm_loader(tmp_path, monkeypatch):
     import mlx_vlm.utils as vlm_utils
 
+    from omlx.patches import dflash_glm5
     from omlx.patches.dflash_glm5 import (
         _load_glm5_target_bundle,
         install_dflash_glm5_backend,
@@ -524,10 +525,20 @@ def test_glm_target_loader_prefers_omlx_custom_vlm_loader(tmp_path, monkeypatch)
     seen = []
 
     def custom_loader(model_ref, *, is_vlm):
-        seen.append((model_ref, is_vlm))
+        seen.append(("load", model_ref, is_vlm))
         return target, processor
 
     monkeypatch.setattr(model_loading, "maybe_load_custom_quantization", custom_loader)
+    monkeypatch.setattr(
+        model_loading,
+        "materialize_lazy_state",
+        lambda model: seen.append(("materialize", model)),
+    )
+    monkeypatch.setattr(
+        dflash_glm5.Glm5NextTargetOps,
+        "install_speculative_hooks",
+        lambda self, model: seen.append(("hooks", model)),
+    )
     monkeypatch.setattr(
         vlm_utils,
         "load",
@@ -537,7 +548,53 @@ def test_glm_target_loader_prefers_omlx_custom_vlm_loader(tmp_path, monkeypatch)
     bundle = _load_glm5_target_bundle(tmp_path)
     assert bundle.model is target
     assert bundle.tokenizer is processor.tokenizer
-    assert seen == [(str(tmp_path), True)]
+    assert seen == [
+        ("load", str(tmp_path), True),
+        ("materialize", target),
+        ("hooks", target),
+    ]
+
+
+def test_glm_target_loader_fails_before_hooks_if_materialization_fails(
+    tmp_path, monkeypatch
+):
+    from omlx.patches import dflash_glm5
+    from omlx.patches.dflash_glm5 import (
+        _load_glm5_target_bundle,
+        install_dflash_glm5_backend,
+    )
+    from omlx.utils import model_loading
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "glm5_next"}), encoding="utf-8"
+    )
+    target = _fake_target()
+    processor = SimpleNamespace(tokenizer=object())
+    hooks = []
+
+    def fail_materialize(_model):
+        raise RuntimeError("materialize failed")
+
+    monkeypatch.setattr(
+        model_loading,
+        "maybe_load_custom_quantization",
+        lambda *_args, **_kwargs: (target, processor),
+    )
+    monkeypatch.setattr(
+        model_loading,
+        "materialize_lazy_state",
+        fail_materialize,
+    )
+    monkeypatch.setattr(
+        dflash_glm5.Glm5NextTargetOps,
+        "install_speculative_hooks",
+        lambda self, model: hooks.append(model),
+    )
+
+    install_dflash_glm5_backend()
+    with pytest.raises(RuntimeError, match="materialize failed"):
+        _load_glm5_target_bundle(tmp_path)
+    assert hooks == []
 
 
 def test_recurrent_verify_hook_matches_target_and_replays_accepted_prefix():
