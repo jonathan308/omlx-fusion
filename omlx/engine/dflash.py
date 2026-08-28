@@ -1217,6 +1217,15 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         from dflash_mlx.runtime import stream_dflash_generate
         from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
 
+        if getattr(self._target_ops, "backend_name", "") == "glm5_next":
+            from ..patches.dflash_glm5 import _glm_native_cache_probe_enabled
+
+            if _glm_native_cache_probe_enabled() and self._block_size != 1:
+                raise RuntimeError(
+                    "OMLX_DFLASH_GLM_NATIVE_CACHE_PROBE requires the explicit "
+                    "model setting dflash_block_size=1"
+                )
+
         stop_ids = _get_dflash_stop_token_ids(self._executor_tokenizer)
 
         # Build a minimal model_provider shim for the prefix cache flow.

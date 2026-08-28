@@ -63,6 +63,16 @@ def _should_profile_glm_verify_layers(cache: list[Any] | None) -> bool:
     )
 
 
+def _glm_native_cache_probe_enabled() -> bool:
+    """Diagnostic-only switch; DFlashEngine separately requires block size 1."""
+    return os.getenv("OMLX_DFLASH_GLM_NATIVE_CACHE_PROBE", "").strip().lower() in (
+        "1",
+        "true",
+        "on",
+        "yes",
+    )
+
+
 def _eval_profile_values(*values: Any) -> None:
     arrays = [value for value in values if isinstance(value, mx.array)]
     if arrays:
@@ -374,6 +384,16 @@ class Glm5NextTargetOps:
         inner = wrapper.model
         if len(caches) != len(inner.layers):
             raise ValueError("GLM-5.3 target cache/layer count mismatch")
+        if _glm_native_cache_probe_enabled():
+            # Diagnostic isolation only. DFlashEngine refuses to enter this
+            # mode unless the explicit request block size is exactly one, so
+            # there are no rejected draft-cache rows to roll back. Keeping the
+            # model's ordinary ArraysCache here tells us whether the large
+            # per-call regression comes from RecurrentRollbackCache itself.
+            logger.warning(
+                "GLM DFlash native-cache probe active; block size 1 is required"
+            )
+            return caches
         for index, layer in enumerate(inner.layers):
             if getattr(layer, "is_linear", False):
                 conv_kernel = int(layer.self_attn.conv_kernel_size)
@@ -678,6 +698,20 @@ class Glm5NextTargetOps:
                     )
                 changed = True
                 continue
+
+            if _glm_native_cache_probe_enabled():
+                from mlx_lm.models.cache import ArraysCache
+
+                if isinstance(cache_entry, ArraysCache):
+                    if not fully_accepted:
+                        raise RuntimeError(
+                            "GLM DFlash native-cache probe cannot roll back "
+                            "rejected draft tokens"
+                        )
+                    # With block size 1 the target-owned token is committed;
+                    # the ordinary recurrent cache is already in the exact
+                    # post-token state and needs no restore operation.
+                    continue
 
             # GLM DSA cache entries are CacheList(KVCache, PoolingCache).
             try:

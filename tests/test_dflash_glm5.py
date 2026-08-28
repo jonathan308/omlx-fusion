@@ -158,6 +158,47 @@ def test_layer_profiler_is_opt_in_and_verify_only(monkeypatch):
     assert _should_profile_glm_verify_layers([cache]) is False
 
 
+def test_native_cache_probe_is_opt_in_and_preserves_default(monkeypatch):
+    from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
+    from mlx_lm.models.cache import ArraysCache
+
+    from omlx.patches.dflash_glm5 import Glm5NextTargetOps
+
+    native_cache = ArraysCache(size=2)
+    inner = SimpleNamespace(
+        layers=[
+            SimpleNamespace(
+                is_linear=True,
+                self_attn=SimpleNamespace(conv_kernel_size=4),
+            )
+        ]
+    )
+    wrapper = SimpleNamespace(model=inner, make_cache=lambda: [native_cache])
+    target = SimpleNamespace(language_model=wrapper)
+    ops = Glm5NextTargetOps()
+
+    monkeypatch.delenv("OMLX_DFLASH_GLM_NATIVE_CACHE_PROBE", raising=False)
+    default_cache = ops.make_cache(
+        target,
+        enable_speculative_linear_cache=True,
+    )
+    assert isinstance(default_cache[0], RecurrentRollbackCache)
+
+    monkeypatch.setenv("OMLX_DFLASH_GLM_NATIVE_CACHE_PROBE", "1")
+    probe_cache = ops.make_cache(
+        target,
+        enable_speculative_linear_cache=True,
+    )
+    assert probe_cache == [native_cache]
+    with pytest.raises(RuntimeError, match="cannot roll back"):
+        ops.restore_after_acceptance(
+            probe_cache,
+            target_len=1,
+            acceptance_length=0,
+            drafted_tokens=1,
+        )
+
+
 def test_composite_dsa_cache_rollback_uses_kv_offset_and_checks_trim():
     from omlx.patches.dflash_glm5 import Glm5NextTargetOps
 

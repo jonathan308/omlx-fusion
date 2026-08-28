@@ -391,6 +391,20 @@ class TestDFlashEngineInit:
         assert model_provider.model is target_model
         assert model_provider.target_ops is target_ops
 
+    def test_glm_native_cache_probe_requires_explicit_block_one(self, monkeypatch):
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(dflash_block_size=5),
+        )
+        engine._target_ops = SimpleNamespace(backend_name="glm5_next")
+        monkeypatch.setenv("OMLX_DFLASH_GLM_NATIVE_CACHE_PROBE", "1")
+
+        with pytest.raises(RuntimeError, match="dflash_block_size=1"):
+            engine._stream_dflash_events(prompt_tokens=[1], max_tokens=1)
+
     def test_runtime_cache_request_boundary_calls_supported_manager(self, monkeypatch):
         try:
             from dflash_mlx.cache import manager as cache_manager_mod
