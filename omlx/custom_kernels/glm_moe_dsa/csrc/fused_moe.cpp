@@ -54,6 +54,14 @@ Mxfp4BlocksVariant mxfp4_blocks_variant(int variant) {
       return {/* bm = */ 16, /* bn = */ 64, /* bk = */ 32, /* wm = */ 1, /* wn = */ 2};
     case 4:
       return {/* bm = */ 32, /* bn = */ 64, /* bk = */ 32, /* wm = */ 1, /* wn = */ 2};
+    case 5:
+      return {/* bm = */ 64, /* bn = */ 32, /* bk = */ 32, /* wm = */ 2, /* wn = */ 2};
+    case 6:
+      return {/* bm = */ 64, /* bn = */ 64, /* bk = */ 32, /* wm = */ 2, /* wn = */ 2};
+    case 7:
+      return {/* bm = */ 128, /* bn = */ 32, /* bk = */ 32, /* wm = */ 4, /* wn = */ 2};
+    case 8:
+      return {/* bm = */ 128, /* bn = */ 64, /* bk = */ 32, /* wm = */ 4, /* wn = */ 2};
     default: {
       std::ostringstream msg;
       msg << "Unsupported DeepSeek MXFP4 block-list variant " << variant << ".";
@@ -93,7 +101,7 @@ int affine_bytes_per_pack(int bits) {
 }
 
 bool supported_deepseek_affine(int group_size, int bits) {
-  return group_size == 64 && (bits == 2 || bits == 3);
+  return group_size == 64 && (bits == 2 || bits == 3 || bits == 4);
 }
 
 int affine_packed_row_bytes(int K, int bits) {

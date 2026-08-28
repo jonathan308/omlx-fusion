@@ -821,11 +821,27 @@ instantiate_deepseek_affine_blocks(float16_t, 16, 32, 32, 1, 2, 64, 2);
 instantiate_deepseek_affine_blocks(float16_t, 32, 32, 32, 1, 2, 64, 2);
 instantiate_deepseek_affine_blocks(float16_t, 16, 32, 32, 1, 2, 64, 3);
 instantiate_deepseek_affine_blocks(float16_t, 32, 32, 32, 1, 2, 64, 3);
+instantiate_deepseek_affine_blocks(float16_t, 16, 32, 32, 1, 2, 64, 4);
+instantiate_deepseek_affine_blocks(float16_t, 32, 32, 32, 1, 2, 64, 4);
+instantiate_deepseek_affine_blocks(float16_t, 16, 64, 32, 1, 2, 64, 4);
+instantiate_deepseek_affine_blocks(float16_t, 32, 64, 32, 1, 2, 64, 4);
+instantiate_deepseek_affine_blocks(float16_t, 64, 32, 32, 2, 2, 64, 4);
+instantiate_deepseek_affine_blocks(float16_t, 64, 64, 32, 2, 2, 64, 4);
+instantiate_deepseek_affine_blocks(float16_t, 128, 32, 32, 4, 2, 64, 4);
+instantiate_deepseek_affine_blocks(float16_t, 128, 64, 32, 4, 2, 64, 4);
 
 instantiate_deepseek_affine_blocks(bfloat16_t, 16, 32, 32, 1, 2, 64, 2);
 instantiate_deepseek_affine_blocks(bfloat16_t, 32, 32, 32, 1, 2, 64, 2);
 instantiate_deepseek_affine_blocks(bfloat16_t, 16, 32, 32, 1, 2, 64, 3);
 instantiate_deepseek_affine_blocks(bfloat16_t, 32, 32, 32, 1, 2, 64, 3);
+instantiate_deepseek_affine_blocks(bfloat16_t, 16, 32, 32, 1, 2, 64, 4);
+instantiate_deepseek_affine_blocks(bfloat16_t, 32, 32, 32, 1, 2, 64, 4);
+instantiate_deepseek_affine_blocks(bfloat16_t, 16, 64, 32, 1, 2, 64, 4);
+instantiate_deepseek_affine_blocks(bfloat16_t, 32, 64, 32, 1, 2, 64, 4);
+instantiate_deepseek_affine_blocks(bfloat16_t, 64, 32, 32, 2, 2, 64, 4);
+instantiate_deepseek_affine_blocks(bfloat16_t, 64, 64, 32, 2, 2, 64, 4);
+instantiate_deepseek_affine_blocks(bfloat16_t, 128, 32, 32, 4, 2, 64, 4);
+instantiate_deepseek_affine_blocks(bfloat16_t, 128, 64, 32, 4, 2, 64, 4);
 
 template <
     typename T,
@@ -996,11 +1012,15 @@ instantiate_deepseek_affine_pair_concat_blocks(float16_t, 16, 32, 32, 1, 2, 64, 
 instantiate_deepseek_affine_pair_concat_blocks(float16_t, 32, 32, 32, 1, 2, 64, 2);
 instantiate_deepseek_affine_pair_concat_blocks(float16_t, 16, 32, 32, 1, 2, 64, 3);
 instantiate_deepseek_affine_pair_concat_blocks(float16_t, 32, 32, 32, 1, 2, 64, 3);
+instantiate_deepseek_affine_pair_concat_blocks(float16_t, 16, 32, 32, 1, 2, 64, 4);
+instantiate_deepseek_affine_pair_concat_blocks(float16_t, 32, 32, 32, 1, 2, 64, 4);
 
 instantiate_deepseek_affine_pair_concat_blocks(bfloat16_t, 16, 32, 32, 1, 2, 64, 2);
 instantiate_deepseek_affine_pair_concat_blocks(bfloat16_t, 32, 32, 32, 1, 2, 64, 2);
 instantiate_deepseek_affine_pair_concat_blocks(bfloat16_t, 16, 32, 32, 1, 2, 64, 3);
 instantiate_deepseek_affine_pair_concat_blocks(bfloat16_t, 32, 32, 32, 1, 2, 64, 3);
+instantiate_deepseek_affine_pair_concat_blocks(bfloat16_t, 16, 32, 32, 1, 2, 64, 4);
+instantiate_deepseek_affine_pair_concat_blocks(bfloat16_t, 32, 32, 32, 1, 2, 64, 4);
 
 template <
     typename T,
