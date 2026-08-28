@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,7 @@ from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
 _BACKEND_PATH = "omlx.patches.dflash_glm5:Glm5NextTargetOps"
 _ORIGINAL_TARGET_LOADER: Any | None = None
 _ORIGINAL_LINEAR_CALLS: dict[type, Any] = {}
+_ORIGINAL_PREFILL_RUNNER: Any | None = None
 
 
 def _config_value(config: Any, name: str, default: Any = None) -> Any:
@@ -161,13 +163,97 @@ def _install_glm5_recurrent_hook(linear_attn: Any) -> None:
     cls.__call__ = speculative_call
 
 
+def _install_glm5_prefill_chunking_bridge() -> bool:
+    """Chunk GLM prefill without claiming or activating snapshot support.
+
+    The pinned dflash runtime currently uses ``supports_prefix_snapshot`` for
+    two independent decisions: whether cache snapshots are legal *and* whether
+    cold prefill is split by ``prefill_step_size``.  GLM's composite DSA cache
+    is intentionally not serializable, but that must not turn a long prompt
+    into one monolithic target forward.
+
+    This scoped bridge temporarily enables only the runtime's chunk loop while
+    sanitizing every snapshot-bearing request field.  It then rewrites the
+    returned prefill result back to ``supports_prefix_snapshot=False``, so
+    decode and generation-snapshot paths continue to see the truthful target
+    capability.  Non-GLM sessions take the original method unchanged.
+    """
+    global _ORIGINAL_PREFILL_RUNNER
+
+    from dflash_mlx.engine.spec_epoch import SpeculativeSession
+
+    current = SpeculativeSession._run_prefill_events
+    if getattr(current, "_omlx_glm5_chunk_bridge", False):
+        return False
+    _ORIGINAL_PREFILL_RUNNER = current
+
+    def run_prefill_chunked(self, *, request, state, yield_pause):
+        if (
+            getattr(getattr(self, "target_ops", None), "backend_name", "")
+            != "glm5_next"
+        ):
+            return current(
+                self,
+                request=request,
+                state=state,
+                yield_pause=yield_pause,
+            )
+
+        # Session.open() already received the real False capability, so it
+        # cannot hydrate a prefix snapshot.  Scrub the request as a second,
+        # local fail-closed boundary before borrowing the chunk loop.
+        safe_request = replace(
+            request,
+            prefix_snapshot=None,
+            snapshot_service=None,
+            stable_prefix_len=None,
+            prefix_cache_active=False,
+            publish_generation_snapshot=False,
+            prefix_hit_kind="miss",
+        )
+
+        def iterate():
+            previous = bool(self.supports_prefix_snapshot)
+            self.supports_prefix_snapshot = True
+            try:
+                result = yield from current(
+                    self,
+                    request=safe_request,
+                    state=state,
+                    yield_pause=yield_pause,
+                )
+                return replace(result, supports_prefix_snapshot=False)
+            finally:
+                self.supports_prefix_snapshot = previous
+
+        return iterate()
+
+    run_prefill_chunked._omlx_glm5_chunk_bridge = True  # type: ignore[attr-defined]
+    run_prefill_chunked._omlx_original = current  # type: ignore[attr-defined]
+    SpeculativeSession._run_prefill_events = run_prefill_chunked
+    return True
+
+
 def restore_glm5_dflash_class_patches() -> int:
-    """Restore every GLM class changed by ``_install_glm5_recurrent_hook``."""
+    """Restore every process-global GLM DFlash runtime hook."""
+    global _ORIGINAL_PREFILL_RUNNER
+
     restored = 0
     for cls, original_call in tuple(_ORIGINAL_LINEAR_CALLS.items()):
         cls.__call__ = original_call
         restored += 1
     _ORIGINAL_LINEAR_CALLS.clear()
+
+    if _ORIGINAL_PREFILL_RUNNER is not None:
+        try:
+            from dflash_mlx.engine.spec_epoch import SpeculativeSession
+
+            current = SpeculativeSession._run_prefill_events
+            if getattr(current, "_omlx_glm5_chunk_bridge", False):
+                SpeculativeSession._run_prefill_events = _ORIGINAL_PREFILL_RUNNER
+                restored += 1
+        finally:
+            _ORIGINAL_PREFILL_RUNNER = None
     return restored
 
 
@@ -402,6 +488,15 @@ class Glm5NextTargetOps:
             delattr(cache_entry, "_omlx_glm5_verify")
         cache_entry.clear_transients()
 
+    @staticmethod
+    def _clear_composite_undo(cache_entry: Any) -> None:
+        """Drop accepted verify-block undo arrays retained by PoolingCache."""
+        for component in getattr(cache_entry, "caches", ()):
+            if hasattr(component, "_undo"):
+                component._undo = None
+            if hasattr(component, "_undo_chain"):
+                component._undo_chain = False
+
     @classmethod
     def _rollback_glm_recurrent(
         cls,
@@ -469,6 +564,8 @@ class Glm5NextTargetOps:
             offset = int(getattr(kv_cache, "offset", 0) or 0)
             trim_count = max(0, offset - int(target_len))
             if trim_count <= 0:
+                if fully_accepted:
+                    self._clear_composite_undo(cache_entry)
                 continue
             trim = getattr(cache_entry, "trim", None)
             if not callable(trim):
@@ -481,6 +578,7 @@ class Glm5NextTargetOps:
                     "GLM-5.3 DFlash composite-cache rollback failed: "
                     f"requested={trim_count}, trimmed={trimmed}"
                 )
+            self._clear_composite_undo(cache_entry)
             changed = True
         return time.perf_counter_ns() - started if changed else 0
 
@@ -549,6 +647,7 @@ def install_dflash_glm5_backend() -> bool:
     from dflash_mlx.runtime import loading
 
     changed = False
+    changed |= _install_glm5_prefill_chunking_bridge()
     if _BACKEND_PATH not in target_ops.TARGET_BACKENDS:
         target_ops.TARGET_BACKENDS.append(_BACKEND_PATH)
         changed = True
