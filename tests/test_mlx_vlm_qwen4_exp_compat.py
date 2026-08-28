@@ -477,6 +477,25 @@ def test_qwen4_gathered_qsa_fails_closed_for_batched_prefill(monkeypatch):
     assert output.shape == hidden.shape
 
 
+def test_qwen4_gathered_qsa_keeps_official_path_at_sparse_budget(monkeypatch):
+    config = _tiny_config()
+    import mlx_vlm.models.qwen4_exp.language as language
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpAttention
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("at-budget prefill must use the official full path")
+
+    monkeypatch.setattr(language, "contiguous_causal_gathered_qsa", must_not_run)
+    attention = Qwen4ExpAttention(config.text_config)
+    budget = attention.indexer.token_budget
+    hidden = mx.random.normal((1, budget, config.text_config.hidden_size))
+
+    output = attention(hidden, mask="causal", cache=QSAKVCache())
+    mx.eval(output)
+
+    assert output.shape == hidden.shape
+
+
 def test_qwen4_gathered_qsa_chunk_grows_with_context():
     _tiny_config()
     from mlx_vlm.models.qwen4_exp.qsa_fast import contiguous_causal_query_chunk

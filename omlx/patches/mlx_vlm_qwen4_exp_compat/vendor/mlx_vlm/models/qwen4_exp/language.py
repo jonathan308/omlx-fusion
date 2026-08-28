@@ -794,8 +794,8 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         self.k_norm = Qwen4ExpRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.indexer = Qwen4ExpQSAIndexer(config, self.rotary_emb)
 
-    @staticmethod
     def _gathered_text_prefill_eligible(
+        self,
         x: mx.array,
         mask: Optional[mx.array],
         cache: Optional[Any],
@@ -810,6 +810,10 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             x.ndim == 3
             and x.shape[0] == 1
             and x.shape[1] > 1
+            # Below the QSA budget the official path attends the complete
+            # prefix directly and is faster than building gathered blocks.
+            # Switch only after sparse selection can reduce actual work.
+            and cache.offset + x.shape[1] > self.indexer.token_budget
             and causal_mask
             and type(cache) is QSAKVCache
             and isinstance(cache.offset, int)
