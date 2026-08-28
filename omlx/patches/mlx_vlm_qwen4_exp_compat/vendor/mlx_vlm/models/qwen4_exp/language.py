@@ -28,10 +28,15 @@ from ..qwen3_5.language import (
 )
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from .config import ModelConfig, TextConfig
-from .qsa_fast import contiguous_causal_gathered_qsa, pool_completed_index_keys
+from .qsa_fast import (
+    contiguous_causal_gathered_qsa,
+    contiguous_causal_gathered_qsa_decode,
+    pool_completed_index_keys,
+)
 
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
+_HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
 
 
 @dataclass(frozen=True)
@@ -1012,6 +1017,19 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         self.k_norm = Qwen4ExpRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.indexer = Qwen4ExpQSAIndexer(config, self.rotary_emb)
 
+    @staticmethod
+    def _batch_one_text_position_ids(
+        position_ids: Optional[mx.array],
+        length: int,
+    ) -> bool:
+        """Accept absent or shape-matched 2-D text positions, never MRoPE."""
+
+        return position_ids is None or bool(
+            isinstance(position_ids, mx.array)
+            and position_ids.ndim == 2
+            and position_ids.shape == (1, length)
+        )
+
     def _gathered_text_prefill_eligible(
         self,
         x: mx.array,
@@ -1024,26 +1042,69 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         """Fail closed outside the proven contiguous batch-one text shape."""
 
         causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
-        return bool(
+        if not (
             x.ndim == 3
             and x.shape[0] == 1
             and x.shape[1] > 1
-            # Below the QSA budget the official path attends the complete
-            # prefix directly and is faster than building gathered blocks.
-            # Switch only after sparse selection can reduce actual work.
-            and cache.offset + x.shape[1] > self.indexer.token_budget
             and causal_mask
             and type(cache) is QSAKVCache
             and isinstance(cache.offset, int)
-            and position_ids is None
             and position_embeddings is None
             and not target_verify
+            and self._batch_one_text_position_ids(position_ids, x.shape[1])
+        ):
+            return False
+        return bool(
+            # Below the QSA budget the official path attends the complete
+            # prefix directly and is faster than building gathered blocks.
+            # Switch only after sparse selection can reduce actual work.
+            cache.offset + x.shape[1] > self.indexer.token_budget
         )
+
+    def _gathered_text_decode_eligible(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[Any],
+        position_ids: Optional[mx.array],
+        position_embeddings: Optional[tuple[mx.array, mx.array]],
+        target_verify: bool,
+    ) -> bool:
+        """Fail closed outside scalar-offset batch-one text decode."""
+
+        causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
+        if not (
+            x.ndim == 3
+            and x.shape[:2] == (1, 1)
+            and causal_mask
+            and type(cache) is QSAKVCache
+            and isinstance(cache.offset, int)
+            and position_embeddings is None
+            and not target_verify
+            and self._batch_one_text_position_ids(position_ids, 1)
+        ):
+            return False
+
+        # A restored/foreign cache without aligned auxiliary indexer state must
+        # stay on the official path.  The gathered arm cannot safely discover
+        # that mismatch after it has appended the new main K/V row.
+        if cache.offset:
+            if cache.index_keys is None or cache.index_position_ids is None:
+                return False
+            if (
+                cache.index_keys.shape[1] != cache.offset
+                or cache.index_position_ids.shape[-1] != cache.offset
+            ):
+                return False
+
+        prospective_blocks = (cache.offset + 1) // self.indexer.compress_ratio
+        return prospective_blocks > self.indexer.block_topk
 
     def _gathered_text_prefill(
         self,
         x: mx.array,
         cache: QSAKVCache,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
         """Project once, append both caches, and attend only to selected K/V."""
 
@@ -1068,14 +1129,21 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         ).transpose(0, 2, 1, 3)
 
         past_len = cache.offset
-        text_position_ids = mx.arange(
-            past_len, past_len + length, dtype=mx.int32
-        )[None]
-        position_ids = mx.broadcast_to(text_position_ids, (3, batch, length))
+        if position_ids is None:
+            text_position_ids = mx.arange(
+                past_len, past_len + length, dtype=mx.int32
+            )[None]
+            rotary_position_ids = mx.broadcast_to(
+                text_position_ids,
+                (3, batch, length),
+            )
+        else:
+            text_position_ids = position_ids
+            rotary_position_ids = position_ids
         queries, keys = self.rotary_emb.apply_rotary(
             queries,
             keys,
-            position_ids,
+            rotary_position_ids,
             unsqueeze_dim=1,
         )
         keys, values = cache.update_and_fetch(keys, values)
@@ -1125,6 +1193,102 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         output = output.reshape(batch, length, -1)
         return self.o_proj(output * mx.sigmoid(gate))
 
+    def _gathered_text_decode(
+        self,
+        x: mx.array,
+        cache: QSAKVCache,
+        position_ids: Optional[mx.array] = None,
+    ) -> mx.array:
+        """Append one token and attend only to QSA-selected cached K/V rows."""
+
+        batch, length, _ = x.shape
+        q_proj_output, new_keys, new_values = _target_verify_linears(
+            (self.q_proj, self.k_proj, self.v_proj),
+            x,
+            False,
+        )
+        queries, gate = mx.split(
+            q_proj_output.reshape(batch, length, self.num_attention_heads, -1),
+            2,
+            axis=-1,
+        )
+        gate = gate.reshape(batch, length, -1)
+        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
+        new_keys = self.k_norm(
+            new_keys.reshape(
+                batch,
+                length,
+                self.num_key_value_heads,
+                self.head_dim,
+            )
+        ).transpose(0, 2, 1, 3)
+        new_values = new_values.reshape(
+            batch,
+            length,
+            self.num_key_value_heads,
+            self.head_dim,
+        ).transpose(0, 2, 1, 3)
+
+        past_len = cache.offset
+        if position_ids is None:
+            text_position_ids = mx.arange(
+                past_len,
+                past_len + 1,
+                dtype=mx.int32,
+            )[None]
+            rotary_position_ids = mx.broadcast_to(
+                text_position_ids,
+                (3, batch, length),
+            )
+        else:
+            text_position_ids = position_ids
+            rotary_position_ids = position_ids
+        queries, new_keys = self.rotary_emb.apply_rotary(
+            queries,
+            new_keys,
+            rotary_position_ids,
+            unsqueeze_dim=1,
+        )
+        keys, values = cache.update_and_fetch(new_keys, new_values)
+
+        projected = self.indexer.index_qk_proj(x).reshape(
+            batch,
+            length,
+            self.indexer.n_heads + self.indexer.kv_heads,
+            self.indexer.head_dim,
+        )
+        index_queries = self.indexer.q_layernorm(
+            projected[:, :, : self.indexer.n_heads]
+        ).transpose(0, 2, 1, 3)
+        raw_index_keys = projected[:, :, self.indexer.n_heads :].squeeze(2)
+        cache.update_indexer(raw_index_keys, text_position_ids)
+        pooled_index_keys = cache.pooled_indexer_keys(
+            self.indexer.compress_ratio,
+            self.indexer.k_layernorm,
+            self.indexer._apply_rope,
+            cache_tag=self.indexer,
+        )
+        index_queries = self.indexer._apply_rope(
+            index_queries,
+            text_position_ids,
+        ).transpose(0, 2, 1, 3)
+
+        output = contiguous_causal_gathered_qsa_decode(
+            queries,
+            keys,
+            values,
+            index_queries,
+            pooled_index_keys,
+            num_query_heads=self.num_attention_heads,
+            num_key_value_heads=self.num_key_value_heads,
+            head_dim=self.head_dim,
+            indexer_head_dim=self.indexer.head_dim,
+            compress_ratio=self.indexer.compress_ratio,
+            token_budget=self.indexer.token_budget,
+        )
+        output = output.reshape(batch, length, -1)
+        return self.o_proj(output * mx.sigmoid(gate))
+
     def __call__(
         self,
         x: mx.array,
@@ -1134,6 +1298,16 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
         target_verify: bool = False,
     ) -> mx.array:
+        if self._gathered_text_decode_eligible(
+            x,
+            mask,
+            cache,
+            position_ids,
+            position_embeddings,
+            target_verify,
+        ):
+            return self._gathered_text_decode(x, cache, position_ids)
+
         if self._gathered_text_prefill_eligible(
             x,
             mask,
@@ -1142,7 +1316,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             position_embeddings,
             target_verify,
         ):
-            return self._gathered_text_prefill(x, cache)
+            return self._gathered_text_prefill(x, cache, position_ids)
 
         qsa_mask = self.indexer(
             x,
@@ -1177,6 +1351,7 @@ class Qwen4ExpGatedResidual(nn.Module):
         super().__init__()
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
+        self.hc_lowrank = config.hc_lowrank
         hc_hidden_size = self.hc_count * self.hidden_size
         self.hc_norm = Qwen4ExpRMSNorm(
             hc_hidden_size,
@@ -1195,15 +1370,51 @@ class Qwen4ExpGatedResidual(nn.Module):
             )
 
     def __call__(self, hyper_input: mx.array, target_verify: bool = False):
+        compiled_forward = getattr(self, "_compiled_forward", None)
+        if (
+            compiled_forward is not None
+            and not target_verify
+            and hyper_input.ndim == 3
+            and hyper_input.shape[-2] == 1
+        ):
+            return compiled_forward(hyper_input)
+        return self._forward(hyper_input, target_verify=target_verify)
+
+    def _forward(self, hyper_input: mx.array, target_verify: bool = False):
         normed = self.hc_norm(hyper_input)
-        mix = nn.silu(
-            _target_verify_linear(
-                self.input_mix_weight_down,
+        input_inject_weight = getattr(self, "input_inject_weight", None)
+        if input_inject_weight is None:
+            mix = _target_verify_linear(
+                self.input_mix_weight_down, normed, target_verify
+            )
+            block_injection = (
+                _target_verify_linear(
+                    self.block_inject_weight, normed, target_verify
+                )
+                if "block_inject_weight" in self
+                else None
+            )
+        else:
+            combined = _target_verify_linear(
+                input_inject_weight,
                 normed,
                 target_verify,
             )
-            / self.hc_count
-        )
+            indices = _HYPER_SPLIT_INDICES.get((self.hc_lowrank, self.hc_count))
+            if indices is None:
+                indices = (
+                    mx.arange(self.hc_lowrank, dtype=mx.int32),
+                    mx.arange(
+                        self.hc_lowrank,
+                        self.hc_lowrank + self.hc_count,
+                        dtype=mx.int32,
+                    ),
+                )
+                _HYPER_SPLIT_INDICES[(self.hc_lowrank, self.hc_count)] = indices
+            mix = mx.take(combined, indices[0], axis=-1)
+            block_injection = mx.take(combined, indices[1], axis=-1)
+
+        mix = nn.silu(mix / self.hc_count)
         mix = mx.sigmoid(
             _target_verify_linear(
                 self.input_mix_weight_up,
@@ -1214,17 +1425,111 @@ class Qwen4ExpGatedResidual(nn.Module):
         mix = mix.reshape(*mix.shape[:-1], self.hc_count, self.hidden_size)
         streams = normed.reshape(*normed.shape[:-1], self.hc_count, self.hidden_size)
         mixed_input = mx.mean(mix * streams, axis=-2)
-        if "block_inject_weight" not in self:
+        if block_injection is None:
             return mixed_input
         injection_weights = 2 * mx.sigmoid(
-            _target_verify_linear(
-                self.block_inject_weight,
-                normed,
-                target_verify,
-            )
-            / self.hc_count
+            block_injection / self.hc_count
         )
         return mixed_input, hyper_input, injection_weights
+
+
+def _matching_projection_tensor(left: nn.Module, right: nn.Module, name: str) -> bool:
+    left_has = hasattr(left, name)
+    right_has = hasattr(right, name)
+    if left_has != right_has:
+        return False
+    if not left_has:
+        return True
+
+    left_value = getattr(left, name)
+    right_value = getattr(right, name)
+    if left_value is None or right_value is None:
+        return left_value is None and right_value is None
+    return (
+        isinstance(left_value, mx.array)
+        and isinstance(right_value, mx.array)
+        and left_value.ndim > 0
+        and left_value.ndim == right_value.ndim
+        and left_value.shape[1:] == right_value.shape[1:]
+        and left_value.dtype == right_value.dtype
+    )
+
+
+def _can_fuse_hyper_connection(module: Qwen4ExpGatedResidual) -> bool:
+    """Fail closed unless both projections have identical MLX semantics."""
+    if type(module) is not Qwen4ExpGatedResidual:
+        return False
+    if hasattr(module, "input_inject_weight") or hasattr(module, "_compiled_forward"):
+        return False
+
+    down = getattr(module, "input_mix_weight_down", None)
+    injection = getattr(module, "block_inject_weight", None)
+    if down is None or injection is None or type(down) is not type(injection):
+        return False
+    if type(down) not in (nn.Linear, nn.QuantizedLinear):
+        return False
+    if not _matching_projection_tensor(down, injection, "weight"):
+        return False
+    if (
+        down.weight.shape[0] != module.hc_lowrank
+        or injection.weight.shape[0] != module.hc_count
+    ):
+        return False
+    for attribute in ("group_size", "bits", "mode"):
+        if getattr(down, attribute, None) != getattr(injection, attribute, None):
+            return False
+    return all(
+        _matching_projection_tensor(down, injection, name)
+        for name in ("scales", "biases", "bias")
+    )
+
+
+def _unique_hyper_connections(model: nn.Module):
+    modules = [model]
+    modules.extend(module for _, module in model.named_modules() if module is not model)
+    seen = set()
+    for module in modules:
+        if id(module) in seen:
+            continue
+        seen.add(id(module))
+        if type(module) is Qwen4ExpGatedResidual:
+            yield module
+
+
+def fuse_hyper_connection_projections(model: nn.Module) -> int:
+    """Fuse compatible low-rank and injection projections row-wise."""
+    targets = [
+        module
+        for module in _unique_hyper_connections(model)
+        if _can_fuse_hyper_connection(module)
+    ]
+    for module in targets:
+        down = module.input_mix_weight_down
+        injection = module.block_inject_weight
+        fused = {"weight": mx.concatenate([down.weight, injection.weight], axis=0)}
+        for name in ("scales", "biases", "bias"):
+            if hasattr(down, name) and getattr(down, name) is not None:
+                fused[name] = mx.concatenate(
+                    [getattr(down, name), getattr(injection, name)], axis=0
+                )
+        mx.eval(*fused.values())
+        for name, value in fused.items():
+            setattr(down, name, value)
+        module.input_inject_weight = down
+        del module.input_mix_weight_down
+        del module.block_inject_weight
+    return len(targets)
+
+
+def compile_hyper_connections(model: nn.Module) -> int:
+    """Compile each hyper-connection's strict single-token decode path once."""
+    compiled = 0
+    for module in _unique_hyper_connections(model):
+        if hasattr(module, "_compiled_forward"):
+            continue
+        module._compiled_forward = mx.compile(module._forward)
+        compiled += 1
+    return compiled
 
 
 _MASK64 = (1 << 64) - 1

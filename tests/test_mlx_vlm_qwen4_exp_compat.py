@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib
 import json
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import mlx.core as mx
 import pytest
@@ -105,6 +106,185 @@ def test_qwen4_exp_config_normalizes_reference_layer_type():
         "qwen_sparse_attention",
     ]
     assert config.text_config.rope_parameters["type"] == "default"
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_qwen4_hyper_connection_fusion_and_compile_are_bit_exact(quantized):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import (
+        Qwen4ExpGatedResidual,
+        compile_hyper_connections,
+        fuse_hyper_connection_projections,
+    )
+
+    config = SimpleNamespace(
+        hc_count=2,
+        hidden_size=32,
+        hc_lowrank=32,
+        rms_norm_eps=1e-6,
+    )
+    mx.random.seed(17)
+    module = Qwen4ExpGatedResidual(config)
+    if quantized:
+        module.input_mix_weight_down = module.input_mix_weight_down.to_quantized(
+            32, 4
+        )
+        module.block_inject_weight = module.block_inject_weight.to_quantized(32, 4)
+
+    inputs = mx.random.normal((2, 3, 64)).astype(mx.bfloat16)
+    eager = module(inputs)
+    verify_eager = module(inputs, target_verify=True)
+    mx.eval(*eager, *verify_eager)
+
+    assert fuse_hyper_connection_projections(module) == 1
+    assert fuse_hyper_connection_projections(module) == 0
+    fused = module(inputs)
+    verify_fused = module(inputs, target_verify=True)
+    mx.eval(*fused, *verify_fused)
+
+    assert hasattr(module, "input_inject_weight")
+    assert not hasattr(module, "input_mix_weight_down")
+    assert not hasattr(module, "block_inject_weight")
+    for expected, actual in zip(eager, fused):
+        assert mx.array_equal(expected, actual).item()
+    for expected, actual in zip(verify_eager, verify_fused):
+        assert mx.array_equal(expected, actual).item()
+
+    assert compile_hyper_connections(module) == 1
+    assert compile_hyper_connections(module) == 0
+    prefill = module(inputs)
+    decode_inputs = inputs[:1, :1]
+    decode_eager = module._forward(decode_inputs)
+    decode_compiled = module(decode_inputs)
+    verify_compiled = module(inputs, target_verify=True)
+    mx.eval(*prefill, *decode_eager, *decode_compiled, *verify_compiled)
+    for expected, actual in zip(fused, prefill):
+        assert mx.array_equal(expected, actual).item()
+    for expected, actual in zip(decode_eager, decode_compiled):
+        assert mx.array_equal(expected, actual).item()
+    for expected, actual in zip(verify_fused, verify_compiled):
+        assert mx.array_equal(expected, actual).item()
+
+    compiled_forward = module._compiled_forward
+    module._compiled_forward = MagicMock(
+        side_effect=AssertionError("target verification entered compiled decode")
+    )
+    verify_decode = module(decode_inputs, target_verify=True)
+    mx.eval(*verify_decode)
+    module._compiled_forward.assert_not_called()
+    module._compiled_forward = compiled_forward
+
+
+def test_qwen4_hyper_connection_optimizations_fail_closed():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import (
+        Qwen4ExpGatedResidual,
+        compile_hyper_connections,
+        fuse_hyper_connection_projections,
+    )
+
+    config = SimpleNamespace(
+        hc_count=2,
+        hidden_size=32,
+        hc_lowrank=32,
+        rms_norm_eps=1e-6,
+    )
+    incompatible = Qwen4ExpGatedResidual(config)
+    incompatible.block_inject_weight = incompatible.block_inject_weight.to_quantized(
+        32, 4
+    )
+    assert fuse_hyper_connection_projections(incompatible) == 0
+    assert hasattr(incompatible, "input_mix_weight_down")
+    assert hasattr(incompatible, "block_inject_weight")
+
+    already_compiled = Qwen4ExpGatedResidual(config)
+    assert compile_hyper_connections(already_compiled) == 1
+    assert fuse_hyper_connection_projections(already_compiled) == 0
+
+
+def test_qwen4_hyper_connection_compile_covers_uncombined_mixer():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import (
+        Qwen4ExpGatedResidual,
+        compile_hyper_connections,
+    )
+
+    config = SimpleNamespace(
+        hc_count=2,
+        hidden_size=32,
+        hc_lowrank=32,
+        rms_norm_eps=1e-6,
+    )
+    mixer = Qwen4ExpGatedResidual(config, use_combine=False)
+    inputs = mx.random.normal((1, 1, 64)).astype(mx.bfloat16)
+    eager = mixer._forward(inputs)
+    assert compile_hyper_connections(mixer) == 1
+    compiled = mixer(inputs)
+    mx.eval(eager, compiled)
+
+    assert mx.allclose(eager, compiled, rtol=1e-5, atol=1e-6).item()
+
+
+def test_qwen4_exp_load_enables_hyper_connection_optimizations(monkeypatch, caplog):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    import mlx.nn as nn
+    from mlx_vlm.models.qwen3_5 import Model as Qwen3_5Model
+    from mlx_vlm.models.qwen4_exp import qwen4_exp as model_module
+
+    model = model_module.Model.__new__(model_module.Model)
+    nn.Module.__init__(model)
+    base_load = MagicMock(return_value="loaded")
+    fuse = MagicMock(return_value=96)
+    compile_connections = MagicMock(return_value=97)
+    monkeypatch.setattr(Qwen3_5Model, "load_weights", base_load)
+    monkeypatch.setattr(model_module, "fuse_hyper_connection_projections", fuse)
+    monkeypatch.setattr(model_module, "compile_hyper_connections", compile_connections)
+    monkeypatch.setattr(
+        model_module,
+        "get_mtp_runtime",
+        MagicMock(return_value=SimpleNamespace(enabled=False)),
+    )
+    caplog.set_level("INFO", logger=model_module.__name__)
+
+    weights = [("language_model.model.embed_tokens.weight", object())]
+    result = model.load_weights(weights, strict=False)
+
+    assert result == "loaded"
+    base_load.assert_called_once_with(weights, strict=False)
+    fuse.assert_called_once_with(model)
+    compile_connections.assert_called_once_with(model)
+    assert "96 fused projection pairs, 97 compiled decode paths" in caplog.text
+
+
+def test_qwen4_exp_load_skips_projection_fusion_during_mtp_verify(
+    monkeypatch, caplog
+):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    import mlx.nn as nn
+    from mlx_vlm.models.qwen3_5 import Model as Qwen3_5Model
+    from mlx_vlm.models.qwen4_exp import qwen4_exp as model_module
+
+    model = model_module.Model.__new__(model_module.Model)
+    nn.Module.__init__(model)
+    base_load = MagicMock(return_value=model)
+    fuse = MagicMock(return_value=96)
+    compile_connections = MagicMock(return_value=100)
+    monkeypatch.setattr(Qwen3_5Model, "load_weights", base_load)
+    monkeypatch.setattr(model_module, "fuse_hyper_connection_projections", fuse)
+    monkeypatch.setattr(model_module, "compile_hyper_connections", compile_connections)
+    monkeypatch.setattr(
+        model_module,
+        "get_mtp_runtime",
+        MagicMock(return_value=SimpleNamespace(enabled=True)),
+    )
+    caplog.set_level("INFO", logger=model_module.__name__)
+
+    assert model.load_weights([], strict=False) is model
+
+    fuse.assert_not_called()
+    compile_connections.assert_called_once_with(model)
+    assert "Skipped Qwen4-Exp hyper-connection projection fusion" in caplog.text
+    assert "0 fused projection pairs, 100 compiled decode paths" in caplog.text
 
 
 def test_qwen4_exp_sanitize_keeps_converted_norm_values():

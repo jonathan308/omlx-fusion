@@ -13,6 +13,8 @@ from .language import (
     LanguageModel,
     Qwen4ExpMTPModule,
     Qwen4ExpRMSNorm,
+    compile_hyper_connections,
+    fuse_hyper_connection_projections,
     get_mtp_runtime,
     get_ple_runtime_mode,
 )
@@ -254,6 +256,24 @@ class Model(Qwen3_5Model):
             sanitized[key] = value
         _normalize_ones_centered_rmsnorm_weights(self, sanitized)
         return sanitized
+
+    def load_weights(self, weights, strict=True):
+        result = super().load_weights(weights, strict=strict)
+        mtp_enabled = get_mtp_runtime().enabled
+        fused = 0 if mtp_enabled else fuse_hyper_connection_projections(self)
+        compiled = compile_hyper_connections(self)
+        if mtp_enabled:
+            logger.info(
+                "Skipped Qwen4-Exp hyper-connection projection fusion while "
+                "Lightning MTP target verification is enabled"
+            )
+        logger.info(
+            "Enabled Qwen4-Exp hyper-connection optimizations: "
+            "%d fused projection pairs, %d compiled decode paths",
+            fused,
+            compiled,
+        )
+        return result
 
     def close(self):
         """Release external PLE mmap handles during oMLX model unload."""
