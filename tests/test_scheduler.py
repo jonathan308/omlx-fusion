@@ -3191,15 +3191,46 @@ class TestSchedulerArraysCacheBlockAlignment:
                 )
                 self.model_type = model_type
                 self.prefill_calls = []
+                self.prefill_kwargs = []
 
             def make_cache(self):
                 return [ArraysCache()]
 
             def __call__(self, tokens, cache=None, **kwargs):
                 self.prefill_calls.append(int(tokens.shape[1]))
+                self.prefill_kwargs.append(dict(kwargs))
                 return mx.zeros((1, tokens.shape[1], 1))
 
         return HybridModel()
+
+    def test_glm5_benchmark_trace_reaches_external_prefill_model(
+        self, mock_tokenizer
+    ):
+        model = self._hybrid_model(model_type="glm5_next")
+        scheduler = Scheduler(
+            model=model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(prefill_step_size=2048),
+        )
+        request = Request(
+            request_id="glm-profile-trace",
+            prompt=[1, 2, 3, 4, 5],
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = list(request.prompt)
+        request.num_prompt_tokens = len(request.prompt)
+        request.benchmark_trace = True
+
+        try:
+            scheduler._do_external_prefill(
+                request,
+                request.prompt_token_ids,
+                model.make_cache(),
+            )
+        finally:
+            scheduler.shutdown()
+
+        assert model.prefill_kwargs == [{"_omlx_benchmark_trace": True}]
 
     def test_qwen35_wide_prefill_aligns_block_size_to_4096(
         self, mock_tokenizer, tmp_path

@@ -1,5 +1,8 @@
+import json
 import logging
+import os
 import threading
+import time
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -43,6 +46,9 @@ _ROUTE_COUNTER_NAMES = (
 )
 _ROUTE_COUNTERS = {name: 0 for name in _ROUTE_COUNTER_NAMES}
 _ROUTE_COUNTER_LOCK = threading.Lock()
+_PREFILL_PROFILE_LOCAL = threading.local()
+_PREFILL_PROFILE_LOCK = threading.Lock()
+_PREFILL_PROFILE_CALLS = 0
 
 
 def _record_route(name: str) -> None:
@@ -58,6 +64,237 @@ def glm5_native_route_counters(*, reset: bool = False) -> dict[str, int]:
             for name in _ROUTE_COUNTERS:
                 _ROUTE_COUNTERS[name] = 0
         return snapshot
+
+
+class _Glm5PrefillProfileSample:
+    """One low-overhead, one-eval GLM-5.3 prefill profile sample.
+
+    Per-phase timings are Python graph-submission times.  MLX is lazy, so they
+    must never be presented as GPU execution attribution.  ``final_eval_ns``
+    is the single synchronized wall interval that evaluates the whole chunk.
+    """
+
+    def __init__(
+        self,
+        *,
+        call_index: int,
+        source: str,
+        chunk_tokens: int,
+        context_tokens: int,
+        skip_lm_head: bool,
+    ):
+        self.call_index = call_index
+        self.source = source
+        self.chunk_tokens = chunk_tokens
+        self.context_tokens = context_tokens
+        self.skip_lm_head = skip_lm_head
+        self.stage_layer_ns: dict[str, dict[int, int]] = {}
+        self.stage_calls: dict[str, int] = {}
+        self.graph_build_ns = 0
+        self.final_eval_ns = 0
+        self.route_before = glm5_native_route_counters()
+
+    def add(self, stage: str, layer_idx: int, elapsed_ns: int) -> None:
+        per_layer = self.stage_layer_ns.setdefault(stage, {})
+        per_layer[layer_idx] = per_layer.get(layer_idx, 0) + max(0, elapsed_ns)
+        self.stage_calls[stage] = self.stage_calls.get(stage, 0) + 1
+
+
+def _prefill_profile_int(name: str, default: int, minimum: int) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _prefill_profile_enabled() -> bool:
+    return os.environ.get("OMLX_GLM5_PREFILL_PROFILE", "0") == "1"
+
+
+def _prefill_cache_offset(model, cache) -> int | None:
+    if not cache:
+        return None
+    try:
+        entry = cache[model.fa_idx]
+        if isinstance(entry, (CacheList, list, tuple)):
+            entry = entry[0]
+        offset = entry._idx if hasattr(entry, "_idx") else entry.offset
+    except (AttributeError, IndexError, TypeError):
+        return None
+    return offset if isinstance(offset, int) and offset >= 0 else None
+
+
+def _new_prefill_profile_sample(
+    model,
+    inputs,
+    inputs_embeds,
+    mask,
+    cache,
+    *,
+    skip_lm_head: bool,
+    benchmark_trace: bool,
+    source: str,
+):
+    """Gate profiling to explicit, zero-padding B1 multi-token prefill."""
+
+    if not _prefill_profile_enabled():
+        return None
+    # Scheduler-driven profiling must also be request-local.  DFlash does not
+    # currently carry benchmark_trace through its pinned runtime request, so
+    # the isolated experimental environment is its explicit second gate.
+    if source != "dflash" and not benchmark_trace:
+        return None
+    if not (
+        isinstance(inputs, mx.array)
+        and inputs.ndim == 2
+        and inputs.shape[0] == 1
+        and inputs.shape[1] > 1
+        and inputs_embeds is None
+        and mask is None
+    ):
+        return None
+    context_tokens = _prefill_cache_offset(model, cache)
+    if context_tokens is None:
+        return None
+
+    global _PREFILL_PROFILE_CALLS
+    with _PREFILL_PROFILE_LOCK:
+        _PREFILL_PROFILE_CALLS += 1
+        call_index = _PREFILL_PROFILE_CALLS
+    warmup = _prefill_profile_int("OMLX_GLM5_PREFILL_PROFILE_WARMUP", 0, 0)
+    interval = _prefill_profile_int("OMLX_GLM5_PREFILL_PROFILE_INTERVAL", 1, 1)
+    if call_index <= warmup or (call_index - warmup - 1) % interval:
+        return None
+    return _Glm5PrefillProfileSample(
+        call_index=call_index,
+        source=source,
+        chunk_tokens=int(inputs.shape[1]),
+        context_tokens=context_tokens,
+        skip_lm_head=bool(skip_lm_head),
+    )
+
+
+def _current_prefill_profile():
+    return getattr(_PREFILL_PROFILE_LOCAL, "sample", None)
+
+
+def _set_prefill_profile(sample):
+    previous = _current_prefill_profile()
+    _PREFILL_PROFILE_LOCAL.sample = sample
+    return previous
+
+
+def _restore_prefill_profile(previous) -> None:
+    if previous is None:
+        if hasattr(_PREFILL_PROFILE_LOCAL, "sample"):
+            del _PREFILL_PROFILE_LOCAL.sample
+    else:
+        _PREFILL_PROFILE_LOCAL.sample = previous
+
+
+def _profile_submit(sample, stage: str, layer_idx: int, function):
+    started = time.perf_counter_ns()
+    result = function()
+    sample.add(stage, layer_idx, time.perf_counter_ns() - started)
+    return result
+
+
+def _profile_eval_once(value) -> None:
+    arrays = []
+
+    def collect(current):
+        if isinstance(current, mx.array):
+            arrays.append(current)
+        elif isinstance(current, dict):
+            for child in current.values():
+                collect(child)
+        elif isinstance(current, (list, tuple)):
+            for child in current:
+                collect(child)
+
+    collect(value)
+    if arrays:
+        mx.eval(*arrays)
+
+
+def _profile_milliseconds(ns: int) -> float:
+    return round(max(0, ns) / 1_000_000.0, 4)
+
+
+def _log_prefill_profile(sample: _Glm5PrefillProfileSample) -> None:
+    route_after = glm5_native_route_counters()
+    route_delta = {
+        name: max(0, route_after.get(name, 0) - sample.route_before.get(name, 0))
+        for name in _ROUTE_COUNTER_NAMES
+    }
+    phase_ns = {
+        stage: sum(per_layer.values())
+        for stage, per_layer in sample.stage_layer_ns.items()
+    }
+    # Sparse attention's outer bracket contains the nested indexer bracket.
+    # Report an exclusive DSA-attention submit time while retaining indexer as
+    # its own category.
+    phase_ns["dsa_attention"] = max(
+        0,
+        phase_ns.pop("dsa_attention_total", 0)
+        - phase_ns.get("dsa_indexer", 0),
+    )
+
+    layers: dict[str, dict[str, float]] = {}
+    layer_ids = sorted(
+        {
+            layer_idx
+            for per_layer in sample.stage_layer_ns.values()
+            for layer_idx in per_layer
+            if layer_idx >= 0
+        }
+    )
+    for layer_idx in layer_ids:
+        entry = {
+            stage: values.get(layer_idx, 0)
+            for stage, values in sample.stage_layer_ns.items()
+            if values.get(layer_idx, 0)
+        }
+        if "dsa_attention_total" in entry:
+            entry["dsa_attention"] = max(
+                0,
+                entry.pop("dsa_attention_total") - entry.get("dsa_indexer", 0),
+            )
+        layers[str(layer_idx)] = {
+            stage: _profile_milliseconds(elapsed)
+            for stage, elapsed in sorted(entry.items())
+        }
+
+    accounted_ns = sum(phase_ns.values())
+    phase_calls = dict(sample.stage_calls)
+    if "dsa_attention_total" in phase_calls:
+        phase_calls["dsa_attention"] = phase_calls.pop("dsa_attention_total")
+    report = {
+        "call": sample.call_index,
+        "source": sample.source,
+        "scope": "glm_target_forward",
+        "mode": "lazy_submit_one_final_eval",
+        "chunk_tokens": sample.chunk_tokens,
+        "context_before": sample.context_tokens,
+        "context_after": sample.context_tokens + sample.chunk_tokens,
+        "lm_head_skipped": sample.skip_lm_head,
+        "graph_build_ms": _profile_milliseconds(sample.graph_build_ns),
+        "final_eval_ms": _profile_milliseconds(sample.final_eval_ns),
+        "build_unattributed_ms": _profile_milliseconds(
+            sample.graph_build_ns - accounted_ns
+        ),
+        "phase_submit_ms": {
+            stage: _profile_milliseconds(elapsed)
+            for stage, elapsed in sorted(phase_ns.items())
+        },
+        "phase_calls": dict(sorted(phase_calls.items())),
+        "layer_submit_ms": layers,
+        "route_delta": route_delta,
+    }
+    logger.info(
+        "[glm5-prefill-profile] %s",
+        json.dumps(report, sort_keys=True, separators=(",", ":")),
+    )
 
 
 def glm5_next_cast_predicate(key: str) -> bool:
@@ -564,8 +801,9 @@ class Glm5NextIndexer(nn.Module):
 
 
 class Glm5NextSparseAttention(nn.Module):
-    def __init__(self, config: TextConfig):
+    def __init__(self, config: TextConfig, layer_idx: int = -1):
         super().__init__()
+        self.layer_idx = layer_idx
         self.config = config
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -635,13 +873,28 @@ class Glm5NextSparseAttention(nn.Module):
         else:
             cache = [None] * 2
 
-        topk_indices = self.indexer(
-            x,
-            qr,
-            mask,
-            cache=cache[1],
-            kv_cache=cache[0],
-        )
+        profile = _current_prefill_profile()
+        if profile is None:
+            topk_indices = self.indexer(
+                x,
+                qr,
+                mask,
+                cache=cache[1],
+                kv_cache=cache[0],
+            )
+        else:
+            topk_indices = _profile_submit(
+                profile,
+                "dsa_indexer",
+                self.layer_idx,
+                lambda: self.indexer(
+                    x,
+                    qr,
+                    mask,
+                    cache=cache[1],
+                    kv_cache=cache[0],
+                ),
+            )
         attn_mask = mask
         if topk_indices is not None:
             Kv = kv_latent.shape[2]
@@ -846,8 +1099,9 @@ class Glm5NextMoEGate(nn.Module):
 
 
 class Glm5NextMoE(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_idx: int = -1):
         super().__init__()
+        self.layer_idx = layer_idx
         self.switch_mlp = SwitchGLU(
             config.hidden_size,
             config.moe_intermediate_size,
@@ -865,31 +1119,62 @@ class Glm5NextMoE(nn.Module):
             )
 
     def __call__(self, x):
-        indices, scores = self.gate(x)
-        y = self.switch_mlp(x, indices, scores=scores, weighted_sum=True)
-        if y.ndim == x.ndim + 1:
-            y = (y * scores[..., None]).sum(axis=-2).astype(x.dtype)
+        profile = _current_prefill_profile()
+        if profile is None:
+            indices, scores = self.gate(x)
+            y = self.switch_mlp(x, indices, scores=scores, weighted_sum=True)
+            if y.ndim == x.ndim + 1:
+                y = (y * scores[..., None]).sum(axis=-2).astype(x.dtype)
+            if self.shared_experts is not None:
+                y = y + self.shared_experts(x)
+            return y
+
+        indices, scores = _profile_submit(
+            profile,
+            "moe_router",
+            self.layer_idx,
+            lambda: self.gate(x),
+        )
+
+        def routed_moe():
+            routed = self.switch_mlp(x, indices, scores=scores, weighted_sum=True)
+            if routed.ndim == x.ndim + 1:
+                routed = (routed * scores[..., None]).sum(axis=-2).astype(x.dtype)
+            return routed
+
+        y = _profile_submit(profile, "routed_moe", self.layer_idx, routed_moe)
         if self.shared_experts is not None:
-            y = y + self.shared_experts(x)
+            y = _profile_submit(
+                profile,
+                "shared_moe",
+                self.layer_idx,
+                lambda: y + self.shared_experts(x),
+            )
         return y
 
 
 class Glm5NextDecoderLayer(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
+        self.layer_idx = layer_idx
         layer_type = config.layer_types[layer_idx]
         self.is_linear = layer_type == "linear_attention"
         if self.is_linear:
             self.self_attn = Glm5NextLinearAttention(config)
         else:
-            self.self_attn = Glm5NextSparseAttention(config)
+            self.self_attn = Glm5NextSparseAttention(config, layer_idx=layer_idx)
 
         is_sparse = (
             config.n_routed_experts is not None
             and layer_idx >= config.first_k_dense_replace
             and config.mlp_layer_types[layer_idx] == "sparse"
         )
-        self.mlp = Glm5NextMoE(config) if is_sparse else Glm5NextMLP(config)
+        self.is_sparse_moe = is_sparse
+        self.mlp = (
+            Glm5NextMoE(config, layer_idx=layer_idx)
+            if is_sparse
+            else Glm5NextMLP(config)
+        )
 
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
@@ -906,6 +1191,10 @@ class Glm5NextDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
+        profile = _current_prefill_profile()
+        if profile is not None:
+            return self._profiled_call(profile, x, mask, cache)
+
         residual = x
         xc, post, comb = self.attn_hc(x)
         r = self.self_attn(self.input_layernorm(xc), mask, cache)
@@ -919,6 +1208,58 @@ class Glm5NextDecoderLayer(nn.Module):
                 self._ffn_c = mx.compile(self._ffn_block)
             return self._ffn_c(x)
         return self._ffn_block(x)
+
+    def _profiled_call(self, profile, x, mask, cache) -> mx.array:
+        layer_idx = self.layer_idx
+        residual = x
+        xc, post, comb = _profile_submit(
+            profile,
+            "mhc",
+            layer_idx,
+            lambda: self.attn_hc(x),
+        )
+        attention_stage = "kda_attention" if self.is_linear else "dsa_attention_total"
+        r = _profile_submit(
+            profile,
+            attention_stage,
+            layer_idx,
+            lambda: self.self_attn(self.input_layernorm(xc), mask, cache),
+        )
+        x = _profile_submit(
+            profile,
+            "mhc",
+            layer_idx,
+            lambda: hc_expand(r, residual, post, comb),
+        )
+
+        residual = x
+        xc, post, comb = _profile_submit(
+            profile,
+            "mhc",
+            layer_idx,
+            lambda: self.ffn_hc(x),
+        )
+        normed = _profile_submit(
+            profile,
+            "ffn_norm",
+            layer_idx,
+            lambda: self.post_attention_layernorm(xc),
+        )
+        if self.is_sparse_moe:
+            m = self.mlp(normed)
+        else:
+            m = _profile_submit(
+                profile,
+                "dense_mlp",
+                layer_idx,
+                lambda: self.mlp(normed),
+            )
+        return _profile_submit(
+            profile,
+            "mhc",
+            layer_idx,
+            lambda: hc_expand(m, residual, post, comb),
+        )
 
     def _ffn_block(self, x: mx.array) -> mx.array:
         # Stateless FFN half (no cache) -> compiles cleanly at a fixed decode shape.
@@ -948,28 +1289,69 @@ class Glm5NextModel(nn.Module):
         cache: Optional[Any] = None,
         inputs_embeds: Optional[mx.array] = None,
     ) -> mx.array:
-        h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
+        profile = _current_prefill_profile()
+        if profile is None:
+            h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
+        else:
+            h = _profile_submit(
+                profile,
+                "embedding",
+                -1,
+                lambda: (
+                    self.embed_tokens(inputs)
+                    if inputs_embeds is None
+                    else inputs_embeds
+                ),
+            )
 
         if cache is None:
             cache = [None] * len(self.layers)
 
         fa_cache = cache[self.fa_idx]
-        fa_mask = create_attention_mask(
-            h, fa_cache[0] if fa_cache else None, return_array=True
-        )
-        ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
+        if profile is None:
+            fa_mask = create_attention_mask(
+                h, fa_cache[0] if fa_cache else None, return_array=True
+            )
+            ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
+            h = mx.broadcast_to(
+                h[:, :, None, :],
+                (h.shape[0], h.shape[1], self.hc_mult, h.shape[2]),
+            )
+            h = mx.contiguous(h)
+        else:
+            def masks_and_expand():
+                fa = create_attention_mask(
+                    h,
+                    fa_cache[0] if fa_cache else None,
+                    return_array=True,
+                )
+                ssm = create_ssm_mask(h, cache[self.ssm_idx])
+                expanded = mx.broadcast_to(
+                    h[:, :, None, :],
+                    (h.shape[0], h.shape[1], self.hc_mult, h.shape[2]),
+                )
+                return fa, ssm, mx.contiguous(expanded)
 
-        h = mx.broadcast_to(
-            h[:, :, None, :], (h.shape[0], h.shape[1], self.hc_mult, h.shape[2])
-        )
-        h = mx.contiguous(h)
+            fa_mask, ssm_mask, h = _profile_submit(
+                profile,
+                "mask_expand",
+                -1,
+                masks_and_expand,
+            )
 
         for layer, c in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
             h = layer(h, mask=mask, cache=c)
 
-        h = h.mean(axis=2)
-        return self.norm(h)
+        if profile is None:
+            h = h.mean(axis=2)
+            return self.norm(h)
+        return _profile_submit(
+            profile,
+            "final_norm",
+            -1,
+            lambda: self.norm(h.mean(axis=2)),
+        )
 
 
 class LanguageModel(nn.Module):
@@ -993,20 +1375,65 @@ class LanguageModel(nn.Module):
     ) -> LanguageModelOutput:
         if inputs is None:
             inputs = kwargs.get("input_ids")
-        out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
-        if skip_lm_head:
-            _record_route("lm_head_skipped")
-            return LanguageModelOutput(logits=None)
-        # Only the last few positions' logits are ever needed for generation; slicing
-        # before the (vocab-wide) projection skips it on discarded prefill positions.
-        nlk = kwargs.get("num_logits_to_keep", 0)
-        if nlk:
-            out = out[:, -nlk:, :]
-        if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
-        else:
-            out = linear_forward(self.lm_head, out)
-        return LanguageModelOutput(logits=out)
+        profile = _new_prefill_profile_sample(
+            self.model,
+            inputs,
+            inputs_embeds,
+            mask,
+            cache,
+            skip_lm_head=skip_lm_head,
+            benchmark_trace=bool(kwargs.get("_omlx_benchmark_trace", False)),
+            source="language",
+        )
+        if profile is None:
+            out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
+            if skip_lm_head:
+                _record_route("lm_head_skipped")
+                return LanguageModelOutput(logits=None)
+            # Only the last few positions' logits are ever needed for generation;
+            # slicing before the vocab-wide projection skips discarded positions.
+            nlk = kwargs.get("num_logits_to_keep", 0)
+            if nlk:
+                out = out[:, -nlk:, :]
+            if self.args.tie_word_embeddings:
+                out = self.model.embed_tokens.as_linear(out)
+            else:
+                out = linear_forward(self.lm_head, out)
+            return LanguageModelOutput(logits=out)
+
+        previous_profile = _set_prefill_profile(profile)
+        build_started = time.perf_counter_ns()
+        try:
+            hidden = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
+            if skip_lm_head:
+                _record_route("lm_head_skipped")
+                output = LanguageModelOutput(logits=None)
+                eval_target = hidden
+            else:
+                nlk = kwargs.get("num_logits_to_keep", 0)
+                logits_input = hidden[:, -nlk:, :] if nlk else hidden
+
+                def project_logits():
+                    if self.args.tie_word_embeddings:
+                        return self.model.embed_tokens.as_linear(logits_input)
+                    return linear_forward(self.lm_head, logits_input)
+
+                logits = _profile_submit(
+                    profile,
+                    "logits",
+                    -1,
+                    project_logits,
+                )
+                output = LanguageModelOutput(logits=logits)
+                eval_target = logits
+            profile.graph_build_ns = time.perf_counter_ns() - build_started
+            eval_started = time.perf_counter_ns()
+            _profile_eval_once(eval_target)
+            profile.final_eval_ns = time.perf_counter_ns() - eval_started
+        finally:
+            _restore_prefill_profile(previous_profile)
+        _log_prefill_profile(profile)
+        return output
 
     def sanitize(self, weights):
         weights = {k: v for k, v in weights.items() if "mtp." not in k}

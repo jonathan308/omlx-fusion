@@ -29,6 +29,8 @@ class hooks.
 from __future__ import annotations
 
 import json
+import os
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -42,6 +44,7 @@ _BACKEND_PATH = "omlx.patches.dflash_glm5:Glm5NextTargetOps"
 _ORIGINAL_TARGET_LOADER: Any | None = None
 _ORIGINAL_LINEAR_CALLS: dict[type, Any] = {}
 _ORIGINAL_PREFILL_RUNNER: Any | None = None
+_GLM5_PREFILL_PROFILE_SCOPE = threading.local()
 
 
 def _config_value(config: Any, name: str, default: Any = None) -> Any:
@@ -214,7 +217,11 @@ def _install_glm5_prefill_chunking_bridge() -> bool:
 
         def iterate():
             previous = bool(self.supports_prefix_snapshot)
+            previous_profile_scope = bool(
+                getattr(_GLM5_PREFILL_PROFILE_SCOPE, "active", False)
+            )
             self.supports_prefix_snapshot = True
+            _GLM5_PREFILL_PROFILE_SCOPE.active = True
             try:
                 result = yield from current(
                     self,
@@ -225,6 +232,10 @@ def _install_glm5_prefill_chunking_bridge() -> bool:
                 return replace(result, supports_prefix_snapshot=False)
             finally:
                 self.supports_prefix_snapshot = previous
+                if previous_profile_scope:
+                    _GLM5_PREFILL_PROFILE_SCOPE.active = True
+                elif hasattr(_GLM5_PREFILL_PROFILE_SCOPE, "active"):
+                    del _GLM5_PREFILL_PROFILE_SCOPE.active
 
         return iterate()
 
@@ -373,39 +384,167 @@ class Glm5NextTargetOps:
         capture_layer_ids: set[int] | None = None,
         logits_last_only: bool = False,
     ) -> tuple[mx.array, list[mx.array] | dict[int, mx.array]]:
+        if (
+            os.environ.get("OMLX_GLM5_PREFILL_PROFILE", "0") != "1"
+            or not getattr(_GLM5_PREFILL_PROFILE_SCOPE, "active", False)
+        ):
+            return self._forward_with_hidden_capture_impl(
+                target_model,
+                input_ids=input_ids,
+                cache=cache,
+                input_embeddings=input_embeddings,
+                capture_layer_ids=capture_layer_ids,
+                logits_last_only=logits_last_only,
+            )
+
+        from mlx_vlm.models.glm5_next import language as glm_language
+
+        inner = self.text_model(target_model)
+        profile = glm_language._new_prefill_profile_sample(
+            inner,
+            input_ids,
+            input_embeddings,
+            None,
+            cache,
+            skip_lm_head=False,
+            benchmark_trace=True,
+            source="dflash",
+        )
+        if profile is None:
+            return self._forward_with_hidden_capture_impl(
+                target_model,
+                input_ids=input_ids,
+                cache=cache,
+                input_embeddings=input_embeddings,
+                capture_layer_ids=capture_layer_ids,
+                logits_last_only=logits_last_only,
+            )
+
+        previous_profile = glm_language._set_prefill_profile(profile)
+        build_started = time.perf_counter_ns()
+        try:
+            result = self._forward_with_hidden_capture_impl(
+                target_model,
+                input_ids=input_ids,
+                cache=cache,
+                input_embeddings=input_embeddings,
+                capture_layer_ids=capture_layer_ids,
+                logits_last_only=logits_last_only,
+                _profile=profile,
+            )
+            profile.graph_build_ns = time.perf_counter_ns() - build_started
+            eval_started = time.perf_counter_ns()
+            glm_language._profile_eval_once(result)
+            profile.final_eval_ns = time.perf_counter_ns() - eval_started
+        finally:
+            glm_language._restore_prefill_profile(previous_profile)
+        glm_language._log_prefill_profile(profile)
+        return result
+
+    def _forward_with_hidden_capture_impl(
+        self,
+        target_model: Any,
+        *,
+        input_ids: mx.array | None = None,
+        cache: list[Any] | None = None,
+        input_embeddings: mx.array | None = None,
+        capture_layer_ids: set[int] | None = None,
+        logits_last_only: bool = False,
+        _profile: Any | None = None,
+    ) -> tuple[mx.array, list[mx.array] | dict[int, mx.array]]:
         from mlx_vlm.models.base import create_attention_mask, create_ssm_mask
 
         inner = self.text_model(target_model)
-        h = (
-            input_embeddings
-            if input_embeddings is not None
-            else inner.embed_tokens(input_ids)
-        )
+        if _profile is None:
+            h = (
+                input_embeddings
+                if input_embeddings is not None
+                else inner.embed_tokens(input_ids)
+            )
+        else:
+            from mlx_vlm.models.glm5_next import language as glm_language
+
+            h = glm_language._profile_submit(
+                _profile,
+                "embedding",
+                -1,
+                lambda: (
+                    input_embeddings
+                    if input_embeddings is not None
+                    else inner.embed_tokens(input_ids)
+                ),
+            )
         if cache is None:
             cache = [None] * len(inner.layers)
         elif len(cache) != len(inner.layers):
             raise ValueError("GLM-5.3 cache/layer count mismatch")
 
         fa_cache = cache[inner.fa_idx]
-        fa_mask = create_attention_mask(
-            h,
-            fa_cache[0] if fa_cache is not None else None,
-            return_array=True,
-        )
-        ssm_mask = create_ssm_mask(h, cache[inner.ssm_idx])
-        h = mx.contiguous(
-            mx.broadcast_to(
-                h[:, :, None, :],
-                (h.shape[0], h.shape[1], inner.hc_mult, h.shape[2]),
+        if _profile is None:
+            fa_mask = create_attention_mask(
+                h,
+                fa_cache[0] if fa_cache is not None else None,
+                return_array=True,
             )
-        )
+            ssm_mask = create_ssm_mask(h, cache[inner.ssm_idx])
+            h = mx.contiguous(
+                mx.broadcast_to(
+                    h[:, :, None, :],
+                    (h.shape[0], h.shape[1], inner.hc_mult, h.shape[2]),
+                )
+            )
+        else:
+            def masks_and_expand():
+                fa = create_attention_mask(
+                    h,
+                    fa_cache[0] if fa_cache is not None else None,
+                    return_array=True,
+                )
+                ssm = create_ssm_mask(h, cache[inner.ssm_idx])
+                expanded = mx.contiguous(
+                    mx.broadcast_to(
+                        h[:, :, None, :],
+                        (h.shape[0], h.shape[1], inner.hc_mult, h.shape[2]),
+                    )
+                )
+                return fa, ssm, expanded
+
+            fa_mask, ssm_mask, h = glm_language._profile_submit(
+                _profile,
+                "mask_expand",
+                -1,
+                masks_and_expand,
+            )
 
         capture_all = capture_layer_ids is None
         if capture_all:
-            captured: list[mx.array] | dict[int, mx.array] = [_contract_mhc_hidden(h)]
+            initial = (
+                _contract_mhc_hidden(h)
+                if _profile is None
+                else glm_language._profile_submit(
+                    _profile,
+                    "capture_mhc",
+                    -1,
+                    lambda: _contract_mhc_hidden(h),
+                )
+            )
+            captured: list[mx.array] | dict[int, mx.array] = [initial]
         else:
             capture_layer_ids = set(capture_layer_ids)
-            captured = {0: _contract_mhc_hidden(h)} if 0 in capture_layer_ids else {}
+            if 0 in capture_layer_ids:
+                initial = (
+                    _contract_mhc_hidden(h)
+                    if _profile is None
+                    else glm_language._profile_submit(
+                        _profile,
+                        "capture_mhc",
+                        -1,
+                        lambda: _contract_mhc_hidden(h),
+                    )
+                )
+                captured = {0: initial}
+            else:
+                captured = {}
 
         for layer_index, (layer, layer_cache) in enumerate(
             zip(inner.layers, cache, strict=True)
@@ -414,15 +553,53 @@ class Glm5NextTargetOps:
             h = layer(h, mask=mask, cache=layer_cache)
             capture_key = layer_index + 1
             if capture_all:
-                captured.append(_contract_mhc_hidden(h))
+                contracted = (
+                    _contract_mhc_hidden(h)
+                    if _profile is None
+                    else glm_language._profile_submit(
+                        _profile,
+                        "capture_mhc",
+                        layer_index,
+                        lambda: _contract_mhc_hidden(h),
+                    )
+                )
+                captured.append(contracted)
             elif capture_layer_ids is not None and capture_key in capture_layer_ids:
-                captured[capture_key] = _contract_mhc_hidden(h)
+                captured[capture_key] = (
+                    _contract_mhc_hidden(h)
+                    if _profile is None
+                    else glm_language._profile_submit(
+                        _profile,
+                        "capture_mhc",
+                        layer_index,
+                        lambda: _contract_mhc_hidden(h),
+                    )
+                )
 
-        normalized = inner.norm(_contract_mhc_hidden(h))
+        normalized = (
+            inner.norm(_contract_mhc_hidden(h))
+            if _profile is None
+            else glm_language._profile_submit(
+                _profile,
+                "final_norm",
+                -1,
+                lambda: inner.norm(_contract_mhc_hidden(h)),
+            )
+        )
         if logits_last_only and isinstance(captured, dict):
             captured[-1] = normalized
         logits_hidden = normalized[:, -1:, :] if logits_last_only else normalized
-        return self.logits_from_hidden(target_model, logits_hidden), captured
+        logits = (
+            self.logits_from_hidden(target_model, logits_hidden)
+            if _profile is None
+            else glm_language._profile_submit(
+                _profile,
+                "logits",
+                -1,
+                lambda: self.logits_from_hidden(target_model, logits_hidden),
+            )
+        )
+        return logits, captured
 
     def verify_block(
         self,

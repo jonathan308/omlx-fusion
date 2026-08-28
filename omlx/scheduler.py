@@ -3860,6 +3860,11 @@ class Scheduler:
                         )
                 if self._supports_skip_lm_head():
                     model_kwargs["skip_lm_head"] = True
+                if (
+                    getattr(request, "benchmark_trace", False)
+                    and getattr(self.model, "model_type", None) == "glm5_next"
+                ):
+                    model_kwargs["_omlx_benchmark_trace"] = True
                 self.model(
                     input_arr[:, :n_to_process],
                     cache=prompt_cache,
@@ -5478,10 +5483,15 @@ class Scheduler:
         with mx.stream(self._stream):
             chunk = state.tokens_remaining[:, :n]
             state.tokens_remaining = state.tokens_remaining[:, n:]
+            model_kwargs: dict[str, Any] = {}
             if self._supports_skip_lm_head():
-                self.model(chunk, cache=state.cache, skip_lm_head=True)
-            else:
-                self.model(chunk, cache=state.cache)
+                model_kwargs["skip_lm_head"] = True
+            if (
+                getattr(state.request, "benchmark_trace", False)
+                and getattr(self.model, "model_type", None) == "glm5_next"
+            ):
+                model_kwargs["_omlx_benchmark_trace"] = True
+            self.model(chunk, cache=state.cache, **model_kwargs)
             mx.eval([c.state for c in state.cache])
         _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
         _throttle_post = get_phys_footprint()
