@@ -172,6 +172,42 @@ class TestDFlashModelSettings:
 class TestDFlashEngineInit:
     """Test DFlashEngine initialization and configuration."""
 
+    def test_stop_ids_union_scalar_list_eot_and_generation_config(self):
+        from omlx.engine.dflash import _get_dflash_stop_token_ids
+
+        tokenizer = SimpleNamespace(
+            eos_token_id=[3, 4],
+            eos_token_ids=2,
+            eot_token_id=[4, 5],
+        )
+
+        assert _get_dflash_stop_token_ids(tokenizer, {2, 5, 6}) == [2, 3, 4, 5, 6]
+
+    def test_stop_ids_encode_eot_string_when_id_is_missing(self):
+        from omlx.engine.dflash import _get_dflash_stop_token_ids
+
+        encode = MagicMock(return_value=[7, 8])
+        tokenizer = SimpleNamespace(
+            eos_token_id=2,
+            eos_token_ids=None,
+            eot_token="<eot>",
+            encode=encode,
+        )
+
+        assert _get_dflash_stop_token_ids(tokenizer) == [2, 7, 8]
+        encode.assert_called_once_with("<eot>", add_special_tokens=False)
+
+    def test_stop_ids_are_unique_and_ignore_boolean_metadata(self):
+        from omlx.engine.dflash import _get_dflash_stop_token_ids
+
+        tokenizer = SimpleNamespace(
+            eos_token_id=[2, 2, True],
+            eos_token_ids=[2, 3, False],
+            eot_token_id=3,
+        )
+
+        assert _get_dflash_stop_token_ids(tokenizer, {3, 4}) == [2, 3, 4]
+
     def test_wired_limit_uses_recommended_working_set_and_is_idempotent(
         self, monkeypatch
     ):
@@ -470,12 +506,15 @@ class TestDFlashEngineInit:
         # normalizes it without mutating the tokenizer.
         engine._executor_tokenizer = SimpleNamespace(
             eos_token_ids=2,
-            eos_token_id=3,
+            eos_token_id=[3, 4],
+            eot_token_id=[4, 5],
         )
         engine._draft_model = object()
         engine._draft_backend = object()
         engine._runtime_context = object()
         engine._suppress_token_ids = {258883, 258882}
+        engine._generation_config_eos = {5, 6}
+        engine._output_parser_factory = SimpleNamespace(stop_token_ids={99})
 
         fake_flow = SimpleNamespace(
             snapshot=snapshot,
@@ -517,7 +556,8 @@ class TestDFlashEngineInit:
         )
 
         assert list(event_iter) == []
-        assert stop_ids == [2, 3]
+        assert stop_ids == [2, 3, 4, 5, 6]
+        assert 99 not in captured["stop_token_ids"]
         assert captured["suppress_token_ids"] == [258882, 258883]
         assert captured["prefix_snapshot"] is snapshot
         assert captured["prefix_hit_kind"] == "l2_prefix"
@@ -638,10 +678,20 @@ class TestDFlashEngineInit:
             "apply_qwen35_moe_gate_up_fusion",
             lambda model: captured.setdefault("fused_target", model),
         )
+        generation_config_calls = []
+
+        def fake_generation_config_token_ids(model_ref, key):
+            generation_config_calls.append((model_ref, key))
+            return {
+                "eos_token_id": {1, 2},
+                "eos_token_ids": {2, 3},
+                "suppress_tokens": set(),
+            }[key]
+
         monkeypatch.setattr(
             dflash_mod,
             "load_generation_config_token_ids",
-            lambda *args, **kwargs: set(),
+            fake_generation_config_token_ids,
         )
         monkeypatch.setattr(
             dflash_mod, "detect_output_parser", lambda *args, **kwargs: None
@@ -666,8 +716,15 @@ class TestDFlashEngineInit:
             assert captured["bound_target_ops"] is engine._target_ops
             assert engine._draft_window_size == 2048
             assert engine._runtime_context.runtime.draft_window_size == 2048
+            assert engine._generation_config_eos == {1, 2, 3}
+            assert generation_config_calls == [
+                ("fake-target", "eos_token_id"),
+                ("fake-target", "eos_token_ids"),
+                ("fake-target", "suppress_tokens"),
+            ]
         finally:
             await engine.stop()
+        assert engine._generation_config_eos == set()
 
     def test_should_fallback_unlimited_when_max_ctx_none(self):
         """A None threshold means dflash handles every prompt size."""

@@ -49,29 +49,55 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
-def _get_dflash_stop_token_ids(tokenizer: Any) -> list[int]:
-    """Normalize tokenizer EOS metadata for the DFlash runtime.
+def _get_dflash_stop_token_ids(
+    tokenizer: Any,
+    generation_config_eos: set[int] | None = None,
+) -> list[int]:
+    """Resolve Scheduler-compatible stop IDs for the DFlash runtime.
 
     Some mlx-vlm tokenizers expose ``eos_token_ids`` as a scalar while
-    dflash-mlx currently assumes it is iterable.  Keep the compatibility at
-    the oMLX boundary instead of mutating the tokenizer object shared with
-    chat-template and detokenization code.
+    dflash-mlx currently assumes it is iterable. Models such as GLM-5.3 also
+    publish additional turn terminators only in ``generation_config.json``.
+    Keep this normalization at the oMLX boundary instead of mutating the
+    tokenizer object shared with chat-template and detokenization code.
     """
-    raw_ids = getattr(tokenizer, "eos_token_ids", None)
-    if raw_ids is None:
-        stop_ids: list[int] = []
-    elif isinstance(raw_ids, int):
-        stop_ids = [int(raw_ids)]
-    else:
-        try:
-            stop_ids = [int(token_id) for token_id in raw_ids]
-        except TypeError:
-            stop_ids = [int(raw_ids)]
 
-    eos_token_id = getattr(tokenizer, "eos_token_id", None)
-    if eos_token_id is not None and int(eos_token_id) not in stop_ids:
-        stop_ids.append(int(eos_token_id))
-    return stop_ids
+    stop_ids: set[int] = set()
+
+    def add_ids(value: Any) -> None:
+        if value is None or isinstance(value, bool):
+            return
+        if isinstance(value, int):
+            stop_ids.add(int(value))
+            return
+        try:
+            values = iter(value)
+        except TypeError:
+            return
+        for token_id in values:
+            if isinstance(token_id, bool):
+                continue
+            try:
+                stop_ids.add(int(token_id))
+            except (TypeError, ValueError):
+                continue
+
+    add_ids(getattr(tokenizer, "eos_token_id", None))
+    add_ids(getattr(tokenizer, "eos_token_ids", None))
+
+    eot_token_id = getattr(tokenizer, "eot_token_id", None)
+    if eot_token_id is not None:
+        add_ids(eot_token_id)
+    else:
+        eot_token = getattr(tokenizer, "eot_token", None)
+        if eot_token:
+            try:
+                add_ids(tokenizer.encode(eot_token, add_special_tokens=False))
+            except Exception:
+                pass
+
+    add_ids(generation_config_eos)
+    return sorted(stop_ids)
 
 
 def _process_output_parser_token(result: Any) -> tuple[str, str, bool, bool]:
@@ -399,6 +425,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._old_wired_limit: int | None = None
         self._wired_limit_owned = False
         self._suppress_token_ids: set[int] = set()
+        self._generation_config_eos: set[int] = set()
         # Protocol-specific output parser factory (gemma4 / harmony).
         # Detected once in start() after the target model is loaded; None means
         # the streaming detokenizer is used as-is (qwen, llama, etc.).
@@ -799,6 +826,17 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         suppress_ref = (
             getattr(self._executor_tokenizer, "name_or_path", None) or self._model_name
         )
+        self._generation_config_eos = set()
+        for key in ("eos_token_id", "eos_token_ids"):
+            configured_ids = load_generation_config_token_ids(suppress_ref, key)
+            if configured_ids:
+                self._generation_config_eos.update(configured_ids)
+        if self._generation_config_eos:
+            logger.info(
+                "DFlash loaded %d EOS token(s) from generation_config.json: %s",
+                len(self._generation_config_eos),
+                self._generation_config_eos,
+            )
         suppress_ids = load_generation_config_token_ids(suppress_ref, "suppress_tokens")
         self._suppress_token_ids = suppress_ids or set()
         if self._suppress_token_ids:
@@ -1014,6 +1052,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._draft_backend = None
         self._tokenizer_obj = None
         self._executor_tokenizer = None
+        self._generation_config_eos.clear()
         self._output_parser_factory = None
         self._prefill_guard = None
         self._in_fallback_mode = False
@@ -1303,7 +1342,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         from dflash_mlx.runtime import stream_dflash_generate
         from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
 
-        stop_ids = _get_dflash_stop_token_ids(self._executor_tokenizer)
+        stop_ids = _get_dflash_stop_token_ids(
+            self._executor_tokenizer,
+            self._generation_config_eos,
+        )
 
         # Build a minimal model_provider shim for the prefix cache flow.
         # ``model_key`` is consumed as a tuple where index 0 = target id and
