@@ -23,6 +23,7 @@ from omlx.patches.glm_moe_dsa.sparse_mla import (
     exact_block_token_attention,
     q8_vup_flat,
     sparse_mla_attention,
+    sparse_mla_attention_nope,
 )
 from .config import ModelConfig, TextConfig
 from .gated_delta import gated_delta_update
@@ -647,18 +648,32 @@ class Glm5NextSparseAttention(nn.Module):
                 return self._gathered_attention(q, kv_latent, topk_indices)
             else:
                 q_latent = self.embed_q(q)
-                q_pe = mx.zeros(q_latent.shape[:-1] + (64,), dtype=q_latent.dtype)
-                k_pe = mx.zeros(kv_latent.shape[:-1] + (64,), dtype=kv_latent.dtype)
                 output = None
                 if Kv >= 4096:
-                    output = sparse_mla_attention(
+                    output = sparse_mla_attention_nope(
                         q_latent,
-                        q_pe,
                         kv_latent,
-                        k_pe,
                         topk_indices,
                         self.scale,
                     )
+                    # Compatibility with an older packaged extension: retain
+                    # the exact historical path until the dedicated NoPE ABI
+                    # is present, rather than silently demoting to dense MLA.
+                    if output is None:
+                        q_pe = mx.zeros(
+                            q_latent.shape[:-1] + (64,), dtype=q_latent.dtype
+                        )
+                        k_pe = mx.zeros(
+                            kv_latent.shape[:-1] + (64,), dtype=kv_latent.dtype
+                        )
+                        output = sparse_mla_attention(
+                            q_latent,
+                            q_pe,
+                            kv_latent,
+                            k_pe,
+                            topk_indices,
+                            self.scale,
+                        )
                 if output is not None:
                     _record_route("sparse_mla_native")
                     output_flat = q8_vup_flat(
