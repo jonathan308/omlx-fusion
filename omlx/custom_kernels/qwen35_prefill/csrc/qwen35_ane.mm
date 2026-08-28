@@ -370,7 +370,7 @@ load_or_compile_ane_model(id model, NSString *identifier, int ane_instance,
         model, @selector(compileWithQoS:options:error:), 21,
         execution_options, &error);
     if (!ok) {
-      [[NSFileManager defaultManager] removeItemAtPath:directory_ error:nil];
+      [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
       throw std::runtime_error(error_text(
           [compile_what stringByAppendingString:@" compilation failed"],
           error));
@@ -895,7 +895,7 @@ public:
       // The loaded program no longer needs the staged MIL/weight files, and
       // removing them here instead of in the destructor keeps a killed or
       // crashed process from leaking multi-GB temp directories.
-      [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
+      [[NSFileManager defaultManager] removeItemAtPath:directory_ error:nil];
 
       input_surface_ = make_surface(static_cast<size_t>(input_dim_) *
                                     sequence_length_ * sizeof(_Float16));
