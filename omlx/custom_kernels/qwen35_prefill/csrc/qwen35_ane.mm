@@ -1335,6 +1335,9 @@ void AneLinearModel::execute(AneLinearModel::Ticket ticket) {
 void AneLinearModel::wait(AneLinearModel::Ticket ticket) {
   impl_->wait(ticket);
 }
+void AneLinearModel::cancel_ticket(AneLinearModel::Ticket ticket) {
+  impl_->cancel_ticket(ticket);
+}
 bool AneLinearModel::completed(AneLinearModel::Ticket ticket) const {
   return [impl_->event_ signaledValue] >= ticket.done;
 }
