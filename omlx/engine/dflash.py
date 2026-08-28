@@ -49,6 +49,31 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
+def _get_dflash_stop_token_ids(tokenizer: Any) -> list[int]:
+    """Normalize tokenizer EOS metadata for the DFlash runtime.
+
+    Some mlx-vlm tokenizers expose ``eos_token_ids`` as a scalar while
+    dflash-mlx currently assumes it is iterable.  Keep the compatibility at
+    the oMLX boundary instead of mutating the tokenizer object shared with
+    chat-template and detokenization code.
+    """
+    raw_ids = getattr(tokenizer, "eos_token_ids", None)
+    if raw_ids is None:
+        stop_ids: list[int] = []
+    elif isinstance(raw_ids, int):
+        stop_ids = [int(raw_ids)]
+    else:
+        try:
+            stop_ids = [int(token_id) for token_id in raw_ids]
+        except TypeError:
+            stop_ids = [int(raw_ids)]
+
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is not None and int(eos_token_id) not in stop_ids:
+        stop_ids.append(int(eos_token_id))
+    return stop_ids
+
+
 def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     """Decide whether ``model_path`` can run on the current dflash backend.
 
@@ -1176,10 +1201,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         repetition_context_size: int = 20,
     ):
         """Build the dflash event iterator with prefix cache plumbed in."""
-        from dflash_mlx.runtime import get_stop_token_ids, stream_dflash_generate
+        from dflash_mlx.runtime import stream_dflash_generate
         from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
 
-        stop_ids = get_stop_token_ids(self._executor_tokenizer)
+        stop_ids = _get_dflash_stop_token_ids(self._executor_tokenizer)
 
         # Build a minimal model_provider shim for the prefix cache flow.
         # ``model_key`` is consumed as a tuple where index 0 = target id and
