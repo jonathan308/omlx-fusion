@@ -1469,6 +1469,18 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             # affect cache hit/miss telemetry.
             prefix_flow = PrefixCacheFlow(cache_manager=None)
 
+        if (
+            use_prefix_cache
+            and getattr(self._target_ops, "backend_name", "") == "glm5_next"
+        ):
+            # Agent clients normalize or omit hidden reasoning when they append
+            # an assistant turn. A generation snapshot therefore requires an
+            # exact token history the next request cannot reproduce and misses
+            # every time. Publish the stable prefill boundary instead: the next
+            # turn reuses the whole prior prompt and prefills only the new
+            # assistant/tool suffix, regardless of reasoning serialization.
+            prefix_flow.publish_generation_snapshot = False
+
         event_iter = stream_dflash_generate(
             target_model=self._target_model,
             target_ops=self._target_ops,

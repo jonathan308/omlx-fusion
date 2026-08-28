@@ -498,7 +498,7 @@ class TestDFlashEngineInit:
             model_settings=ModelSettings(dflash_block_size=5),
         )
         target_model = object()
-        target_ops = object()
+        target_ops = SimpleNamespace(backend_name="glm5_next")
         snapshot = object()
         engine._target_model = target_model
         engine._target_ops = target_ops
@@ -561,6 +561,7 @@ class TestDFlashEngineInit:
         assert captured["suppress_token_ids"] == [258882, 258883]
         assert captured["prefix_snapshot"] is snapshot
         assert captured["prefix_hit_kind"] == "l2_prefix"
+        assert captured["publish_generation_snapshot"] is False
         assert captured["temperature"] == 1.0
         assert captured["top_p"] == 0.95
         assert captured["top_k"] == 20
