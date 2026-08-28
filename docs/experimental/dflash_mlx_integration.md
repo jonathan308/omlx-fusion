@@ -133,6 +133,9 @@ linear DFlash verification remains available. Cold prefill still follows the
 runtime `prefill_step_size`; chunking is kept independent from snapshot
 hydration or publication for this target. The published checkpoint is
 CC BY-NC-ND 4.0; oMLX neither bundles nor automatically downloads its weights.
+The mlx-vlm fallback target is constructed eagerly, matching normal
+`VLMEngine` startup, and then passes through the same bounded whole-tree
+materialization gate. Custom oQ checkpoints retain their dedicated loader.
 
 ### Per-model settings
 
