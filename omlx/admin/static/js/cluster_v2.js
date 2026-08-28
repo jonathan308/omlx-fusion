@@ -913,23 +913,15 @@ function clusterV2Wizard() {
                 'peer_lost',
                 'launcher_lost',
             ]);
-            if (
-                jobs.some(
-                    (job) =>
-                        terminalPhases.has(job?.phase) ||
-                        (typeof job?.error === 'string' && !!job.error.trim()),
-                ) ||
-                terminalPhases.has(launcher?.phase) ||
-                launcher?.returncode != null ||
-                (typeof launcher?.failure_reason === 'string' &&
-                    !!launcher.failure_reason.trim())
-            ) {
-                return 'failed';
-            }
 
             // Runtime ownership is reconciled server-side against the engine
-            // pool. Both ownership and a fresh live heartbeat are required;
-            // an old marker with phase=ready is explicitly detached there.
+            // pool. Prefer that current ownership before retained diagnostic
+            // markers: a failed marker intentionally survives for support,
+            // and is briefly relabelled `loading` when a retry starts before
+            // the new rank overwrites it. Letting its old phase/error win made
+            // the card flash Failed -> Failed -> Ready and hid the real load
+            // progress. A live ready marker or an active loading owner is
+            // authoritative; terminal evidence wins only when neither exists.
             if (
                 jobs.some(
                     (job) =>
@@ -943,13 +935,24 @@ function clusterV2Wizard() {
             if (
                 jobs.some(
                     (job) =>
-                        job?.ownership === 'loading' &&
-                        job?.live === true &&
-                        job?.phase === 'loading',
+                        job?.ownership === 'loading',
                 ) ||
                 ['preflight', 'loading'].includes(launcher?.phase)
             ) {
                 return 'loading';
+            }
+            if (
+                jobs.some(
+                    (job) =>
+                        terminalPhases.has(job?.phase) ||
+                        (typeof job?.error === 'string' && !!job.error.trim()),
+                ) ||
+                terminalPhases.has(launcher?.phase) ||
+                launcher?.returncode != null ||
+                (typeof launcher?.failure_reason === 'string' &&
+                    !!launcher.failure_reason.trim())
+            ) {
+                return 'failed';
             }
             if (jobs.some((job) => job?.ownership === 'loaded')) {
                 // The pool still claims ownership but there is no fresh ready
@@ -1247,7 +1250,11 @@ function clusterV2Wizard() {
             const ready = jobs.filter(
                 (job) => job?.phase === 'ready' && job?.live === true,
             ).length;
-            return `${ready} of ${jobs.length} ranks ready · readiness canary runs last`;
+            const expected = Math.max(
+                jobs.length,
+                ...jobs.map((job) => Math.max(0, Number(job?.world_size || 0))),
+            );
+            return `${ready} of ${expected} ranks ready · readiness canary runs last`;
         },
 
         // Step-4 hint is strategy-aware: a tensor split gives every Mac every
