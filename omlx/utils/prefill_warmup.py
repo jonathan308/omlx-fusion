@@ -13,7 +13,7 @@ _DS4_PREFILL_SHAPE_WARMUP_TOKENS = 1024
 # GLM-5.3's first text request otherwise pays to compile the KDA, dense-MLA,
 # hyper-connection, and affine-QMM pipelines. Their Metal specializations do
 # not depend on the prompt width, so a small disposable forward is sufficient.
-_GLM5_NEXT_PREFILL_SHAPE_WARMUP_TOKENS = 256
+_GLM5_NEXT_PREFILL_SHAPE_WARMUP_TOKENS = 64
 
 
 def _enabled(value: str) -> bool:

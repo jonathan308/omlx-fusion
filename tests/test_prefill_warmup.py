@@ -17,7 +17,7 @@ def test_local_ds4_shape_warmup_is_enabled_by_default(model_type):
 
 
 def test_local_glm5_next_shape_warmup_is_small_and_enabled_by_default():
-    assert planned_local_prefill_shape_warmup_tokens("glm5_next", environ={}) == 256
+    assert planned_local_prefill_shape_warmup_tokens("glm5_next", environ={}) == 64
 
 
 def test_local_shape_warmup_is_gated_and_operator_can_disable_it():
