@@ -114,6 +114,14 @@ class ModelLayout:
     # Whether mlx-lm can split this architecture into pipeline stages. False
     # means the model runs on one node or not at all, however well it fits.
     supports_pipeline: bool = False
+    # MTP draft-head tensor bytes, counted separately only when the layout was
+    # measured with ``mtp_enabled=True``. With the flag off both fields keep
+    # their zero values and head tensors keep their historical buckets, so an
+    # MTP-bearing checkpoint plans byte-identically to a build without them.
+    mtp_head_bytes: int = 0
+    # Digest of the head's config echo and tensor sizes; the signed plan
+    # carries it so every rank can prove it staged the same head.
+    mtp_head_sha256: str = ""
 
     def __post_init__(self) -> None:
         if self.fixed_weight_bytes < 0:
@@ -136,6 +144,15 @@ class ModelLayout:
             raise ValueError("tensor_parallel_kv_heads must be non-negative")
         if self.kv_bytes_per_token_per_layer < 0:
             raise ValueError("kv_bytes_per_token_per_layer must be non-negative")
+        if self.mtp_head_bytes < 0:
+            raise ValueError("mtp_head_bytes must be non-negative")
+        if self.mtp_head_sha256 and (
+            len(self.mtp_head_sha256) != 64
+            or any(
+                char not in "0123456789abcdef" for char in self.mtp_head_sha256
+            )
+        ):
+            raise ValueError("mtp_head_sha256 must be a lowercase SHA-256 digest")
         if self.tensor_parallel_kv_heads == 0:
             object.__setattr__(
                 self, "tensor_parallel_kv_heads", self.tensor_parallel_heads
@@ -180,6 +197,8 @@ class ModelLayout:
             "supports_pipeline": self.supports_pipeline,
             "kv_bytes_per_token_per_layer": self.kv_bytes_per_token_per_layer,
             "kv_replicated_across_tp": self.kv_replicated_across_tp,
+            "mtp_head_bytes": self.mtp_head_bytes,
+            "mtp_head_sha256": self.mtp_head_sha256,
         }
 
     @classmethod
@@ -225,6 +244,8 @@ class ModelLayout:
                     payload.get("supports_tensor_parallel", False)
                 ),
                 supports_pipeline=bool(payload.get("supports_pipeline", False)),
+                mtp_head_bytes=int(payload.get("mtp_head_bytes", 0)),
+                mtp_head_sha256=str(payload.get("mtp_head_sha256", "")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise PlanningError(f"model layout is malformed: {exc}") from exc
@@ -510,6 +531,120 @@ def _tensor_layer_index(name: str) -> int | None:
         if match := pattern.search(name):
             return int(match.group(1))
     return None
+
+
+def _is_mtp_head_tensor(
+    name: str,
+    layer_index: int | None,
+    declared_depth: int,
+) -> bool:
+    """Whether a checkpoint tensor belongs to the MTP draft head.
+
+    Two on-disk layouts exist. DeepSeek/GLM-style native checkpoints keep the
+    head as whole decoder layers at index ``num_hidden_layers`` and up
+    ("nextn"); converted Qwen3.5/3.6 checkpoints keep it under a root-level
+    ``mtp.`` prefix (default mlx-lm converters strip those; the PR 990 path
+    keeps them). Everything else is backbone or fixed weight.
+    """
+
+    if name.startswith("mtp."):
+        return True
+    return (
+        layer_index is not None
+        and declared_depth > 0
+        and layer_index >= declared_depth
+    )
+
+
+# Config echo mixed into the head digest: the fields the MTP patches read to
+# build the head. Two checkpoints whose heads differ in shape or count salt
+# differently even when tensor names coincide.
+_MTP_FINGERPRINT_CONFIG_KEYS = (
+    "model_type",
+    "num_hidden_layers",
+    "num_nextn_predict_layers",
+    "mtp_num_hidden_layers",
+    "mtp_config",
+)
+
+
+def _mtp_head_digest(
+    config: dict[str, Any],
+    mtp_tensors: list[list[Any]],
+) -> str:
+    """One digest over the head's config echo and every head tensor's size."""
+
+    payload = {key: config.get(key) for key in _MTP_FINGERPRINT_CONFIG_KEYS}
+    payload["tensors"] = sorted(mtp_tensors)
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def mtp_head_fingerprint(model_path: str | Path) -> str:
+    """Digest of a checkpoint's MTP head, read from safetensors headers only.
+
+    Every rank recomputes this from its own copy of the model and refuses to
+    serve when it disagrees with the signed plan, which is what makes "all
+    ranks loaded the same head" a checked fact rather than an assumption.
+    Returns "" when the checkpoint carries no MTP head tensors.
+    """
+
+    root = Path(model_path).expanduser()
+    if not root.is_dir():
+        raise PlanningError(f"model path is not a directory: {root}")
+    config = _model_config(root)
+    declared_depth = _config_int(config, "num_hidden_layers", 0)
+    mtp_tensors: list[list[Any]] = []
+    for weight_file in _model_weight_files(root):
+        header, payload_bytes = _safetensors_header(weight_file)
+        for name, spec in header.items():
+            if name == "__metadata__":
+                continue
+            if not isinstance(spec, dict):
+                raise PlanningError(f"invalid tensor metadata for {name}")
+            offsets = spec.get("data_offsets")
+            if (
+                not isinstance(offsets, list)
+                or len(offsets) != 2
+                or not all(
+                    isinstance(value, int) and not isinstance(value, bool)
+                    for value in offsets
+                )
+                or offsets[0] < 0
+                or offsets[1] < offsets[0]
+                or offsets[1] > payload_bytes
+            ):
+                raise PlanningError(f"invalid data offsets for tensor {name}")
+            if _is_mtp_head_tensor(
+                name, _tensor_layer_index(name), declared_depth
+            ):
+                mtp_tensors.append([name, offsets[1] - offsets[0]])
+    if not mtp_tensors:
+        return ""
+    return _mtp_head_digest(config, mtp_tensors)
+
+
+def _charge_mtp_head(model: ModelLayout) -> ModelLayout:
+    """Fold the MTP draft head into every rank's replicated fixed weights.
+
+    The patched ``Model.__init__`` attaches the head on every rank before
+    ``pipeline()`` trims the backbone, and mlx-lm's per-rank weight-file
+    selection keeps any parameter still on the model — so the head is
+    resident on every rank even though only the final stage (rank zero in
+    MLX-LM's convention) runs the draft/verify step. Charging it per rank is
+    what keeps the rank that hosts the head inside its admission budget.
+    """
+
+    if model.mtp_head_bytes <= 0:
+        raise PlanningError(
+            "mtp_enabled but the checkpoint has no MTP head tensors: the "
+            "converter stripped them, or the model has no MTP head at all"
+        )
+    return replace(
+        model,
+        fixed_weight_bytes=model.fixed_weight_bytes + model.mtp_head_bytes,
+    )
 
 
 def _activation_bytes_per_token(model_path: Path) -> int:
@@ -901,17 +1036,32 @@ def _model_weight_files(model_path: Path) -> tuple[Path, ...]:
     return tuple(files)
 
 
-def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
-    """Read only safetensors headers and total weights by transformer layer."""
+def inspect_safetensors_layout(
+    model_path: str | Path,
+    *,
+    mtp_enabled: bool = False,
+) -> ModelLayout:
+    """Read only safetensors headers and total weights by transformer layer.
+
+    With ``mtp_enabled`` the MTP draft-head tensors (root-level ``mtp.*``
+    names and nextn layers past the declared depth) are lifted out of the
+    fixed/layer buckets into ``mtp_head_bytes`` and digested into
+    ``mtp_head_sha256``; the plan functions then charge the head explicitly.
+    With it off every byte keeps its historical bucket, so MTP-bearing
+    checkpoints plan exactly as they always have.
+    """
 
     root = Path(model_path).expanduser()
     if not root.is_dir():
         raise PlanningError(f"model path is not a directory: {root}")
 
+    config = _model_config(root)
+    declared_depth = _config_int(config, "num_hidden_layers", 0)
     fixed_bytes = 0
     layer_sizes: dict[int, int] = {}
     tensor_names: set[str] = set()
     tensor_count = 0
+    mtp_tensors: list[list[Any]] = []
     for weight_file in _model_weight_files(root):
         header, payload_bytes = _safetensors_header(weight_file)
         intervals: list[tuple[int, int, str]] = []
@@ -940,7 +1090,11 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
                 intervals.append((offsets[0], offsets[1], name))
             tensor_bytes = offsets[1] - offsets[0]
             layer_index = _tensor_layer_index(name)
-            if layer_index is None:
+            if mtp_enabled and _is_mtp_head_tensor(
+                name, layer_index, declared_depth
+            ):
+                mtp_tensors.append([name, tensor_bytes])
+            elif layer_index is None:
                 fixed_bytes += tensor_bytes
             else:
                 layer_sizes[layer_index] = (
@@ -964,9 +1118,6 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
     # the runtime model never instantiates them. Counting them as decoder
     # layers put a stage boundary over weights that do not exist at runtime,
     # and the last stage failed activation with end_layer beyond the model.
-    declared_depth = _config_int(
-        _model_config(root), "num_hidden_layers", 0
-    )
     if declared_depth > 0 and max(layer_sizes) >= declared_depth:
         trimmed = {
             index: size
@@ -1004,10 +1155,22 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         kv_replicated_across_tp=_kv_cache_replicated_across_tp(
             _model_config(root)
         ),
+        mtp_head_bytes=(
+            sum(size for _name, size in mtp_tensors) if mtp_enabled else 0
+        ),
+        mtp_head_sha256=(
+            _mtp_head_digest(config, mtp_tensors)
+            if mtp_enabled and mtp_tensors
+            else ""
+        ),
     )
 
 
-def complete_model_layout(model_path: str | Path) -> ModelLayout:
+def complete_model_layout(
+    model_path: str | Path,
+    *,
+    mtp_enabled: bool = False,
+) -> ModelLayout:
     """Layout of a model this node holds in full, refusing one it holds part of.
 
     A pipeline rank keeps its own stage's shards and nothing else. Where the
@@ -1027,7 +1190,7 @@ def complete_model_layout(model_path: str | Path) -> ModelLayout:
     from omlx.utils.model_loading import maybe_apply_pre_load_patches
 
     maybe_apply_pre_load_patches(str(root))
-    layout = inspect_safetensors_layout(root)
+    layout = inspect_safetensors_layout(root, mtp_enabled=mtp_enabled)
     declared = _config_int(_model_config(root), "num_hidden_layers", 0)
     # Multi-token-prediction and draft heads add layers past the declared
     # depth, so only a shortfall means missing weights.
@@ -1045,6 +1208,17 @@ _REMOTE_LAYOUT_SNIPPET = (
     "print(json.dumps(complete_model_layout(sys.argv[1]).to_dict()))"
 )
 
+# Same read, with the MTP draft head lifted into its own accounting. A peer
+# running an oMLX build that predates the flag answers with a TypeError,
+# which surfaces as a PlanningError — the correct refusal, since an old peer
+# cannot measure what this plan must budget.
+_REMOTE_LAYOUT_MTP_SNIPPET = (
+    "import json,sys;"
+    "from omlx.cluster.planner import complete_model_layout;"
+    "print(json.dumps(complete_model_layout("
+    "sys.argv[1], mtp_enabled=True).to_dict()))"
+)
+
 
 def remote_model_layout(
     ssh_target: str,
@@ -1052,6 +1226,7 @@ def remote_model_layout(
     *,
     python_executable: str = DEFAULT_REMOTE_PYTHON,
     timeout: float = 600.0,
+    mtp_enabled: bool = False,
 ) -> ModelLayout:
     """Measure a model that lives on a peer, on the peer.
 
@@ -1063,7 +1238,7 @@ def remote_model_layout(
     try:
         payload = run_remote_python(
             ssh_target,
-            _REMOTE_LAYOUT_SNIPPET,
+            _REMOTE_LAYOUT_MTP_SNIPPET if mtp_enabled else _REMOTE_LAYOUT_SNIPPET,
             str(model_dir),
             description="read the model layout",
             python_executable=python_executable,
@@ -1318,11 +1493,16 @@ def plan_unequal_pipeline(
     workload_profile: ExecutionProfileName = "balanced",
     microbatch_size: int = 1,
     context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
+    mtp_enabled: bool = False,
 ) -> ShardPlan:
     """Assign contiguous layers in MLX pipeline order across unequal nodes."""
 
     if not nodes:
         raise ValueError("at least one node is required")
+    if mtp_enabled:
+        # The head attaches on every rank before the pipeline trim, so its
+        # bytes join the replicated fixed weights every node must fit.
+        model = _charge_mtp_head(model)
     if workload_profile not in {"interactive", "balanced", "throughput"}:
         raise ValueError("workload profile is invalid")
     if (
@@ -1677,6 +1857,7 @@ def plan_hybrid(
     workload_profile: ExecutionProfileName = "balanced",
     microbatch_size: int = 1,
     context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
+    mtp_enabled: bool = False,
 ) -> ShardPlan:
     """Plan hybrid pipeline + tensor parallelism across nodes.
 
@@ -1693,6 +1874,11 @@ def plan_hybrid(
 
     if not nodes:
         raise ValueError("at least one node is required")
+    if mtp_enabled:
+        # Same contract as plan_unequal_pipeline: the head is resident on
+        # every rank (each TP member included), so it joins the replicated
+        # fixed weights before any stage budget is derived.
+        model = _charge_mtp_head(model)
     if tensor_parallel_size < 1:
         raise ValueError("tensor_parallel_size must be at least 1")
     if len(nodes) % tensor_parallel_size != 0:

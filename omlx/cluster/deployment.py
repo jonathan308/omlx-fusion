@@ -8,6 +8,7 @@ import binascii
 import ipaddress
 import json
 import math
+import os
 import re
 import zlib
 from dataclasses import dataclass, field
@@ -22,6 +23,7 @@ from .performance import (
 )
 from .planner import (
     PipelineAssignment,
+    mtp_head_fingerprint,
     normalize_memory_guard_tier,
     normalize_node_role,
 )
@@ -35,6 +37,18 @@ _RDMA_DEVICE = re.compile(r"^rdma_[A-Za-z0-9_.-]+$")
 _NODE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _MAX_MODEL_ID_BYTES = 16 * 1024
 _MAX_PLAN_BYTES = 256 * 1024
+
+# Experimental MTP-over-pipeline opt-in, read on the coordinator. The plan,
+# budget, and rank-agreement machinery is complete, but the draft/verify loop
+# over live pipeline collectives is only verifiable on real hardware, so
+# every entry point refuses MTP intent unless the operator sets this.
+_CLUSTER_MTP_GATE_ENV = "OMLX_CLUSTER_MTP_ENABLED"
+
+
+def cluster_mtp_gate_enabled() -> bool:
+    """Whether the operator opted this coordinator into cluster MTP."""
+
+    return os.environ.get(_CLUSTER_MTP_GATE_ENV, "").strip() == "1"
 
 RDMAPath = str | tuple[str, ...] | None
 
@@ -249,6 +263,13 @@ class ClusterDeployment:
     performance_profiles: tuple[NodePerformanceProfile, ...] = ()
     tensor_parallel_size: int = 1
     target_context_tokens: int = 8192
+    # Rank-agreed MTP intent. When True every rank attaches the checkpoint's
+    # MTP draft head and verifies its copy against ``mtp_head_sha256`` before
+    # serving, so ranks cannot drift on enablement or on which head they
+    # loaded. Draft depth resolves from the shared config.json on each rank,
+    # identically by construction.
+    mtp_enabled: bool = False
+    mtp_head_sha256: str = ""
 
     def __post_init__(self) -> None:
         if _NODE_ID.fullmatch(self.deployment_id) is None:
@@ -290,6 +311,21 @@ class ClusterDeployment:
             char not in "0123456789abcdef" for char in self.plan_hash
         ):
             raise ValueError("plan_hash must be a lowercase SHA-256 digest")
+        if not isinstance(self.mtp_enabled, bool):
+            raise ValueError("mtp_enabled must be a boolean")
+        if self.mtp_head_sha256 and (
+            len(self.mtp_head_sha256) != 64
+            or any(
+                char not in "0123456789abcdef" for char in self.mtp_head_sha256
+            )
+        ):
+            raise ValueError("mtp_head_sha256 must be a lowercase SHA-256 digest")
+        if self.mtp_enabled and not self.mtp_head_sha256:
+            raise ValueError(
+                "an MTP-enabled deployment requires the head fingerprint"
+            )
+        if self.mtp_head_sha256 and not self.mtp_enabled:
+            raise ValueError("MTP head fingerprint without mtp_enabled")
 
         assignments = sorted(self.assignments, key=lambda item: item.rank)
         if [item.rank for item in assignments] != list(range(len(self.hosts))):
@@ -388,6 +424,8 @@ class ClusterDeployment:
             ],
             "tensor_parallel_size": self.tensor_parallel_size,
             "target_context_tokens": self.target_context_tokens,
+            "mtp_enabled": self.mtp_enabled,
+            "mtp_head_sha256": self.mtp_head_sha256,
         }
 
     @classmethod
@@ -429,6 +467,8 @@ class ClusterDeployment:
             ),
             tensor_parallel_size=int(payload.get("tensor_parallel_size", 1)),
             target_context_tokens=int(payload.get("target_context_tokens", 8192)),
+            mtp_enabled=bool(payload.get("mtp_enabled", False)),
+            mtp_head_sha256=str(payload.get("mtp_head_sha256", "")),
         )
 
     def encode_worker_plan(self) -> str:
