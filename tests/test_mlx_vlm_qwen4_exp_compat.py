@@ -199,6 +199,83 @@ def test_qwen4_decode_profiler_reports_synchronized_model_stages(
     assert "outer+logits=" in message
 
 
+def test_qwen4_coarse_profiler_is_exclusive_and_sparse(monkeypatch):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    import mlx_vlm.models.qwen4_exp.language as language
+
+    model = SimpleNamespace(fa_idx=0)
+    cache = [SimpleNamespace(offset=12)]
+    inputs = mx.array([[3]], dtype=mx.int32)
+    monkeypatch.setattr(language, "_COARSE_PROFILE_CALLS", 0)
+    monkeypatch.setattr(
+        language,
+        "_MTP_RUNTIME",
+        language.Qwen4ExpMTPRuntime(enabled=False),
+    )
+    monkeypatch.delenv("OMLX_QWEN4_DECODE_PROFILE", raising=False)
+    monkeypatch.setenv("OMLX_QWEN4_DECODE_COARSE_PROFILE", "1")
+    monkeypatch.setenv("OMLX_QWEN4_DECODE_COARSE_PROFILE_WARMUP", "0")
+    monkeypatch.setenv("OMLX_QWEN4_DECODE_COARSE_PROFILE_INTERVAL", "2")
+
+    first = language._new_coarse_profile_sample(
+        model, inputs, None, None, cache, {}
+    )
+    skipped = language._new_coarse_profile_sample(
+        model, inputs, None, None, cache, {}
+    )
+    third = language._new_coarse_profile_sample(
+        model, inputs, None, None, cache, {}
+    )
+    assert first is not None
+    assert skipped is None
+    assert third is not None
+
+    monkeypatch.setenv("OMLX_QWEN4_DECODE_PROFILE", "1")
+    assert (
+        language._new_coarse_profile_sample(
+            model, inputs, None, None, cache, {}
+        )
+        is None
+    )
+
+
+def test_qwen4_coarse_profiler_reports_graph_build_and_final_eval(
+    monkeypatch, caplog
+):
+    config = _tiny_config()
+    config.text_config.ple_layer_ids = []
+    import mlx_vlm.models.qwen4_exp.language as language
+
+    monkeypatch.setattr(language, "_COARSE_PROFILE_CALLS", 0)
+    monkeypatch.setattr(
+        language,
+        "_MTP_RUNTIME",
+        language.Qwen4ExpMTPRuntime(enabled=False),
+    )
+    monkeypatch.delenv("OMLX_QWEN4_DECODE_PROFILE", raising=False)
+    monkeypatch.delenv("OMLX_QWEN4_DECODE_COARSE_PROFILE", raising=False)
+    model = language.LanguageModel(config.text_config, config)
+    cache = model.make_cache()
+    prefix = model(mx.array([[2, 3, 4, 5, 6, 7, 8, 9, 10, 11]]), cache=cache)
+    mx.eval(prefix.logits)
+
+    monkeypatch.setenv("OMLX_QWEN4_DECODE_COARSE_PROFILE", "1")
+    monkeypatch.setenv("OMLX_QWEN4_DECODE_COARSE_PROFILE_WARMUP", "0")
+    monkeypatch.setenv("OMLX_QWEN4_DECODE_COARSE_PROFILE_INTERVAL", "1")
+    with caplog.at_level("INFO", logger=language.__name__):
+        output = model(mx.array([[12]]), cache=cache)
+        mx.eval(output.logits)
+
+    message = next(
+        record.message
+        for record in caplog.records
+        if "[qwen4-decode-coarse]" in record.message
+    )
+    assert "context=10" in message
+    assert "graph_build=" in message
+    assert "final_eval=" in message
+
+
 @pytest.mark.parametrize("quantized", [False, True])
 def test_qwen4_hyper_connection_fusion_and_compile_are_bit_exact(quantized):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()

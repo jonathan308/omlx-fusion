@@ -43,6 +43,8 @@ _HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
 _DECODE_PROFILE_LOCAL = threading.local()
 _DECODE_PROFILE_LOCK = threading.Lock()
 _DECODE_PROFILE_CALLS = 0
+_COARSE_PROFILE_LOCK = threading.Lock()
+_COARSE_PROFILE_CALLS = 0
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +70,12 @@ class _Qwen4DecodeProfileSample:
 
     def milliseconds(self, stage: str) -> float:
         return self.stage_ns.get(stage, 0) / 1_000_000.0
+
+
+class _Qwen4CoarseProfileSample:
+    def __init__(self, call_index: int, context_tokens: int):
+        self.call_index = call_index
+        self.context_tokens = context_tokens
 
 
 def _decode_profile_int(name: str, default: int, minimum: int) -> int:
@@ -123,6 +131,45 @@ def _new_decode_profile_sample(model, inputs, inputs_embeds, mask, cache, kwargs
     if call_index <= warmup or (call_index - warmup - 1) % interval:
         return None
     return _Qwen4DecodeProfileSample(call_index, context_tokens)
+
+
+def _new_coarse_profile_sample(model, inputs, inputs_embeds, mask, cache, kwargs):
+    """Sample normal lazy graph construction separately from its final eval."""
+
+    if (
+        os.environ.get("OMLX_QWEN4_DECODE_COARSE_PROFILE", "0") != "1"
+        or _decode_profile_enabled()
+        or get_mtp_runtime().enabled
+    ):
+        return None
+    if not (
+        isinstance(inputs, mx.array)
+        and inputs.ndim == 2
+        and inputs.shape == (1, 1)
+        and inputs_embeds is None
+        and (mask is None or (isinstance(mask, str) and mask == "causal"))
+        and not kwargs.get("return_hidden", False)
+        and kwargs.get("capture_layer_ids") is None
+        and not kwargs.get("skip_logits", False)
+    ):
+        return None
+    context_tokens = _decode_profile_context_tokens(model, cache)
+    if context_tokens is None:
+        return None
+
+    global _COARSE_PROFILE_CALLS
+    with _COARSE_PROFILE_LOCK:
+        _COARSE_PROFILE_CALLS += 1
+        call_index = _COARSE_PROFILE_CALLS
+    warmup = _decode_profile_int(
+        "OMLX_QWEN4_DECODE_COARSE_PROFILE_WARMUP", 8, 0
+    )
+    interval = _decode_profile_int(
+        "OMLX_QWEN4_DECODE_COARSE_PROFILE_INTERVAL", 16, 1
+    )
+    if call_index <= warmup or (call_index - warmup - 1) % interval:
+        return None
+    return _Qwen4CoarseProfileSample(call_index, context_tokens)
 
 
 def _profile_eval(value) -> None:
@@ -186,6 +233,22 @@ def _log_decode_profile(sample: _Qwen4DecodeProfileSample, total_ns: int) -> Non
         sample.milliseconds("mlp_residual"),
         sample.milliseconds("final_hc"),
         model_unaccounted_ms,
+    )
+
+
+def _log_coarse_profile(
+    sample: _Qwen4CoarseProfileSample,
+    build_ns: int,
+    eval_ns: int,
+) -> None:
+    logger.info(
+        "[qwen4-decode-coarse] ordinary lazy path call=%d context=%d "
+        "graph_build=%.3fms final_eval=%.3fms total=%.3fms",
+        sample.call_index,
+        sample.context_tokens,
+        build_ns / 1_000_000.0,
+        eval_ns / 1_000_000.0,
+        (build_ns + eval_ns) / 1_000_000.0,
     )
 
 
@@ -2796,16 +2859,33 @@ class LanguageModel(Qwen3_5LanguageModel):
             cache,
             kwargs,
         )
+        coarse_profile = _new_coarse_profile_sample(
+            self.model,
+            inputs,
+            inputs_embeds,
+            mask,
+            cache,
+            kwargs,
+        )
         previous_profile = _current_decode_profile()
         if profile is not None:
             mx.synchronize()
             outer_started = time.perf_counter_ns()
             _DECODE_PROFILE_LOCAL.sample = profile
+        elif coarse_profile is not None:
+            mx.synchronize()
+            build_started = time.perf_counter_ns()
         try:
             output = super().__call__(inputs, inputs_embeds, mask, cache, **kwargs)
             if profile is not None:
                 _profile_eval(output.logits)
                 total_ns = time.perf_counter_ns() - outer_started
+            elif coarse_profile is not None:
+                build_ns = time.perf_counter_ns() - build_started
+                eval_started = time.perf_counter_ns()
+                mx.eval(output.logits)
+                mx.synchronize()
+                eval_ns = time.perf_counter_ns() - eval_started
         finally:
             if profile is not None:
                 if previous_profile is None:
@@ -2816,6 +2896,8 @@ class LanguageModel(Qwen3_5LanguageModel):
             output.hidden_states = [output.hidden_states[0]]
         if profile is not None:
             _log_decode_profile(profile, total_ns)
+        elif coarse_profile is not None:
+            _log_coarse_profile(coarse_profile, build_ns, eval_ns)
         return output
 
     def mtp_forward(
