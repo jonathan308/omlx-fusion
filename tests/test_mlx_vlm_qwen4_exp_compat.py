@@ -277,7 +277,7 @@ def test_qwen4_coarse_profiler_reports_graph_build_and_final_eval(
 
 
 @pytest.mark.parametrize("quantized", [False, True])
-def test_qwen4_hyper_connection_fusion_and_compile_are_bit_exact(quantized):
+def test_qwen4_small_hyper_connection_fusion_fails_closed(quantized):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import (
         Qwen4ExpGatedResidual,
@@ -304,15 +304,15 @@ def test_qwen4_hyper_connection_fusion_and_compile_are_bit_exact(quantized):
     verify_eager = module(inputs, target_verify=True)
     mx.eval(*eager, *verify_eager)
 
-    assert fuse_hyper_connection_projections(module) == 1
+    assert fuse_hyper_connection_projections(module) == 0
     assert fuse_hyper_connection_projections(module) == 0
     fused = module(inputs)
     verify_fused = module(inputs, target_verify=True)
     mx.eval(*fused, *verify_fused)
 
-    assert hasattr(module, "input_inject_weight")
-    assert not hasattr(module, "input_mix_weight_down")
-    assert not hasattr(module, "block_inject_weight")
+    assert not hasattr(module, "input_inject_weight")
+    assert hasattr(module, "input_mix_weight_down")
+    assert hasattr(module, "block_inject_weight")
     for expected, actual in zip(eager, fused):
         assert mx.array_equal(expected, actual).item()
     for expected, actual in zip(verify_eager, verify_fused):
@@ -456,7 +456,10 @@ def test_qwen4_exp_load_enables_hyper_connection_optimizations(monkeypatch, capl
     fuse.assert_called_once_with(model)
     fuse_ple.assert_called_once_with(model)
     compile_connections.assert_called_once_with(model)
-    assert "96 fused projection pairs, 97 compiled decode paths" in caplog.text
+    assert (
+        "96 exact hybrid projection pairs, 97 compiled decode paths"
+        in caplog.text
+    )
     assert "Fused 1 resident Qwen4-Exp PLE table" in caplog.text
 
 
@@ -490,8 +493,11 @@ def test_qwen4_exp_load_skips_projection_fusion_during_mtp_verify(
     fuse.assert_not_called()
     fuse_ple.assert_called_once_with(model)
     compile_connections.assert_called_once_with(model)
-    assert "Skipped Qwen4-Exp hyper-connection projection fusion" in caplog.text
-    assert "0 fused projection pairs, 100 compiled decode paths" in caplog.text
+    assert "Skipped Qwen4-Exp exact hybrid projections" in caplog.text
+    assert (
+        "0 exact hybrid projection pairs, 100 compiled decode paths"
+        in caplog.text
+    )
 
 
 def test_qwen4_exp_sanitize_keeps_converted_norm_values():

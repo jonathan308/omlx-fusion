@@ -261,18 +261,18 @@ class Model(Qwen3_5Model):
     def load_weights(self, weights, strict=True):
         result = super().load_weights(weights, strict=strict)
         mtp_enabled = get_mtp_runtime().enabled
-        fused = 0 if mtp_enabled else fuse_hyper_connection_projections(self)
+        hybrid = 0 if mtp_enabled else fuse_hyper_connection_projections(self)
         fused_ple = fuse_resident_ple_embeddings(self)
         compiled = compile_hyper_connections(self)
         if mtp_enabled:
             logger.info(
-                "Skipped Qwen4-Exp hyper-connection projection fusion while "
+                "Skipped Qwen4-Exp exact hybrid projections while "
                 "Lightning MTP target verification is enabled"
             )
         logger.info(
             "Enabled Qwen4-Exp hyper-connection optimizations: "
-            "%d fused projection pairs, %d compiled decode paths",
-            fused,
+            "%d exact hybrid projection pairs, %d compiled decode paths",
+            hybrid,
             compiled,
         )
         if fused_ple:

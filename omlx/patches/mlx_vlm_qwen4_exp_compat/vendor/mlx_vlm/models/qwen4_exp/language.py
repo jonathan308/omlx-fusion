@@ -1588,15 +1588,37 @@ class Qwen4ExpGatedResidual(nn.Module):
             compiled_forward is not None
             and not target_verify
             and hyper_input.ndim == 3
-            and hyper_input.shape[-2] == 1
+            and hyper_input.shape[:2] == (1, 1)
+            and hyper_input.dtype == mx.bfloat16
+            and not get_mtp_runtime().enabled
         ):
             return compiled_forward(hyper_input)
         return self._forward(hyper_input, target_verify=target_verify)
 
     def _forward(self, hyper_input: mx.array, target_verify: bool = False):
         normed = self.hc_norm(hyper_input)
+        hybrid = None
+        if (
+            getattr(self, "_omlx_exact_hybrid_projection", False)
+            and not target_verify
+            and hyper_input.shape == (1, 1, 10240)
+            and hyper_input.dtype == mx.bfloat16
+            and not get_mtp_runtime().enabled
+        ):
+            from .hc_projection import hybrid_projection
+
+            hybrid = hybrid_projection(
+                normed,
+                self.input_mix_weight_down,
+                self.block_inject_weight,
+            )
         input_inject_weight = getattr(self, "input_inject_weight", None)
-        if input_inject_weight is None:
+        if hybrid is not None:
+            mix = hybrid[..., : self.hc_lowrank]
+            block_injection = hybrid[
+                ..., self.hc_lowrank : self.hc_lowrank + self.hc_count
+            ]
+        elif input_inject_weight is None:
             mix = _target_verify_linear(
                 self.input_mix_weight_down, normed, target_verify
             )
@@ -1672,7 +1694,11 @@ def _can_fuse_hyper_connection(module: Qwen4ExpGatedResidual) -> bool:
     """Fail closed unless both projections have identical MLX semantics."""
     if type(module) is not Qwen4ExpGatedResidual:
         return False
-    if hasattr(module, "input_inject_weight") or hasattr(module, "_compiled_forward"):
+    if (
+        hasattr(module, "input_inject_weight")
+        or hasattr(module, "_compiled_forward")
+        or getattr(module, "_omlx_exact_hybrid_projection", False)
+    ):
         return False
 
     down = getattr(module, "input_mix_weight_down", None)
@@ -1697,6 +1723,21 @@ def _can_fuse_hyper_connection(module: Qwen4ExpGatedResidual) -> bool:
     )
 
 
+def _can_prepare_exact_hybrid(module: Qwen4ExpGatedResidual) -> bool:
+    if not (
+        module.hc_count == 4
+        and module.hidden_size == 2560
+        and module.hc_lowrank == 320
+    ):
+        return False
+    from .hc_projection import compatible_projections
+
+    return compatible_projections(
+        module.input_mix_weight_down,
+        module.block_inject_weight,
+    )
+
+
 def _unique_hyper_connections(model: nn.Module):
     modules = [model]
     modules.extend(module for _, module in model.named_modules() if module is not model)
@@ -1710,27 +1751,21 @@ def _unique_hyper_connections(model: nn.Module):
 
 
 def fuse_hyper_connection_projections(model: nn.Module) -> int:
-    """Fuse compatible low-rank and injection projections row-wise."""
+    """Prepare the lossless one-dispatch Qwen4 decode projection.
+
+    The tempting 324-row concatenation was rejected because MLX changes its
+    QMV traversal at that width and can change raw BF16 outputs.  The raw
+    320-row low-rank and four-row injection banks deliberately remain separate
+    so every fallback retains the checkpoint's canonical two projections.
+    """
     targets = [
         module
         for module in _unique_hyper_connections(model)
         if _can_fuse_hyper_connection(module)
+        and _can_prepare_exact_hybrid(module)
     ]
     for module in targets:
-        down = module.input_mix_weight_down
-        injection = module.block_inject_weight
-        fused = {"weight": mx.concatenate([down.weight, injection.weight], axis=0)}
-        for name in ("scales", "biases", "bias"):
-            if hasattr(down, name) and getattr(down, name) is not None:
-                fused[name] = mx.concatenate(
-                    [getattr(down, name), getattr(injection, name)], axis=0
-                )
-        mx.eval(*fused.values())
-        for name, value in fused.items():
-            setattr(down, name, value)
-        module.input_inject_weight = down
-        del module.input_mix_weight_down
-        del module.block_inject_weight
+        module._omlx_exact_hybrid_projection = True
     return len(targets)
 
 
