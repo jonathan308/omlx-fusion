@@ -510,6 +510,37 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
     def model_type(self) -> str | None:
         return self._model_type_str
 
+    @property
+    def supports_tool_calling(self) -> bool:
+        """Expose the GLM native tool dialect on the DFlash lane."""
+        return bool(
+            self._model_type_str == "glm5_next"
+            and getattr(self._tokenizer_obj, "has_tool_calling", False)
+            and getattr(self._tokenizer_obj, "tool_parser", None) is not None
+        )
+
+    def _install_glm_tool_parser(self) -> None:
+        """Install mlx-lm's GLM47 parser on both DFlash tokenizer copies."""
+        if self._model_type_str != "glm5_next":
+            return
+        try:
+            from mlx_lm.tool_parsers.glm47 import (
+                parse_tool_call,
+                tool_call_end,
+                tool_call_start,
+            )
+        except ImportError as exc:
+            logger.warning("GLM tool parser unavailable on DFlash lane: %s", exc)
+            return
+        for tokenizer in (self._tokenizer_obj, self._executor_tokenizer):
+            if tokenizer is None:
+                continue
+            tokenizer.has_tool_calling = True
+            tokenizer.tool_call_start = tool_call_start
+            tokenizer.tool_call_end = tool_call_end
+            tokenizer.tool_parser = parse_tool_call
+        logger.info("GLM DFlash tool calling enabled: parser=glm47")
+
     def _acquire_wired_limit(self) -> None:
         """Mirror BatchGenerator's recommended working-set wired limit."""
         if self._wired_limit_owned or not mx.metal.is_available():
@@ -814,6 +845,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             self._model_type_str = config.get("model_type")
         elif hasattr(config, "model_type"):
             self._model_type_str = config.model_type
+
+        self._install_glm_tool_parser()
 
         self._pairing_warning = check_draft_target_precision_pairing(
             self._model_name,

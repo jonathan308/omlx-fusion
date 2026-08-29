@@ -1990,6 +1990,15 @@ class TestDFlashLoadWarmup:
         engine._target_ops.backend_name = "qwen"
         assert engine._requires_load_warmup() is False
 
+    def test_glm_dflash_exposes_tool_parser_capability(self):
+        engine = self._engine()
+        engine._tokenizer_obj = engine._executor_tokenizer
+        engine._model_type_str = "glm5_next"
+        engine._install_glm_tool_parser()
+        assert engine.supports_tool_calling is True
+        assert engine._tokenizer_obj.tool_call_start == "<tool_call>"
+        assert engine._tokenizer_obj.tool_call_end == "</tool_call>"
+
     def test_warmup_prompt_excludes_stop_and_suppress_tokens(self):
         engine = self._engine()
         prompt = engine._build_load_warmup_prompt_tokens(prompt_len=6)
