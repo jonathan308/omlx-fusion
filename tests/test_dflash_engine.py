@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for DFlash engine integration."""
 
+import asyncio
 import json
+import threading
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -170,6 +172,183 @@ class TestDFlashModelSettings:
 class TestDFlashEngineInit:
     """Test DFlashEngine initialization and configuration."""
 
+    def test_stop_ids_union_scalar_list_eot_and_generation_config(self):
+        from omlx.engine.dflash import _get_dflash_stop_token_ids
+
+        tokenizer = SimpleNamespace(
+            eos_token_id=[3, 4],
+            eos_token_ids=2,
+            eot_token_id=[4, 5],
+        )
+
+        assert _get_dflash_stop_token_ids(tokenizer, {2, 5, 6}) == [2, 3, 4, 5, 6]
+
+    def test_stop_ids_encode_eot_string_when_id_is_missing(self):
+        from omlx.engine.dflash import _get_dflash_stop_token_ids
+
+        encode = MagicMock(return_value=[7, 8])
+        tokenizer = SimpleNamespace(
+            eos_token_id=2,
+            eos_token_ids=None,
+            eot_token="<eot>",
+            encode=encode,
+        )
+
+        assert _get_dflash_stop_token_ids(tokenizer) == [2, 7, 8]
+        encode.assert_called_once_with("<eot>", add_special_tokens=False)
+
+    def test_stop_ids_are_unique_and_ignore_boolean_metadata(self):
+        from omlx.engine.dflash import _get_dflash_stop_token_ids
+
+        tokenizer = SimpleNamespace(
+            eos_token_id=[2, 2, True],
+            eos_token_ids=[2, 3, False],
+            eot_token_id=3,
+        )
+
+        assert _get_dflash_stop_token_ids(tokenizer, {3, 4}) == [2, 3, 4]
+
+    def test_wired_limit_uses_recommended_working_set_and_is_idempotent(
+        self, monkeypatch
+    ):
+        from omlx.engine import dflash as dflash_mod
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine("target", "draft")
+        calls = []
+        synchronized = []
+        monkeypatch.setattr(dflash_mod.mx.metal, "is_available", lambda: True)
+        monkeypatch.setattr(
+            dflash_mod.mx,
+            "device_info",
+            lambda: {
+                "max_recommended_working_set_size": 96,
+                "memory_size": 256,
+            },
+        )
+
+        def set_wired_limit(value):
+            calls.append(value)
+            return 41
+
+        monkeypatch.setattr(dflash_mod.mx, "set_wired_limit", set_wired_limit)
+        monkeypatch.setattr(
+            dflash_mod.mx,
+            "synchronize",
+            lambda: synchronized.append(True),
+        )
+
+        engine._acquire_wired_limit()
+        engine._acquire_wired_limit()
+        assert calls == [96]
+        assert engine._old_wired_limit == 41
+        assert engine._wired_limit_owned is True
+
+        assert engine._restore_wired_limit() is True
+        assert engine._restore_wired_limit() is False
+        assert calls == [96, 41]
+        assert synchronized == [True]
+
+    def test_wired_limit_restores_when_start_loader_fails(self, monkeypatch):
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine("target", "draft")
+        events = []
+
+        def acquire():
+            engine._wired_limit_owned = True
+            events.append("acquire")
+
+        def restore():
+            engine._wired_limit_owned = False
+            events.append("restore")
+            return True
+
+        monkeypatch.setattr(engine, "_acquire_wired_limit", acquire)
+        monkeypatch.setattr(engine, "_restore_wired_limit", restore)
+
+        def fail_load():
+            events.append("load")
+            raise RuntimeError("load failed")
+
+        with pytest.raises(RuntimeError, match="load failed"):
+            engine._load_with_wired_limit(fail_load)
+        assert events == ["acquire", "load", "restore"]
+
+    @pytest.mark.asyncio
+    async def test_start_restores_wired_limit_after_finalize_failure(
+        self, monkeypatch
+    ):
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine("target", "draft")
+        monkeypatch.setattr(
+            engine,
+            "_start_impl",
+            AsyncMock(side_effect=RuntimeError("finalize failed")),
+        )
+        restore = AsyncMock(return_value=True)
+        monkeypatch.setattr(engine, "_restore_wired_limit_async", restore)
+
+        with pytest.raises(RuntimeError, match="finalize failed"):
+            await engine.start()
+        restore.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_wired_limit_restores_before_fallback_teardown(self, monkeypatch):
+        from dflash_mlx.cache import manager as cache_manager
+
+        from omlx.engine import dflash as dflash_mod
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine("target", "draft")
+        restore = AsyncMock(return_value=True)
+        monkeypatch.setattr(engine, "_restore_wired_limit_async", restore)
+        monkeypatch.setattr(dflash_mod.mx, "get_active_memory", lambda: 0)
+
+        def stop_after_restore():
+            raise RuntimeError("stop after restore")
+
+        monkeypatch.setattr(
+            cache_manager,
+            "shutdown_runtime_cache_manager",
+            stop_after_restore,
+        )
+
+        with pytest.raises(RuntimeError, match="stop after restore"):
+            await engine._evict_dflash_and_start_fallback()
+        restore.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_double_stop_restores_wired_limit_once(self, monkeypatch):
+        from dflash_mlx.cache import manager as cache_manager
+
+        from omlx import engine_core
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine("target", "draft")
+        engine._wired_limit_owned = True
+        restores = []
+
+        def restore():
+            if not engine._wired_limit_owned:
+                return False
+            engine._wired_limit_owned = False
+            restores.append(True)
+            return True
+
+        monkeypatch.setattr(engine, "_restore_wired_limit", restore)
+        monkeypatch.setattr(engine_core, "get_mlx_executor", lambda: None)
+        monkeypatch.setattr(
+            cache_manager,
+            "shutdown_runtime_cache_manager",
+            lambda: None,
+        )
+
+        await engine.stop()
+        await engine.stop()
+        assert restores == [True]
+
     def test_import_without_dflash_mlx(self):
         from omlx.engine import DFlashEngine  # noqa: F401
 
@@ -319,15 +498,23 @@ class TestDFlashEngineInit:
             model_settings=ModelSettings(dflash_block_size=5),
         )
         target_model = object()
-        target_ops = object()
+        target_ops = SimpleNamespace(backend_name="glm5_next")
         snapshot = object()
         engine._target_model = target_model
         engine._target_ops = target_ops
-        engine._executor_tokenizer = object()
+        # GLM tokenizers expose eos_token_ids as a scalar; the oMLX boundary
+        # normalizes it without mutating the tokenizer.
+        engine._executor_tokenizer = SimpleNamespace(
+            eos_token_ids=2,
+            eos_token_id=[3, 4],
+            eot_token_id=[4, 5],
+        )
         engine._draft_model = object()
         engine._draft_backend = object()
         engine._runtime_context = object()
         engine._suppress_token_ids = {258883, 258882}
+        engine._generation_config_eos = {5, 6}
+        engine._output_parser_factory = SimpleNamespace(stop_token_ids={99})
 
         fake_flow = SimpleNamespace(
             snapshot=snapshot,
@@ -347,8 +534,6 @@ class TestDFlashEngineInit:
         monkeypatch.setattr(
             PrefixCacheFlow, "for_request", classmethod(fake_for_request)
         )
-        monkeypatch.setattr(dflash_runtime, "get_stop_token_ids", lambda tokenizer: [2])
-
         def fake_stream_dflash_generate(**kwargs):
             captured.update(kwargs)
             return iter(())
@@ -371,10 +556,12 @@ class TestDFlashEngineInit:
         )
 
         assert list(event_iter) == []
-        assert stop_ids == [2]
+        assert stop_ids == [2, 3, 4, 5, 6]
+        assert 99 not in captured["stop_token_ids"]
         assert captured["suppress_token_ids"] == [258882, 258883]
         assert captured["prefix_snapshot"] is snapshot
         assert captured["prefix_hit_kind"] == "l2_prefix"
+        assert captured["publish_generation_snapshot"] is False
         assert captured["temperature"] == 1.0
         assert captured["top_p"] == 0.95
         assert captured["top_k"] == 20
@@ -492,10 +679,20 @@ class TestDFlashEngineInit:
             "apply_qwen35_moe_gate_up_fusion",
             lambda model: captured.setdefault("fused_target", model),
         )
+        generation_config_calls = []
+
+        def fake_generation_config_token_ids(model_ref, key):
+            generation_config_calls.append((model_ref, key))
+            return {
+                "eos_token_id": {1, 2},
+                "eos_token_ids": {2, 3},
+                "suppress_tokens": set(),
+            }[key]
+
         monkeypatch.setattr(
             dflash_mod,
             "load_generation_config_token_ids",
-            lambda *args, **kwargs: set(),
+            fake_generation_config_token_ids,
         )
         monkeypatch.setattr(
             dflash_mod, "detect_output_parser", lambda *args, **kwargs: None
@@ -520,8 +717,15 @@ class TestDFlashEngineInit:
             assert captured["bound_target_ops"] is engine._target_ops
             assert engine._draft_window_size == 2048
             assert engine._runtime_context.runtime.draft_window_size == 2048
+            assert engine._generation_config_eos == {1, 2, 3}
+            assert generation_config_calls == [
+                ("fake-target", "eos_token_id"),
+                ("fake-target", "eos_token_ids"),
+                ("fake-target", "suppress_tokens"),
+            ]
         finally:
             await engine.stop()
+        assert engine._generation_config_eos == set()
 
     def test_should_fallback_unlimited_when_max_ctx_none(self):
         """A None threshold means dflash handles every prompt size."""
@@ -1331,6 +1535,120 @@ class TestDFlashOutputParserWiring:
         ]
         return engine, create_with_tools, tools, tool_calls
 
+    def _parser_stop_engine(self):
+        events = pytest.importorskip("dflash_mlx.engine.events")
+
+        from omlx.engine.dflash import DFlashEngine
+
+        class TrackingIterator:
+            def __init__(self, values):
+                self._values = iter(values)
+                self.next_calls = 0
+                self.close_calls = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.next_calls += 1
+                return next(self._values)
+
+            def close(self):
+                self.close_calls += 1
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(),
+        )
+        engine._loaded = True
+        engine._tokenizer_obj = SimpleNamespace(
+            encode=lambda text: [1, 2],
+            decode=lambda tokens, **kwargs: "".join(str(token) for token in tokens),
+        )
+        engine._executor_tokenizer = engine._tokenizer_obj
+        engine._should_fallback = lambda tokens: False
+        engine._detect_needs_think_prefix = lambda tokens: False
+
+        tool_calls = [
+            {
+                "name": "internal_search",
+                "arguments": '{"query":"maintenance contract"}',
+            }
+        ]
+        parser_session = MagicMock()
+
+        def process_token(token_id):
+            if token_id == 7:
+                return SimpleNamespace(
+                    stream_text="<think>streamed",
+                    visible_text="visible",
+                    is_stop=False,
+                    record_token=True,
+                )
+            if token_id == 8:
+                return SimpleNamespace(
+                    stream_text="",
+                    visible_text="",
+                    is_stop=True,
+                    record_token=False,
+                )
+            pytest.fail(f"parser processed token after stop: {token_id}")
+
+        parser_session.process_token.side_effect = process_token
+        parser_session.finalize.return_value = SimpleNamespace(
+            stream_text="</think>",
+            visible_text="-tail",
+            output_text_prefix="PREFIX:",
+            tool_calls=tool_calls,
+            finish_reason="tool_calls",
+        )
+        engine._output_parser_factory = SimpleNamespace(
+            create_session=MagicMock(return_value=parser_session),
+            create_session_with_tools=None,
+        )
+
+        token_1 = events.TokenEvent(
+            token_id=7,
+            generated_tokens=1,
+            acceptance_ratio=0.5,
+            cycles_completed=1,
+        )
+        stop_token = events.TokenEvent(
+            token_id=8,
+            generated_tokens=2,
+            acceptance_ratio=0.5,
+            cycles_completed=2,
+        )
+        forbidden_token = events.TokenEvent(
+            token_id=9,
+            generated_tokens=3,
+            acceptance_ratio=0.5,
+            cycles_completed=3,
+        )
+        summary = events.SummaryEvent(
+            elapsed_us=1000,
+            prompt_token_count=2,
+            generated_token_ids=(7, 8, 9),
+            generation_tokens=3,
+            accepted_from_draft=0,
+            acceptance_ratio=0.5,
+            cycles_completed=3,
+            phase_timings_us={},
+        )
+        event_iter = TrackingIterator([token_1, stop_token, forbidden_token, summary])
+        engine._stream_dflash_events = MagicMock(
+            return_value=(
+                event_iter,
+                SimpleNamespace(hit_tokens=0),
+                [],
+            )
+        )
+        cache_manager = object()
+        engine._begin_runtime_cache_request = MagicMock(return_value=cache_manager)
+        engine._end_runtime_cache_request = MagicMock()
+        return engine, parser_session, event_iter, cache_manager, tool_calls
+
     @pytest.mark.asyncio
     async def test_non_streaming_propagates_parser_tool_calls(self):
         engine, create_with_tools, tools, tool_calls = self._tool_parser_engine()
@@ -1360,6 +1678,157 @@ class TestDFlashOutputParserWiring:
         assert outputs[0].tool_calls == tool_calls
         assert outputs[0].finish_reason == "tool_calls"
         assert outputs[0].completion_tokens == 1
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_parser_stop_closes_iterator_and_keeps_clean_output(
+        self,
+    ):
+        engine, parser, event_iter, cache_manager, tool_calls = (
+            self._parser_stop_engine()
+        )
+
+        output = await engine.generate([1, 2])
+
+        assert parser.process_token.call_args_list == [((7,),), ((8,),)]
+        parser.finalize.assert_called_once_with()
+        assert event_iter.next_calls == 2
+        assert event_iter.close_calls == 1
+        engine._end_runtime_cache_request.assert_called_once_with(cache_manager)
+        assert output.tokens == [7]
+        assert output.completion_tokens == 1
+        assert output.text == "PREFIX:visible-tail"
+        assert output.tool_calls == tool_calls
+        assert output.finish_reason == "tool_calls"
+
+    @pytest.mark.asyncio
+    async def test_streaming_parser_stop_has_one_final_and_no_late_tokens(self):
+        engine, parser, event_iter, cache_manager, tool_calls = (
+            self._parser_stop_engine()
+        )
+
+        outputs = [output async for output in engine.stream_generate([1, 2])]
+
+        assert parser.process_token.call_args_list == [((7,),), ((8,),)]
+        parser.finalize.assert_called_once_with()
+        assert event_iter.next_calls == 2
+        assert event_iter.close_calls == 1
+        engine._end_runtime_cache_request.assert_called_once_with(cache_manager)
+        assert sum(output.finished for output in outputs) == 1
+        assert outputs[-1].finished is True
+        assert outputs[-1].new_text == "</think>"
+        assert outputs[-1].text == "PREFIX:visible-tail"
+        assert outputs[-1].completion_tokens == 1
+        assert outputs[-1].tool_calls == tool_calls
+        assert outputs[-1].finish_reason == "tool_calls"
+
+    @pytest.mark.asyncio
+    async def test_streaming_worker_enqueues_exactly_one_terminal_item(self):
+        engine, parser, event_iter, cache_manager, tool_calls = (
+            self._parser_stop_engine()
+        )
+        queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        engine._update_activity = MagicMock()
+
+        await asyncio.to_thread(
+            engine._run_generate_streaming,
+            [1, 2],
+            32,
+            0.0,
+            1.0,
+            0,
+            0.0,
+            1.0,
+            20,
+            None,
+            None,
+            queue,
+            loop,
+            threading.Event(),
+            "activity-id",
+        )
+        queued = []
+        while True:
+            item = await asyncio.wait_for(queue.get(), timeout=1.0)
+            queued.append(item)
+            if item[2]:
+                break
+        await asyncio.sleep(0)
+        while not queue.empty():
+            queued.append(queue.get_nowait())
+
+        finals = [item for item in queued if item[2]]
+        assert len(finals) == 1
+        assert finals[0][0] == "</think>"
+        assert finals[0][3]["output_text"] == "PREFIX:visible-tail"
+        assert finals[0][3]["completion_tokens"] == 1
+        assert finals[0][3]["tool_calls"] == tool_calls
+        parser.finalize.assert_called_once_with()
+        assert event_iter.close_calls == 1
+        engine._end_runtime_cache_request.assert_called_once_with(cache_manager)
+        assert engine._update_activity.call_count == 2
+        engine._update_activity.assert_called_with(
+            "activity-id", detail="generating", phase="decode"
+        )
+
+    @pytest.mark.asyncio
+    async def test_streaming_without_parser_keeps_token_and_summary_behavior(
+        self, monkeypatch
+    ):
+        events = pytest.importorskip("dflash_mlx.engine.events")
+        from omlx.engine import dflash as dflash_mod
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine("target", "draft")
+        engine._loaded = True
+        engine._tokenizer_obj = SimpleNamespace(
+            encode=lambda text: [1, 2],
+            decode=lambda tokens, **kwargs: "".join(
+                {7: "A", 8: "B"}[token] for token in tokens
+            ),
+        )
+        engine._executor_tokenizer = engine._tokenizer_obj
+        engine._should_fallback = lambda tokens: False
+        engine._detect_needs_think_prefix = lambda tokens: False
+        engine._output_parser_factory = None
+        monkeypatch.setattr(
+            dflash_mod, "create_streaming_detokenizer", lambda *a, **k: None
+        )
+
+        token_1 = events.TokenEvent(
+            token_id=7,
+            generated_tokens=1,
+            acceptance_ratio=1.0,
+            cycles_completed=1,
+        )
+        token_2 = events.TokenEvent(
+            token_id=8,
+            generated_tokens=2,
+            acceptance_ratio=1.0,
+            cycles_completed=2,
+        )
+        summary = events.SummaryEvent(
+            elapsed_us=1000,
+            prompt_token_count=2,
+            generated_token_ids=(7, 8),
+            generation_tokens=2,
+            accepted_from_draft=2,
+            acceptance_ratio=1.0,
+            cycles_completed=2,
+            phase_timings_us={},
+        )
+        engine._stream_dflash_events = MagicMock(
+            return_value=(iter([token_1, token_2, summary]), SimpleNamespace(), [])
+        )
+
+        outputs = [output async for output in engine.stream_generate([1, 2])]
+
+        assert [output.new_text for output in outputs] == ["A", "B", ""]
+        assert [output.tokens for output in outputs] == [[7], [8], []]
+        assert outputs[-1].text == "AB"
+        assert outputs[-1].completion_tokens == 2
+        assert outputs[-1].finish_reason == "stop"
+        assert sum(output.finished for output in outputs) == 1
 
 
 class TestDFlashCachedTokens:
@@ -1494,6 +1963,103 @@ class TestDFlashPretokenizedPrompt:
         engine._tokenizer_obj.encode.assert_called_once_with("hello")
 
 
+class TestDFlashLoadWarmup:
+    def _engine(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(dflash_block_size=8),
+        )
+        engine._target_ops = SimpleNamespace(backend_name="glm5_next")
+        engine._executor_tokenizer = SimpleNamespace(
+            encode=lambda text, add_special_tokens=False: [2, 11, 12],
+            eos_token_id=2,
+            eos_token_ids=None,
+            eot_token_id=None,
+            vocab_size=100,
+        )
+        engine._generation_config_eos = set()
+        engine._suppress_token_ids = {12}
+        return engine
+
+    def test_only_glm_backend_requires_load_warmup(self):
+        engine = self._engine()
+        assert engine._requires_load_warmup() is True
+        engine._target_ops.backend_name = "qwen"
+        assert engine._requires_load_warmup() is False
+
+    def test_glm_dflash_exposes_tool_parser_capability(self):
+        engine = self._engine()
+        engine._tokenizer_obj = engine._executor_tokenizer
+        engine._model_type_str = "glm5_next"
+        engine._install_glm_tool_parser()
+        assert engine.supports_tool_calling is True
+        assert engine._tokenizer_obj.tool_call_start == "<tool_call>"
+        assert engine._tokenizer_obj.tool_call_end == "</tool_call>"
+
+    def test_warmup_prompt_excludes_stop_and_suppress_tokens(self):
+        engine = self._engine()
+        prompt = engine._build_load_warmup_prompt_tokens(prompt_len=6)
+        assert prompt == [11] * 6
+
+    def test_warmup_consumes_summary_closes_iterator_and_disables_cache(self):
+        from dflash_mlx.engine.events import SummaryEvent
+
+        engine = self._engine()
+        summary = SummaryEvent(
+            elapsed_us=1000,
+            prompt_token_count=64,
+            generated_token_ids=(5,),
+            generation_tokens=1,
+            accepted_from_draft=1,
+            acceptance_ratio=1.0,
+            cycles_completed=1,
+            phase_timings_us={},
+        )
+
+        class TrackingIterator:
+            def __init__(self):
+                self.closed = False
+
+            def __iter__(self):
+                return iter([summary])
+
+            def close(self):
+                self.closed = True
+
+        events = TrackingIterator()
+        engine._stream_dflash_events = MagicMock(return_value=(events, None, []))
+
+        engine._warmup_dflash_sync()
+
+        assert events.closed is True
+        kwargs = engine._stream_dflash_events.call_args.kwargs
+        assert kwargs["use_prefix_cache"] is False
+        assert kwargs["max_tokens"] == 8
+
+    def test_warmup_fails_closed_without_summary_and_closes_iterator(self):
+        engine = self._engine()
+
+        class TrackingIterator:
+            def __init__(self):
+                self.closed = False
+
+            def __iter__(self):
+                return iter(())
+
+            def close(self):
+                self.closed = True
+
+        events = TrackingIterator()
+        engine._stream_dflash_events = MagicMock(return_value=(events, None, []))
+
+        with pytest.raises(RuntimeError, match="without a summary"):
+            engine._warmup_dflash_sync()
+        assert events.closed is True
+
+
 class TestDFlashActivityTracking:
     """DFlash bypasses the scheduler, so the admin Active Models card reads
     the engine's own activity snapshot (#2396)."""
@@ -1517,7 +2083,20 @@ class TestDFlashActivityTracking:
         assert engine.has_active_requests() is True
 
         engine._update_activity(activity_id, token_count=42)
-        assert engine.get_activity_snapshot()["activities"][0]["token_count"] == 42
+        activity = engine.get_activity_snapshot()["activities"][0]
+        assert activity["token_count"] == 42
+        engine._update_activity(
+            activity_id,
+            detail="prefilling",
+            phase="prefill",
+            processed=2048,
+            total=4096,
+        )
+        activity = engine.get_activity_snapshot()["activities"][0]
+        assert activity["detail"] == "prefilling"
+        assert activity["phase"] == "prefill"
+        assert activity["processed"] == 2048
+        assert activity["total"] == 4096
 
         engine._end_activity(activity_id)
         assert engine.get_activity_snapshot()["active_requests"] == 0

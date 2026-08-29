@@ -1532,7 +1532,7 @@
                                                 </span>
                                             </template>
                                             <!-- Ready state -->
-                                            <template x-if="!model.virtual && !model.is_loading && !model.loaded">
+                                            <template x-if="!model.virtual && !model.is_helper && !model.is_loading && !model.loaded">
                                                 <button @click="loadModel(model.id)"
                                                         :class="hover
                                                             ? 'bg-green-100 text-green-700 border-green-200 cursor-pointer'
@@ -1541,6 +1541,11 @@
                                                     <span :class="hover ? 'bg-green-500' : 'bg-neutral-400'" class="w-1.5 h-1.5 rounded-full"></span>
                                                     <span x-text="hover ? window.t('settings.models.table.status_load') : window.t('settings.models.table.status_ready')"></span>
                                                 </button>
+                                            </template>
+                                            <!-- DFlash helpers are owned by their target engine. -->
+                                            <template x-if="!model.virtual && model.is_helper && !model.is_loading && !model.loaded">
+                                                <span class="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full gap-1 bg-amber-50 text-amber-700 border border-amber-200"
+                                                      x-text="window.t('settings.models.table.helper_badge')"></span>
                                             </template>
                                         </div>
 

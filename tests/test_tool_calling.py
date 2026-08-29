@@ -4435,3 +4435,92 @@ def test_bracket_deep_decode_never_runs_raw_arguments():
         for call in calls or []:
             if call.function.name == "bad":
                 assert not call.function.arguments.startswith('{"raw":')
+
+
+def test_glm_openwebui_unclosed_skill_envelope_recovers_registered_uri():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "skill://cweather",
+                "description": "Get current weather.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    text = (
+        '<tool_call>skill://cweather\n<skill id="cweather">\n'
+        "- **Skill**: cweather\n- **Description**: Get weather."
+    )
+    cleaned, calls = parse_tool_calls(text, MagicMock(spec=[]), tools)
+    assert cleaned == ""
+    assert calls is not None and len(calls) == 1
+    assert calls[0].function.name == "skill://cweather"
+    assert calls[0].function.arguments == "{}"
+
+
+def test_glm_openwebui_skill_uri_can_map_to_bare_registered_name():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "cweather",
+                "description": "Get current weather.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    text = '<tool_call>skill://cweather\n<skill id="cweather">\n- details'
+    cleaned, calls = parse_tool_calls(text, MagicMock(spec=[]), tools)
+    assert cleaned == ""
+    assert calls is not None and calls[0].function.name == "cweather"
+
+
+def test_glm_openwebui_closed_skill_uri_is_recovered():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "skill://cweather",
+                "description": "Get current weather.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    text = "<tool_call>skill://cweather</tool_call>"
+    cleaned, calls = parse_tool_calls(text, MagicMock(spec=[]), tools)
+    assert cleaned == ""
+    assert calls is not None and calls[0].function.name == "skill://cweather"
+
+
+def test_unknown_native_parser_result_falls_through_to_skill_recovery():
+    tok = MagicMock(spec=[])
+    tok.has_tool_calling = True
+    tok.tool_call_start = "<tool_call>"
+    tok.tool_call_end = "</tool_call>"
+    tok.tool_parser = lambda _text, _tools: {
+        "name": "unknown",
+        "arguments": {"raw": "skill://cweather"},
+    }
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "skill://cweather",
+                "description": "Get current weather.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    cleaned, calls = parse_tool_calls(
+        "<tool_call>skill://cweather</tool_call>", tok, tools
+    )
+    assert cleaned == ""
+    assert calls is not None and calls[0].function.name == "skill://cweather"
+
+
+def test_glm_openwebui_unregistered_skill_is_not_promoted():
+    text = '<tool_call>skill://cweather\n<skill id="cweather">\n- details'
+    cleaned, calls = parse_tool_calls(text, MagicMock(spec=[]), [])
+    assert calls is None
+    assert cleaned == text

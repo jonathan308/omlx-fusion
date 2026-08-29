@@ -2260,6 +2260,14 @@ async def load_model(
     entry = engine_pool.get_entry(model_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+    if bool(getattr(entry, "is_helper", False)):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "DFlash helper models load automatically with their target model. "
+                "Load the target model and enable DFlash instead."
+            ),
+        )
     if entry.engine is not None:
         return {
             "status": "ok",

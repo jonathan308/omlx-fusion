@@ -2016,12 +2016,12 @@ class TestAdmissionSoftTargetEviction:
         assert pool.loaded_model_count == 2
 
 
-class TestGuardOffBestEffortAdmission:
+class TestGuardOffSafeAdmission:
     """#2290: model-swap eviction must survive disabling the memory guard.
 
     With the guard off `_get_final_ceiling` reads 0; the pool falls back
     to `_get_admission_ceiling` (enforcer static ceiling) for LRU
-    eviction, but never refuses a load under it.
+    eviction and still refuses a load that would exceed physical residency.
     """
 
     @pytest.fixture
@@ -2063,10 +2063,8 @@ class TestGuardOffBestEffortAdmission:
         assert pool._entries["model-b"].engine is not None
 
     @pytest.mark.asyncio
-    async def test_nothing_evictable_admits_over_ceiling(
-        self, guard_off_pool, caplog
-    ):
-        """Guard off + nothing to evict: warn and load anyway, never raise."""
+    async def test_nothing_evictable_refuses_over_ceiling(self, guard_off_pool):
+        """Guard off never permits model residency to crash the host."""
         pool = guard_off_pool
         pool._entries["model-a"].is_pinned = True
 
@@ -2076,12 +2074,11 @@ class TestGuardOffBestEffortAdmission:
 
         with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
             await pool.get_engine("model-a")
-            with caplog.at_level(logging.WARNING, logger="omlx.engine_pool"):
+            with pytest.raises(InsufficientMemoryError):
                 await pool.get_engine("model-b")
 
         assert pool._entries["model-a"].engine is not None
-        assert pool._entries["model-b"].engine is not None
-        assert any("memory guard disabled" in r.message for r in caplog.records)
+        assert pool._entries["model-b"].engine is None
 
     @pytest.mark.asyncio
     async def test_no_admission_callback_admits_unconditionally(

@@ -3,8 +3,9 @@
 DFlash engine for block diffusion speculative decoding.
 
 This engine wraps dflash-mlx (>= 0.1.5) to provide faster decoding on Apple
-Silicon for Qwen, Gemma4, and Laguna model families. By default it serves all
-requests through dflash; setting ``model_settings.dflash_max_ctx`` opts into
+Silicon for Qwen, Gemma4, Laguna, Muse Glimmer, and GLM-5.3 model families. By
+default it serves all requests through dflash; setting
+``model_settings.dflash_max_ctx`` opts into
 evicting the dflash models and delegating long-context requests to omlx's
 BatchedEngine/VLMBatchedEngine (paged cache, SSD cache, continuous batching).
 """
@@ -46,6 +47,77 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _get_dflash_stop_token_ids(
+    tokenizer: Any,
+    generation_config_eos: set[int] | None = None,
+) -> list[int]:
+    """Resolve Scheduler-compatible stop IDs for the DFlash runtime.
+
+    Some mlx-vlm tokenizers expose ``eos_token_ids`` as a scalar while
+    dflash-mlx currently assumes it is iterable. Models such as GLM-5.3 also
+    publish additional turn terminators only in ``generation_config.json``.
+    Keep this normalization at the oMLX boundary instead of mutating the
+    tokenizer object shared with chat-template and detokenization code.
+    """
+
+    stop_ids: set[int] = set()
+
+    def add_ids(value: Any) -> None:
+        if value is None or isinstance(value, bool):
+            return
+        if isinstance(value, int):
+            stop_ids.add(int(value))
+            return
+        try:
+            values = iter(value)
+        except TypeError:
+            return
+        for token_id in values:
+            if isinstance(token_id, bool):
+                continue
+            try:
+                stop_ids.add(int(token_id))
+            except (TypeError, ValueError):
+                continue
+
+    add_ids(getattr(tokenizer, "eos_token_id", None))
+    add_ids(getattr(tokenizer, "eos_token_ids", None))
+
+    eot_token_id = getattr(tokenizer, "eot_token_id", None)
+    if eot_token_id is not None:
+        add_ids(eot_token_id)
+    else:
+        eot_token = getattr(tokenizer, "eot_token", None)
+        if eot_token:
+            try:
+                add_ids(tokenizer.encode(eot_token, add_special_tokens=False))
+            except Exception:
+                pass
+
+    add_ids(generation_config_eos)
+    return sorted(stop_ids)
+
+
+def _process_output_parser_token(result: Any) -> tuple[str, str, bool, bool]:
+    """Normalize the scheduler-facing parser token contract."""
+    is_stop = bool(getattr(result, "is_stop", False))
+    record_token = getattr(result, "record_token", None)
+    should_record = bool(record_token) if record_token is not None else not is_stop
+    return result.stream_text, result.visible_text, is_stop, should_record
+
+
+def _finalize_output_parser(
+    parser_session: Any,
+    visible_parts: list[str],
+) -> tuple[Any, str]:
+    """Finalize once and return Scheduler-compatible cumulative output text."""
+    final = parser_session.finalize()
+    if final.visible_text:
+        visible_parts.append(final.visible_text)
+    prefix = getattr(final, "output_text_prefix", "") or ""
+    return final, prefix + "".join(visible_parts)
 
 
 def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
@@ -92,9 +164,11 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     is_gemma4 = model_type in ("gemma4", "gemma4_text", "gemma4_unified")
     is_laguna = model_type == "laguna"
     is_muse = model_type in ("muse_glimmer", "muse_glimmer_text")
-    if not (is_qwen or is_gemma4 or is_laguna or is_muse):
+    is_glm5 = model_type == "glm5_next"
+    if not (is_qwen or is_gemma4 or is_laguna or is_muse or is_glm5):
         return False, (
-            f"DFlash supports only Qwen, Gemma4, Laguna, and Muse Glimmer "
+            f"DFlash supports only Qwen, Gemma4, Laguna, Muse Glimmer, and "
+            f"GLM-5.3 "
             f"models (model_type='{cfg.get('model_type', '')}')"
         )
     return True, ""
@@ -346,7 +420,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._prefill_guard: _DFlashPrefillGuard | None = None
         self._runtime_context: Any | None = None
         self._dflash_prefix_cache: Any | None = None
+        # DFlash bypasses mlx-lm's BatchGenerator, which normally owns the
+        # process Metal wired-limit raise/restore lifecycle.
+        self._old_wired_limit: int | None = None
+        self._wired_limit_owned = False
         self._suppress_token_ids: set[int] = set()
+        self._generation_config_eos: set[int] = set()
         # Protocol-specific output parser factory (gemma4 / harmony).
         # Detected once in start() after the target model is loaded; None means
         # the streaming detokenizer is used as-is (qwen, llama, etc.).
@@ -430,6 +509,88 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
     @property
     def model_type(self) -> str | None:
         return self._model_type_str
+
+    @property
+    def supports_tool_calling(self) -> bool:
+        """Expose the GLM native tool dialect on the DFlash lane."""
+        return bool(
+            self._model_type_str == "glm5_next"
+            and getattr(self._tokenizer_obj, "has_tool_calling", False)
+            and getattr(self._tokenizer_obj, "tool_parser", None) is not None
+        )
+
+    def _install_glm_tool_parser(self) -> None:
+        """Install mlx-lm's GLM47 parser on both DFlash tokenizer copies."""
+        if self._model_type_str != "glm5_next":
+            return
+        try:
+            from mlx_lm.tool_parsers.glm47 import (
+                parse_tool_call,
+                tool_call_end,
+                tool_call_start,
+            )
+        except ImportError as exc:
+            logger.warning("GLM tool parser unavailable on DFlash lane: %s", exc)
+            return
+        for tokenizer in (self._tokenizer_obj, self._executor_tokenizer):
+            if tokenizer is None:
+                continue
+            tokenizer.has_tool_calling = True
+            tokenizer.tool_call_start = tool_call_start
+            tokenizer.tool_call_end = tool_call_end
+            tokenizer.tool_parser = parse_tool_call
+        logger.info("GLM DFlash tool calling enabled: parser=glm47")
+
+    def _acquire_wired_limit(self) -> None:
+        """Mirror BatchGenerator's recommended working-set wired limit."""
+        if self._wired_limit_owned or not mx.metal.is_available():
+            return
+        recommended = int(
+            mx.device_info().get("max_recommended_working_set_size", 0) or 0
+        )
+        if recommended <= 0:
+            raise RuntimeError("MLX did not report a recommended working set size")
+        self._old_wired_limit = mx.set_wired_limit(recommended)
+        self._wired_limit_owned = True
+
+    def _restore_wired_limit(self) -> bool:
+        """Restore the pre-DFlash limit once, on the owning MLX thread."""
+        if not self._wired_limit_owned:
+            return False
+        previous = self._old_wired_limit
+        self._wired_limit_owned = False
+        self._old_wired_limit = None
+        try:
+            mx.synchronize()
+        finally:
+            if previous is not None:
+                mx.set_wired_limit(previous)
+        return True
+
+    def _load_with_wired_limit(self, loader):
+        """Acquire before loading and restore without masking load failures."""
+        try:
+            self._acquire_wired_limit()
+            return loader()
+        except BaseException:
+            try:
+                self._restore_wired_limit()
+            except Exception:
+                logger.warning(
+                    "DFlash wired-limit restore failed after load error",
+                    exc_info=True,
+                )
+            raise
+
+    async def _restore_wired_limit_async(self) -> bool:
+        if not self._wired_limit_owned:
+            return False
+        from ..engine_core import get_mlx_executor
+
+        loop = asyncio.get_running_loop()
+        return bool(
+            await loop.run_in_executor(get_mlx_executor(), self._restore_wired_limit)
+        )
 
     @staticmethod
     def _build_quant_spec(
@@ -522,13 +683,37 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
     async def start(self) -> None:
         if self._loaded:
             return
+        try:
+            await self._start_impl()
+        except BaseException:
+            try:
+                await asyncio.shield(self._restore_wired_limit_async())
+            except Exception:
+                logger.warning(
+                    "DFlash wired-limit restore failed after start error",
+                    exc_info=True,
+                )
+            raise
+
+    async def _start_impl(self) -> None:
+        if self._loaded:
+            return
 
         from ..engine_core import get_mlx_executor
 
         loop = asyncio.get_running_loop()
         runtime_context = self._build_runtime_context()
 
-        def _load_models():
+        def _load_models_owned():
+            # Register oMLX-owned target extensions before importing the
+            # dflash loader functions below. GLM-5.3 is mlx-vlm-only, so its
+            # installer wraps ``load_target_bundle`` with a scoped VLM loader.
+            from ..patches.dflash_glm5 import install_dflash_glm5_backend
+            from ..patches.dflash_laguna import install_dflash_laguna_backend
+
+            install_dflash_laguna_backend()
+            install_dflash_glm5_backend()
+
             from dflash_mlx.draft_backend import EagerDraftBackend
             from dflash_mlx.engine.target_ops import bind_draft_to_target
             from dflash_mlx.runtime.loading import (
@@ -545,13 +730,6 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             maybe_apply_pre_load_patches(
                 self._model_name, model_settings=self._model_settings
             )
-
-            # dflash-mlx 0.1.10 has no Laguna backend. Register oMLX's strict
-            # TargetOps plus the official gated Laguna drafter specialization
-            # before load_target_bundle resolves either architecture.
-            from ..patches.dflash_laguna import install_dflash_laguna_backend
-
-            install_dflash_laguna_backend()
 
             # Wrap dflash's hook installers so we can revert the class-level
             # __call__ patches when this engine stops. Without this, a later
@@ -605,6 +783,13 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     else None
                 ),
             )
+            from ..patches.dflash_glm5 import validate_glm5_dflash_pair
+
+            validate_glm5_dflash_pair(
+                target_bundle.model,
+                draft,
+                draft_meta,
+            )
             bind_draft_to_target(
                 draft,
                 target_bundle.model,
@@ -613,9 +798,34 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             draft_backend = EagerDraftBackend()
             return target_bundle, draft, draft_backend, draft_meta
 
-        result = await loop.run_in_executor(get_mlx_executor(), _load_models)
+        result = await loop.run_in_executor(
+            get_mlx_executor(),
+            self._load_with_wired_limit,
+            _load_models_owned,
+        )
         target_bundle, self._draft_model, self._draft_backend, draft_meta = result
         self._draft_window_size = self._resolve_draft_window_size(draft_meta)
+        capabilities_for = getattr(target_bundle.target_ops, "capabilities_for", None)
+        target_capabilities = (
+            capabilities_for(target_bundle.model)
+            if callable(capabilities_for)
+            else None
+        )
+        if (
+            self._in_memory_cache_enabled
+            and target_capabilities is not None
+            and not target_capabilities.supports_prefix_snapshot
+        ):
+            # Do not advertise or initialize an inert cache. GLM-5.3's DSA
+            # layers use CacheList(KVCache, PoolingCache), which the pinned
+            # dflash snapshot codec cannot serialize yet.
+            logger.warning(
+                "DFlash prefix snapshots are not supported by target backend %s; "
+                "disabling DFlash L1/L2 cache for this load",
+                getattr(target_bundle.target_ops, "backend_name", "unknown"),
+            )
+            self._in_memory_cache_enabled = False
+            self._ssd_cache_requested = False
         runtime_context = self._build_runtime_context()
         self._runtime_context = runtime_context
         self._target_model = target_bundle.model
@@ -636,6 +846,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         elif hasattr(config, "model_type"):
             self._model_type_str = config.model_type
 
+        self._install_glm_tool_parser()
+
         self._pairing_warning = check_draft_target_precision_pairing(
             self._model_name,
             config if isinstance(config, dict) else None,
@@ -647,6 +859,17 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         suppress_ref = (
             getattr(self._executor_tokenizer, "name_or_path", None) or self._model_name
         )
+        self._generation_config_eos = set()
+        for key in ("eos_token_id", "eos_token_ids"):
+            configured_ids = load_generation_config_token_ids(suppress_ref, key)
+            if configured_ids:
+                self._generation_config_eos.update(configured_ids)
+        if self._generation_config_eos:
+            logger.info(
+                "DFlash loaded %d EOS token(s) from generation_config.json: %s",
+                len(self._generation_config_eos),
+                self._generation_config_eos,
+            )
         suppress_ids = load_generation_config_token_ids(suppress_ref, "suppress_tokens")
         self._suppress_token_ids = suppress_ids or set()
         if self._suppress_token_ids:
@@ -689,6 +912,19 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 # prefill OOM protection this engine relies on.
                 logger.warning(f"DFlash prefill guard init failed: {exc}")
                 self._prefill_guard = None
+
+        # GLM-5.3's first DFlash request compiles the target prefill, recurrent
+        # rollback, draft, and block-verification graphs.  That cold compile can
+        # take long enough that an OpenAI client sees only keepalives and the
+        # admin UI paints the request as stalled, even though model loading was
+        # already reported complete.  Compile against a disposable request
+        # before publishing readiness so the first real request behaves like
+        # every subsequent one.
+        if self._requires_load_warmup():
+            await loop.run_in_executor(
+                get_mlx_executor(),
+                self._warmup_dflash_sync,
+            )
 
         self._loaded = True
         self._in_fallback_mode = False
@@ -763,6 +999,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
         loop = asyncio.get_running_loop()
         pre_active = mx.get_active_memory()
+
+        # BatchGenerator would restore this in close(); DFlash owns the same
+        # lifecycle explicitly before its target allocations are released.
+        await self._restore_wired_limit_async()
 
         # Release dflash model and cache references
         shutdown_runtime_cache_manager()
@@ -845,6 +1085,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         if self._fallback_engine is not None:
             await self._fallback_engine.stop()
             self._fallback_engine = None
+        await self._restore_wired_limit_async()
         try:
             shutdown_runtime_cache_manager()
         except Exception as exc:
@@ -857,6 +1098,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._draft_backend = None
         self._tokenizer_obj = None
         self._executor_tokenizer = None
+        self._generation_config_eos.clear()
         self._output_parser_factory = None
         self._prefill_guard = None
         self._in_fallback_mode = False
@@ -1131,6 +1373,87 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         tag = getattr(self._tokenizer_obj, "think_start", "<think>")
         return f"{tag}\n"
 
+    def _requires_load_warmup(self) -> bool:
+        """Return whether this backend needs a readiness-gated cold compile."""
+        return getattr(self._target_ops, "backend_name", "") == "glm5_next"
+
+    def _build_load_warmup_prompt_tokens(self, prompt_len: int = 64) -> list[int]:
+        """Build a non-stop-token prompt for the disposable GLM warmup."""
+        tokenizer = self._executor_tokenizer
+        try:
+            encoded = tokenizer.encode(
+                "oMLX DFlash readiness warmup. Reply with ready.",
+                add_special_tokens=False,
+            )
+        except TypeError:
+            encoded = tokenizer.encode(
+                "oMLX DFlash readiness warmup. Reply with ready."
+            )
+
+        stop_ids = set(
+            _get_dflash_stop_token_ids(tokenizer, self._generation_config_eos)
+        )
+        usable = [
+            int(token_id)
+            for token_id in encoded
+            if int(token_id) not in stop_ids
+            and int(token_id) not in self._suppress_token_ids
+        ]
+        if not usable:
+            vocab_size = int(getattr(tokenizer, "vocab_size", 0) or 0)
+            search_limit = vocab_size if vocab_size > 0 else 4096
+            usable = [
+                token_id
+                for token_id in range(search_limit)
+                if token_id not in stop_ids and token_id not in self._suppress_token_ids
+            ][:1]
+        if not usable:
+            raise RuntimeError("DFlash load warmup could not find a safe prompt token")
+        repeats = (prompt_len + len(usable) - 1) // len(usable)
+        return (usable * repeats)[:prompt_len]
+
+    def _warmup_dflash_sync(self) -> None:
+        """Compile GLM DFlash before the engine is advertised as ready."""
+        from dflash_mlx.engine.events import SummaryEvent
+
+        prompt_tokens = self._build_load_warmup_prompt_tokens()
+        max_tokens = max(8, int(self._block_size or 8))
+        started = time.perf_counter()
+        event_iter = None
+        summary = None
+        try:
+            event_iter, _, _ = self._stream_dflash_events(
+                prompt_tokens=prompt_tokens,
+                max_tokens=max_tokens,
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                min_p=0.0,
+                repetition_penalty=1.0,
+                repetition_context_size=20,
+                use_prefix_cache=False,
+            )
+            for event in event_iter:
+                if isinstance(event, SummaryEvent):
+                    summary = event
+        finally:
+            close = getattr(event_iter, "close", None)
+            if callable(close):
+                close()
+
+        if summary is None:
+            raise RuntimeError("GLM DFlash load warmup ended without a summary")
+        if int(summary.cycles_completed) < 1:
+            raise RuntimeError("GLM DFlash load warmup completed no verify cycles")
+        logger.info(
+            "GLM DFlash load warmup completed: prompt=%d tokens=%d "
+            "elapsed=%.2fs acceptance=%.1f%%",
+            len(prompt_tokens),
+            int(summary.generation_tokens),
+            time.perf_counter() - started,
+            float(summary.acceptance_ratio) * 100.0,
+        )
+
     def _stream_dflash_events(
         self,
         prompt_tokens: list[int],
@@ -1141,12 +1464,16 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         min_p: float = 0.0,
         repetition_penalty: float = 1.0,
         repetition_context_size: int = 20,
+        use_prefix_cache: bool = True,
     ):
         """Build the dflash event iterator with prefix cache plumbed in."""
-        from dflash_mlx.runtime import get_stop_token_ids, stream_dflash_generate
+        from dflash_mlx.runtime import stream_dflash_generate
         from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
 
-        stop_ids = get_stop_token_ids(self._executor_tokenizer)
+        stop_ids = _get_dflash_stop_token_ids(
+            self._executor_tokenizer,
+            self._generation_config_eos,
+        )
 
         # Build a minimal model_provider shim for the prefix cache flow.
         # ``model_key`` is consumed as a tuple where index 0 = target id and
@@ -1161,14 +1488,31 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             tokenizer = self._executor_tokenizer
             cli_args = None
 
-        prefix_flow = PrefixCacheFlow.for_request(
-            model_provider=_ModelProviderShim(),
-            draft_model=self._draft_model,
-            tokenizer=self._executor_tokenizer,
-            prompt=prompt_tokens,
-            max_new_tokens=max_tokens,
-            runtime_context=self._runtime_context,
-        )
+        if use_prefix_cache:
+            prefix_flow = PrefixCacheFlow.for_request(
+                model_provider=_ModelProviderShim(),
+                draft_model=self._draft_model,
+                tokenizer=self._executor_tokenizer,
+                prompt=prompt_tokens,
+                max_new_tokens=max_tokens,
+                runtime_context=self._runtime_context,
+            )
+        else:
+            # Load warmups must not become user-visible prefix snapshots or
+            # affect cache hit/miss telemetry.
+            prefix_flow = PrefixCacheFlow(cache_manager=None)
+
+        if (
+            use_prefix_cache
+            and getattr(self._target_ops, "backend_name", "") == "glm5_next"
+        ):
+            # Agent clients normalize or omit hidden reasoning when they append
+            # an assistant turn. A generation snapshot therefore requires an
+            # exact token history the next request cannot reproduce and misses
+            # every time. Publish the stable prefill boundary instead: the next
+            # turn reuses the whole prior prompt and prefills only the new
+            # assistant/tool suffix, regardless of reasoning serialization.
+            prefix_flow.publish_generation_snapshot = False
 
         event_iter = stream_dflash_generate(
             target_model=self._target_model,
@@ -1239,6 +1583,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         queue: asyncio.Queue,
         loop: asyncio.AbstractEventLoop,
         stop_event: threading.Event,
+        activity_id: str,
     ) -> None:
         """Run dflash generation with streaming on MLX executor thread.
 
@@ -1247,10 +1592,62 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         return promptly so the single MLX executor thread is freed for the
         next request.
         """
-        from dflash_mlx.engine.events import SummaryEvent, TokenEvent
+        from dflash_mlx.engine.events import (
+            PrefillProgressEvent,
+            SummaryEvent,
+            TokenEvent,
+        )
 
         event_iter = None
         cache_manager = None
+        prefix_flow = None
+        parser_session = None
+        parser_final = None
+        parser_output_text = ""
+        parser_finalized = False
+        final_enqueued = False
+        recorded_completion = 0
+        parsed_visible_parts: list[str] = []
+        last_acceptance_ratio = 0.0
+        last_cycles_completed = 0
+
+        def enqueue(item: tuple[str, list[int], bool, dict[str, Any] | None]) -> None:
+            asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+
+        def finalize_parser_once():
+            nonlocal parser_final, parser_finalized, parser_output_text
+            if parser_session is None or parser_finalized:
+                return parser_final
+            # Mark first so a failing parser finalizer is never invoked twice
+            # from the error/finally cleanup paths.
+            parser_finalized = True
+            parser_final, parser_output_text = _finalize_output_parser(
+                parser_session, parsed_visible_parts
+            )
+            return parser_final
+
+        def add_parser_final_metrics(metrics: dict[str, Any]) -> str:
+            final = finalize_parser_once()
+            if final is None:
+                return ""
+            metrics["output_text"] = parser_output_text
+            if final.tool_calls:
+                metrics["tool_calls"] = final.tool_calls
+            if final.finish_reason:
+                metrics["finish_reason"] = final.finish_reason
+            return final.stream_text or ""
+
+        def enqueue_final(
+            metrics: dict[str, Any],
+            *,
+            new_text: str = "",
+        ) -> None:
+            nonlocal final_enqueued
+            if final_enqueued:
+                return
+            final_enqueued = True
+            enqueue((new_text, [], True, metrics))
+
         try:
             self._record_prefill_guard_active_memory()
             if seed is not None:
@@ -1285,46 +1682,78 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     detokenizer.reset()
 
             for event in event_iter:
+                # Prefill/cycle events are real forward progress even when no
+                # output token is ready yet. Keep the admin activity heartbeat
+                # fresh so long DFlash prefill is not painted amber/red as a
+                # stalled request.
+                if isinstance(event, PrefillProgressEvent):
+                    self._update_activity(
+                        activity_id,
+                        detail="prefilling",
+                        phase="prefill",
+                        processed=int(event.tokens_processed),
+                        total=int(event.tokens_total),
+                    )
+                elif isinstance(event, TokenEvent):
+                    self._update_activity(
+                        activity_id,
+                        detail="generating",
+                        phase="decode",
+                    )
+                else:
+                    self._update_activity(activity_id)
                 if stop_event.is_set():
                     logger.info("DFlash generation aborted by client")
                     break
 
                 if isinstance(event, TokenEvent):
                     token_id = int(event.token_id)
+                    last_acceptance_ratio = float(event.acceptance_ratio)
+                    last_cycles_completed = int(event.cycles_completed)
                     # Skip EOS/stop tokens from output
                     if token_id in stop_ids:
                         continue
                     if parser_session is not None:
                         result = parser_session.process_token(token_id)
-                        text = result.stream_text
+                        (
+                            text,
+                            visible_text,
+                            is_parser_stop,
+                            should_record_token,
+                        ) = _process_output_parser_token(result)
+                        if visible_text:
+                            parsed_visible_parts.append(visible_text)
+                        if should_record_token:
+                            recorded_completion += 1
+                        chunk_tokens = (
+                            [token_id]
+                            if should_record_token and not is_parser_stop
+                            else []
+                        )
                     elif detokenizer is not None:
+                        recorded_completion += 1
                         detokenizer.add_token(token_id)
                         text = detokenizer.last_segment
+                        chunk_tokens = [token_id]
                     else:
+                        recorded_completion += 1
                         text = self._executor_tokenizer.decode([token_id])
+                        chunk_tokens = [token_id]
                     # Parser sessions can emit empty stream_text on protocol
                     # marker tokens — skip the chunk so clients don't see a
                     # flood of empty deltas.
-                    if not text:
-                        continue
-                    asyncio.run_coroutine_threadsafe(
-                        queue.put((text, [token_id], False, None)), loop
-                    )
+                    if text:
+                        enqueue((text, chunk_tokens, False, None))
+                    if parser_session is not None and is_parser_stop:
+                        logger.info(
+                            "DFlash streaming generation stopped by output parser "
+                            "after %d recorded token(s)",
+                            recorded_completion,
+                        )
+                        break
 
                 elif isinstance(event, SummaryEvent):
                     self._record_speculation_summary(event)
-                    # Flush any buffered tail from the parser (e.g. close an
-                    # unterminated <think> block) before the metrics chunk so
-                    # the client sees a well-formed final delta.
-                    parser_final = None
-                    if parser_session is not None:
-                        parser_final = parser_session.finalize()
-                        tail = parser_final.stream_text
-                        if tail:
-                            asyncio.run_coroutine_threadsafe(
-                                queue.put((tail, [], False, None)), loop
-                            )
-
                     gen_tokens = int(event.generation_tokens)
                     accept_ratio = float(event.acceptance_ratio)
                     cycles = int(event.cycles_completed)
@@ -1346,31 +1775,42 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     )
                     metrics: dict[str, Any] = {
                         "prompt_tokens": int(event.prompt_token_count),
-                        "completion_tokens": gen_tokens,
+                        "completion_tokens": (
+                            recorded_completion
+                            if parser_session is not None
+                            else gen_tokens
+                        ),
                         "acceptance_ratio": accept_ratio,
                         "cycles_completed": cycles,
                         # Prefix-snapshot hit count, surfaced on the final
                         # (usage) chunk so the API reports cached_tokens (#1441).
                         "cached_tokens": self._cached_tokens_from_flow(prefix_flow),
                     }
-                    if parser_final is not None:
-                        if parser_final.tool_calls:
-                            metrics["tool_calls"] = parser_final.tool_calls
-                        if parser_final.finish_reason:
-                            metrics["finish_reason"] = parser_final.finish_reason
-                    asyncio.run_coroutine_threadsafe(
-                        queue.put(("", [], True, metrics)), loop
-                    )
+                    tail = add_parser_final_metrics(metrics)
+                    enqueue_final(metrics, new_text=tail)
+                    break
 
                 # Cycle, memory, prefill, and snapshot events are consumed by the
                 # runtime cache manager and metrics layers — omlx does not surface
                 # them so all other event types are intentionally ignored.
 
+            if not final_enqueued:
+                metrics = {
+                    "prompt_tokens": len(prompt_tokens),
+                    "completion_tokens": recorded_completion,
+                    "acceptance_ratio": last_acceptance_ratio,
+                    "cycles_completed": last_cycles_completed,
+                    "cached_tokens": self._cached_tokens_from_flow(prefix_flow),
+                    "aborted": stop_event.is_set(),
+                }
+                tail = ""
+                if not stop_event.is_set():
+                    tail = add_parser_final_metrics(metrics)
+                enqueue_final(metrics, new_text=tail)
+
         except Exception as e:
             logger.error(f"DFlash streaming generation error: {e}")
-            asyncio.run_coroutine_threadsafe(
-                queue.put(("", [], True, {"error": str(e)})), loop
-            )
+            enqueue_final({"error": str(e), "completion_tokens": recorded_completion})
         finally:
             # Closing the dflash generator throws GeneratorExit on its next
             # yield, releasing kernel state and any draft cache it holds.
@@ -1383,11 +1823,14 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     except Exception as exc:
                         logger.debug(f"event_iter.close() raised: {exc}")
             self._end_runtime_cache_request(cache_manager)
-            # Always send a sentinel so the async consumer doesn't deadlock
-            # when an abort happened before the dflash summary was emitted.
-            asyncio.run_coroutine_threadsafe(
-                queue.put(("", [], True, {"aborted": stop_event.is_set()})),
-                loop,
+            # Exactly one terminal queue item is required: the async consumer
+            # otherwise either deadlocks (no SummaryEvent after parser stop) or
+            # observes two finals (SummaryEvent plus an unconditional sentinel).
+            enqueue_final(
+                {
+                    "completion_tokens": recorded_completion,
+                    "aborted": stop_event.is_set(),
+                }
             )
             self._active_request = False
 
@@ -1468,7 +1911,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         activity_id = self._begin_activity("generate", detail="generating")
 
         def _run():
-            from dflash_mlx.engine.events import SummaryEvent, TokenEvent
+            from dflash_mlx.engine.events import (
+                PrefillProgressEvent,
+                SummaryEvent,
+                TokenEvent,
+            )
 
             event_iter = None
             cache_manager = None
@@ -1499,37 +1946,78 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 summary: SummaryEvent | None = None
                 first_token_at: float | None = None
                 parser_final = None
+                parser_output_text = ""
                 for event in event_iter:
+                    # DFlash emits prefill and cycle events between tokens.
+                    # Treat every event as activity so the dashboard's
+                    # last-progress indicator reflects compute, not token gaps.
+                    if isinstance(event, PrefillProgressEvent):
+                        self._update_activity(
+                            activity_id,
+                            detail="prefilling",
+                            phase="prefill",
+                            processed=int(event.tokens_processed),
+                            total=int(event.tokens_total),
+                        )
+                    elif isinstance(event, TokenEvent):
+                        self._update_activity(
+                            activity_id,
+                            detail="generating",
+                            phase="decode",
+                        )
+                    else:
+                        self._update_activity(activity_id)
                     if stop_event.is_set():
                         logger.info("DFlash generation aborted by client")
                         break
                     if isinstance(event, TokenEvent):
-                        if first_token_at is None:
-                            first_token_at = time.perf_counter()
                         token_id = int(event.token_id)
                         if token_id in stop_ids:
                             continue
-                        tokens.append(token_id)
-                        self._update_activity(activity_id, token_count=len(tokens))
                         if parser_session is not None:
                             result = parser_session.process_token(token_id)
-                            if result.visible_text:
-                                parsed_visible_parts.append(result.visible_text)
+                            (
+                                _,
+                                visible_text,
+                                is_parser_stop,
+                                should_record_token,
+                            ) = _process_output_parser_token(result)
+                            if visible_text:
+                                parsed_visible_parts.append(visible_text)
+                            if should_record_token:
+                                if first_token_at is None:
+                                    first_token_at = time.perf_counter()
+                                tokens.append(token_id)
+                                self._update_activity(
+                                    activity_id, token_count=len(tokens)
+                                )
+                            if is_parser_stop:
+                                logger.info(
+                                    "DFlash generation stopped by output parser "
+                                    "after %d recorded token(s)",
+                                    len(tokens),
+                                )
+                                break
+                        else:
+                            if first_token_at is None:
+                                first_token_at = time.perf_counter()
+                            tokens.append(token_id)
+                            self._update_activity(activity_id, token_count=len(tokens))
                     elif isinstance(event, SummaryEvent):
                         summary = event
                         self._record_speculation_summary(event)
                 if parser_session is not None:
-                    parser_final = parser_session.finalize()
-                    if parser_final.visible_text:
-                        parsed_visible_parts.append(parser_final.visible_text)
+                    parser_final, parser_output_text = _finalize_output_parser(
+                        parser_session, parsed_visible_parts
+                    )
                 return (
                     summary,
                     tokens,
                     parser_session,
                     parser_final,
-                    parsed_visible_parts,
                     prefix_flow,
                     first_token_at,
+                    parser_output_text,
                 )
             finally:
                 self._record_prefill_guard_active_memory()
@@ -1552,9 +2040,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     generated,
                     parser_session,
                     parser_final,
-                    parsed_visible_parts,
                     prefix_flow,
                     first_token_at,
+                    parser_output_text,
                 ) = await asyncio.shield(asyncio.wrap_future(future))
             except asyncio.CancelledError:
                 stop_event.set()
@@ -1576,7 +2064,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             # and stripped channel marker tokens, so just join the visible
             # segments. Don't re-decode the raw token list — that would
             # reintroduce the raw markers and double-buffer detokenization.
-            text = "".join(parsed_visible_parts)
+            text = parser_output_text
         else:
             text = self._tokenizer_obj.decode(generated, skip_special_tokens=True)
             text = clean_special_tokens(text)
@@ -1598,8 +2086,19 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             if summary is not None
             else len(prompt_tokens)
         )
+        # Parser sessions decide whether a protocol/control token belongs to
+        # completion accounting.  Once a parser stop closes the DFlash event
+        # iterator there is no SummaryEvent, so the recorded token list is the
+        # scheduler-compatible source of truth.  Preserve the historical
+        # summary accounting for ordinary, parser-free generation.
         completion_token_count = (
-            int(summary.generation_tokens) if summary is not None else len(generated)
+            len(generated)
+            if parser_session is not None
+            else (
+                int(summary.generation_tokens)
+                if summary is not None
+                else len(generated)
+            )
         )
         return GenerationOutput(
             text=text,
@@ -1726,6 +2225,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             queue,
             loop,
             stop_event,
+            activity_id,
         )
 
         total_text = ""
@@ -1748,6 +2248,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 if finished:
                     if metrics and metrics.get("completion_tokens") is not None:
                         total_completion = int(metrics["completion_tokens"])
+                    if metrics and metrics.get("output_text") is not None:
+                        # Protocol parsers maintain a visible-output channel
+                        # distinct from their streamed control/reasoning text.
+                        # Match Scheduler by exposing prefix + visible text as
+                        # the final cumulative GenerationOutput.text.
+                        total_text = str(metrics["output_text"])
                     if metrics and metrics.get("error"):
                         finish_reason = "error"
                     else:
