@@ -656,6 +656,50 @@ def _parse_xml_tool_calls(
     return cleaned, tool_calls
 
 
+def _parse_glm_skill_tool_call(
+    text: str, tools: Optional[List] = None
+) -> Tuple[str, Optional[List[ToolCall]]]:
+    """Recover GLM/OpenWebUI's unclosed ``skill://`` tool envelope.
+
+    OpenWebUI skill adapters sometimes render a GLM call as
+    ``<tool_call>skill://name<skill id="name">...`` without emitting the
+    normal GLM ``arg_key``/``arg_value`` fields or closing ``</tool_call>``.
+    Only promote this form when the URI (or its bare id) matches exactly one
+    registered tool; otherwise preserve the text as ordinary model output.
+    """
+    if "<tool_call>" not in text or "skill://" not in text:
+        return text, None
+    match = re.search(
+        r"<tool_call>\s*(skill://[A-Za-z0-9][A-Za-z0-9._:/-]*)"
+        r"(?:\s*<skill\s+id=[\"']([^\"']+)[\"'][^>]*>.*)?"
+        r"\s*(?:</tool_call>)?$",
+        text,
+        flags=re.DOTALL,
+    )
+    if match is None:
+        return text, None
+    uri = match.group(1)
+    skill_id = match.group(2) or uri.removeprefix("skill://")
+    if skill_id != uri.removeprefix("skill://"):
+        return text, None
+
+    valid_names = _extract_tool_names(tools or [])
+    candidates = {uri, skill_id} & valid_names
+    if len(candidates) != 1:
+        logger.warning(
+            "Unclosed GLM skill envelope did not match one registered tool: %r",
+            uri,
+        )
+        return text, None
+    name = next(iter(candidates))
+    built = _build_tool_call(name, {})
+    if built is None:
+        return text, None
+    cleaned = (text[: match.start()]).strip()
+    logger.info("Recovered unclosed GLM skill tool call: %s", name)
+    return cleaned, [built]
+
+
 def _parse_namespaced_tool_calls(
     text: str, namespace: str, tools: Optional[List] = None
 ) -> Tuple[str, Optional[List[ToolCall]]]:
@@ -1682,7 +1726,12 @@ def _parse_tool_calls_impl(
 
     # Fallback: parse XML <tool_call> tags (GLM, Qwen, generic formats)
     if "<tool_call>" in cleaned_text:
-        return _parse_xml_tool_calls(cleaned_text, tools)
+        xml_cleaned, xml_calls = _parse_xml_tool_calls(cleaned_text, tools)
+        if xml_calls:
+            return xml_cleaned, xml_calls
+        # OpenWebUI's skill adapter can omit both GLM argument tags and the
+        # closing envelope; recover only an exact registered skill URI.
+        return _parse_glm_skill_tool_call(cleaned_text, tools)
 
     # Fallback: namespaced tool_call tags (e.g. <minimax:tool_call>)
     ns_match = re.search(r"<([A-Za-z_][\w.-]*):tool_call>", cleaned_text)
