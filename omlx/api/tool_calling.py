@@ -1641,6 +1641,16 @@ def _parse_tool_calls_impl(
                     for p in items:
                         name = p.get("name", "")
                         arguments = p.get("arguments", {})
+                        # Some native parsers return a sentinel unknown/raw
+                        # result for a dialect they do not understand (GLM47
+                        # does this for ZCode's skill:// envelope). Treat it
+                        # as a parser miss so the dialect-specific fallback
+                        # can recover a registered tool, rather than exposing
+                        # a bogus executable tool named "unknown".
+                        if name == "unknown" and isinstance(arguments, dict) and set(
+                            arguments
+                        ) == {"raw"}:
+                            raise ValueError("native parser returned unknown/raw")
                         _built = _build_tool_call(name, arguments)
                         if _built is not None:
                             tool_calls.append(_built)
