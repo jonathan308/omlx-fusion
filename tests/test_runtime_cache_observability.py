@@ -106,6 +106,14 @@ def test_scheduler_gdn_and_ssd_observability_is_mapped_to_model_row(tmp_path):
                     "block_size": 2048,
                     "gdn_checkpoint_loads": 3,
                     "gdn_checkpoint_walkbacks": 2,
+                    "mtp_prefix_snapshot_count": 2,
+                    "mtp_prefix_snapshot_bytes": 123456,
+                    "mtp_prefix_snapshot_evictions": 4,
+                    "mtp_prefix_snapshot_capacity_evictions": 4,
+                    "mtp_prefix_snapshot_lifecycle_drops": 3,
+                    "mtp_prefix_snapshot_oversize_drops": 2,
+                    "mtp_prefix_snapshot_accounting_drops": 1,
+                    "mtp_prefix_snapshot_max_bytes": 1073741824,
                     "gdn_last_restore": {
                         "chosen_endpoint_tokens": 169984,
                         "checkpoint_load_latency_ms": 12.5,
@@ -162,10 +170,27 @@ def test_scheduler_gdn_and_ssd_observability_is_mapped_to_model_row(tmp_path):
             },
         )
 
-    row = _build(_Pool(Engine()), tmp_path)["models"][0]
+    payload = _build(_Pool(Engine()), tmp_path)
+    row = payload["models"][0]
 
     assert row["gdn_checkpoint_loads"] == 3
     assert row["gdn_checkpoint_walkbacks"] == 2
+    assert row["mtp_prefix_snapshot_count"] == 2
+    assert row["mtp_prefix_snapshot_bytes"] == 123456
+    assert row["mtp_prefix_snapshot_evictions"] == 4
+    assert row["mtp_prefix_snapshot_capacity_evictions"] == 4
+    assert row["mtp_prefix_snapshot_lifecycle_drops"] == 3
+    assert row["mtp_prefix_snapshot_oversize_drops"] == 2
+    assert row["mtp_prefix_snapshot_accounting_drops"] == 1
+    assert row["mtp_prefix_snapshot_max_bytes"] == 1073741824
+    assert payload["mtp_prefix_snapshot_count"] == 2
+    assert payload["mtp_prefix_snapshot_bytes"] == 123456
+    assert payload["mtp_prefix_snapshot_evictions"] == 4
+    assert payload["mtp_prefix_snapshot_capacity_evictions"] == 4
+    assert payload["mtp_prefix_snapshot_lifecycle_drops"] == 3
+    assert payload["mtp_prefix_snapshot_oversize_drops"] == 2
+    assert payload["mtp_prefix_snapshot_accounting_drops"] == 1
+    assert payload["mtp_prefix_snapshot_max_bytes"] == 1073741824
     assert row["gdn_last_restore"] == {
         "chosen_endpoint_tokens": 169984,
         "checkpoint_load_latency_ms": 12.5,
@@ -208,3 +233,20 @@ def test_engine_returning_none_stats_is_skipped(tmp_path):
 
     assert payload["models"] == []
     assert payload["hot_cache_max_bytes"] == 0
+
+
+def test_missing_global_settings_keeps_complete_mtp_snapshot_schema():
+    payload = admin_routes._build_runtime_cache_observability(None)
+
+    assert payload["models"] == []
+    for field in (
+        "mtp_prefix_snapshot_count",
+        "mtp_prefix_snapshot_bytes",
+        "mtp_prefix_snapshot_evictions",
+        "mtp_prefix_snapshot_capacity_evictions",
+        "mtp_prefix_snapshot_lifecycle_drops",
+        "mtp_prefix_snapshot_oversize_drops",
+        "mtp_prefix_snapshot_accounting_drops",
+        "mtp_prefix_snapshot_max_bytes",
+    ):
+        assert payload[field] == 0

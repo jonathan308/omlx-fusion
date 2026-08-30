@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import math
+from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
@@ -222,6 +223,224 @@ def test_qsa_ephemeral_pool_rebuilds_after_restore_extract_and_rewinds_trim():
     assert cache._pooled_index_keys is pooled_backing
     assert block_calls == [1]
     assert mx.array_equal(rebuilt, expected).item()
+
+
+def test_mtp_prefix_snapshot_compacts_qsa_and_preserves_exact_selection_logits():
+    from omlx.patches.mlx_lm_mtp import prompt_priming
+
+    total = 2052  # 513 completed blocks: a real top-512 selection.
+    mx.random.seed(733)
+    raw = mx.random.normal((1, total, 8)).astype(mx.float16)
+    cache = language.QSAKVCache()
+    _append(cache, raw, 0, total)
+    indexer_tag = SimpleNamespace(
+        # Model-owned parameters reachable through the identity tag are not
+        # retained sidecar payload and must not enter byte accounting.
+        weight=mx.ones((4096,), dtype=mx.float16)
+    )
+    pooled = cache.pooled_indexer_keys(
+        4,
+        lambda x: x,
+        _identity_rope,
+        cache_tag=indexer_tag,
+    )
+    cache._omlx_text_position_ids_qualified = True
+    mx.eval(cache.state, pooled)
+    assert cache.keys.shape[2] == 8192
+    assert cache._index_keys.shape[1] == 8192
+    assert cache._pooled_index_keys.shape[1] == 2048
+
+    [snapshot] = prompt_priming._cache_at_offset([cache], total)
+    assert type(snapshot) is type(cache)
+    assert snapshot.offset == total
+    assert snapshot.keys.shape[2] == total
+    assert snapshot.values.shape[2] == total
+    assert snapshot._index_keys.shape[1] == total
+    assert snapshot._index_position_ids.shape[-1] == total
+    assert snapshot._pooled_index_keys.shape == (1, total // 4, 8)
+    assert snapshot._pooled_index_offset == total // 4
+    assert snapshot._pooled_index_ratio == 4
+    assert snapshot._pooled_index_tag is indexer_tag
+    assert snapshot._omlx_text_position_ids_qualified is True
+
+    # Exercise the same lifecycle as prepare_prefix_context: detach the
+    # retained sidecar again into request-owned state. The compact pooled bank
+    # and exact indexer identity must survive this second restore as well.
+    [restored] = prompt_priming._cache_at_offset([snapshot], total)
+    assert restored is not snapshot
+    assert restored._pooled_index_keys is not snapshot._pooled_index_keys
+    assert restored._pooled_index_keys.shape == (1, total // 4, 8)
+    assert restored._pooled_index_offset == total // 4
+    assert restored._pooled_index_ratio == 4
+    assert restored._pooled_index_tag is indexer_tag
+    assert restored._omlx_text_position_ids_qualified is True
+
+    rebuild_rows = []
+
+    def must_not_rebuild(x):
+        rebuild_rows.append(int(x.shape[1]))
+        return x
+
+    rebuilt = restored.pooled_indexer_keys(
+        4,
+        must_not_rebuild,
+        _identity_rope,
+        cache_tag=indexer_tag,
+    )
+    mx.eval(rebuilt)
+    assert rebuild_rows == []
+    assert mx.array_equal(rebuilt, pooled).item()
+
+    index_query = mx.random.normal((1, 1, 4, 8)).astype(mx.float16)
+    original_scores = qsa_fast._portable_indexer_scores(index_query, pooled, 8)
+    restored_scores = qsa_fast._portable_indexer_scores(index_query, rebuilt, 8)
+    original_topk = mx.sort(
+        mx.argpartition(original_scores, kth=-512, axis=-1)[..., -512:],
+        axis=-1,
+    )
+    restored_topk = mx.sort(
+        mx.argpartition(restored_scores, kth=-512, axis=-1)[..., -512:],
+        axis=-1,
+    )
+
+    queries = mx.random.normal((1, 2, 1, 4)).astype(mx.float16)
+    common = dict(
+        num_query_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        indexer_head_dim=8,
+        compress_ratio=4,
+        token_budget=2048,
+    )
+    original_output = qsa_fast.contiguous_causal_gathered_qsa_decode(
+        queries,
+        cache.state[0],
+        cache.state[1],
+        index_query,
+        pooled,
+        **common,
+    )
+    restored_output = qsa_fast.contiguous_causal_gathered_qsa_decode(
+        queries,
+        restored.state[0],
+        restored.state[1],
+        index_query,
+        rebuilt,
+        **common,
+    )
+    lm_head = mx.random.normal((8, 32)).astype(mx.float16)
+    original_logits = original_output.reshape(1, 8) @ lm_head
+    restored_logits = restored_output.reshape(1, 8) @ lm_head
+    mx.eval(
+        original_topk,
+        restored_topk,
+        original_output,
+        restored_output,
+        original_logits,
+        restored_logits,
+    )
+    assert mx.array_equal(original_topk, restored_topk).item()
+    assert mx.array_equal(original_output, restored_output).item()
+    assert mx.array_equal(original_logits, restored_logits).item()
+    assert mx.array_equal(
+        mx.argmax(original_logits, axis=-1),
+        mx.argmax(restored_logits, axis=-1),
+    ).item()
+
+    # Ties at the top-512 boundary are especially sensitive to any changed
+    # pooled row or order. Zero queries make every score equal and prove the
+    # restored selector preserves the original deterministic tie result.
+    tie_query = mx.zeros_like(index_query)
+    original_tie_scores = qsa_fast._portable_indexer_scores(tie_query, pooled, 8)
+    restored_tie_scores = qsa_fast._portable_indexer_scores(tie_query, rebuilt, 8)
+    original_tie_topk = mx.sort(
+        mx.argpartition(original_tie_scores, kth=-512, axis=-1)[..., -512:],
+        axis=-1,
+    )
+    restored_tie_topk = mx.sort(
+        mx.argpartition(restored_tie_scores, kth=-512, axis=-1)[..., -512:],
+        axis=-1,
+    )
+    mx.eval(original_tie_topk, restored_tie_topk)
+    assert mx.array_equal(original_tie_topk, restored_tie_topk).item()
+
+
+def test_mtp_prefix_snapshot_trims_live_qsa_to_nondivisible_earlier_boundary():
+    from omlx.cache.prefix_cache import _snapshot_value_nbytes
+    from omlx.patches.mlx_lm_mtp import prompt_priming
+
+    total = 37
+    target = 31
+    ratio = 4
+    raw = mx.sin(mx.arange(total * 8, dtype=mx.float32)).reshape(1, total, 8)
+    cache = language.QSAKVCache()
+    _append(cache, raw, 0, total)
+    indexer_tag = SimpleNamespace(
+        # Model-owned parameters reachable through the identity tag are not
+        # retained sidecar payload and must not enter byte accounting.
+        weight=mx.ones((4096,), dtype=mx.float16)
+    )
+    live_pooled = cache.pooled_indexer_keys(
+        ratio,
+        lambda x: x,
+        _identity_rope,
+        cache_tag=indexer_tag,
+    )
+    pending_hidden = mx.ones((1, 1, 8), dtype=mx.float16)
+    estimated = prompt_priming._estimate_compact_mtp_snapshot_nbytes(
+        [cache], target, pending_hidden
+    )
+
+    [snapshot_cache] = prompt_priming._cache_at_offset([cache], target)
+    snapshot = prompt_priming._MtpPrefixSnapshot(
+        boundary_tokens=target + 1,
+        mtp_cache=[snapshot_cache],
+        pending_hidden=pending_hidden,
+    )
+    mx.eval(*prompt_priming._snapshot_arrays(snapshot), live_pooled)
+    assert snapshot_cache.offset == target
+    assert snapshot_cache._pooled_index_offset == target // ratio
+    assert snapshot_cache._pooled_index_keys.shape[1] == target // ratio
+    assert snapshot_cache._pooled_index_tag is indexer_tag
+    assert snapshot_cache._omlx_text_position_ids_qualified is False
+    assert estimated == _snapshot_value_nbytes(snapshot)
+    assert estimated < indexer_tag.weight.nbytes
+
+    rebuilt_rows = []
+
+    def must_not_rebuild(x):
+        rebuilt_rows.append(int(x.shape[1]))
+        return x
+
+    restored_pooled = snapshot_cache.pooled_indexer_keys(
+        ratio,
+        must_not_rebuild,
+        _identity_rope,
+        cache_tag=indexer_tag,
+    )
+    mx.eval(restored_pooled)
+    assert rebuilt_rows == []
+    assert mx.array_equal(
+        restored_pooled,
+        live_pooled[:, : target // ratio],
+    ).item()
+
+
+def test_mtp_prefix_snapshot_rejects_stale_pooled_qsa_bank():
+    from omlx.patches.mlx_lm_mtp import prompt_priming
+
+    total = 20
+    raw = mx.arange(total * 8, dtype=mx.float32).reshape(1, total, 8)
+    cache = language.QSAKVCache()
+    _append(cache, raw, 0, total)
+    cache.pooled_indexer_keys(
+        4,
+        lambda x: x,
+        _identity_rope,
+        cache_tag=object(),
+    )
+    cache._pooled_index_offset -= 1
+    assert prompt_priming._cache_at_offset([cache], total) is None
 
 
 def test_qsa_equal_mrope_text_planes_qualify_once_and_3d_update_revokes():

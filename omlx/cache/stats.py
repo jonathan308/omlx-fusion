@@ -95,6 +95,14 @@ class PrefixCacheStats(BaseCacheStats):
     exact_prefix_tokens_restored: int = 0
     exact_prefix_stores: int = 0
     exact_prefix_store_failures: int = 0
+    mtp_prefix_snapshot_count: int = 0
+    mtp_prefix_snapshot_bytes: int = 0
+    mtp_prefix_snapshot_evictions: int = 0
+    mtp_prefix_snapshot_capacity_evictions: int = 0
+    mtp_prefix_snapshot_lifecycle_drops: int = 0
+    mtp_prefix_snapshot_oversize_drops: int = 0
+    mtp_prefix_snapshot_accounting_drops: int = 0
+    mtp_prefix_snapshot_max_bytes: int = 0
     _total_queries: int = field(default=0, repr=False)
 
     @property
@@ -125,6 +133,14 @@ class PrefixCacheStats(BaseCacheStats):
         self.exact_prefix_tokens_restored = 0
         self.exact_prefix_stores = 0
         self.exact_prefix_store_failures = 0
+        self.mtp_prefix_snapshot_count = 0
+        self.mtp_prefix_snapshot_bytes = 0
+        self.mtp_prefix_snapshot_evictions = 0
+        self.mtp_prefix_snapshot_capacity_evictions = 0
+        self.mtp_prefix_snapshot_lifecycle_drops = 0
+        self.mtp_prefix_snapshot_oversize_drops = 0
+        self.mtp_prefix_snapshot_accounting_drops = 0
+        self.mtp_prefix_snapshot_max_bytes = 0
         self._total_queries = 0
 
 

@@ -153,7 +153,7 @@ def test_block_prefix_cache_mtp_sidecar_uses_live_chain_hash_and_evicts():
     cache._mtp_prefix_snapshot_lock = threading.RLock()
 
     tokens = list(range(8))
-    snapshot = object()
+    snapshot = SimpleNamespace(nbytes=0)
     assert cache.store_mtp_prefix_snapshot(tokens, 8, snapshot)
     tip = cache._mtp_prefix_chain_tip(tokens, 8)
     assert tip is not None
@@ -192,7 +192,7 @@ def test_block_prefix_cache_mtp_sidecar_lru_four_and_clear_lifecycle():
     entries = []
     for branch in range(5):
         tokens = [branch * 100 + i for i in range(8)]
-        snapshot = object()
+        snapshot = SimpleNamespace(nbytes=0)
         assert cache.store_mtp_prefix_snapshot(tokens, 8, snapshot)
         tip = cache._mtp_prefix_chain_tip(tokens, 8)
         assert tip is not None
@@ -208,10 +208,368 @@ def test_block_prefix_cache_mtp_sidecar_lru_four_and_clear_lifecycle():
     # remaining sidecars and the ordinary prefix index together.
     cache._on_block_hash_dropped(entries[-1][1])
     assert cache.restore_mtp_prefix_snapshot(entries[-1][0], 8) is None
+    assert cache._mtp_prefix_snapshot_lifecycle_drops == 1
     cache._prefix_index[b"ordinary"] = (1, 2, 3)
     cache._on_hash_map_cleared()
     assert not cache._mtp_prefix_snapshots
     assert not cache._prefix_index
+    assert cache._mtp_prefix_snapshot_lifecycle_drops == 4
+
+
+class _SizedSnapshotPayload:
+    def __init__(self, nbytes):
+        self.nbytes = int(nbytes)
+
+
+def _make_production_sidecar_cache(max_bytes):
+    from omlx.cache.prefix_cache import BlockAwarePrefixCache
+
+    class _HashMap:
+        def __init__(self):
+            self.blocks = {}
+
+        def get_block(self, key):
+            return self.blocks.get(key)
+
+    hash_map = _HashMap()
+    cache = BlockAwarePrefixCache.__new__(BlockAwarePrefixCache)
+    cache.block_size = 4
+    cache.paged_cache = SimpleNamespace(
+        model_name="mtp-byte-budget-test",
+        cached_block_hash_to_block=hash_map,
+        stats=SimpleNamespace(evictions=0),
+        get_memory_usage=lambda: {},
+        reset_stats=lambda: None,
+        clear=lambda: None,
+    )
+    cache._prefix_index = {}
+    cache._request_tables = {}
+    cache._mtp_prefix_snapshots = OrderedDict()
+    cache._mtp_prefix_snapshot_lock = threading.RLock()
+    cache._mtp_prefix_snapshot_max_bytes = int(max_bytes)
+    cache._mtp_prefix_snapshot_bytes = 0
+    cache._mtp_prefix_snapshot_evictions = 0
+    cache._mtp_prefix_snapshot_lifecycle_drops = 0
+    cache._mtp_prefix_snapshot_oversize_drops = 0
+    cache._mtp_prefix_snapshot_accounting_drops = 0
+    for attr in (
+        "_hits",
+        "_misses",
+        "_tokens_saved",
+        "_partial_block_skips",
+        "_partial_tokens_skipped",
+        "_tokens_matched_total",
+        "_tokens_requested_total",
+        "_last_partial_tokens_skipped",
+        "_last_tokens_to_next_block",
+        "_exact_prefix_hits",
+        "_exact_prefix_misses",
+        "_exact_prefix_tokens_restored",
+        "_exact_prefix_stores",
+        "_exact_prefix_store_failures",
+        "_gdn_checkpoint_loads",
+        "_gdn_checkpoint_walkbacks",
+    ):
+        setattr(cache, attr, 0)
+    cache._last_gdn_restore = None
+    return cache, hash_map
+
+
+def test_block_prefix_cache_mtp_sidecar_byte_budget_replacement_and_stats():
+    """Synthetic 20K..220K snapshots obey both byte and count LRU bounds."""
+
+    # Exact logical QSA-head bytes without allocating the hundreds of MiB.
+    per_token = 2 * 2 * 256 * 2 + 128 * 2 + 4 + (128 * 2) // 4
+    sizes = [tokens * per_token for tokens in (20_000, 60_000, 90_000, 220_000)]
+    budget = sizes[-1] + sizes[2]
+    cache, hash_map = _make_production_sidecar_cache(budget)
+    entries = []
+    for branch, size in enumerate(sizes):
+        tokens = [branch * 100 + i for i in range(8)]
+        snapshot = SimpleNamespace(payload=_SizedSnapshotPayload(size))
+        assert cache.store_mtp_prefix_snapshot(tokens, 8, snapshot)
+        tip = cache._mtp_prefix_chain_tip(tokens, 8)
+        hash_map.blocks[tip] = object()
+        entries.append((tokens, tip, snapshot, size))
+
+    stats = cache.get_stats_dict()
+    assert stats["mtp_prefix_snapshot_count"] == 2
+    assert stats["mtp_prefix_snapshot_bytes"] == sizes[-1] + sizes[2]
+    assert stats["mtp_prefix_snapshot_evictions"] == 2
+    assert stats["mtp_prefix_snapshot_capacity_evictions"] == 2
+    assert stats["mtp_prefix_snapshot_lifecycle_drops"] == 0
+    assert stats["mtp_prefix_snapshot_oversize_drops"] == 0
+    assert stats["mtp_prefix_snapshot_accounting_drops"] == 0
+    assert stats["mtp_prefix_snapshot_max_bytes"] == budget
+    assert cache.restore_mtp_prefix_snapshot(entries[0][0], 8) is None
+    assert cache.restore_mtp_prefix_snapshot(entries[-1][0], 8) is entries[-1][2]
+
+    # Replacing one hash subtracts the old bytes before charging the new value.
+    replacement_size = sizes[0]
+    replacement = SimpleNamespace(payload=_SizedSnapshotPayload(replacement_size))
+    assert cache.store_mtp_prefix_snapshot(entries[-1][0], 8, replacement)
+    assert cache._mtp_prefix_snapshot_bytes == sizes[2] + replacement_size
+
+    # Backbone hash eviction and wholesale clear update exact byte accounting.
+    cache._on_block_hash_dropped(entries[2][1])
+    assert cache._mtp_prefix_snapshot_bytes == replacement_size
+    assert cache._mtp_prefix_snapshot_evictions == 2
+    assert cache._mtp_prefix_snapshot_lifecycle_drops == 1
+    assert cache.clear() >= 1
+    assert cache._mtp_prefix_snapshot_bytes == 0
+    assert cache._mtp_prefix_snapshot_evictions == 0
+    assert cache._mtp_prefix_snapshot_lifecycle_drops == 0
+    assert cache._mtp_prefix_snapshot_oversize_drops == 0
+    assert cache._mtp_prefix_snapshot_accounting_drops == 0
+    assert not cache._mtp_prefix_snapshots
+
+
+def test_block_prefix_cache_mtp_sidecar_oversize_fails_closed():
+    cache, _ = _make_production_sidecar_cache(1024)
+    assert cache.admit_mtp_prefix_snapshot_size(1024)
+    assert not cache.admit_mtp_prefix_snapshot_size(1025)
+    snapshot = SimpleNamespace(payload=_SizedSnapshotPayload(1025))
+    assert not cache.store_mtp_prefix_snapshot(list(range(8)), 8, snapshot)
+    assert cache._mtp_prefix_snapshot_bytes == 0
+    assert cache._mtp_prefix_snapshot_oversize_drops == 2
+    assert not cache._mtp_prefix_snapshots
+
+
+def test_mtp_snapshot_nested_arrays_are_counted_once_and_cannot_bypass_cap():
+    from mlx_lm.models.cache import ArraysCache
+
+    payload = mx.zeros((1024,), dtype=mx.float32)
+    hidden = mx.zeros((4,), dtype=mx.float32)
+    nested = ArraysCache(2)
+    nested.cache = [payload, payload]
+    snapshot = prompt_priming._MtpPrefixSnapshot(
+        boundary_tokens=8,
+        mtp_cache=[nested],
+        pending_hidden=hidden,
+    )
+
+    assert payload.nbytes == 4096
+    assert hidden.nbytes == 16
+    assert snapshot.nbytes == 4112
+    assert sum(array.nbytes for array in prompt_priming._snapshot_arrays(snapshot)) == 4112
+
+    cache, _ = _make_production_sidecar_cache(4111)
+    assert not cache.store_mtp_prefix_snapshot(list(range(8)), 8, snapshot)
+    assert cache._mtp_prefix_snapshot_bytes == 0
+    assert cache._mtp_prefix_snapshot_oversize_drops == 1
+    assert not cache._mtp_prefix_snapshots
+
+
+def test_mtp_snapshot_quantized_tuple_payload_and_aliases_are_counted_once():
+    packed = mx.zeros((256,), dtype=mx.uint32)
+    scales = mx.zeros((64,), dtype=mx.float16)
+    biases = mx.zeros((64,), dtype=mx.float16)
+    hidden = mx.zeros((4,), dtype=mx.float32)
+
+    class _TupleCache:
+        offset = 1
+
+        def __init__(self):
+            self.keys = (packed, scales, biases)
+            self.values = (packed, scales, biases)
+
+    snapshot = prompt_priming._MtpPrefixSnapshot(
+        boundary_tokens=8,
+        mtp_cache=[_TupleCache()],
+        pending_hidden=hidden,
+    )
+    expected = packed.nbytes + scales.nbytes + biases.nbytes + hidden.nbytes
+    assert snapshot.nbytes == expected
+    arrays = prompt_priming._snapshot_arrays(snapshot)
+    assert len({id(array) for array in arrays}) == 4
+    assert sum(array.nbytes for array in arrays) == expected
+
+
+def test_mtp_snapshot_opaque_nonempty_payload_fails_closed_and_is_counted():
+    class _OpaqueCache:
+        offset = 7
+
+        def __init__(self):
+            self.payload = object()
+
+    snapshot = prompt_priming._MtpPrefixSnapshot(
+        boundary_tokens=8,
+        mtp_cache=[_OpaqueCache()],
+        pending_hidden=mx.zeros((4,), dtype=mx.float32),
+    )
+    with pytest.raises(ValueError, match="opaque payload"):
+        _ = snapshot.nbytes
+
+    cache, _ = _make_production_sidecar_cache(1 << 20)
+    assert not cache.store_mtp_prefix_snapshot(list(range(8)), 8, snapshot)
+    assert cache._mtp_prefix_snapshot_accounting_drops == 1
+    assert not cache._mtp_prefix_snapshots
+
+
+def test_mtp_snapshot_reason_counters_reset_without_clearing_retained_entries():
+    cache, _ = _make_production_sidecar_cache(1 << 20)
+    tips = []
+    for branch in range(5):
+        tokens = [branch * 100 + i for i in range(8)]
+        assert cache.store_mtp_prefix_snapshot(
+            tokens,
+            8,
+            SimpleNamespace(payload=_SizedSnapshotPayload(16)),
+        )
+        tips.append(cache._mtp_prefix_chain_tip(tokens, 8))
+    assert cache._mtp_prefix_snapshot_evictions == 1
+
+    cache._on_block_hash_dropped(tips[-1])
+    assert cache._mtp_prefix_snapshot_lifecycle_drops == 1
+    assert not cache.admit_mtp_prefix_snapshot_size((1 << 20) + 1)
+    assert cache._mtp_prefix_snapshot_oversize_drops == 1
+    opaque = SimpleNamespace(payload=object())
+    assert not cache.store_mtp_prefix_snapshot(list(range(8)), 8, opaque)
+    assert cache._mtp_prefix_snapshot_accounting_drops == 1
+
+    retained_count = len(cache._mtp_prefix_snapshots)
+    retained_bytes = cache._mtp_prefix_snapshot_bytes
+    cache.reset_stats()
+    assert len(cache._mtp_prefix_snapshots) == retained_count
+    assert cache._mtp_prefix_snapshot_bytes == retained_bytes
+    assert cache._mtp_prefix_snapshot_evictions == 0
+    assert cache._mtp_prefix_snapshot_lifecycle_drops == 0
+    assert cache._mtp_prefix_snapshot_oversize_drops == 0
+    assert cache._mtp_prefix_snapshot_accounting_drops == 0
+
+    cache.clear()
+    assert not cache._mtp_prefix_snapshots
+    assert cache._mtp_prefix_snapshot_bytes == 0
+
+
+def test_mtp_cache_unknown_qsa_family_fails_closed():
+    class QSAQuantizedKVCache:
+        offset = 8
+
+        def trim(self, n):
+            self.offset -= n
+            return n
+
+    assert prompt_priming._cache_at_offset([QSAQuantizedKVCache()], 8) is None
+
+
+def test_prepare_prefix_context_eagerly_materializes_request_owned_detach(
+    monkeypatch,
+):
+    """Restore pays the second detach before the first suffix/decode call.
+
+    The retained sidecar and request-owned cache are distinct lazy MLX graphs.
+    Evaluating the retained snapshot here would leave the request copy to
+    materialize on first decode, inflating visible TTFT and allocator peak.
+    """
+
+    class _Entry:
+        def __init__(self, payload):
+            self.offset = 7
+            self.payload = payload
+
+    class _Host:
+        _omlx_mtp_decode_enabled = True
+        _omlx_mtp_chain = True
+        mtp = object()
+
+    source_array = mx.arange(8, dtype=mx.float32)
+    request_array = source_array + mx.array(1, dtype=mx.float32)
+    source_entry = _Entry(source_array)
+    request_entry = _Entry(request_array)
+    retained = prompt_priming._MtpPrefixSnapshot(
+        boundary_tokens=8,
+        mtp_cache=[source_entry],
+        pending_hidden=mx.ones((1, 1, 8), dtype=mx.float32),
+    )
+    prefix_cache = SimpleNamespace(
+        block_size=8,
+        restore_mtp_prefix_snapshot=lambda *args, **kwargs: retained,
+    )
+    monkeypatch.setattr(
+        prompt_priming,
+        "_cache_at_offset",
+        lambda cache, target: [request_entry],
+    )
+
+    evaluated = []
+    real_eval = mx.eval
+
+    def tracked_eval(*arrays):
+        evaluated.extend(arrays)
+        return real_eval(*arrays)
+
+    monkeypatch.setattr(mx, "eval", tracked_eval)
+    host = _Host()
+    assert prompt_priming.prepare_prefix_context(
+        host,
+        request_id="materialize-before-decode",
+        prompt_tokens=list(range(8)),
+        cached_tokens=8,
+        prefix_cache=prefix_cache,
+    )
+    ctx = prompt_priming._find_ctx(host)
+    assert ctx is not None
+    assert ctx.mtp_cache == [request_entry]
+    assert any(value is request_array for value in evaluated)
+    assert all(value is not source_array for value in evaluated)
+    assert any(value is ctx.pending_hidden for value in evaluated)
+
+
+def test_boundary_publish_rejects_definitely_oversize_before_detached_copy(
+    monkeypatch,
+):
+    """The retained-byte cap can reject an impossible candidate pre-alloc."""
+
+    qsa_cache_type = type("QSAKVCache", (), {})
+    entry = qsa_cache_type()
+    entry.offset = 7
+    entry.keys = mx.zeros((1, 1, 7, 2), dtype=mx.float16)
+    entry.values = mx.zeros((1, 1, 7, 2), dtype=mx.float16)
+    entry._index_keys = mx.zeros((1, 7, 2), dtype=mx.float16)
+    entry._index_position_ids = mx.arange(7, dtype=mx.int32)[None]
+    entry._pooled_index_keys = None
+    entry._pooled_index_offset = 0
+    entry._pooled_index_ratio = None
+    entry._pooled_index_tag = None
+
+    admitted_sizes = []
+
+    def reject_size(size):
+        admitted_sizes.append(size)
+        return False
+
+    prefix_cache = SimpleNamespace(
+        admit_mtp_prefix_snapshot_size=reject_size,
+        store_mtp_prefix_snapshot=lambda *args, **kwargs: pytest.fail(
+            "oversize snapshot reached store"
+        ),
+    )
+    ctx = prompt_priming._PrimeCtx(
+        mtp_cache=[entry],
+        prompt_tokens=tuple(range(8)),
+        prefix_cache=prefix_cache,
+        snapshot_candidate=prompt_priming._MtpBoundaryCandidate(
+            boundary_tokens=8,
+            pending_hidden=mx.zeros((1, 1, 4), dtype=mx.float16),
+        ),
+    )
+    monkeypatch.setattr(
+        prompt_priming,
+        "_cache_at_offset",
+        lambda *args, **kwargs: pytest.fail(
+            "oversize snapshot allocated a detached copy"
+        ),
+    )
+
+    prompt_priming._publish_boundary_candidate(ctx)
+    assert admitted_sizes == [
+        entry.keys.nbytes
+        + entry.values.nbytes
+        + entry._index_keys.nbytes
+        + entry._index_position_ids.nbytes
+        + ctx.snapshot_candidate.pending_hidden.nbytes
+    ]
 
 
 @pytest.fixture(autouse=True)

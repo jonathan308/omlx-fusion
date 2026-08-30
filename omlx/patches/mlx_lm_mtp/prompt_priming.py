@@ -180,6 +180,15 @@ class _MtpPrefixSnapshot:
     mtp_cache: List[Any]
     pending_hidden: Any
 
+    @property
+    def nbytes(self) -> int:
+        """Unique retained arrays, excluding model-owned identity metadata."""
+
+        total, complete, _arrays = _measure_snapshot_payload(self)
+        if not complete:
+            raise ValueError("MTP prefix snapshot contains opaque payload bytes")
+        return total
+
 
 @dataclass
 class _MtpBoundaryCandidate:
@@ -391,24 +400,174 @@ def _inputs_match_plan(
     return actual == plan.prompt_tokens[start:stop]
 
 
-def _clone_mtp_cache(cache: List[Any]) -> List[Any]:
+_LOGICAL_QSA_CACHE_CLASS = "QSAKVCache"
+_SNAPSHOT_REFERENCE_FIELDS = frozenset({"_pooled_index_tag"})
+
+
+def _detach_snapshot_value(value: Any) -> Any:
+    """Detach arrays/containers while preserving their exact logical shape."""
+
+    import mlx.core as mx
+
+    if isinstance(value, mx.array):
+        try:
+            return mx.copy(value)
+        except AttributeError:
+            return value + mx.zeros((), dtype=value.dtype)
+    if isinstance(value, list):
+        return [_detach_snapshot_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_detach_snapshot_value(item) for item in value)
+    if isinstance(value, dict):
+        return {
+            key: _detach_snapshot_value(item) for key, item in value.items()
+        }
+    return value
+
+
+def _compact_qsa_snapshot(entry: Any) -> bool:
+    """Rebind one Qwen4 QSA cache to detached logical state only.
+
+    ``QSAKVCache.state`` exposes K/V, raw index keys and positions sliced to
+    ``offset``. The validated completed-block bank is also retained at its
+    logical length with the exact model-owned indexer tag; this avoids an
+    O(context) first-decode rebuild without serializing geometric capacity.
+    Unknown QSA-family classes fail closed instead of being silently coerced.
+    """
+
+    class_name = type(entry).__name__
+    if "QSA" not in class_name:
+        return True
+    if class_name != _LOGICAL_QSA_CACHE_CLASS:
+        return False
+    snapshot = getattr(entry, "prefix_cache_snapshot", None)
+    restore = getattr(entry, "prefix_cache_restore", None)
+    if not callable(snapshot) or not callable(restore):
+        return False
+    try:
+        pooled_keys = getattr(entry, "_pooled_index_keys", None)
+        pooled_offset = int(getattr(entry, "_pooled_index_offset", 0) or 0)
+        pooled_ratio = getattr(entry, "_pooled_index_ratio", None)
+        pooled_tag = getattr(entry, "_pooled_index_tag", None)
+        text_positions_qualified = getattr(
+            entry, "_omlx_text_position_ids_qualified", False
+        )
+        if type(text_positions_qualified) is not bool:
+            return False
+        compact_pooled = None
+        if pooled_keys is not None:
+            if (
+                not isinstance(pooled_ratio, int)
+                or pooled_ratio <= 0
+                or pooled_tag is None
+                or pooled_offset < 0
+                or pooled_offset > int(pooled_keys.shape[1])
+            ):
+                return False
+            offset_before = _read_offset(entry)
+            if offset_before is None or pooled_offset != offset_before // pooled_ratio:
+                # A stale/incomplete derived bank would force an O(context)
+                # rebuild on first decode. Decline the sidecar instead of
+                # claiming a zero-regression warm restore.
+                return False
+            compact_pooled = _detach_snapshot_value(
+                pooled_keys[:, :pooled_offset]
+            )
+        elif (
+            pooled_offset != 0
+            or pooled_ratio is not None
+            or pooled_tag is not None
+        ):
+            return False
+
+        compact = _detach_snapshot_value(snapshot())
+        state = compact.get("state") if isinstance(compact, dict) else None
+        if not isinstance(state, (list, tuple)) or len(state) != 4:
+            return False
+        keys, values, index_keys, positions = state
+        offset = _read_offset(entry)
+        if offset is None:
+            return False
+        if offset == 0:
+            if keys is not None or values is not None:
+                return False
+        elif (
+            keys is None
+            or values is None
+            or index_keys is None
+            or positions is None
+            or int(keys.shape[2]) != offset
+            or int(values.shape[2]) != offset
+            or int(index_keys.shape[1]) != offset
+            or int(positions.shape[-1]) != offset
+        ):
+            return False
+        restore(compact)
+        if compact_pooled is not None:
+            entry._pooled_index_keys = compact_pooled
+            entry._pooled_index_offset = pooled_offset
+            entry._pooled_index_ratio = pooled_ratio
+            entry._pooled_index_tag = pooled_tag
+        entry._omlx_text_position_ids_qualified = text_positions_qualified
+        return bool(
+            _read_offset(entry) == offset
+            and (
+                (
+                    compact_pooled is None
+                    and getattr(entry, "_pooled_index_keys", None) is None
+                )
+                or (
+                    getattr(entry, "_pooled_index_keys", None) is compact_pooled
+                    and getattr(entry, "_pooled_index_offset", None)
+                    == pooled_offset
+                    and getattr(entry, "_pooled_index_ratio", None)
+                    == pooled_ratio
+                    and getattr(entry, "_pooled_index_tag", None) is pooled_tag
+                )
+            )
+            and getattr(entry, "_omlx_text_position_ids_qualified", False)
+            is text_positions_qualified
+        )
+    except Exception as exc:
+        logger.debug("MTP QSA snapshot compaction failed closed: %s", exc)
+        return False
+
+
+def _clone_mtp_cache(cache: List[Any]) -> Optional[List[Any]]:
     """Detach an MTP cache so later decode writes cannot mutate a snapshot."""
     import copy
 
     import mlx.core as mx
+
+    pending = list(cache)
+    while pending:
+        candidate = pending.pop()
+        if candidate is None:
+            continue
+        pending.extend(getattr(candidate, "caches", ()) or ())
+        class_name = type(candidate).__name__
+        if "QSA" in class_name and class_name != _LOGICAL_QSA_CACHE_CLASS:
+            return None
 
     def clone_one(entry: Any) -> Any:
         if entry is None:
             return None
         subs = getattr(entry, "caches", None)
         if subs is not None:
-            return type(entry)(*[clone_one(sub) for sub in subs])
+            cloned_subs = [clone_one(sub) for sub in subs]
+            return type(entry)(*cloned_subs)
+        if "QSA" in type(entry).__name__:
+            if type(entry).__name__ != _LOGICAL_QSA_CACHE_CLASS:
+                return None
+            # QSA trim changes logical offsets only. Share backing arrays until
+            # _cache_at_offset has selected the target, then compact once.
+            return copy.copy(entry)
         clone = copy.copy(entry)
         for attr, value in vars(entry).items():
-            if isinstance(value, mx.array):
-                setattr(clone, attr, value + 0)
-            elif isinstance(value, list):
-                setattr(clone, attr, list(value))
+            if attr in _SNAPSHOT_REFERENCE_FIELDS:
+                continue
+            if isinstance(value, (mx.array, list, tuple, dict)):
+                setattr(clone, attr, _detach_snapshot_value(value))
         return clone
 
     return [clone_one(entry) for entry in cache]
@@ -464,6 +623,8 @@ def _cache_at_offset(cache: List[Any], target: int) -> Optional[List[Any]]:
     if target < 0 or not cache:
         return None
     cloned = _clone_mtp_cache(cache)
+    if cloned is None:
+        return None
     saw_offset = False
     for entry in _flat_cache_entries(cloned):
         current = _read_offset(entry)
@@ -479,21 +640,221 @@ def _cache_at_offset(cache: List[Any], target: int) -> Optional[List[Any]]:
                 return None
         if _read_offset(entry) != target:
             return None
+        if not _compact_qsa_snapshot(entry):
+            return None
     return cloned if saw_offset else None
+
+
+def _measure_snapshot_value(
+    value: Any,
+    *,
+    seen: set[int],
+    arrays: list[Any],
+    field_name: str | None = None,
+) -> tuple[int, bool]:
+    """Measure one retained payload recursively with identity deduplication.
+
+    Model-owned identity references are deliberately excluded. Containers and
+    cache fields are traversed before falling back to a declared ``nbytes`` so
+    duplicate aliases in ArraysCache/quantized tuples count only once.
+    """
+
+    import mlx.core as mx
+
+    if field_name in _SNAPSHOT_REFERENCE_FIELDS:
+        return 0, True
+    if value is None or isinstance(
+        value, (str, bytes, bytearray, bool, int, float, complex)
+    ):
+        return 0, True
+    if isinstance(value, type) or callable(value):
+        return 0, True
+
+    value_id = id(value)
+    if value_id in seen:
+        return 0, True
+    seen.add(value_id)
+
+    if isinstance(value, mx.array):
+        arrays.append(value)
+        return int(value.nbytes), True
+
+    if isinstance(value, dict):
+        total = 0
+        for key, item in value.items():
+            child, complete = _measure_snapshot_value(
+                item,
+                seen=seen,
+                arrays=arrays,
+                field_name=str(key),
+            )
+            total += child
+            if not complete:
+                return total, False
+        return total, True
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        total = 0
+        for item in value:
+            child, complete = _measure_snapshot_value(
+                item,
+                seen=seen,
+                arrays=arrays,
+            )
+            total += child
+            if not complete:
+                return total, False
+        return total, True
+
+    try:
+        declared = getattr(value, "nbytes", None)
+    except Exception:
+        declared = None
+    declared = declared if isinstance(declared, int) and declared >= 0 else None
+    fields = getattr(value, "__dict__", None)
+    if isinstance(fields, dict) and fields:
+        total = 0
+        complete = True
+        for name, item in fields.items():
+            child, child_complete = _measure_snapshot_value(
+                item,
+                seen=seen,
+                arrays=arrays,
+                field_name=name,
+            )
+            total += child
+            complete = complete and child_complete
+        if complete and total > 0:
+            return total, True
+        if complete and declared is not None and declared > 0:
+            return declared, True
+        offset = _read_offset(value)
+        if complete and total == 0 and (offset is None or offset == 0):
+            return 0, True
+        if not complete and declared is not None:
+            return max(total, declared), True
+        return total, False
+
+    if declared is not None:
+        return declared, True
+    return 0, False
+
+
+def _measure_snapshot_payload(
+    snapshot: _MtpPrefixSnapshot,
+) -> tuple[int, bool, list[Any]]:
+    """Return retained bytes, completeness, and arrays for one sidecar."""
+
+    seen: set[int] = set()
+    arrays: list[Any] = []
+    total = 0
+    complete = True
+    for value in (snapshot.pending_hidden, snapshot.mtp_cache):
+        child, child_complete = _measure_snapshot_value(
+            value,
+            seen=seen,
+            arrays=arrays,
+        )
+        total += child
+        complete = complete and child_complete
+    return total, complete, arrays
 
 
 def _snapshot_arrays(snapshot: _MtpPrefixSnapshot) -> list[Any]:
     """Arrays that must be materialized to sever the live prefill graph."""
-    import mlx.core as mx
 
-    arrays: list[Any] = []
-    if isinstance(snapshot.pending_hidden, mx.array):
-        arrays.append(snapshot.pending_hidden)
-    for entry in _flat_cache_entries(snapshot.mtp_cache):
-        for value in vars(entry).values():
-            if isinstance(value, mx.array):
-                arrays.append(value)
+    _total, complete, arrays = _measure_snapshot_payload(snapshot)
+    if not complete:
+        raise ValueError("MTP prefix snapshot contains opaque payload arrays")
     return arrays
+
+
+def _estimate_compact_qsa_nbytes(entry: Any, target: int) -> Optional[int]:
+    """Exact retained-array estimate for one compact Qwen4 QSA snapshot."""
+
+    if type(entry).__name__ != _LOGICAL_QSA_CACHE_CLASS:
+        return None
+    try:
+        current = _read_offset(entry)
+        if current is None or target < 0 or target > current:
+            return None
+        arrays = (
+            getattr(entry, "keys", None),
+            getattr(entry, "values", None),
+            getattr(entry, "_index_keys", None),
+            getattr(entry, "_index_position_ids", None),
+        )
+        if target and any(array is None for array in arrays):
+            return None
+        total = 0
+        if target:
+            total += int(arrays[0][..., :target, :].nbytes)
+            total += int(arrays[1][..., :target, :].nbytes)
+            total += int(arrays[2][:, :target, :].nbytes)
+            total += int(arrays[3][..., :target].nbytes)
+
+        pooled = getattr(entry, "_pooled_index_keys", None)
+        pooled_offset = int(getattr(entry, "_pooled_index_offset", 0) or 0)
+        pooled_ratio = getattr(entry, "_pooled_index_ratio", None)
+        pooled_tag = getattr(entry, "_pooled_index_tag", None)
+        if pooled is not None:
+            if (
+                not isinstance(pooled_ratio, int)
+                or pooled_ratio <= 0
+                or pooled_tag is None
+            ):
+                return None
+            required = target // pooled_ratio
+            if pooled_offset < required or required > int(pooled.shape[1]):
+                return None
+            total += int(pooled[:, :required].nbytes)
+        elif (
+            pooled_offset != 0
+            or pooled_ratio is not None
+            or pooled_tag is not None
+        ):
+            return None
+        return total
+    except Exception:
+        return None
+
+
+def _estimate_compact_mtp_snapshot_nbytes(
+    cache: List[Any],
+    target: int,
+    pending_hidden: Any,
+) -> Optional[int]:
+    """Conservative pre-allocation estimate for one MTP boundary snapshot."""
+
+    total = int(getattr(pending_hidden, "nbytes", 0) or 0)
+    saw_offset = False
+    pending = list(cache)
+    while pending:
+        entry = pending.pop()
+        if entry is None:
+            continue
+        subs = getattr(entry, "caches", None)
+        if subs is not None:
+            pending.extend(subs)
+            continue
+        current = _read_offset(entry)
+        if current is not None:
+            saw_offset = True
+            if current < target:
+                return None
+        if "QSA" in type(entry).__name__:
+            qsa_bytes = _estimate_compact_qsa_nbytes(entry, target)
+            if qsa_bytes is None:
+                return None
+            total += qsa_bytes
+            continue
+        # Generic families keep their pre-existing detached clone semantics.
+        # Their reported nbytes is conservative when trim does not shrink.
+        nbytes = getattr(entry, "nbytes", None)
+        if not isinstance(nbytes, int) or nbytes < 0:
+            return None
+        total += nbytes
+    return total if saw_offset else None
 
 
 def capture_eligible(host: Any, cache: Optional[List[Any]]) -> bool:
@@ -626,9 +987,17 @@ def prepare_prefix_context(
     )
     setattr(host, _CTX_ATTR, ctx)
     try:
-        arrays = [pending_hidden, *_snapshot_arrays(snapshot)]
+        active_snapshot = _MtpPrefixSnapshot(
+            boundary_tokens=snapshot.boundary_tokens,
+            mtp_cache=restored_cache,
+            pending_hidden=pending_hidden,
+        )
+        arrays = _snapshot_arrays(active_snapshot)
         if arrays:
-            mx.async_eval(arrays)
+            # Materialize the request-owned detach during restore instead of
+            # deferring it into the first suffix/decode kernel. This work still
+            # belongs to end-to-end restore TTFT and must be measured there.
+            mx.eval(*arrays)
     except Exception as exc:
         drop_ctx(model)
         logger.debug("MTP prefix sidecar materialization failed closed: %s", exc)
@@ -701,8 +1070,29 @@ def _publish_boundary_candidate(ctx: _PrimeCtx) -> None:
     if not isinstance(candidate, _MtpBoundaryCandidate) or not callable(store):
         return
     try:
+        target_offset = candidate.boundary_tokens - 1
+        estimate = _estimate_compact_mtp_snapshot_nbytes(
+            ctx.mtp_cache,
+            target_offset,
+            candidate.pending_hidden,
+        )
+        admit_size = getattr(
+            ctx.prefix_cache,
+            "admit_mtp_prefix_snapshot_size",
+            None,
+        )
+        if (
+            estimate is not None
+            and callable(admit_size)
+            and not admit_size(estimate)
+        ):
+            logger.debug(
+                "MTP prefix sidecar skipped before allocation: estimated=%d",
+                estimate,
+            )
+            return
         snapshot_cache = _cache_at_offset(
-            ctx.mtp_cache, candidate.boundary_tokens - 1
+            ctx.mtp_cache, target_offset
         )
         if snapshot_cache is None:
             return

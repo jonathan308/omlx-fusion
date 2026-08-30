@@ -5221,6 +5221,18 @@ def _build_runtime_cache_observability(
             "total_num_files": 0,
             "total_size_bytes": 0,
             "effective_block_sizes": [],
+            "disk_max_bytes": 0,
+            "hot_cache_max_bytes": 0,
+            "hot_cache_size_bytes": 0,
+            "hot_cache_entries": 0,
+            "mtp_prefix_snapshot_count": 0,
+            "mtp_prefix_snapshot_bytes": 0,
+            "mtp_prefix_snapshot_evictions": 0,
+            "mtp_prefix_snapshot_capacity_evictions": 0,
+            "mtp_prefix_snapshot_lifecycle_drops": 0,
+            "mtp_prefix_snapshot_oversize_drops": 0,
+            "mtp_prefix_snapshot_accounting_drops": 0,
+            "mtp_prefix_snapshot_max_bytes": 0,
         }
 
     cache_dir = global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
@@ -5243,6 +5255,14 @@ def _build_runtime_cache_observability(
         "hot_cache_max_bytes": 0,
         "hot_cache_size_bytes": 0,
         "hot_cache_entries": 0,
+        "mtp_prefix_snapshot_count": 0,
+        "mtp_prefix_snapshot_bytes": 0,
+        "mtp_prefix_snapshot_evictions": 0,
+        "mtp_prefix_snapshot_capacity_evictions": 0,
+        "mtp_prefix_snapshot_lifecycle_drops": 0,
+        "mtp_prefix_snapshot_oversize_drops": 0,
+        "mtp_prefix_snapshot_accounting_drops": 0,
+        "mtp_prefix_snapshot_max_bytes": 0,
     }
 
     engine_pool = _get_engine_pool()
@@ -5441,6 +5461,34 @@ def _build_runtime_cache_observability(
             "hot_cache_max_bytes": int(ssd_stats.get("hot_cache_max_bytes", 0) or 0),
             "hot_cache_size_bytes": int(ssd_stats.get("hot_cache_size_bytes", 0) or 0),
             "hot_cache_entries": int(ssd_stats.get("hot_cache_entries", 0) or 0),
+            "mtp_prefix_snapshot_count": int(
+                prefix_stats.get("mtp_prefix_snapshot_count", 0) or 0
+            ),
+            "mtp_prefix_snapshot_bytes": int(
+                prefix_stats.get("mtp_prefix_snapshot_bytes", 0) or 0
+            ),
+            "mtp_prefix_snapshot_evictions": int(
+                prefix_stats.get("mtp_prefix_snapshot_evictions", 0) or 0
+            ),
+            "mtp_prefix_snapshot_capacity_evictions": int(
+                prefix_stats.get(
+                    "mtp_prefix_snapshot_capacity_evictions",
+                    prefix_stats.get("mtp_prefix_snapshot_evictions", 0),
+                )
+                or 0
+            ),
+            "mtp_prefix_snapshot_lifecycle_drops": int(
+                prefix_stats.get("mtp_prefix_snapshot_lifecycle_drops", 0) or 0
+            ),
+            "mtp_prefix_snapshot_oversize_drops": int(
+                prefix_stats.get("mtp_prefix_snapshot_oversize_drops", 0) or 0
+            ),
+            "mtp_prefix_snapshot_accounting_drops": int(
+                prefix_stats.get("mtp_prefix_snapshot_accounting_drops", 0) or 0
+            ),
+            "mtp_prefix_snapshot_max_bytes": int(
+                prefix_stats.get("mtp_prefix_snapshot_max_bytes", 0) or 0
+            ),
             "gdn_checkpoint_loads": int(
                 prefix_stats.get("gdn_checkpoint_loads", 0) or 0
             ),
@@ -5492,14 +5540,59 @@ def _build_runtime_cache_observability(
     disk_max = payload["disk_max_bytes"]
     hot_cache_size_total = 0
     hot_cache_entries_total = 0
+    mtp_snapshot_count_total = 0
+    mtp_snapshot_bytes_total = 0
+    mtp_snapshot_evictions_total = 0
+    mtp_snapshot_capacity_evictions_total = 0
+    mtp_snapshot_lifecycle_drops_total = 0
+    mtp_snapshot_oversize_drops_total = 0
+    mtp_snapshot_accounting_drops_total = 0
+    mtp_snapshot_max_bytes = 0
     for m in payload["models"]:
         hot_cache_size_total += m.get("hot_cache_size_bytes", 0)
         hot_cache_entries_total += m.get("hot_cache_entries", 0)
         hot_cache_max = max(hot_cache_max, m.get("hot_cache_max_bytes", 0))
         disk_max = max(disk_max, m.get("max_size_bytes", 0))
+        mtp_snapshot_count_total += m.get("mtp_prefix_snapshot_count", 0)
+        mtp_snapshot_bytes_total += m.get("mtp_prefix_snapshot_bytes", 0)
+        mtp_snapshot_evictions_total += m.get(
+            "mtp_prefix_snapshot_evictions", 0
+        )
+        mtp_snapshot_capacity_evictions_total += m.get(
+            "mtp_prefix_snapshot_capacity_evictions", 0
+        )
+        mtp_snapshot_lifecycle_drops_total += m.get(
+            "mtp_prefix_snapshot_lifecycle_drops", 0
+        )
+        mtp_snapshot_oversize_drops_total += m.get(
+            "mtp_prefix_snapshot_oversize_drops", 0
+        )
+        mtp_snapshot_accounting_drops_total += m.get(
+            "mtp_prefix_snapshot_accounting_drops", 0
+        )
+        mtp_snapshot_max_bytes = max(
+            mtp_snapshot_max_bytes,
+            m.get("mtp_prefix_snapshot_max_bytes", 0),
+        )
     payload["hot_cache_max_bytes"] = hot_cache_max
     payload["hot_cache_size_bytes"] = hot_cache_size_total
     payload["hot_cache_entries"] = hot_cache_entries_total
+    payload["mtp_prefix_snapshot_count"] = mtp_snapshot_count_total
+    payload["mtp_prefix_snapshot_bytes"] = mtp_snapshot_bytes_total
+    payload["mtp_prefix_snapshot_evictions"] = mtp_snapshot_evictions_total
+    payload["mtp_prefix_snapshot_capacity_evictions"] = (
+        mtp_snapshot_capacity_evictions_total
+    )
+    payload["mtp_prefix_snapshot_lifecycle_drops"] = (
+        mtp_snapshot_lifecycle_drops_total
+    )
+    payload["mtp_prefix_snapshot_oversize_drops"] = (
+        mtp_snapshot_oversize_drops_total
+    )
+    payload["mtp_prefix_snapshot_accounting_drops"] = (
+        mtp_snapshot_accounting_drops_total
+    )
+    payload["mtp_prefix_snapshot_max_bytes"] = mtp_snapshot_max_bytes
     payload["disk_max_bytes"] = disk_max
 
     # Fallback: if no loaded models contributed stats, scan the cache

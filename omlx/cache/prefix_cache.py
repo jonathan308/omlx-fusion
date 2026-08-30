@@ -8,6 +8,7 @@ with SSD persistence. oMLX only supports paged SSD-based caching.
 
 import logging
 import math
+import os
 import threading
 import time
 from collections import OrderedDict
@@ -104,12 +105,91 @@ _BACKFILL_CHECKED_MAX_ENTRIES = 4096
 # Lightning-MTP prompt priming has one small attention cache of its own.  The
 # normal prefix cache stores only the backbone cache, so a warm trunk restore
 # used to lose the MTP history and restart speculative decode unprimed.  Keep a
-# deliberately tiny in-memory sidecar of full-block boundary snapshots.  Four
-# entries bounds the worst-case Qwen4 100K-context footprint to roughly the
-# same order as one ordinary request cache while covering the recent branches
-# of an interactive conversation.  The entries are keyed by the *same* chain
-# hash as the backbone block and are dropped with that block/hash lifecycle.
+# deliberately tiny in-memory sidecar of full-block boundary snapshots. Four
+# entries cover recent conversation branches. The byte budget bounds retained
+# sidecar payload, not transient allocator peak: an accepted replacement can
+# briefly overlap the old entry while its detached copy materializes. Entries
+# are keyed by the *same* chain hash as the backbone block and are dropped with
+# that block/hash lifecycle.
 _MTP_PREFIX_SNAPSHOT_MAX_ENTRIES = 4
+_MTP_PREFIX_SNAPSHOT_DEFAULT_MAX_BYTES = 1024**3
+
+
+def _mtp_prefix_snapshot_default_max_bytes() -> int:
+    raw = os.environ.get("OMLX_MTP_PREFIX_SNAPSHOT_MAX_BYTES", "").strip()
+    if not raw:
+        return _MTP_PREFIX_SNAPSHOT_DEFAULT_MAX_BYTES
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid OMLX_MTP_PREFIX_SNAPSHOT_MAX_BYTES=%r; using %d",
+            raw,
+            _MTP_PREFIX_SNAPSHOT_DEFAULT_MAX_BYTES,
+        )
+        return _MTP_PREFIX_SNAPSHOT_DEFAULT_MAX_BYTES
+
+
+def _snapshot_value_nbytes(
+    value: Any,
+    seen: set[int] | None = None,
+) -> int | None:
+    """Count unique payload bytes, or ``None`` when accounting is opaque."""
+
+    if seen is None:
+        seen = set()
+    if value is None or isinstance(
+        value, (str, bytes, bytearray, bool, int, float, complex)
+    ):
+        return 0
+    if isinstance(value, type) or callable(value):
+        return 0
+    object_id = id(value)
+    if object_id in seen:
+        return 0
+    seen.add(object_id)
+    try:
+        nbytes = getattr(value, "nbytes", None)
+    except Exception:
+        return None
+    if isinstance(nbytes, int) and nbytes >= 0:
+        return nbytes
+    if isinstance(value, dict):
+        total = 0
+        for item in value.values():
+            child = _snapshot_value_nbytes(item, seen)
+            if child is None:
+                return None
+            total += child
+        return total
+    if isinstance(value, (list, tuple, set, frozenset)):
+        total = 0
+        for item in value:
+            child = _snapshot_value_nbytes(item, seen)
+            if child is None:
+                return None
+            total += child
+        return total
+    fields = getattr(value, "__dict__", None)
+    if isinstance(fields, dict):
+        total = 0
+        for item in fields.values():
+            child = _snapshot_value_nbytes(item, seen)
+            if child is None:
+                return None
+            total += child
+        offset = fields.get("offset")
+        if total == 0 and isinstance(offset, int) and offset > 0:
+            return None
+        return total
+    return None
+
+
+@dataclass(frozen=True)
+class _MtpPrefixSnapshotEntry:
+    boundary_tokens: int
+    snapshot: Any
+    size_bytes: int
 
 
 def _wrap_cachelist_sub_marker(
@@ -206,6 +286,7 @@ class BlockAwarePrefixCache(CacheManager):
         paged_cache_manager: PagedCacheManager,
         paged_ssd_cache_manager: PagedSSDCacheManager | None = None,
         gdn_ssd_split_enabled: bool = False,
+        mtp_prefix_snapshot_max_bytes: int | None = None,
     ):
         """
         Initialize block-aware prefix cache.
@@ -214,6 +295,10 @@ class BlockAwarePrefixCache(CacheManager):
             model: The MLX model (used for identification)
             paged_cache_manager: The PagedCacheManager instance for block management
             paged_ssd_cache_manager: The PagedSSDCacheManager for SSD storage (required for paged SSD-only mode)
+            mtp_prefix_snapshot_max_bytes: Retained-byte cap for memory-only
+                Lightning-MTP prompt-history sidecars. ``None`` uses the
+                environment/default. Accepted replacements can transiently
+                overlap the prior entry during detached-copy materialization.
         """
         self.model = model
         self.model_key = id(model)
@@ -268,10 +353,26 @@ class BlockAwarePrefixCache(CacheManager):
         # Access can race with the asynchronous backbone store worker's hash
         # callbacks, so use a private lock rather than relying on the GIL for
         # the multi-step LRU operations.
-        self._mtp_prefix_snapshots: OrderedDict[bytes, tuple[int, Any]] = (
+        self._mtp_prefix_snapshots: OrderedDict[bytes, _MtpPrefixSnapshotEntry] = (
             OrderedDict()
         )
         self._mtp_prefix_snapshot_lock = threading.RLock()
+        self._mtp_prefix_snapshot_max_bytes = max(
+            0,
+            int(
+                _mtp_prefix_snapshot_default_max_bytes()
+                if mtp_prefix_snapshot_max_bytes is None
+                else mtp_prefix_snapshot_max_bytes
+            ),
+        )
+        self._mtp_prefix_snapshot_bytes = 0
+        # Legacy internal/export name retained for compatibility; it now means
+        # capacity/count LRU pressure only. Lifecycle and rejected-admission
+        # drops have dedicated counters below.
+        self._mtp_prefix_snapshot_evictions = 0
+        self._mtp_prefix_snapshot_lifecycle_drops = 0
+        self._mtp_prefix_snapshot_oversize_drops = 0
+        self._mtp_prefix_snapshot_accounting_drops = 0
 
         # Callback for restoring cold blocks (deprecated in paged SSD-only mode)
         # Kept for API compatibility
@@ -4845,13 +4946,66 @@ class BlockAwarePrefixCache(CacheManager):
         """
         self._prefix_index.pop(block_hash, None)
         with self._mtp_prefix_snapshot_lock:
-            self._mtp_prefix_snapshots.pop(block_hash, None)
+            self._ensure_mtp_prefix_snapshot_accounting()
+            removed = self._mtp_prefix_snapshots.pop(block_hash, None)
+            if removed is not None:
+                self._mtp_prefix_snapshot_bytes = max(
+                    0,
+                    self._mtp_prefix_snapshot_bytes - removed.size_bytes,
+                )
+                self._mtp_prefix_snapshot_lifecycle_drops += 1
 
     def _on_hash_map_cleared(self) -> None:
         """Drop all prefix-index entries after a wholesale hash-map clear."""
         self._prefix_index.clear()
         with self._mtp_prefix_snapshot_lock:
+            self._ensure_mtp_prefix_snapshot_accounting()
+            self._mtp_prefix_snapshot_lifecycle_drops += len(
+                self._mtp_prefix_snapshots
+            )
             self._mtp_prefix_snapshots.clear()
+            self._mtp_prefix_snapshot_bytes = 0
+
+    def _ensure_mtp_prefix_snapshot_accounting(self) -> None:
+        """Initialize byte accounting for constructor-bypassing tests/adapters."""
+
+        if not hasattr(self, "_mtp_prefix_snapshot_max_bytes"):
+            self._mtp_prefix_snapshot_max_bytes = (
+                _mtp_prefix_snapshot_default_max_bytes()
+            )
+        if not hasattr(self, "_mtp_prefix_snapshot_bytes"):
+            self._mtp_prefix_snapshot_bytes = sum(
+                int(getattr(entry, "size_bytes", 0) or 0)
+                for entry in self._mtp_prefix_snapshots.values()
+            )
+        if not hasattr(self, "_mtp_prefix_snapshot_evictions"):
+            self._mtp_prefix_snapshot_evictions = 0
+        if not hasattr(self, "_mtp_prefix_snapshot_lifecycle_drops"):
+            self._mtp_prefix_snapshot_lifecycle_drops = 0
+        if not hasattr(self, "_mtp_prefix_snapshot_oversize_drops"):
+            self._mtp_prefix_snapshot_oversize_drops = 0
+        if not hasattr(self, "_mtp_prefix_snapshot_accounting_drops"):
+            self._mtp_prefix_snapshot_accounting_drops = 0
+
+    def admit_mtp_prefix_snapshot_size(self, size_bytes: int) -> bool:
+        """Reject a definitely oversize sidecar before allocating its copy.
+
+        The retained-byte cap cannot eliminate the ordinary replacement peak
+        (old and accepted-new snapshots overlap briefly), but this admission
+        avoids constructing a candidate that can never fit even after LRU
+        eviction.
+        """
+
+        size_bytes = max(0, int(size_bytes))
+        with self._mtp_prefix_snapshot_lock:
+            self._ensure_mtp_prefix_snapshot_accounting()
+            allowed = bool(
+                self._mtp_prefix_snapshot_max_bytes > 0
+                and size_bytes <= self._mtp_prefix_snapshot_max_bytes
+            )
+            if not allowed:
+                self._mtp_prefix_snapshot_oversize_drops += 1
+            return allowed
 
     def _mtp_prefix_chain_tip(
         self,
@@ -4913,11 +5067,41 @@ class BlockAwarePrefixCache(CacheManager):
         )
         if tip is None or snapshot is None:
             return False
+        size_bytes = _snapshot_value_nbytes(snapshot)
         with self._mtp_prefix_snapshot_lock:
-            self._mtp_prefix_snapshots[tip] = (int(boundary_tokens), snapshot)
+            self._ensure_mtp_prefix_snapshot_accounting()
+            if size_bytes is None:
+                self._mtp_prefix_snapshot_accounting_drops += 1
+                return False
+            max_bytes = self._mtp_prefix_snapshot_max_bytes
+            if max_bytes <= 0 or size_bytes > max_bytes:
+                self._mtp_prefix_snapshot_oversize_drops += 1
+                return False
+            previous = self._mtp_prefix_snapshots.pop(tip, None)
+            if previous is not None:
+                self._mtp_prefix_snapshot_bytes = max(
+                    0,
+                    self._mtp_prefix_snapshot_bytes - previous.size_bytes,
+                )
+            self._mtp_prefix_snapshots[tip] = _MtpPrefixSnapshotEntry(
+                boundary_tokens=int(boundary_tokens),
+                snapshot=snapshot,
+                size_bytes=size_bytes,
+            )
+            self._mtp_prefix_snapshot_bytes += size_bytes
             self._mtp_prefix_snapshots.move_to_end(tip)
-            while len(self._mtp_prefix_snapshots) > _MTP_PREFIX_SNAPSHOT_MAX_ENTRIES:
-                self._mtp_prefix_snapshots.popitem(last=False)
+            while self._mtp_prefix_snapshots and (
+                len(self._mtp_prefix_snapshots) > _MTP_PREFIX_SNAPSHOT_MAX_ENTRIES
+                or self._mtp_prefix_snapshot_bytes > max_bytes
+            ):
+                _, evicted = self._mtp_prefix_snapshots.popitem(last=False)
+                self._mtp_prefix_snapshot_bytes = max(
+                    0,
+                    self._mtp_prefix_snapshot_bytes - evicted.size_bytes,
+                )
+                self._mtp_prefix_snapshot_evictions += 1
+            if tip not in self._mtp_prefix_snapshots:
+                return False
         return True
 
     def restore_mtp_prefix_snapshot(
@@ -4944,11 +5128,12 @@ class BlockAwarePrefixCache(CacheManager):
         if self.paged_cache.cached_block_hash_to_block.get_block(tip) is None:
             return None
         with self._mtp_prefix_snapshot_lock:
+            self._ensure_mtp_prefix_snapshot_accounting()
             entry = self._mtp_prefix_snapshots.get(tip)
-            if entry is None or entry[0] != int(boundary_tokens):
+            if entry is None or entry.boundary_tokens != int(boundary_tokens):
                 return None
             self._mtp_prefix_snapshots.move_to_end(tip)
-            return entry[1]
+            return entry.snapshot
 
     def get_stats(self) -> PrefixCacheStats:
         """
@@ -4957,6 +5142,18 @@ class BlockAwarePrefixCache(CacheManager):
         Returns:
             PrefixCacheStats with cache metrics.
         """
+        with self._mtp_prefix_snapshot_lock:
+            self._ensure_mtp_prefix_snapshot_accounting()
+            mtp_snapshot_count = len(self._mtp_prefix_snapshots)
+            mtp_snapshot_bytes = self._mtp_prefix_snapshot_bytes
+            mtp_snapshot_evictions = self._mtp_prefix_snapshot_evictions
+            mtp_snapshot_lifecycle_drops = (
+                self._mtp_prefix_snapshot_lifecycle_drops
+            )
+            mtp_snapshot_oversize_drops = self._mtp_prefix_snapshot_oversize_drops
+            mtp_snapshot_accounting_drops = (
+                self._mtp_prefix_snapshot_accounting_drops
+            )
         return PrefixCacheStats(
             hits=self._hits,
             misses=self._misses,
@@ -4974,6 +5171,14 @@ class BlockAwarePrefixCache(CacheManager):
             exact_prefix_tokens_restored=self._exact_prefix_tokens_restored,
             exact_prefix_stores=self._exact_prefix_stores,
             exact_prefix_store_failures=self._exact_prefix_store_failures,
+            mtp_prefix_snapshot_count=mtp_snapshot_count,
+            mtp_prefix_snapshot_bytes=mtp_snapshot_bytes,
+            mtp_prefix_snapshot_evictions=mtp_snapshot_evictions,
+            mtp_prefix_snapshot_capacity_evictions=mtp_snapshot_evictions,
+            mtp_prefix_snapshot_lifecycle_drops=mtp_snapshot_lifecycle_drops,
+            mtp_prefix_snapshot_oversize_drops=mtp_snapshot_oversize_drops,
+            mtp_prefix_snapshot_accounting_drops=mtp_snapshot_accounting_drops,
+            mtp_prefix_snapshot_max_bytes=self._mtp_prefix_snapshot_max_bytes,
         )
 
     def get_stats_dict(self) -> dict[str, Any]:
@@ -4986,6 +5191,18 @@ class BlockAwarePrefixCache(CacheManager):
             Dictionary with cache statistics.
         """
         paged_stats = self.paged_cache.get_memory_usage()
+        with self._mtp_prefix_snapshot_lock:
+            self._ensure_mtp_prefix_snapshot_accounting()
+            mtp_snapshot_count = len(self._mtp_prefix_snapshots)
+            mtp_snapshot_bytes = self._mtp_prefix_snapshot_bytes
+            mtp_snapshot_evictions = self._mtp_prefix_snapshot_evictions
+            mtp_snapshot_lifecycle_drops = (
+                self._mtp_prefix_snapshot_lifecycle_drops
+            )
+            mtp_snapshot_oversize_drops = self._mtp_prefix_snapshot_oversize_drops
+            mtp_snapshot_accounting_drops = (
+                self._mtp_prefix_snapshot_accounting_drops
+            )
         return {
             "hits": self._hits,
             "misses": self._misses,
@@ -5007,6 +5224,14 @@ class BlockAwarePrefixCache(CacheManager):
             "exact_prefix_tokens_restored": self._exact_prefix_tokens_restored,
             "exact_prefix_stores": self._exact_prefix_stores,
             "exact_prefix_store_failures": self._exact_prefix_store_failures,
+            "mtp_prefix_snapshot_count": mtp_snapshot_count,
+            "mtp_prefix_snapshot_bytes": mtp_snapshot_bytes,
+            "mtp_prefix_snapshot_evictions": mtp_snapshot_evictions,
+            "mtp_prefix_snapshot_capacity_evictions": mtp_snapshot_evictions,
+            "mtp_prefix_snapshot_lifecycle_drops": mtp_snapshot_lifecycle_drops,
+            "mtp_prefix_snapshot_oversize_drops": mtp_snapshot_oversize_drops,
+            "mtp_prefix_snapshot_accounting_drops": mtp_snapshot_accounting_drops,
+            "mtp_prefix_snapshot_max_bytes": self._mtp_prefix_snapshot_max_bytes,
             "gdn_checkpoint_loads": self._gdn_checkpoint_loads,
             "gdn_checkpoint_walkbacks": self._gdn_checkpoint_walkbacks,
             "gdn_last_restore": (
@@ -5037,6 +5262,12 @@ class BlockAwarePrefixCache(CacheManager):
         self._gdn_checkpoint_loads = 0
         self._gdn_checkpoint_walkbacks = 0
         self._last_gdn_restore = None
+        with self._mtp_prefix_snapshot_lock:
+            self._ensure_mtp_prefix_snapshot_accounting()
+            self._mtp_prefix_snapshot_evictions = 0
+            self._mtp_prefix_snapshot_lifecycle_drops = 0
+            self._mtp_prefix_snapshot_oversize_drops = 0
+            self._mtp_prefix_snapshot_accounting_drops = 0
         self.paged_cache.reset_stats()
 
     def clear(self) -> int:
@@ -5047,6 +5278,7 @@ class BlockAwarePrefixCache(CacheManager):
             Number of entries cleared.
         """
         with self._mtp_prefix_snapshot_lock:
+            self._ensure_mtp_prefix_snapshot_accounting()
             mtp_snapshot_count = len(self._mtp_prefix_snapshots)
         cleared_count = (
             len(self._request_tables) + len(self._prefix_index) + mtp_snapshot_count
@@ -5055,6 +5287,7 @@ class BlockAwarePrefixCache(CacheManager):
         self._prefix_index.clear()
         with self._mtp_prefix_snapshot_lock:
             self._mtp_prefix_snapshots.clear()
+            self._mtp_prefix_snapshot_bytes = 0
         self.paged_cache.clear()
         self.reset_stats()
         return cleared_count
