@@ -70,18 +70,6 @@ mx::array qwen4_qsa_indexer_scores(
     int mask_q_offset = 0,
     mx::StreamOrDevice s = {});
 
-// Additive exact score ABI for bounded decode/verification windows. Queries
-// retain their natural [1,M,4,128] layout (1 <= M <= 9); the four adjacent
-// head rows are evaluated in one BK16 Steel GEMM and reduced to fp32
-// [1,M,N] in the same h0..h3 order as qwen4_qsa_indexer_scores. Keeping a
-// separate symbol lets stale extensions fail closed to the established ABI.
-mx::array qwen4_qsa_indexer_scores_packed(
-    const mx::array& queries,
-    const mx::array& pooled_keys,
-    int mask_ratio = 4,
-    int mask_q_offset = 0,
-    mx::StreamOrDevice s = {});
-
 // Lossless fixed-width Qwen4 QSA block selection. Scores are the contiguous
 // fp32 [1, M, N] result of qwen4_qsa_indexer_scores; the output is uint32
 // [1, M, 512]. Cutoff ties deliberately retain the highest block indices to

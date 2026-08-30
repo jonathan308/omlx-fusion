@@ -75,14 +75,6 @@ NB_MODULE(_ext, m) {
       "mask_q_offset"_a = 0,
       "stream"_a = nb::none());
   m.def(
-      "qwen4_qsa_indexer_scores_packed",
-      &omlx::glm_kernels::qwen4_qsa_indexer_scores_packed,
-      "queries"_a,
-      "pooled_keys"_a,
-      "mask_ratio"_a = 4,
-      "mask_q_offset"_a = 0,
-      "stream"_a = nb::none());
-  m.def(
       "qwen4_qsa_topk_indices",
       &omlx::glm_kernels::qwen4_qsa_topk_indices,
       "scores"_a,
