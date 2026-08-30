@@ -327,8 +327,8 @@ class TestCaptureFold:
         )
         warm_ctx = prompt_priming._find_ctx(model)
         assert warm_ctx is not None
-        assert warm_ctx.folded == 7
-        assert warm_ctx.expected_offset == 8
+        assert warm_ctx.head_hist_offset == 7
+        assert warm_ctx.target_expected_offset == 8
         assert mx.array_equal(warm_ctx.pending_hidden, boundary_pending).item()
 
         # The scheduler's prepared-set normally prevents this second call;

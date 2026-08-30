@@ -25,7 +25,7 @@ first forward starts at offset 0), so it invalidates or restarts the slot,
 and the activating request is always the slot's last writer.
 
 Fail-safe invariant: every capture verifies the anchor offset advanced
-contiguously since the previous capture (``expected_offset``). Any rewind,
+contiguously since the previous capture (``target_expected_offset``). Any rewind,
 trim, request switch, or unknown cache path breaks the equality and
 invalidates the context, degrading to the current unprimed behaviour —
 never to a wrong history. A batched (B>1) forward advances the anchor
@@ -72,6 +72,7 @@ HEAD_HIDDEN_POST_NORM = True
 
 _CTX_ATTR = "_omlx_mtp_prime_ctx"
 _PLAN_ATTR = "_omlx_mtp_prime_plan"
+_QWEN4_SUFFIX_LOCAL_CAPABILITY = "qwen4-verified-text-v1"
 
 _SUPPRESS = threading.local()
 
@@ -123,11 +124,18 @@ class _PrimeCtx:
     # Head-input hidden of the newest seen token, (1, 1, ..., H) — pairs
     # with the first token of the next chunk (or main_tok at activation).
     pending_hidden: Optional[Any] = None
-    # Folded (hidden, next_token) pairs == head-cache offset.
-    folded: int = 0
+    # Folded (hidden, next_token) pairs == the LOCAL head-cache offset.  For
+    # ordinary/full-history priming this also equals the absolute history.  A
+    # Qwen4 suffix-local context deliberately starts this counter at zero even
+    # when the target backbone was restored at a large absolute offset.
+    head_hist_offset: int = 0
     # Anchor cache offset observed after the last captured forward. The next
-    # capture requires offset_now - S == expected_offset (contiguity).
-    expected_offset: int = 0
+    # capture requires offset_now - S == target_expected_offset (contiguity).
+    # This is always the ABSOLUTE target/backbone timeline.
+    target_expected_offset: int = 0
+    # Qwen4-only verified-drafter mode: the head contains only the uncached
+    # text suffix. The target still owns/validates the absolute full history.
+    suffix_local: bool = False
     valid: bool = True
     # The current contiguous timeline exceeded OMLX_MTP_PRIME_WINDOW. Keep a
     # lightweight marker so later small chunks cannot restart priming.
@@ -156,6 +164,7 @@ class _PrimePlan:
 
     request_id: str
     prompt_tokens: tuple[int, ...]
+    cached_tokens: int
     block_size: int
     prefix_cache: Any
     extra_keys: Optional[tuple[Any, ...]] = None
@@ -178,6 +187,15 @@ class _MtpBoundaryCandidate:
 
     boundary_tokens: int
     pending_hidden: Any
+
+
+@dataclass(frozen=True)
+class SuffixLocalPrimedState:
+    """Qwen4 head state whose offsets are local to the uncached text suffix."""
+
+    mtp_cache: List[Any]
+    head_hist_offset: int
+    target_expected_offset: int
 
 
 def _read_offset(entry: Any) -> Optional[int]:
@@ -331,6 +349,48 @@ def _eligible_host(model: Any) -> Any | None:
     return None
 
 
+def _text_only_suffix_plan(host: Any, plan: Optional[_PrimePlan]) -> bool:
+    """Narrow capability gate for Qwen4 verified-drafter local history."""
+
+    return bool(
+        getattr(host, "_omlx_mtp_suffix_local_capability", None)
+        == _QWEN4_SUFFIX_LOCAL_CAPABILITY
+        and isinstance(plan, _PrimePlan)
+        and plan.cached_tokens > 0
+        and not plan.extra_keys
+        and plan.extra_key_token_start is None
+        and not plan.extra_key_ranges
+    )
+
+
+def _inputs_match_plan(
+    inputs: Any,
+    plan: _PrimePlan,
+    *,
+    start: int,
+    stop: int,
+) -> bool:
+    """Prove a suffix chunk is the exact scheduler-owned text-token slice.
+
+    This intentionally materializes ``inputs`` on the host as the fail-closed
+    cross-request identity proof. BatchGenerator's usual size-one array anchor
+    already synchronizes just above, but a scalar-offset cache need not; these
+    figures are therefore only the incremental, already-materialized cost, not
+    a bound on a pending graph. M3 Ultra microbenchmark (2026-08-30, 300 warm
+    samples, materialized int32): median 25.0/25.5/32.3/60.8/88.6 us for
+    1/64/512/2048/4096 tokens; p95 33.5/32.8/57.7/84.8/107.0 us. Real-model
+    synchronization/throughput impact remains explicitly deferred.
+    """
+
+    if start < plan.cached_tokens or stop > len(plan.prompt_tokens) or stop <= start:
+        return False
+    try:
+        actual = tuple(int(token) for token in inputs.reshape(-1).tolist())
+    except Exception:
+        return False
+    return actual == plan.prompt_tokens[start:stop]
+
+
 def _clone_mtp_cache(cache: List[Any]) -> List[Any]:
     """Detach an MTP cache so later decode writes cannot mutate a snapshot."""
     import copy
@@ -361,6 +421,42 @@ def _flat_cache_entries(cache: List[Any]):
             yield entry
         else:
             yield from subs
+
+
+def mtp_cache_offset(cache: Optional[List[Any]]) -> Optional[int]:
+    """Uniform local offset across every readable MTP-head cache entry."""
+
+    if not cache:
+        return None
+    offsets: list[int] = []
+    for entry in _flat_cache_entries(cache):
+        offset = _read_offset(entry)
+        if offset is not None:
+            offsets.append(offset)
+    if not offsets or any(offset != offsets[0] for offset in offsets[1:]):
+        return None
+    return offsets[0]
+
+
+def target_cache_offset(cache: Optional[List[Any]]) -> Optional[int]:
+    """Uniform absolute offset across every readable target cache layer.
+
+    A first-layer answer is insufficient for suffix-local priming: a partial
+    rollback can leave one later QSA layer misaligned while the leading layer
+    still looks valid.  Unreadable recurrent caches are ignored, but every
+    readable leaf must agree or the verified-drafter seam fails closed.
+    """
+
+    if not cache:
+        return None
+    offsets: list[int] = []
+    for entry in _flat_cache_entries(cache):
+        offset = _read_offset(entry)
+        if offset is not None:
+            offsets.append(offset)
+    if not offsets or any(offset != offsets[0] for offset in offsets[1:]):
+        return None
+    return offsets[0]
 
 
 def _cache_at_offset(cache: List[Any], target: int) -> Optional[List[Any]]:
@@ -450,19 +546,28 @@ def prepare_prefix_context(
     existing = _find_ctx(model)
     plan = _find_plan(model)
     if (
-        (existing is not None and existing.request_id == request_id)
+        (
+            existing is not None
+            and existing.request_id == request_id
+            and existing.prompt_tokens == tokens
+        )
         or (
             plan is not None
             and plan.request_id == request_id
             and plan.prompt_tokens == tokens
+            and plan.cached_tokens == cached_tokens
         )
     ):
-        return existing is not None and existing.expected_offset >= cached_tokens
+        return (
+            existing is not None
+            and existing.target_expected_offset >= cached_tokens
+        )
 
     drop_ctx(model)
     plan = _PrimePlan(
         request_id=request_id,
         prompt_tokens=tokens,
+        cached_tokens=cached_tokens,
         block_size=max(0, int(getattr(prefix_cache, "block_size", 0) or 0)),
         prefix_cache=prefix_cache,
         extra_keys=extra_keys,
@@ -509,8 +614,8 @@ def prepare_prefix_context(
     ctx = _PrimeCtx(
         mtp_cache=restored_cache,
         pending_hidden=pending_hidden,
-        folded=target_offset,
-        expected_offset=cached_tokens,
+        head_hist_offset=target_offset,
+        target_expected_offset=cached_tokens,
         request_id=request_id,
         prompt_tokens=tokens,
         block_size=plan.block_size,
@@ -544,6 +649,10 @@ def _capture_boundary_candidate(
     seq_end: int,
 ) -> None:
     """Detach the newest full-block MTP boundary crossed by this chunk."""
+    # A suffix-local cache cannot represent the missing durable prefix. Never
+    # publish it under an absolute full-history block hash.
+    if ctx.suffix_local:
+        return
     block = int(ctx.block_size or 0)
     if (
         block <= 0
@@ -565,7 +674,7 @@ def _capture_boundary_candidate(
     # A backbone boundary at C tokens needs MTP pairs through C-1 and keeps
     # hidden(token[C-1]) pending for the next token.  ``normed`` spans
     # [seq_start, seq_end), so the boundary row is available without replay.
-    if boundary <= 1 or ctx.folded < boundary - 1:
+    if boundary <= 1 or ctx.head_hist_offset < boundary - 1:
         return
     row = boundary - seq_start - 1
     if row < 0 or row >= int(normed.shape[1]):
@@ -585,6 +694,8 @@ def _capture_boundary_candidate(
 
 
 def _publish_boundary_candidate(ctx: _PrimeCtx) -> None:
+    if ctx.suffix_local:
+        return
     candidate = ctx.snapshot_candidate
     store = getattr(ctx.prefix_cache, "store_mtp_prefix_snapshot", None)
     if not isinstance(candidate, _MtpBoundaryCandidate) or not callable(store):
@@ -632,8 +743,10 @@ def maybe_capture(
     ``host`` is the patched language model (mlx-lm ``TextModel`` or mlx-vlm
     ``LanguageModel``) exposing ``mtp`` / ``model.embed_tokens`` /
     ``make_mtp_cache``. ``normed`` is the trunk-normed hidden for all
-    positions of ``inputs`` (1, S, H). Host-side bookkeeping only — the head
-    forward is dispatched lazily and no GPU sync happens here.
+    positions of ``inputs`` (1, S, H). The head forward is dispatched lazily.
+    Offset contiguity performs the existing anchor sync; Qwen4 suffix-local
+    capture additionally materializes the small token chunk for exact
+    scheduler-plan identity (cost documented in :func:`_inputs_match_plan`).
 
     Call sites guard the cheap negatives (return_hidden / n_confirmed /
     inputs_embeds) before calling; everything here re-checks what is
@@ -663,16 +776,30 @@ def maybe_capture(
     if offset_after is None:
         return
 
+    seq_start = offset_after - seq_len
     ctx = getattr(host, _CTX_ATTR, None)
     if ctx is not None and (
-        not ctx.valid or ctx.expected_offset != offset_after - seq_len
+        not ctx.valid or ctx.target_expected_offset != seq_start
     ):
         # Rewind / trim / request switch / unknown path: never guess.
         drop_ctx(host)
         ctx = None
     if ctx is not None and ctx.window_exceeded:
-        ctx.expected_offset = offset_after
+        ctx.target_expected_offset = offset_after
         return
+    if ctx is not None and ctx.suffix_local:
+        plan = _find_plan(host)
+        if not (
+            _text_only_suffix_plan(host, plan)
+            and _inputs_match_plan(
+                inputs,
+                plan,
+                start=seq_start,
+                stop=offset_after,
+            )
+        ):
+            drop_ctx(host)
+            return
     window = prime_window()
     if window:
         # Cap by the primed span (the head-KV the window exists to bound),
@@ -685,35 +812,63 @@ def maybe_capture(
                 host,
                 _CTX_ATTR,
                 _PrimeCtx(
-                    expected_offset=offset_after,
+                    target_expected_offset=offset_after,
                     window_exceeded=True,
                 ),
             )
             return
     if ctx is None:
-        # A fresh priming history is valid only when this forward began at
-        # cache offset zero. Prefix-cache/SSD restores do not persist the MTP
-        # head history, so folding only their suffix would label a partial
-        # speculative history as complete.
-        if offset_after != seq_len:
+        # Generic/DS4 priming still requires a zero-offset full history.
+        # Qwen4 alone may opt into a clearly tagged local head timeline for an
+        # exact scheduler-owned text suffix: the target keeps the absolute
+        # durable history and verifies every draft.
+        plan = _find_plan(host)
+        suffix_local = offset_after != seq_len
+        if suffix_local and not (
+            _text_only_suffix_plan(host, plan)
+            and seq_start == plan.cached_tokens
+            and _inputs_match_plan(
+                inputs,
+                plan,
+                start=seq_start,
+                stop=offset_after,
+            )
+        ):
             return
-        if seq_len <= 1:
+        if not suffix_local and seq_len <= 1:
             # A lone decode step cannot start a prompt timeline.
             return
-        plan = _find_plan(host)
         ctx = _PrimeCtx(
             mtp_cache=host.make_mtp_cache(),
+            target_expected_offset=seq_start,
+            suffix_local=suffix_local,
             request_id=plan.request_id if plan is not None else None,
             prompt_tokens=plan.prompt_tokens if plan is not None else None,
-            block_size=plan.block_size if plan is not None else 0,
-            prefix_cache=plan.prefix_cache if plan is not None else None,
-            extra_keys=plan.extra_keys if plan is not None else None,
-            extra_key_token_start=(
-                plan.extra_key_token_start if plan is not None else None
+            # A suffix-local cache is intentionally never publishable as an
+            # absolute full-history sidecar.
+            block_size=(
+                plan.block_size if plan is not None and not suffix_local else 0
             ),
-            extra_key_ranges=(plan.extra_key_ranges if plan is not None else None),
+            prefix_cache=(
+                plan.prefix_cache if plan is not None and not suffix_local else None
+            ),
+            extra_keys=(
+                plan.extra_keys if plan is not None and not suffix_local else None
+            ),
+            extra_key_token_start=(
+                plan.extra_key_token_start
+                if plan is not None and not suffix_local
+                else None
+            ),
+            extra_key_ranges=(
+                plan.extra_key_ranges
+                if plan is not None and not suffix_local
+                else None
+            ),
         )
         if not ctx.mtp_cache:
+            return
+        if suffix_local and mtp_cache_offset(ctx.mtp_cache) != 0:
             return
         setattr(host, _CTX_ATTR, ctx)
 
@@ -726,7 +881,7 @@ def maybe_capture(
     else:
         if seq_len <= 1:
             ctx.pending_hidden = normed[:, -1:]
-            ctx.expected_offset = offset_after
+            ctx.target_expected_offset = offset_after
             return
         pairs_hidden = normed[:, :-1]
         pairs_tokens = inputs[:, 1:]
@@ -736,10 +891,10 @@ def maybe_capture(
     # model patch. The returned logits are never evaluated — nothing pulls
     # on them, so the lm_head tail costs nothing.
     host.mtp_forward(pairs_hidden, pairs_tokens, ctx.mtp_cache, logits_keep=1)
-    ctx.folded += int(pairs_tokens.shape[1])
+    ctx.head_hist_offset += int(pairs_tokens.shape[1])
     ctx.folded_this_request += int(pairs_tokens.shape[1])
     ctx.pending_hidden = normed[:, -1:]
-    ctx.expected_offset = offset_after
+    ctx.target_expected_offset = offset_after
     _capture_boundary_candidate(
         ctx,
         normed,
@@ -801,13 +956,21 @@ def take_primed(
         # hook declined without popping it — not ours to consume.
         return None
     drop_ctx(model)
-    if not (ctx.valid and ctx.folded > 0 and ctx.pending_hidden is not None):
+    if not (
+        ctx.valid
+        and (ctx.head_hist_offset > 0 or ctx.suffix_local)
+        and ctx.pending_hidden is not None
+    ):
         return None
-    offset = _activation_offset(cache)
-    if offset is None or ctx.expected_offset != offset - 1:
+    offset = (
+        target_cache_offset(cache)
+        if ctx.suffix_local
+        else _activation_offset(cache)
+    )
+    if offset is None or ctx.target_expected_offset != offset - 1:
         logger.debug(
             "MTP priming discarded: seam offset mismatch (ctx=%s cache=%s)",
-            ctx.expected_offset,
+            ctx.target_expected_offset,
             offset,
         )
         return None
@@ -821,14 +984,35 @@ def take_primed(
     except Exception as exc:
         logger.debug("MTP priming discarded: seam fold failed: %s", exc)
         return None
+    local_offset = ctx.head_hist_offset + 1
+    if ctx.suffix_local:
+        observed = mtp_cache_offset(ctx.mtp_cache)
+        if observed != local_offset:
+            logger.debug(
+                "Qwen4 suffix-local MTP priming discarded: head offset "
+                "mismatch (expected=%s observed=%s target=%s)",
+                local_offset,
+                observed,
+                offset,
+            )
+            return None
+        return SuffixLocalPrimedState(
+            mtp_cache=ctx.mtp_cache,
+            head_hist_offset=local_offset,
+            target_expected_offset=offset,
+        )
     _publish_boundary_candidate(ctx)
-    return ctx.mtp_cache, ctx.folded + 1
+    return ctx.mtp_cache, local_offset
 
 
 def prime_ctx_stats(model: Any) -> Optional[int]:
     """Folded pair count of a live context (introspection / tests)."""
     ctx = _find_ctx(model)
-    return ctx.folded if ctx is not None and not ctx.window_exceeded else None
+    return (
+        ctx.head_hist_offset
+        if ctx is not None and not ctx.window_exceeded
+        else None
+    )
 
 
 __all__ = [
@@ -841,4 +1025,7 @@ __all__ = [
     "take_primed",
     "drop_ctx",
     "prime_ctx_stats",
+    "SuffixLocalPrimedState",
+    "mtp_cache_offset",
+    "target_cache_offset",
 ]
