@@ -77,6 +77,56 @@ def test_qwen4_exp_mlx_metadata_is_hidden_only_for_model_shards(
     assert safetensors.safe_open is fake_safe_open
 
 
+def test_glm5_loader_remaps_quantized_forget_gate_and_vision_paths(
+    tmp_path, monkeypatch
+):
+    import mlx_vlm.utils as vlm_utils
+
+    model_dir = tmp_path / "glm5"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"model_type": "glm5_next"}), encoding="utf-8"
+    )
+    original_config = {
+        "model_type": "glm5_next",
+        "quantization": {
+            "group_size": 64,
+            "bits": 4,
+            "language_model.model.layers.0.self_attn.f_a_proj": {
+                "group_size": 64,
+                "bits": 8,
+            },
+            "vision_tower.patch_embed.proj": {"group_size": 64, "bits": 8},
+        },
+        "quantization_config": {
+            "group_size": 64,
+            "bits": 4,
+            "language_model.model.layers.0.self_attn.f_b_proj": {
+                "group_size": 64,
+                "bits": 8,
+            },
+        },
+    }
+
+    def fake_load_config(*_args, **_kwargs):
+        return original_config
+
+    monkeypatch.setattr(vlm_utils, "load_config", fake_load_config)
+    with vlm_module._force_qwen4_exp_sanitize_on_load(model_dir):
+        remapped = vlm_utils.load_config(model_dir)
+
+    assert vlm_utils.load_config is fake_load_config
+    assert (
+        "language_model.model.layers.0.self_attn.forget_gate.f_a_proj"
+        in remapped["quantization"]
+    )
+    assert (
+        "language_model.model.layers.0.self_attn.forget_gate.f_b_proj"
+        in remapped["quantization_config"]
+    )
+    assert "vision_model.patch_embed.proj" in remapped["quantization"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("model_type", "expected_lazy"),

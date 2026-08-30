@@ -1062,9 +1062,42 @@ def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
         return
 
     import safetensors
+    import mlx_vlm.utils as mlx_vlm_utils
 
     original_safe_open = safetensors.safe_open
+    original_load_config = mlx_vlm_utils.load_config
     is_target_shard = _model_shard_matcher(model_dir)
+
+    def _remap_glm5_quantization_paths(config: dict) -> dict:
+        if model_type != "glm5_next":
+            return config
+        config = dict(config)
+        for section_name in ("quantization", "quantization_config"):
+            section = config.get(section_name)
+            if not isinstance(section, dict):
+                continue
+            remapped = {}
+            for key, value in section.items():
+                new_key = key
+                if isinstance(key, str):
+                    for projection in ("f_a_proj", "f_b_proj"):
+                        new_key = new_key.replace(
+                            f".self_attn.{projection}",
+                            f".self_attn.forget_gate.{projection}",
+                        )
+                    if new_key.startswith("vision_tower."):
+                        new_key = "vision_model." + new_key[len("vision_tower.") :]
+                remapped[new_key] = value
+            config[section_name] = remapped
+        return config
+
+    def _patched_load_config(path, *args, **kwargs):
+        config = original_load_config(path, *args, **kwargs)
+        try:
+            same_model = Path(path).resolve() == model_dir.resolve()
+        except (OSError, TypeError, ValueError):
+            same_model = False
+        return _remap_glm5_quantization_paths(config) if same_model else config
 
     class _SafeOpenMetadataWrapper:
         def __init__(self, inner):
@@ -1094,6 +1127,7 @@ def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
         return handle
 
     safetensors.safe_open = _patched_safe_open
+    mlx_vlm_utils.load_config = _patched_load_config
     try:
         logger.info(
             "%s pre-quantization sanitize active for %s",
@@ -1102,6 +1136,7 @@ def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
         )
         yield
     finally:
+        mlx_vlm_utils.load_config = original_load_config
         safetensors.safe_open = original_safe_open
 
 
