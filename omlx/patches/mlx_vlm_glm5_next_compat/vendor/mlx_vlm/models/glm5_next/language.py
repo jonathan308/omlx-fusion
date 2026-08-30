@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -12,6 +13,7 @@ from ..base import (
 )
 from ..cache import ArraysCache, CacheList, KVCache
 from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
+from mlx_lm.models.switch_layers import SwitchGLU as StockSwitchGLU
 from mlx_lm.models.mla import MultiLinear
 from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
 from omlx.patches.glm_moe_dsa.deepseek_v32 import (
@@ -29,6 +31,11 @@ from .linear import fused_quantized_matmul, linear_forward
 
 logger = logging.getLogger(__name__)
 _NATIVE_INDEXER_WARNED = False
+_USE_STOCK_MOE = os.environ.get("OMLX_GLM5_STOCK_MOE", "0").strip().lower() in (
+    "1",
+    "true",
+    "on",
+)
 
 
 def glm5_next_cast_predicate(key: str) -> bool:
@@ -771,7 +778,9 @@ class Glm5NextMoEGate(nn.Module):
 class Glm5NextMoE(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.switch_mlp = SwitchGLU(
+        self._stock_switch_mlp = _USE_STOCK_MOE
+        switch_cls = StockSwitchGLU if self._stock_switch_mlp else SwitchGLU
+        self.switch_mlp = switch_cls(
             config.hidden_size,
             config.moe_intermediate_size,
             config.n_routed_experts,
@@ -789,9 +798,13 @@ class Glm5NextMoE(nn.Module):
 
     def __call__(self, x):
         indices, scores = self.gate(x)
-        y = self.switch_mlp(x, indices, scores=scores, weighted_sum=True)
-        if y.ndim == x.ndim + 1:
+        if self._stock_switch_mlp:
+            y = self.switch_mlp(x, indices)
             y = (y * scores[..., None]).sum(axis=-2).astype(x.dtype)
+        else:
+            y = self.switch_mlp(x, indices, scores=scores, weighted_sum=True)
+            if y.ndim == x.ndim + 1:
+                y = (y * scores[..., None]).sum(axis=-2).astype(x.dtype)
         if self.shared_experts is not None:
             y = y + self.shared_experts(x)
         return y
