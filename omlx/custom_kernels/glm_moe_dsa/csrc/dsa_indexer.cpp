@@ -852,8 +852,8 @@ class Qwen4QSAFP32TopKIndicesPrimitive : public Primitive {
     out.set_data(allocator::malloc(out.nbytes()));
 
     constexpr int topk = 512;
+    constexpr int threads = 256;
     const int rows = scores.shape(1);
-    const int threads = rows <= 9 ? 1024 : 256;
     DSATopKParams params{
         /* int rows = */ rows,
         /* int L = */ rows,
@@ -862,12 +862,8 @@ class Qwen4QSAFP32TopKIndicesPrimitive : public Primitive {
         /* bool causal_valid_prefix = */ false};
 
     auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
-    std::string kernel_name;
-    concatenate(
-        kernel_name,
-        "qwen4_qsa_fp32_topk_indices_topk512_t",
-        threads);
-    auto kernel = d.get_kernel(kernel_name, lib);
+    auto kernel =
+        d.get_kernel("qwen4_qsa_fp32_topk_indices_topk512_t256", lib);
     auto& encoder = metal::get_command_encoder(s);
     encoder.set_compute_pipeline_state(kernel);
     encoder.set_input_array(scores, 0);
