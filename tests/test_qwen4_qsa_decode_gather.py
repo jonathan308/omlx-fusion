@@ -110,7 +110,11 @@ def test_qwen4_decode_gathers_budget_and_tail_and_matches_official(monkeypatch):
         assert mx.array_equal(fast_value, reference_value).item()
 
 
-def test_qwen4_verify_window_uses_direct_qsa_and_matches_official(monkeypatch):
+@pytest.mark.parametrize("verify_width", [4, 8, 9])
+def test_qwen4_verify_window_uses_direct_qsa_and_matches_official(
+    monkeypatch,
+    verify_width,
+):
     config = _tiny_text_config()
     import mlx_vlm.models.qwen4_exp.language as language
 
@@ -122,7 +126,7 @@ def test_qwen4_verify_window_uses_direct_qsa_and_matches_official(monkeypatch):
 
     mx.random.seed(29)
     prefix = mx.random.normal((1, 10, config.hidden_size))
-    verify = mx.random.normal((1, 4, config.hidden_size))
+    verify = mx.random.normal((1, verify_width, config.hidden_size))
     mx.eval(
         attention(prefix, mask="causal", cache=fast_cache),
         attention(prefix, mask="causal", cache=reference_cache),
@@ -156,18 +160,134 @@ def test_qwen4_verify_window_uses_direct_qsa_and_matches_official(monkeypatch):
     )
     mx.eval(actual, expected)
 
-    assert calls == [(4, 14)]
+    assert calls == [(verify_width, 10 + verify_width)]
     assert mx.allclose(actual, expected, rtol=2e-5, atol=2e-5).item()
     assert mx.array_equal(
         mx.argmax(actual, axis=-1),
         mx.argmax(expected, axis=-1),
     ).item()
-    assert fast_cache.offset == reference_cache.offset == 14
+    assert fast_cache.offset == reference_cache.offset == 10 + verify_width
     for fast_value, reference_value in zip(
         fast_cache.state,
         reference_cache.state,
     ):
         assert mx.array_equal(fast_value, reference_value).item()
+
+
+@pytest.mark.parametrize(
+    ("verify_width", "accepted"),
+    [
+        (verify_width, accepted)
+        for verify_width in (8, 9)
+        for accepted in range(verify_width)
+    ],
+)
+def test_qwen4_mixed_qsa_gdn_verify_rollback_matches_canonical_prefix(
+    monkeypatch,
+    verify_width,
+    accepted,
+):
+    """Every depth-7/8 accepted prefix restores canonical mixed-layer state.
+
+    QSA storage is representation-identical.  GDN's FP32 recurrent replay can
+    differ from the shorter canonical graph by a final rounding ULP, so it is
+    bounded tightly and followed by an end-to-end greedy-token parity check.
+    """
+
+    config = _tiny_text_config()
+    import mlx_vlm.models.qwen4_exp.language as language
+
+    root_config = SimpleNamespace(
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+        image_token_id=60,
+        video_token_id=61,
+        vision_start_token_id=58,
+    )
+    model = language.LanguageModel(config, root_config)
+    monkeypatch.setattr(language, "_QSA_DIRECT_VERIFY_MIN_TOKENS", 0)
+    mx.eval(model.parameters())
+
+    verify_cache = model.make_cache()
+    singleton_cache = model.make_cache()
+    prefix = mx.arange(2, 12, dtype=mx.int32)[None]
+    verify_tokens = mx.arange(
+        12,
+        12 + verify_width,
+        dtype=mx.int32,
+    )[None]
+    mx.eval(
+        model(prefix, cache=verify_cache).logits,
+        model(prefix, cache=singleton_cache).logits,
+    )
+
+    verified = model(
+        verify_tokens,
+        cache=verify_cache,
+        return_hidden=True,
+    )
+    mx.eval(verified.logits, *verified.gdn_states)
+    full_qsa_state = tuple(value * 1 for value in verify_cache[1].state)
+    mx.eval(*full_qsa_state)
+    gdn_state = verified.gdn_states[0]
+    conv_input = gdn_state[9]
+    kernel_size = int(gdn_state[10])
+    intermediate_states = gdn_state[11]
+    expected_conv = conv_input[:, accepted + 1 : accepted + kernel_size]
+    expected_recurrent = intermediate_states[:, accepted]
+    mx.eval(expected_conv, expected_recurrent)
+    model.rollback_speculative_cache(
+        verify_cache,
+        verified.gdn_states,
+        accepted=accepted,
+        block_size=verify_width,
+    )
+
+    retained = accepted + 1
+    retained_total = prefix.shape[1] + retained
+    expected_qsa_state = (
+        full_qsa_state[0][:, :, :retained_total],
+        full_qsa_state[1][:, :, :retained_total],
+        full_qsa_state[2][:, :retained_total],
+        full_qsa_state[3][..., :retained_total],
+    )
+    assert mx.array_equal(verify_cache[0][0], expected_conv).item()
+    assert mx.array_equal(verify_cache[0][1], expected_recurrent).item()
+    for actual, expected in zip(verify_cache[1].state, expected_qsa_state):
+        mx.eval(actual, expected)
+        assert mx.array_equal(actual, expected).item()
+
+    mx.eval(
+        model(
+            verify_tokens[:, :retained],
+            cache=singleton_cache,
+        ).logits
+    )
+
+    for actual_cache, expected_cache in zip(verify_cache, singleton_cache):
+        actual_state = actual_cache.state
+        expected_state = expected_cache.state
+        assert len(actual_state) == len(expected_state)
+        for actual, expected in zip(actual_state, expected_state):
+            if actual is None or expected is None:
+                assert actual is expected
+                continue
+            mx.eval(actual, expected)
+            assert actual.shape == expected.shape
+            assert actual.dtype == expected.dtype
+            if actual.dtype == mx.int32:
+                assert mx.array_equal(actual, expected).item()
+            else:
+                assert mx.allclose(actual, expected, rtol=2e-5, atol=2e-5).item()
+
+    probe = mx.array([[31]], dtype=mx.int32)
+    actual_next = model(probe, cache=verify_cache).logits
+    expected_next = model(probe, cache=singleton_cache).logits
+    mx.eval(actual_next, expected_next)
+    assert mx.allclose(actual_next, expected_next, rtol=2e-5, atol=2e-5).item()
+    assert mx.array_equal(
+        mx.argmax(actual_next[:, -1], axis=-1),
+        mx.argmax(expected_next[:, -1], axis=-1),
+    ).item()
 
 
 def test_qwen4_verify_window_eligibility_fails_closed(monkeypatch):
