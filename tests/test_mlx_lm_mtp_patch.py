@@ -1869,6 +1869,221 @@ class TestBatchGeneratorDispatch:
         assert host.uids == []
         assert host.prompt_cache == []
 
+    def test_qwen4_rowwise_late_join_finish_compacts_survivor_and_isolates_cache(
+        self, monkeypatch
+    ):
+        """A ragged B2 late join must become an exact singleton after B2->B1.
+
+        Hardware hit this transition after the older row exhausted its token
+        budget while the late row had an empty MTP queue.  Keeping the latter
+        in a one-row BatchQSAKVCache made the following depth-8 verify compare
+        its logical QSA selector against a longer physical KV extent.  This
+        exercises the finish/filter/promotion path and then runs the survivor's
+        next verify, while proving that neither row can observe the other's raw
+        indexer state.
+        """
+
+        from collections import deque
+
+        import mlx.core as mx
+        from mlx_lm.generate import GenerationBatch, SequenceStateMachine
+        from mlx_lm.models.cache import KVCache, TokenBuffer
+
+        from omlx.patches.mlx_lm_mtp import (
+            apply_mlx_lm_mtp_patch,
+            batch_generator as bg,
+        )
+        from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+            apply_mlx_vlm_qwen4_exp_compat_patch,
+        )
+
+        apply_mlx_vlm_qwen4_exp_compat_patch()
+        import omlx.scheduler  # noqa: F401  (cache promotion hooks)
+
+        apply_mlx_lm_mtp_patch()
+        from mlx_vlm.models.qwen4_exp.language import (
+            BatchQSAKVCache,
+            QSAKVCache,
+        )
+
+        def make_qsa(length, value):
+            cache = QSAKVCache()
+            cache.state = (
+                mx.full((1, 2, length, 4), value, dtype=mx.float32),
+                mx.full((1, 2, length, 4), value + 1, dtype=mx.float32),
+                mx.full((1, length, 3), value + 2, dtype=mx.float32),
+                mx.full((1, length), value + 3, dtype=mx.int32),
+            )
+            return cache
+
+        logprobs = mx.zeros((64,))
+        host_state = bg._MtpState(
+            uid=1,
+            queue=deque([(41, logprobs, "draft")]),
+        )
+        survivor_state = bg._MtpState(
+            uid=2,
+            queue=deque([(51, logprobs, "draft")]),
+        )
+
+        batch = GenerationBatch.__new__(GenerationBatch)
+        batch.model = SimpleNamespace()
+        batch.uids = [1, 2]
+        batch.prompt_cache = [
+            BatchQSAKVCache.merge([make_qsa(11, 10), make_qsa(7, 50)]),
+            KVCache.merge([make_qsa(11, 90), make_qsa(7, 110)]),
+        ]
+        batch.tokens = [[10], [20]]
+        batch.samplers = [None, None]
+        batch.fallback_sampler = None
+        batch.logits_processors = [[], []]
+        batch.state_machines = [SequenceStateMachine(), SequenceStateMachine()]
+        batch.max_tokens = [1, 2]
+        batch._current_tokens = None
+        batch._current_logprobs = []
+        batch._next_tokens = mx.array([41, 51], dtype=mx.uint32)
+        batch._next_logprobs = [logprobs, logprobs]
+        batch._token_context = [TokenBuffer([10]), TokenBuffer([20])]
+        batch._num_tokens = [0, 0]
+        batch._matcher_states = [
+            state.make_state() for state in batch.state_machines
+        ]
+        batch._omlx_mtp_batch_state = bg._MtpBatchState(
+            states={1: host_state, 2: survivor_state}
+        )
+
+        first = bg._mtp_batch_next(batch, batch._omlx_mtp_batch_state)
+        observed = [
+            (response.uid, response.token, response.finish_reason)
+            for response in first
+        ]
+        assert observed == [
+            (1, 41, "length"),
+            (2, 51, None),
+        ]
+        assert batch.uids == [2]
+        assert not hasattr(batch, "_omlx_mtp_batch_state")
+        assert batch._omlx_mtp_state is survivor_state
+
+        survivor_cache = batch.prompt_cache[0]
+        assert type(survivor_cache) is QSAKVCache
+        assert type(batch.prompt_cache[1]) is KVCache
+        assert survivor_cache.offset == 7
+        assert batch.prompt_cache[1].offset == 7
+        assert survivor_cache.index_keys.shape[1] == 7
+        assert survivor_cache.index_position_ids.shape[-1] == 7
+        assert mx.all(survivor_cache.index_keys == 52).item()
+        assert mx.all(first[0].prompt_cache[0].index_keys == 12).item()
+
+        # The next MTP cycle must see a scalar, internally aligned singleton.
+        # Mutate only its own suffix and queue one exact verified token.
+        def verify_survivor(row, state):
+            cache = row.prompt_cache[0]
+            assert type(cache) is QSAKVCache
+            assert cache.offset == cache.index_keys.shape[1]
+            assert cache.offset == cache.index_position_ids.shape[-1]
+            cache.update_and_fetch(
+                mx.full((1, 2, 1, 4), 80, dtype=mx.float32),
+                mx.full((1, 2, 1, 4), 81, dtype=mx.float32),
+            )
+            cache.update_indexer(
+                mx.full((1, 1, 3), 82, dtype=mx.float32),
+                mx.full((1, 1), 83, dtype=mx.int32),
+            )
+            state.queue.append((52, logprobs, "verify"))
+
+        monkeypatch.setattr(bg, "_run_verify_cycle", verify_survivor)
+        [second] = bg._mtp_next(batch, survivor_state)
+        assert (second.uid, second.token, second.finish_reason) == (2, 52, "length")
+        assert second.prompt_cache[0].offset == 8
+        assert second.prompt_cache[0].index_keys.shape[1] == 8
+        assert mx.all(first[0].prompt_cache[0].index_keys == 12).item()
+        assert batch.uids == []
+        assert batch.prompt_cache == []
+
+    def test_qwen4_rowwise_survivor_alignment_gate_never_truncates_aux_state(self):
+        """A malformed QSA survivor fails closed instead of guessing a trim."""
+
+        import mlx.core as mx
+
+        from omlx.patches.mlx_lm_mtp import batch_generator as bg
+        from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+            apply_mlx_vlm_qwen4_exp_compat_patch,
+        )
+
+        apply_mlx_vlm_qwen4_exp_compat_patch()
+        from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+
+        cache = QSAKVCache()
+        cache.state = (
+            mx.zeros((1, 2, 8, 4)),
+            mx.zeros((1, 2, 8, 4)),
+            mx.zeros((1, 4, 3)),
+            mx.zeros((1, 4), dtype=mx.int32),
+        )
+        # Restoring state resets offset from K/V (8) but keeps the intentionally
+        # short raw index bank (4), matching the hardware failure's invariant.
+        error = bg._qsa_singleton_alignment_error([cache])
+        assert error == (
+            "QSAKVCache lengths disagree: kv=8, index_keys=4, positions=4"
+        )
+
+    def test_qwen4_batch_qsa_reject_four_then_next_verify_stays_aligned(self):
+        """Rejected verify columns cannot reappear on the following cycle.
+
+        This is the small hardware-shaped form of the 20,047/20,051 crash:
+        a depth-eight verify appends nine rows, rejects four, and another
+        depth-eight verify follows.  K/V, raw index keys, and position IDs
+        must have one identical physical/logical extent after both cycles.
+        """
+
+        import mlx.core as mx
+
+        from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+            apply_mlx_vlm_qwen4_exp_compat_patch,
+        )
+
+        apply_mlx_vlm_qwen4_exp_compat_patch()
+        from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+
+        def make_singleton(length):
+            singleton = QSAKVCache()
+            singleton.state = (
+                mx.zeros((1, 2, length, 4)),
+                mx.zeros((1, 2, length, 4)),
+                mx.zeros((1, length, 3)),
+                mx.zeros((1, length), dtype=mx.int32),
+            )
+            return singleton
+
+        cache = QSAKVCache.merge([make_singleton(20), make_singleton(16)])
+        assert cache.left_padding.tolist() == [0, 4]
+
+        def append_verify(width):
+            cache.update_and_fetch(
+                mx.zeros((2, 2, width, 4)),
+                mx.zeros((2, 2, width, 4)),
+            )
+            cache.update_indexer(
+                mx.zeros((2, width, 3)),
+                mx.zeros((2, width), dtype=mx.int32),
+            )
+
+        append_verify(9)
+        assert cache.trim(4) == 4
+        assert cache.kv_cache._idx == 25
+        assert cache.index_offset == 25
+        assert cache.offset.tolist() == [25, 21]
+        assert cache.index_keys.shape[1] == 25
+        assert cache.index_position_ids.shape[-1] == 25
+
+        append_verify(9)
+        assert cache.kv_cache._idx == 34
+        assert cache.index_offset == 34
+        assert cache.offset.tolist() == [34, 30]
+        assert cache.index_keys.shape[1] == 34
+        assert cache.index_position_ids.shape[-1] == 34
+
     def test_performance_park_starts_reentry_cooldown(self, monkeypatch):
         import mlx.core as mx
 

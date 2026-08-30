@@ -331,8 +331,13 @@ def apply() -> bool:
 
         def patched_filter(self, keep, *args, **kwargs):
             old_uids = list(getattr(self, "uids", []) or [])
+            had_rowwise_state = (
+                getattr(self, "_omlx_mtp_batch_state", None) is not None
+            )
             result = original_filter(self, keep, *args, **kwargs)
             _drop_invalid_mtp_state(self, "filter", log_empty=True)
+            if had_rowwise_state and len(old_uids) > 1 and len(keep) == 1:
+                _compact_rowwise_mtp_survivor(self)
             _drop_invalid_mtp_batch_state(
                 self,
                 "filter",
@@ -1394,6 +1399,74 @@ def _make_row_batch(
     if state is not None:
         row._omlx_mtp_state = state
     return row
+
+
+def _qsa_singleton_alignment_error(prompt_cache: List[Any]) -> Optional[str]:
+    """Return a diagnostic when a compact Qwen4 QSA row is not exact.
+
+    Row-wise MTP deliberately runs every request against extracted singleton
+    caches.  When a B2 batch shrinks to B1, the surviving state is promoted to
+    the singleton MTP path as well.  Its cache must therefore be the same
+    compact representation: leaving a one-row ``BatchQSAKVCache`` attached
+    makes the next verify use a vector logical offset against a physical
+    right-aligned extent.  At a ragged late-join boundary that produced the
+    observed QSA mask/KV mismatch (four columns at depth eight).
+
+    This check is intentionally structural.  It never trims or fabricates
+    auxiliary indexer rows: the QSA raw keys and position IDs are part of the
+    exact selector state, so an inconsistency must fail closed rather than be
+    guessed back into alignment.
+    """
+
+    pending = list(prompt_cache)
+    while pending:
+        cache = pending.pop()
+        pending.extend(getattr(cache, "caches", ()) or ())
+        if type(cache).__name__ not in {"QSAKVCache", "QSAQuantizedKVCache"}:
+            continue
+        offset = getattr(cache, "offset", None)
+        if not isinstance(offset, int):
+            return f"{type(cache).__name__} retained non-scalar offset {offset!r}"
+        index_keys = getattr(cache, "index_keys", None)
+        index_positions = getattr(cache, "index_position_ids", None)
+        if offset == 0 and index_keys is None and index_positions is None:
+            continue
+        if index_keys is None or index_positions is None:
+            return f"{type(cache).__name__} is missing auxiliary indexer state"
+        key_length = int(index_keys.shape[1])
+        position_length = int(index_positions.shape[-1])
+        if key_length != offset or position_length != offset:
+            return (
+                f"{type(cache).__name__} lengths disagree: kv={offset}, "
+                f"index_keys={key_length}, positions={position_length}"
+            )
+    return None
+
+
+def _compact_rowwise_mtp_survivor(gen_batch: Any) -> None:
+    """Move a B2->B1 row-wise survivor back to exact singleton caches.
+
+    ``GenerationBatch.filter`` keeps the cache container batched even when a
+    single row remains.  The row-wise MTP state, however, is promoted to
+    ``_omlx_mtp_state`` and the next Qwen4 verify is a singleton operation.
+    Extract the surviving logical row after filtering: this removes physical
+    left padding, restores scalar offsets, and prevents another request's
+    capacity/tail from leaking into QSA selection.  Extraction is also the
+    ownership boundary used by normal finished responses, so arrays remain
+    request-isolated.
+    """
+
+    uids = list(getattr(gen_batch, "uids", []) or [])
+    if len(uids) != 1:
+        return
+    batch_state = getattr(gen_batch, "_omlx_mtp_batch_state", None)
+    if batch_state is None or uids[0] not in batch_state.states:
+        return
+    compact = gen_batch.extract_cache(0)
+    error = _qsa_singleton_alignment_error(compact)
+    if error is not None:
+        raise ValueError(f"Qwen4 row-wise survivor cache is not exact: {error}")
+    gen_batch.prompt_cache = compact
 
 
 def _merge_row_caches(row_caches: List[List[Any]]) -> List[Any]:

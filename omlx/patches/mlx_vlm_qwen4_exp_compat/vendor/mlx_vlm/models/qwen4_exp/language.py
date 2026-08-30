@@ -984,6 +984,16 @@ class BatchQSAKVCache:
     def trim(self, n):
         trimmed = self.kv_cache.trim(n)
         self.index_offset = max(0, self.index_offset - trimmed)
+        # Keep the physical auxiliary arrays at the committed extent.  The
+        # next update_indexer() concatenates onto these arrays and derives its
+        # new extent from shape[1]; retaining rejected verify columns here
+        # would therefore resurrect them and desynchronize QSA selection from
+        # the trimmed K/V cache (issue #3245 / PR #3246).
+        if trimmed and self.index_keys is not None:
+            self.index_keys = self.index_keys[:, : self.index_offset]
+            self.index_position_ids = self.index_position_ids[
+                ..., : self.index_offset
+            ]
         return trimmed
 
     @property
