@@ -30,6 +30,12 @@ Examples::
 
     python benchmarks/bench_qwen4_concurrency.py --self-test
 
+    python benchmarks/bench_qwen4_concurrency.py \
+      --model Qwen3.8-Flash-Next-oQ4e-mtp --streams 1 \
+      --contexts 20k,50k,100k,150k,200k,220k \
+      --prompt-mode predictable-code --calibrate-contexts \
+      --no-prime-cache --max-tokens 500
+
 Context sizes are targets.  With ``--calibrate-contexts`` the oMLX Anthropic
 token-count endpoint is used to bring the generated prompt close to the target;
 otherwise the final report's server-reported ``prompt_tokens`` is authoritative.
@@ -53,12 +59,24 @@ import uuid
 import httpx
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_UNIT = (
     "def qwen4_scheduler_step(sequence, cache):\n"
     "    selected = cache.exact_top_blocks(sequence, limit=512)\n"
     "    return sequence.attend(selected, fp32_scores=True)\n\n"
 )
+PREDICTABLE_CODE_MODE = "predictable-code"
+
+
+def _predictable_code_unit(index: int) -> str:
+    """One deterministic continuation unit with a monotonically numbered name."""
+
+    return (
+        f"def qwen4_transform_{index:06d}(value: int) -> int:\n"
+        "    doubled = value * 2\n"
+        "    adjusted = doubled + 1\n"
+        "    return adjusted\n\n"
+    )
 
 
 def _round(value: float | None, digits: int = 4) -> float | None:
@@ -193,6 +211,51 @@ def _cached_tokens(usage: dict[str, Any]) -> int:
     return int(details.get("cached_tokens") or 0)
 
 
+def _server_acceptance_telemetry(
+    event: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Copy explicit server acceptance fields without deriving a ratio."""
+
+    field_names = (
+        "acceptance_ratio",
+        "mtp_acceptance_ratio",
+        "speculative_acceptance_ratio",
+        "acceptance_percent",
+        "mtp_acceptance_percent",
+        "accepted_draft_tokens",
+        "drafted_tokens",
+        "tokens_per_cycle",
+        "mtp_tokens_per_cycle",
+    )
+    containers = (
+        ("event", event),
+        ("usage", event.get("usage")),
+        ("metrics", event.get("metrics")),
+        ("telemetry", event.get("telemetry")),
+        ("mtp", event.get("mtp")),
+        ("speculative", event.get("speculative")),
+    )
+    found: list[dict[str, Any]] = []
+    for source, container in containers:
+        if not isinstance(container, dict):
+            continue
+        values = {
+            name: container[name]
+            for name in field_names
+            if isinstance(container.get(name), (int, float))
+            and not isinstance(container.get(name), bool)
+        }
+        if values:
+            found.append(
+                {
+                    "source": source,
+                    "values": values,
+                    "derived": False,
+                }
+            )
+    return found
+
+
 @dataclass(frozen=True)
 class StreamSpec:
     label: str
@@ -200,6 +263,7 @@ class StreamSpec:
     prompt: str
     max_tokens: int
     cancel_after_chunks: int = 0
+    prompt_mode: str = "default"
 
 
 @dataclass
@@ -218,6 +282,7 @@ class StreamResult:
     content_events: int = 0
     output: str = ""
     usage: dict[str, Any] = field(default_factory=dict)
+    acceptance_telemetry: list[dict[str, Any]] = field(default_factory=list)
 
     def report(self, epoch: float) -> dict[str, Any]:
         prompt_tokens = int(self.usage.get("prompt_tokens") or 0)
@@ -238,7 +303,7 @@ class StreamResult:
         ]
         server_tps = self.usage.get("generation_tokens_per_second")
         output_hash = hashlib.sha256(self.output.encode("utf-8")).hexdigest()
-        return {
+        report = {
             "label": self.label,
             "marker": self.marker,
             "status": self.status,
@@ -271,6 +336,9 @@ class StreamResult:
             "output_preview": self.output[:160],
             "usage": self.usage,
         }
+        if self.acceptance_telemetry:
+            report["server_acceptance_telemetry"] = self.acceptance_telemetry
+        return report
 
 
 def _cache_coverage(streams: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -358,6 +426,8 @@ async def _stream_request(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if spec.prompt_mode == PREDICTABLE_CODE_MODE:
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
     if seed is not None:
         payload["seed"] = seed
     await start_gate.wait()
@@ -379,6 +449,9 @@ async def _stream_request(
                     result.response_id = str(event["id"])
                 if event.get("usage"):
                     result.usage = dict(event["usage"])
+                for telemetry in _server_acceptance_telemetry(event):
+                    if telemetry not in result.acceptance_telemetry:
+                        result.acceptance_telemetry.append(telemetry)
                 finish_reason = _finish_reason(event)
                 if finish_reason is not None:
                     result.finish_reason = finish_reason
@@ -444,6 +517,14 @@ def _round_report(
     ]
     output_hashes = [row["output_sha256"] for row in completed]
     response_ids = [row["response_id"] for row in completed if row["response_id"]]
+    acceptance_rows = [
+        {
+            "label": row["label"],
+            "telemetry": row["server_acceptance_telemetry"],
+        }
+        for row in completed
+        if row.get("server_acceptance_telemetry")
+    ]
     report = {
         "label": label,
         "stream_count": len(results),
@@ -500,6 +581,8 @@ def _round_report(
             "event through stream finish). This proves concurrent active decode "
             "windows, not the server's private per-step kernel batch width."
         )
+    if acceptance_rows:
+        report["server_acceptance_telemetry"] = acceptance_rows
     return report
 
 
@@ -550,7 +633,23 @@ def _make_shared_prefix(
     chars_per_token: float,
     corpus: str,
     repeats: int | None = None,
+    prompt_mode: str = "default",
 ) -> tuple[str, int]:
+    if prompt_mode == PREDICTABLE_CODE_MODE:
+        header = (
+            f"# QWEN4 PREDICTABLE CODE BENCHMARK {run_salt}\n"
+            "# Continue the monotonically numbered function series exactly.\n\n"
+        )
+        sample = _predictable_code_unit(0)
+        if repeats is None:
+            target_chars = max(
+                1,
+                int(target_tokens * chars_per_token) - len(header),
+            )
+            repeats = max(1, math.ceil(target_chars / len(sample)))
+        code = "".join(_predictable_code_unit(index) for index in range(repeats))
+        return header + code, repeats
+
     header = (
         f"QWEN4 EXACT CONCURRENCY BENCHMARK {run_salt}.\n"
         "Treat all preceding source as immutable context.\n\n"
@@ -561,7 +660,24 @@ def _make_shared_prefix(
     return header + corpus * repeats, repeats
 
 
-def _prompt(prefix: str, marker: str) -> str:
+def _prompt(
+    prefix: str,
+    marker: str,
+    *,
+    prompt_mode: str = "default",
+) -> str:
+    if prompt_mode == PREDICTABLE_CODE_MODE:
+        next_index = prefix.count("def qwen4_transform_")
+        return (
+            prefix
+            + "# CONTINUATION TASK\n"
+            + f"# First output line: # {marker}\n"
+            + f"# Then begin with qwen4_transform_{next_index:06d} and continue "
+            "the exact numbered function pattern above.\n"
+            "# Output Python code only. No explanation, reasoning, headings, or "
+            "Markdown fences. Do not stop before the token limit unless a complete "
+            "function would not fit.\n"
+        )
     return (
         prefix
         + "\nEND IMMUTABLE CONTEXT.\n"
@@ -573,14 +689,22 @@ def _prompt(prefix: str, marker: str) -> str:
 
 
 async def _count_prompt_tokens(
-    client: httpx.AsyncClient, endpoint: str, model: str, prompt: str
+    client: httpx.AsyncClient,
+    endpoint: str,
+    model: str,
+    prompt: str,
+    *,
+    prompt_mode: str = "default",
 ) -> int:
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if prompt_mode == PREDICTABLE_CODE_MODE:
+        payload["thinking"] = {"type": "disabled"}
     response = await client.post(
         _v1_url(endpoint, "messages/count_tokens"),
-        json={
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-        },
+        json=payload,
     )
     response.raise_for_status()
     return int(response.json()["input_tokens"])
@@ -595,19 +719,25 @@ async def _calibrate_prefix(
     run_salt: str,
     chars_per_token: float,
     corpus: str,
+    prompt_mode: str = "default",
 ) -> tuple[str, dict[str, Any]]:
     prefix, repeats = _make_shared_prefix(
         target_tokens,
         run_salt=run_salt,
         chars_per_token=chars_per_token,
         corpus=corpus,
+        prompt_mode=prompt_mode,
     )
     marker = "ISOLATION-CALIBRATION"
     attempts: list[dict[str, int]] = []
     try:
         for attempt_index in range(4):
             actual = await _count_prompt_tokens(
-                client, endpoint, model, _prompt(prefix, marker)
+                client,
+                endpoint,
+                model,
+                _prompt(prefix, marker, prompt_mode=prompt_mode),
+                prompt_mode=prompt_mode,
             )
             attempts.append({"repeats": repeats, "tokens": actual})
             error = target_tokens - actual
@@ -623,12 +753,14 @@ async def _calibrate_prefix(
                 chars_per_token=chars_per_token,
                 corpus=corpus,
                 repeats=repeats,
+                prompt_mode=prompt_mode,
             )
         return prefix, {
             "method": "omlx_count_tokens",
             "target_tokens": target_tokens,
             "final_tokens": attempts[-1]["tokens"],
             "repeats": repeats,
+            "prompt_mode": prompt_mode,
             "attempts": attempts,
         }
     except Exception as exc:
@@ -636,6 +768,7 @@ async def _calibrate_prefix(
             "method": "character_estimate_fallback",
             "target_tokens": target_tokens,
             "repeats": repeats,
+            "prompt_mode": prompt_mode,
             "error": f"{type(exc).__name__}: {exc}",
             "attempts": attempts,
         }
@@ -662,17 +795,24 @@ def _specs(
     max_tokens: int,
     phase: str,
     cancel_first_after_chunks: int = 0,
+    prompt_mode: str = "default",
 ) -> list[StreamSpec]:
     result = []
     for index in range(count):
-        marker = f"ISOLATION-{phase}-C{context}-S{index}-{uuid.uuid4().hex[:10]}"
+        if prompt_mode == PREDICTABLE_CODE_MODE:
+            marker = f"ISOLATION-{phase}-C{context}-S{index}"
+        else:
+            marker = (
+                f"ISOLATION-{phase}-C{context}-S{index}-{uuid.uuid4().hex[:10]}"
+            )
         result.append(
             StreamSpec(
                 label=f"{phase}-c{context}-s{index}",
                 marker=marker,
-                prompt=_prompt(prefix, marker),
+                prompt=_prompt(prefix, marker, prompt_mode=prompt_mode),
                 max_tokens=max_tokens,
                 cancel_after_chunks=cancel_first_after_chunks if index == 0 else 0,
+                prompt_mode=prompt_mode,
             )
         )
     return result
@@ -688,6 +828,7 @@ async def _prime_cache(
     epoch: float,
     temperature: float,
     seed: int | None,
+    prompt_mode: str = "default",
 ) -> dict[str, Any]:
     return await _run_round(
         client,
@@ -699,6 +840,7 @@ async def _prime_cache(
             count=1,
             max_tokens=1,
             phase="cache-prime",
+            prompt_mode=prompt_mode,
         ),
         epoch=epoch,
         label=f"cache-prime-{context}",
@@ -734,6 +876,7 @@ async def _prime_each_stream(
             marker=spec.marker,
             prompt=spec.prompt,
             max_tokens=1,
+            prompt_mode=spec.prompt_mode,
         )
         rounds.append(
             await _run_round(
@@ -777,6 +920,7 @@ async def _run_mixed_phase(
     temperature: float,
     seed: int | None,
     first_token_timeout: float,
+    prompt_mode: str = "default",
 ) -> dict[str, Any]:
     # Prime only the common victim prefix so both the standalone baseline and
     # the contended victim begin from the same cache/MTP-history state.
@@ -789,6 +933,7 @@ async def _run_mixed_phase(
         epoch=epoch,
         temperature=temperature,
         seed=seed,
+        prompt_mode=prompt_mode,
     )
     baseline_spec = _specs(
         prefix=victim_prefix,
@@ -796,6 +941,7 @@ async def _run_mixed_phase(
         count=1,
         max_tokens=max_tokens,
         phase="mixed-baseline",
+        prompt_mode=prompt_mode,
     )[0]
     baseline = await _run_round(
         client,
@@ -816,6 +962,7 @@ async def _run_mixed_phase(
         count=1,
         max_tokens=max_tokens,
         phase="mixed-victim",
+        prompt_mode=prompt_mode,
     )[0]
     victim_task = asyncio.create_task(
         _stream_request(
@@ -840,6 +987,7 @@ async def _run_mixed_phase(
             count=prefillers,
             max_tokens=1,
             phase="mixed-prefill",
+            prompt_mode=prompt_mode,
         )
         intruder_gate = asyncio.Event()
         intruder_tasks = [
@@ -1007,6 +1155,13 @@ async def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 "max_tokens": args.max_tokens,
                 "temperature": args.temperature,
                 "seed": args.seed,
+                "prompt_mode": args.prompt_mode,
+                "chat_template_kwargs": (
+                    {"enable_thinking": False}
+                    if args.prompt_mode == PREDICTABLE_CODE_MODE
+                    else None
+                ),
+                "acceptance_reporting": "explicit_server_telemetry_only",
                 "prime_cache": args.prime_cache,
                 "prime_each_stream": args.prime_each_stream,
                 "calibrate_contexts": args.calibrate_contexts,
@@ -1020,7 +1175,11 @@ async def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
         }
         prefixes: dict[int, str] = {}
         for context in args.contexts:
-            context_salt = f"{run_salt}-c{context}"
+            context_salt = (
+                f"predictable-code-c{context}"
+                if args.prompt_mode == PREDICTABLE_CODE_MODE
+                else f"{run_salt}-c{context}"
+            )
             if args.calibrate_contexts:
                 prefix, calibration = await _calibrate_prefix(
                     client,
@@ -1030,6 +1189,7 @@ async def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     run_salt=context_salt,
                     chars_per_token=args.chars_per_token,
                     corpus=corpus,
+                    prompt_mode=args.prompt_mode,
                 )
             else:
                 prefix, repeats = _make_shared_prefix(
@@ -1037,11 +1197,13 @@ async def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     run_salt=context_salt,
                     chars_per_token=args.chars_per_token,
                     corpus=corpus,
+                    prompt_mode=args.prompt_mode,
                 )
                 calibration = {
                     "method": "character_estimate",
                     "target_tokens": context,
                     "repeats": repeats,
+                    "prompt_mode": args.prompt_mode,
                 }
             prefixes[context] = prefix
             report["context_calibration"].append(calibration)
@@ -1055,6 +1217,7 @@ async def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     epoch=epoch,
                     temperature=args.temperature,
                     seed=args.seed,
+                    prompt_mode=args.prompt_mode,
                 )
                 report["cache_primes"].append(prime)
             for count in args.streams:
@@ -1064,6 +1227,7 @@ async def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     count=count,
                     max_tokens=args.max_tokens,
                     phase=f"matrix-b{count}",
+                    prompt_mode=args.prompt_mode,
                 )
                 exact_prime = None
                 if args.prime_each_stream:
@@ -1114,12 +1278,14 @@ async def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 run_salt=f"{run_salt}-mixed-victim",
                 chars_per_token=args.chars_per_token,
                 corpus=corpus,
+                prompt_mode=args.prompt_mode,
             )[0]
             prefill_prefix = prefixes.get(prefill_context) or _make_shared_prefix(
                 prefill_context,
                 run_salt=f"{run_salt}-mixed-prefill",
                 chars_per_token=args.chars_per_token,
                 corpus=corpus,
+                prompt_mode=args.prompt_mode,
             )[0]
             report["mixed"] = await _run_mixed_phase(
                 client,
@@ -1135,6 +1301,7 @@ async def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 temperature=args.temperature,
                 seed=args.seed,
                 first_token_timeout=args.request_timeout,
+                prompt_mode=args.prompt_mode,
             )
 
         if args.cancellation:
@@ -1144,6 +1311,7 @@ async def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 run_salt=f"{run_salt}-cancel",
                 chars_per_token=args.chars_per_token,
                 corpus=corpus,
+                prompt_mode=args.prompt_mode,
             )[0]
             report["cancellation"] = await _run_round(
                 client,
@@ -1156,6 +1324,7 @@ async def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     max_tokens=args.max_tokens,
                     phase="cancel",
                     cancel_first_after_chunks=args.cancel_after_chunks,
+                    prompt_mode=args.prompt_mode,
                 ),
                 epoch=epoch,
                 label=f"cancellation-c{context}-b{args.cancel_streams}",
@@ -1174,6 +1343,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--endpoint", default="http://127.0.0.1:8000/v1")
     parser.add_argument("--api-key", help="Defaults to OMLX_API_KEY/OPENAI_API_KEY")
     parser.add_argument("--model", help="Defaults to the first /v1/models entry")
+    parser.add_argument(
+        "--prompt-mode",
+        choices=("default", PREDICTABLE_CODE_MODE),
+        default="default",
+        help=(
+            "default preserves the cache-isolation prose task; predictable-code "
+            "uses deterministic output-only numbered Python continuation and "
+            "disables thinking for high-acceptance B1 measurement"
+        ),
+    )
     parser.add_argument("--contexts", type=_parse_int_list, default=[20_000])
     parser.add_argument("--streams", type=_parse_int_list, default=[1, 2, 4, 6])
     parser.add_argument("--max-tokens", type=int, default=500)
@@ -1238,6 +1417,67 @@ def _self_test() -> None:
     assert repeats > 0 and "test" in prefix
     marker = "ISOLATION-SELFTEST"
     assert marker in _prompt(prefix, marker)
+
+    predictable_a, predictable_repeats = _make_shared_prefix(
+        1_000,
+        run_salt="predictable-code-c1000",
+        chars_per_token=3.4,
+        corpus=DEFAULT_UNIT,
+        prompt_mode=PREDICTABLE_CODE_MODE,
+    )
+    predictable_b, repeats_b = _make_shared_prefix(
+        1_000,
+        run_salt="predictable-code-c1000",
+        chars_per_token=3.4,
+        corpus=DEFAULT_UNIT,
+        prompt_mode=PREDICTABLE_CODE_MODE,
+    )
+    assert predictable_a == predictable_b
+    assert predictable_repeats == repeats_b
+    assert "def qwen4_transform_000000" in predictable_a
+    assert (
+        f"def qwen4_transform_{predictable_repeats - 1:06d}"
+        in predictable_a
+    )
+    predictable_prompt = _prompt(
+        predictable_a,
+        "ISOLATION-PREDICTABLE",
+        prompt_mode=PREDICTABLE_CODE_MODE,
+    )
+    assert "Output Python code only" in predictable_prompt
+    assert (
+        f"qwen4_transform_{predictable_repeats:06d}" in predictable_prompt
+    )
+    predictable_specs_a = _specs(
+        prefix=predictable_a,
+        context=1_000,
+        count=1,
+        max_tokens=500,
+        phase="matrix-b1",
+        prompt_mode=PREDICTABLE_CODE_MODE,
+    )
+    predictable_specs_b = _specs(
+        prefix=predictable_a,
+        context=1_000,
+        count=1,
+        max_tokens=500,
+        phase="matrix-b1",
+        prompt_mode=PREDICTABLE_CODE_MODE,
+    )
+    assert predictable_specs_a == predictable_specs_b
+    assert predictable_specs_a[0].prompt_mode == PREDICTABLE_CODE_MODE
+
+    raw_acceptance = _server_acceptance_telemetry(
+        {"metrics": {"accepted_draft_tokens": 7, "drafted_tokens": 10}}
+    )
+    assert raw_acceptance == [
+        {
+            "source": "metrics",
+            "values": {"accepted_draft_tokens": 7, "drafted_tokens": 10},
+            "derived": False,
+        }
+    ]
+    assert "acceptance_ratio" not in raw_acceptance[0]["values"]
 
     now = time.perf_counter()
     one = StreamResult(
@@ -1343,6 +1583,11 @@ async def _async_self_test() -> None:
                         "prompt_tokens_details": {"cached_tokens": 64},
                         "generation_tokens_per_second": 42.0,
                     },
+                    "metrics": {
+                        "mtp_acceptance_ratio": 0.875,
+                        "accepted_draft_tokens": 7,
+                        "drafted_tokens": 8,
+                    },
                 }
             ),
             "data: [DONE]",
@@ -1378,6 +1623,18 @@ async def _async_self_test() -> None:
         assert result.response_id == "chatcmpl-selftest"
         assert result.output == marker + " output"
         assert result.usage["completion_tokens"] == 2
+        assert result.acceptance_telemetry == [
+            {
+                "source": "metrics",
+                "values": {
+                    "mtp_acceptance_ratio": 0.875,
+                    "accepted_draft_tokens": 7,
+                    "drafted_tokens": 8,
+                },
+                "derived": False,
+            }
+        ]
+        assert "chat_template_kwargs" not in seen_requests[0]
 
         cancelled = await _stream_request(
             client,
@@ -1405,12 +1662,14 @@ async def _async_self_test() -> None:
                     marker=marker,
                     prompt="exact prompt zero",
                     max_tokens=500,
+                    prompt_mode=PREDICTABLE_CODE_MODE,
                 ),
                 StreamSpec(
                     label="exact-1",
                     marker=marker,
                     prompt="exact prompt one",
                     max_tokens=500,
+                    prompt_mode=PREDICTABLE_CODE_MODE,
                 ),
             ],
             epoch=time.perf_counter(),
@@ -1424,6 +1683,10 @@ async def _async_self_test() -> None:
         assert [
             request["messages"][0]["content"] for request in seen_requests[-2:]
         ] == ["exact prompt zero", "exact prompt one"]
+        assert all(
+            request["chat_template_kwargs"] == {"enable_thinking": False}
+            for request in seen_requests[-2:]
+        )
 
 
 def main(argv: Iterable[str] | None = None) -> int:
@@ -1435,6 +1698,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 0
     if any(value not in {1, 2, 4, 6} for value in args.streams):
         raise SystemExit("--streams must contain only 1,2,4,6")
+    if args.prompt_mode == PREDICTABLE_CODE_MODE and args.streams != [1]:
+        raise SystemExit(
+            "--prompt-mode predictable-code is a B1 gate; pass --streams 1"
+        )
+    if args.prompt_mode == PREDICTABLE_CODE_MODE and args.corpus_file:
+        raise SystemExit(
+            "--corpus-file cannot be combined with --prompt-mode predictable-code"
+        )
     if any(value <= 0 for value in (args.max_tokens, args.cancel_after_chunks)):
         raise SystemExit("token/chunk counts must be positive")
     report = asyncio.run(_benchmark(args))
