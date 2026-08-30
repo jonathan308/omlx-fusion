@@ -31,14 +31,39 @@ class _AdaptivePrefillConfig:
     min_remaining: int
 
 
+_GLM5_NATIVE_PREFILL_SYMBOLS = (
+    "dsa_indexer_scores",
+    "dsa_topk_indices",
+    "glm_dsa_sparse_mla_attention",
+    "glm_dsa_exact_block_attention",
+    "glm_dsa_q8_vup_flat",
+)
+
+
+def _glm5_native_sparse_available() -> bool:
+    try:
+        from ...custom_kernels.glm_moe_dsa import fast
+
+        return bool(
+            fast.is_native_available()
+            and not fast.missing_symbols(_GLM5_NATIVE_PREFILL_SYMBOLS)
+        )
+    except Exception:
+        return False
+
+
 def _glm_dsa_adaptive_prefill_config(
     model: Any, prefill_step_size: int
 ) -> _AdaptivePrefillConfig | None:
     model_type = getattr(model, "model_type", None) or getattr(
         getattr(model, "args", None), "model_type", None
     )
+    supported_type = model_type == "glm_moe_dsa" or (
+        model_type in {"glm5_next", "glm5_next_text"}
+        and _glm5_native_sparse_available()
+    )
     if (
-        model_type != "glm_moe_dsa"
+        not supported_type
         or prefill_step_size != 2048
         or os.environ.get("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP", "1") != "1"
     ):
