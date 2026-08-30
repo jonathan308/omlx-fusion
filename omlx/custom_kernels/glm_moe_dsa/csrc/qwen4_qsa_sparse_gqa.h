@@ -14,3 +14,4 @@ mx::array qwen4_qsa_sparse_gqa_attention(
     int key_tile = 128, int dimension_tile = 32, mx::StreamOrDevice s = {});
 
 } // namespace omlx::glm_kernels
+// SPDX-License-Identifier: Apache-2.0

@@ -1490,6 +1490,10 @@ _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
         "BatchTurboQuantKVCache",
         "ChunkedKVCache",
         "MiniMaxM3KVCache",
+        # QSA handlers support block slicing. Their growing KV/index state
+        # must not be copied into every long-prefill boundary snapshot.
+        "QSAKVCache",
+        "QSAQuantizedKVCache",
     }
 )
 
@@ -2991,7 +2995,20 @@ class Scheduler:
                 model_type = str(
                     getattr(getattr(self.model, "config", None), "model_type", "") or ""
                 )
-            if model_type.startswith(("qwen3_5", "qwen4_exp")):
+            is_qwen35 = model_type.startswith("qwen3_5")
+            is_qwen4 = model_type.startswith("qwen4_exp")
+            if is_qwen4:
+                # Qwen4's wider prefill floor is only safe when the native
+                # sparse QSA path is available. Otherwise a 4096-row tile can
+                # recreate the dense memory pressure that the release guard
+                # is intended to avoid.
+                from .custom_kernels.glm_moe_dsa import fast
+
+                if not fast.is_native_available() or not fast.has_symbol(
+                    "qwen4_qsa_sparse_gqa_attention"
+                ):
+                    return 0
+            if is_qwen35 or is_qwen4:
                 from .custom_kernels.nax import is_nax_available
                 from .settings import get_system_memory
 
@@ -12163,6 +12180,10 @@ class Scheduler:
                     ) + len(responses)
                     if self._tokens_since_clear_cache >= 1024:
                         self._tokens_since_clear_cache = 0
+                        # Refresh the executor-owned active-memory sample while
+                        # decode is running. The background hard-watermark
+                        # enforcer otherwise sees the last prefill reading.
+                        self._current_usage_bytes()
                         if (
                             mx.get_cache_memory()
                             > self._periodic_clear_threshold_bytes()

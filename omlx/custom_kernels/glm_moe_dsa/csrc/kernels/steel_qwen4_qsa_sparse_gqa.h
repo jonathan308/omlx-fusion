@@ -319,3 +319,4 @@ qwen4_qsa_sparse_gqa_attention(
                                        short2(D - sn, rows_left));
   }
 }
+# SPDX-License-Identifier: Apache-2.0

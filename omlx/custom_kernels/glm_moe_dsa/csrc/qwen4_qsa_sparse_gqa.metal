@@ -20,3 +20,4 @@ instantiate_qwen4_sparse_gqa(bfloat16, bfloat16_t, 128, 32);
 instantiate_qwen4_sparse_gqa(bfloat16, bfloat16_t, 256, 32);
 instantiate_qwen4_sparse_gqa(bfloat16, bfloat16_t, 64, 64);
 instantiate_qwen4_sparse_gqa(bfloat16, bfloat16_t, 128, 64);
+// SPDX-License-Identifier: Apache-2.0

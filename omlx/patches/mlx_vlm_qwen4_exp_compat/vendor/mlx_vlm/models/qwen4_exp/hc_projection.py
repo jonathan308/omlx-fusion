@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Lossless one-dispatch Qwen4 hyperconnection input projection.
 
 The Metal arithmetic in this module is transcribed from MLX core at pinned

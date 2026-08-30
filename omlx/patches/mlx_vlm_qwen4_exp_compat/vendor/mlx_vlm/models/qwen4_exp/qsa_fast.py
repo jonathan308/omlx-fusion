@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Exact gathered QSA prefill for contiguous batch-one text prompts.
 
 This is the exact path proven by Fusion's native Qwen4-Exp bring-up. It never

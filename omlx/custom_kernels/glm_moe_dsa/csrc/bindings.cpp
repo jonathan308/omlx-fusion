@@ -93,6 +93,32 @@ NB_MODULE(_ext, m) {
       "dimension_tile"_a = 32,
       "stream"_a = nb::none());
   m.def(
+      "qwen4_qsa_indexer_scores",
+      &omlx::glm_kernels::qwen4_qsa_indexer_scores,
+      "queries"_a,
+      "pooled_keys"_a,
+      "mask_ratio"_a = 4,
+      "mask_q_offset"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen4_qsa_topk_indices",
+      &omlx::glm_kernels::qwen4_qsa_topk_indices,
+      "scores"_a,
+      "topk"_a = 512,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen4_qsa_sparse_gqa_attention",
+      &omlx::glm_kernels::qwen4_qsa_sparse_gqa_attention,
+      "queries"_a,
+      "keys"_a,
+      "values"_a,
+      "selected_blocks"_a,
+      "scale"_a,
+      "q_offset"_a,
+      "key_tile"_a = 128,
+      "dimension_tile"_a = 32,
+      "stream"_a = nb::none());
+  m.def(
       "dsa_topk_indices",
       &omlx::glm_kernels::dsa_topk_indices,
       "scores"_a,

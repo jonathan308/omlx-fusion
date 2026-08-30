@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Benchmark Qwen4 direct-index sparse GQA against the gathered MLX path."""
 
 from __future__ import annotations

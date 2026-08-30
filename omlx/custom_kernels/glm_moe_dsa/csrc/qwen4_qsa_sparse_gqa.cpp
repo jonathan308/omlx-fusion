@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 #include "qwen4_qsa_sparse_gqa.h"
 
 #include <dlfcn.h>
