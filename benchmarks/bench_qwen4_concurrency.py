@@ -25,6 +25,7 @@ Examples::
       --model Qwen3.8-Flash-Next-oQ4e-mtp \
       --contexts 20k,50k,100k,150k,200k,220k \
       --streams 1,2,4,6 --max-tokens 500 --prime-cache \
+      --prime-each-stream \
       --mixed --cancellation --output /tmp/qwen4-concurrency.json
 
     python benchmarks/bench_qwen4_concurrency.py --self-test
@@ -52,7 +53,7 @@ import uuid
 import httpx
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_UNIT = (
     "def qwen4_scheduler_step(sequence, cache):\n"
     "    selected = cache.exact_top_blocks(sequence, limit=512)\n"
@@ -258,6 +259,7 @@ class StreamResult:
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "cached_tokens": cached,
+            "uncached_prompt_tokens": max(0, prompt_tokens - cached),
             "cache_hit_ratio": _round(cached / prompt_tokens) if prompt_tokens else 0.0,
             "content_events": self.content_events,
             "inter_event_gap_p50_s": _round(_percentile(gaps, 0.50)),
@@ -269,6 +271,71 @@ class StreamResult:
             "output_preview": self.output[:160],
             "usage": self.usage,
         }
+
+
+def _cache_coverage(streams: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize only server-observed cache coverage; infer no block size."""
+
+    observed = [row for row in streams if row["status"] == "completed"]
+    prompt_tokens = sum(int(row["prompt_tokens"]) for row in observed)
+    cached_tokens = sum(int(row["cached_tokens"]) for row in observed)
+    return {
+        "streams_observed": len(observed),
+        "streams_with_cache_hit": sum(
+            int(row["cached_tokens"]) > 0 for row in observed
+        ),
+        "total_prompt_tokens": prompt_tokens,
+        "total_cached_tokens": cached_tokens,
+        "total_uncached_prompt_tokens": max(0, prompt_tokens - cached_tokens),
+        "aggregate_cache_hit_ratio": _round(cached_tokens / prompt_tokens)
+        if prompt_tokens
+        else 0.0,
+        "per_stream": [
+            {
+                "label": row["label"],
+                "prompt_tokens": row["prompt_tokens"],
+                "cached_tokens": row["cached_tokens"],
+                "uncached_prompt_tokens": row["uncached_prompt_tokens"],
+                "cache_hit_ratio": row["cache_hit_ratio"],
+            }
+            for row in observed
+        ],
+        "interpretation": (
+            "Coverage comes from prompt_tokens_details.cached_tokens. The public "
+            "API does not expose cache block size, so this report does not claim "
+            "that a partially covered final block was restored."
+        ),
+    }
+
+
+def _max_observed_active_decode_batch(
+    results: Sequence[StreamResult],
+) -> int | None:
+    """Return maximum overlapping first-token-to-finish intervals.
+
+    This is a black-box concurrency observation, not a claim about the
+    scheduler's internal kernel batch width. End events sort before starts at
+    the same timestamp so merely adjacent streams are not counted as overlap.
+    """
+
+    events: list[tuple[float, int, int]] = []
+    for result in results:
+        if (
+            result.status != "completed"
+            or result.first_token_at is None
+            or result.finished_at <= result.first_token_at
+        ):
+            continue
+        events.append((result.first_token_at, 1, 1))
+        events.append((result.finished_at, 0, -1))
+    if not events:
+        return None
+    active = 0
+    maximum = 0
+    for _timestamp, _order, delta in sorted(events):
+        active += delta
+        maximum = max(maximum, active)
+    return maximum
 
 
 async def _stream_request(
@@ -377,7 +444,7 @@ def _round_report(
     ]
     output_hashes = [row["output_sha256"] for row in completed]
     response_ids = [row["response_id"] for row in completed if row["response_id"]]
-    return {
+    report = {
         "label": label,
         "stream_count": len(results),
         "completed_streams": len(completed),
@@ -422,8 +489,18 @@ def _round_report(
         "output_hashes_unique": len(output_hashes) == len(set(output_hashes)),
         "response_ids_unique": len(response_ids) == len(completed)
         and len(response_ids) == len(set(response_ids)),
+        "cache_coverage": _cache_coverage(streams),
         "streams": streams,
     }
+    observed_batch = _max_observed_active_decode_batch(results)
+    if observed_batch is not None:
+        report["max_observed_active_decode_batch"] = observed_batch
+        report["active_decode_batch_observation"] = (
+            "Maximum overlap of client-observed decode intervals (first content "
+            "event through stream finish). This proves concurrent active decode "
+            "windows, not the server's private per-step kernel batch width."
+        )
+    return report
 
 
 async def _run_round(
@@ -630,6 +707,61 @@ async def _prime_cache(
     )
 
 
+async def _prime_each_stream(
+    client: httpx.AsyncClient,
+    *,
+    endpoint: str,
+    model: str,
+    specs: Sequence[StreamSpec],
+    epoch: float,
+    label: str,
+    temperature: float,
+    seed: int | None,
+) -> dict[str, Any]:
+    """Serially prime every exact prompt/marker before its measured round.
+
+    The one-token request changes only ``max_tokens``. Prompt text and marker
+    are byte-identical to the later matrix request. Serial execution makes
+    cache publication deterministic and avoids calling simultaneous cold
+    requests a successful prime when none could have observed another's
+    completed blocks.
+    """
+
+    rounds: list[dict[str, Any]] = []
+    for index, spec in enumerate(specs):
+        prime_spec = StreamSpec(
+            label=spec.label,
+            marker=spec.marker,
+            prompt=spec.prompt,
+            max_tokens=1,
+        )
+        rounds.append(
+            await _run_round(
+                client,
+                endpoint=endpoint,
+                model=model,
+                specs=[prime_spec],
+                epoch=epoch,
+                label=f"{label}-stream-{index}",
+                temperature=temperature,
+                seed=seed,
+            )
+        )
+    stream_rows = [round_["streams"][0] for round_ in rounds]
+    return {
+        "label": label,
+        "mode": "serial_exact_prompt_one_token",
+        "stream_count": len(specs),
+        "completed_streams": sum(
+            row["status"] == "completed" for row in stream_rows
+        ),
+        "all_exact_prompts_primed": bool(stream_rows)
+        and all(row["status"] == "completed" for row in stream_rows),
+        "cache_coverage_during_prime": _cache_coverage(stream_rows),
+        "rounds": rounds,
+    }
+
+
 async def _run_mixed_phase(
     client: httpx.AsyncClient,
     *,
@@ -779,6 +911,15 @@ def _evaluate_gates(
     report: dict[str, Any], args: argparse.Namespace
 ) -> list[dict[str, Any]]:
     failures: list[dict[str, Any]] = []
+    if args.prime_each_stream:
+        for prime in report.get("stream_primes", []):
+            if not prime["all_exact_prompts_primed"]:
+                failures.append(
+                    {
+                        "round": prime["label"],
+                        "gate": "all_exact_prompts_primed",
+                    }
+                )
     for row in report["matrix"]:
         label = row["label"]
         checks = {
@@ -788,7 +929,9 @@ def _evaluate_gates(
         }
         if args.require_markers:
             checks["all_markers_present"] = row["all_markers_present"]
-        if args.min_cache_hit_ratio is not None and args.prime_cache:
+        if args.min_cache_hit_ratio is not None and (
+            args.prime_cache or args.prime_each_stream
+        ):
             value = row.get("min_cache_hit_ratio")
             checks["min_cache_hit_ratio"] = (
                 value is not None and value >= args.min_cache_hit_ratio
@@ -865,12 +1008,14 @@ async def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 "temperature": args.temperature,
                 "seed": args.seed,
                 "prime_cache": args.prime_cache,
+                "prime_each_stream": args.prime_each_stream,
                 "calibrate_contexts": args.calibrate_contexts,
                 "mixed": args.mixed,
                 "cancellation": args.cancellation,
             },
             "context_calibration": [],
             "cache_primes": [],
+            "stream_primes": [],
             "matrix": [],
         }
         prefixes: dict[int, str] = {}
@@ -913,23 +1058,51 @@ async def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 report["cache_primes"].append(prime)
             for count in args.streams:
+                matrix_specs = _specs(
+                    prefix=prefix,
+                    context=context,
+                    count=count,
+                    max_tokens=args.max_tokens,
+                    phase=f"matrix-b{count}",
+                )
+                exact_prime = None
+                if args.prime_each_stream:
+                    exact_prime = await _prime_each_stream(
+                        client,
+                        endpoint=args.endpoint,
+                        model=model,
+                        specs=matrix_specs,
+                        epoch=epoch,
+                        label=f"exact-prime-c{context}-b{count}",
+                        temperature=args.temperature,
+                        seed=args.seed,
+                    )
+                    exact_prime["context_target"] = context
+                    report["stream_primes"].append(exact_prime)
                 row = await _run_round(
                     client,
                     endpoint=args.endpoint,
                     model=model,
-                    specs=_specs(
-                        prefix=prefix,
-                        context=context,
-                        count=count,
-                        max_tokens=args.max_tokens,
-                        phase=f"matrix-b{count}",
-                    ),
+                    specs=matrix_specs,
                     epoch=epoch,
                     label=f"context-{context}-b{count}",
                     temperature=args.temperature,
                     seed=args.seed,
                 )
                 row["context_target"] = context
+                row["exact_prompt_prime"] = {
+                    "enabled": args.prime_each_stream,
+                    "mode": (
+                        "serial_exact_prompt_one_token"
+                        if args.prime_each_stream
+                        else None
+                    ),
+                    "all_exact_prompts_primed": (
+                        exact_prime["all_exact_prompts_primed"]
+                        if exact_prime is not None
+                        else None
+                    ),
+                }
                 report["matrix"].append(row)
         _annotate_scaling(report["matrix"])
 
@@ -1012,6 +1185,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prime-cache", action=argparse.BooleanOptionalAction, default=True
     )
+    parser.add_argument(
+        "--prime-each-stream",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Before each measured B1/B2/B4/B6 round, serially run every exact "
+            "prompt/marker to one token so all unique prompts can restore cache"
+        ),
+    )
     parser.add_argument("--mixed", action="store_true")
     parser.add_argument("--mixed-victim-context", type=_parse_scaled_int, default=2_000)
     parser.add_argument(
@@ -1089,10 +1271,44 @@ def _self_test() -> None:
     assert row["all_markers_present"] is True
     assert row["aggregate_decode_tps"] == 50.0
     assert row["response_ids_unique"] is True
+    assert row["cache_coverage"]["aggregate_cache_hit_ratio"] == 0.8
+    assert row["max_observed_active_decode_batch"] == 1
+
+    marker_two = "ISOLATION-SELFTEST-TWO"
+    two = StreamResult(
+        label="s1",
+        marker=marker_two,
+        status="completed",
+        response_id="r1",
+        finish_reason="length",
+        started_at=now,
+        first_token_at=now + 1.5,
+        finished_at=now + 2.5,
+        content_event_times=[now + 1.5, now + 2.5],
+        content_events=2,
+        output=marker_two + " output",
+        usage={
+            "prompt_tokens": 1_000,
+            "completion_tokens": 50,
+            "prompt_tokens_details": {"cached_tokens": 900},
+            "generation_tokens_per_second": 50.0,
+        },
+    )
+    overlap = _round_report(
+        label="overlap-selftest",
+        results=[one, two],
+        epoch=now,
+        round_started=now,
+        round_finished=now + 3.0,
+    )
+    assert overlap["max_observed_active_decode_batch"] == 2
+    assert overlap["cache_coverage"]["aggregate_cache_hit_ratio"] == 0.85
+    assert overlap["cache_coverage"]["streams_with_cache_hit"] == 2
 
 
 async def _async_self_test() -> None:
     marker = "ISOLATION-ASYNC-SELFTEST"
+    seen_requests: list[dict[str, Any]] = []
     body = "\n".join(
         (
             "data: "
@@ -1136,6 +1352,7 @@ async def _async_self_test() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/chat/completions"
+        seen_requests.append(json.loads(request.content))
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
@@ -1177,6 +1394,36 @@ async def _async_self_test() -> None:
         )
         assert cancelled.status == "cancelled_by_client"
         assert cancelled.content_events == 1
+
+        primes = await _prime_each_stream(
+            client,
+            endpoint="http://selftest/v1",
+            model="qwen4-selftest",
+            specs=[
+                StreamSpec(
+                    label="exact-0",
+                    marker=marker,
+                    prompt="exact prompt zero",
+                    max_tokens=500,
+                ),
+                StreamSpec(
+                    label="exact-1",
+                    marker=marker,
+                    prompt="exact prompt one",
+                    max_tokens=500,
+                ),
+            ],
+            epoch=time.perf_counter(),
+            label="exact-prime-selftest",
+            temperature=0.0,
+            seed=1234,
+        )
+        assert primes["all_exact_prompts_primed"] is True
+        assert primes["stream_count"] == 2
+        assert [request["max_tokens"] for request in seen_requests[-2:]] == [1, 1]
+        assert [
+            request["messages"][0]["content"] for request in seen_requests[-2:]
+        ] == ["exact prompt zero", "exact prompt one"]
 
 
 def main(argv: Iterable[str] | None = None) -> int:
