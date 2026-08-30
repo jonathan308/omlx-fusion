@@ -1,5 +1,4 @@
 import logging
-import threading
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -23,7 +22,6 @@ from omlx.patches.glm_moe_dsa.sparse_mla import (
     exact_block_token_attention,
     q8_vup_flat,
     sparse_mla_attention,
-    sparse_mla_attention_nope,
 )
 from .config import ModelConfig, TextConfig
 from .gated_delta import gated_delta_update
@@ -31,33 +29,6 @@ from .linear import fused_quantized_matmul, linear_forward
 
 logger = logging.getLogger(__name__)
 _NATIVE_INDEXER_WARNED = False
-_ROUTE_COUNTER_NAMES = (
-    "indexer_native",
-    "indexer_fallback",
-    "topk_native",
-    "topk_fallback",
-    "sparse_mla_native",
-    "exact_block_native",
-    "dense_attention_fallback",
-    "lm_head_skipped",
-)
-_ROUTE_COUNTERS = {name: 0 for name in _ROUTE_COUNTER_NAMES}
-_ROUTE_COUNTER_LOCK = threading.Lock()
-
-
-def _record_route(name: str) -> None:
-    with _ROUTE_COUNTER_LOCK:
-        _ROUTE_COUNTERS[name] += 1
-
-
-def glm5_native_route_counters(*, reset: bool = False) -> dict[str, int]:
-    """Snapshot native/fallback routing for one physical benchmark window."""
-    with _ROUTE_COUNTER_LOCK:
-        snapshot = dict(_ROUTE_COUNTERS)
-        if reset:
-            for name in _ROUTE_COUNTERS:
-                _ROUTE_COUNTERS[name] = 0
-        return snapshot
 
 
 def glm5_next_cast_predicate(key: str) -> bool:
@@ -379,31 +350,6 @@ class Glm5NextIndexer(nn.Module):
         try:
             from omlx.custom_kernels.glm_moe_dsa import fast
 
-            # Decode has exactly one query row.  Route it through the exact
-            # M=1 specialization of the same Steel MMA score kernel used by
-            # prefill.  This preserves the historical row-0 dot/reduction
-            # order bit-for-bit while avoiding both the 64-row input/output
-            # padding and 63 unused MMA rows.  Older extension builds safely
-            # accept M=1 with the historical BM64 implementation, so this is
-            # also an exact compatibility path rather than a new ABI.
-            if (
-                q.shape[1] == 1
-                and fast.has_symbol("dsa_indexer_scores")
-            ):
-                qt = q.transpose(0, 2, 1, 3)
-                try:
-                    scores = fast.dsa_indexer_scores(
-                        qt,
-                        pool_keys[:, None],
-                        weights,
-                        causal=False,
-                    )
-                    return scores[:, 0]
-                except (AttributeError, RuntimeError, TypeError, ValueError):
-                    # Preserve availability through the historical padded
-                    # route below if a packaged extension rejects M=1.
-                    pass
-
             if not fast.has_symbol("dsa_indexer_scores"):
                 return None
             qt = q.transpose(0, 2, 1, 3)
@@ -509,15 +455,12 @@ class Glm5NextIndexer(nn.Module):
             weights = (weights * self.weight_scale).astype(q_chunk.dtype)
             index_scores = self._native_scores(q_chunk, pool_keys, weights)
             if index_scores is None:
-                _record_route("indexer_fallback")
                 head_scores = q_chunk @ pool_keys[:, None].swapaxes(-1, -2)
                 index_scores = mx.sum(
                     weights[..., None]
                     * mx.maximum(head_scores, mx.array(0, head_scores.dtype)),
                     axis=2,
                 )
-            else:
-                _record_route("indexer_native")
             query_pos = before_a[:, None] + mx.arange(c0, c1)[None]
             valid_candidates = (
                 pool_idx[None, None] < pool_lengths_a[:, None, None]
@@ -525,12 +468,9 @@ class Glm5NextIndexer(nn.Module):
             index_scores = mx.where(valid_candidates, index_scores, -1e30)
             selected = self._native_topk(index_scores, select_k)
             if selected is None:
-                _record_route("topk_fallback")
                 selected = mx.argpartition(-index_scores, kth=select_k - 1, axis=-1)[
                     ..., :select_k
                 ]
-            else:
-                _record_route("topk_native")
             selected_valid = mx.take_along_axis(valid_candidates, selected, axis=-1)
             selected_indices = (
                 selected[..., None] * self.index_kpool
@@ -673,34 +613,19 @@ class Glm5NextSparseAttention(nn.Module):
                 return self._gathered_attention(q, kv_latent, topk_indices)
             else:
                 q_latent = self.embed_q(q)
+                q_pe = mx.zeros(q_latent.shape[:-1] + (64,), dtype=q_latent.dtype)
+                k_pe = mx.zeros(kv_latent.shape[:-1] + (64,), dtype=kv_latent.dtype)
                 output = None
                 if Kv >= 4096:
-                    output = sparse_mla_attention_nope(
+                    output = sparse_mla_attention(
                         q_latent,
+                        q_pe,
                         kv_latent,
+                        k_pe,
                         topk_indices,
                         self.scale,
                     )
-                    # Compatibility with an older packaged extension: retain
-                    # the exact historical path until the dedicated NoPE ABI
-                    # is present, rather than silently demoting to dense MLA.
-                    if output is None:
-                        q_pe = mx.zeros(
-                            q_latent.shape[:-1] + (64,), dtype=q_latent.dtype
-                        )
-                        k_pe = mx.zeros(
-                            kv_latent.shape[:-1] + (64,), dtype=kv_latent.dtype
-                        )
-                        output = sparse_mla_attention(
-                            q_latent,
-                            q_pe,
-                            kv_latent,
-                            k_pe,
-                            topk_indices,
-                            self.scale,
-                        )
                 if output is not None:
-                    _record_route("sparse_mla_native")
                     output_flat = q8_vup_flat(
                         output,
                         self.unembed_out,
@@ -721,11 +646,9 @@ class Glm5NextSparseAttention(nn.Module):
                     self.scale,
                 )
                 if output is not None:
-                    _record_route("exact_block_native")
                     output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
                     return linear_forward(self.o_proj, output)
 
-                _record_route("dense_attention_fallback")
                 shape = list(topk_indices.shape)
                 shape[-1] = Kv + 1
                 safe_idx = mx.where(valid_sel, topk_indices, Kv)
@@ -988,15 +911,11 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         mask: Optional[mx.array] = None,
-        skip_lm_head: bool = False,
         **kwargs,
     ) -> LanguageModelOutput:
         if inputs is None:
             inputs = kwargs.get("input_ids")
         out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
-        if skip_lm_head:
-            _record_route("lm_head_skipped")
-            return LanguageModelOutput(logits=None)
         # Only the last few positions' logits are ever needed for generation; slicing
         # before the (vocab-wide) projection skips it on discarded prefill positions.
         nlk = kwargs.get("num_logits_to_keep", 0)

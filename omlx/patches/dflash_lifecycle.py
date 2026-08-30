@@ -221,14 +221,6 @@ def restore_dflash_class_patches() -> None:
         restored += 1
 
     _DFLASH_BACKUP.clear()
-    # GLM-5.3's KDA adapter owns a separate hook because dflash-mlx has no
-    # upstream GLM module to wrap. Restore it at the same lifecycle boundary.
-    try:
-        from .dflash_glm5 import restore_glm5_dflash_class_patches
-
-        restored += restore_glm5_dflash_class_patches()
-    except Exception:
-        logger.debug("GLM-5.3 dflash class restore skipped", exc_info=True)
     logger.info("dflash class patches restored on %d class(es)", restored)
 
 

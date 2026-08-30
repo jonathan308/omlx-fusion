@@ -3,7 +3,7 @@
 DFlash engine for block diffusion speculative decoding.
 
 This engine wraps dflash-mlx (>= 0.1.5) to provide faster decoding on Apple
-Silicon for Qwen, Gemma4, Laguna, Muse Glimmer, and GLM-5.3 model families. By
+Silicon for Qwen, Gemma4, Laguna, and Muse Glimmer model families. By
 default it serves all requests through dflash; setting
 ``model_settings.dflash_max_ctx`` opts into
 evicting the dflash models and delegating long-context requests to omlx's
@@ -164,11 +164,11 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     is_gemma4 = model_type in ("gemma4", "gemma4_text", "gemma4_unified")
     is_laguna = model_type == "laguna"
     is_muse = model_type in ("muse_glimmer", "muse_glimmer_text")
-    is_glm5 = model_type == "glm5_next"
-    if not (is_qwen or is_gemma4 or is_laguna or is_muse or is_glm5):
+    if model_type == "glm5_next":
+        return False, "GLM-5.3 uses the native oMLX VLM engine"
+    if not (is_qwen or is_gemma4 or is_laguna or is_muse):
         return False, (
-            f"DFlash supports only Qwen, Gemma4, Laguna, Muse Glimmer, and "
-            f"GLM-5.3 "
+            f"DFlash supports only Qwen, Gemma4, Laguna, and Muse Glimmer "
             f"models (model_type='{cfg.get('model_type', '')}')"
         )
     return True, ""
@@ -706,13 +706,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
         def _load_models_owned():
             # Register oMLX-owned target extensions before importing the
-            # dflash loader functions below. GLM-5.3 is mlx-vlm-only, so its
-            # installer wraps ``load_target_bundle`` with a scoped VLM loader.
-            from ..patches.dflash_glm5 import install_dflash_glm5_backend
+            # dflash loader functions below.
             from ..patches.dflash_laguna import install_dflash_laguna_backend
 
             install_dflash_laguna_backend()
-            install_dflash_glm5_backend()
 
             from dflash_mlx.draft_backend import EagerDraftBackend
             from dflash_mlx.engine.target_ops import bind_draft_to_target
@@ -782,13 +779,6 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     if self._draft_quant_enabled
                     else None
                 ),
-            )
-            from ..patches.dflash_glm5 import validate_glm5_dflash_pair
-
-            validate_glm5_dflash_pair(
-                target_bundle.model,
-                draft,
-                draft_meta,
             )
             bind_draft_to_target(
                 draft,

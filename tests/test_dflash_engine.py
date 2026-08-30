@@ -1016,6 +1016,14 @@ class TestDFlashCompatibility:
         compatible, reason = is_dflash_compatible(tmp_path)
         assert compatible is True
 
+    def test_glm5_uses_native_vlm_engine(self, tmp_path):
+        from omlx.engine.dflash import is_dflash_compatible
+
+        self._write_config(tmp_path, "glm5_next")
+        compatible, reason = is_dflash_compatible(tmp_path)
+        assert compatible is False
+        assert "native oMLX VLM engine" in reason
+
     def test_llama_is_incompatible(self, tmp_path):
         try:
             from omlx.engine.dflash import is_dflash_compatible
