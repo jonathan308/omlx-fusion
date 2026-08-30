@@ -265,6 +265,27 @@ class Qwen4ExpMTPRuntime:
 _MTP_RUNTIME = Qwen4ExpMTPRuntime()
 
 
+@dataclass
+class _PLESpeculativeState:
+    """PLE inputs needed to restore a partially accepted verify window.
+
+    The state is armed by the n-gram lookup and completed only after the
+    paired short-convolution capture from the same target-verify forward.
+    Rollback refuses half-written or shape-inconsistent snapshots before it
+    mutates QSA/GDN state, so PLE can never be committed from another epoch.
+    """
+
+    history: mx.array
+    input_ids: mx.array
+    conv_state: mx.array | None = None
+    conv_inputs: mx.array | None = None
+    complete: bool = False
+
+
+class _PLESpeculativeRollbackError(RuntimeError):
+    """A PLE verify snapshot cannot be restored transactionally."""
+
+
 def configure_mtp_runtime(
     model_path: str | Path,
     *,
@@ -809,6 +830,27 @@ class BatchQSAKVCache:
     @property
     def left_padding(self):
         return self.kv_cache.left_padding
+
+    # mlx-vlm's vector speculative rollback probes ``keys``/``values`` on
+    # every trimmable cache before it invokes prepare(right_padding=...) and
+    # finalize().  Keep BatchQSA's storage encapsulated in BatchKVCache while
+    # exposing that established cache protocol; without these views a mixed
+    # accepted-count rollback raises before either QSA or PLE can be restored.
+    @property
+    def keys(self):
+        return self.kv_cache.keys
+
+    @keys.setter
+    def keys(self, value):
+        self.kv_cache.keys = value
+
+    @property
+    def values(self):
+        return self.kv_cache.values
+
+    @values.setter
+    def values(self, value):
+        self.kv_cache.values = value
 
     def update_and_fetch(self, keys, values):
         return self.kv_cache.update_and_fetch(keys, values)
@@ -2640,7 +2682,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         valid = (position_in_segment >= shift) & (source_positions[None] >= 0)
         return mx.where(valid, shifted, self.eos_token_id)
 
-    def __call__(self, input_ids: mx.array, cache: Optional[ArraysCache]):
+    def __call__(
+        self,
+        input_ids: mx.array,
+        cache: Optional[ArraysCache],
+        *,
+        capture_speculative_state: bool = False,
+    ):
         input_ids = input_ids.astype(mx.int64)
         batch = input_ids.shape[0]
         if cache is not None and cache[3] is not None:
@@ -2649,6 +2697,19 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             previous_context = mx.full(
                 (batch, self.context_len), self.eos_token_id, dtype=mx.int64
             )
+
+        if cache is not None:
+            if capture_speculative_state:
+                # Start a new transaction for this target-verify window.  The
+                # paired PLE convolution capture marks it complete below.
+                cache._qwen4_exp_ple_speculative_state = _PLESpeculativeState(
+                    history=previous_context,
+                    input_ids=input_ids,
+                )
+            elif getattr(cache, "_qwen4_exp_ple_speculative_state", None) is not None:
+                # A fully accepted verifier does not call rollback.  Its old
+                # snapshot cannot describe this ordinary committed forward.
+                cache._qwen4_exp_ple_speculative_state = None
 
         token_history = mx.concatenate([previous_context, input_ids], axis=-1)
         if cache is not None:
@@ -2717,7 +2778,13 @@ class Qwen4ExpPLELayer(nn.Module):
             bias=False,
         )
 
-    def _short_conv(self, x: mx.array, cache: Optional[ArraysCache]):
+    def _short_conv(
+        self,
+        x: mx.array,
+        cache: Optional[ArraysCache],
+        *,
+        capture_speculative_state: bool = False,
+    ):
         batch = x.shape[0]
         if cache is not None and cache[2] is not None:
             state = cache[2]
@@ -2726,6 +2793,12 @@ class Qwen4ExpPLELayer(nn.Module):
                 (batch, self.short_conv_state_len, x.shape[-1]), dtype=x.dtype
             )
         conv_input = mx.concatenate([state, x], axis=1)
+        if capture_speculative_state and cache is not None:
+            snapshot = getattr(cache, "_qwen4_exp_ple_speculative_state", None)
+            if snapshot is not None:
+                snapshot.conv_state = state
+                snapshot.conv_inputs = x
+                snapshot.complete = True
         if cache is not None:
             cache[2] = mx.contiguous(conv_input[:, -self.short_conv_state_len :])
         return nn.silu(self.conv1d(conv_input))
@@ -2738,7 +2811,12 @@ class Qwen4ExpPLELayer(nn.Module):
         mask: Optional[mx.array],
         target_verify: bool = False,
     ):
-        embeddings = self.ple_embedding(input_ids, cache)
+        capture_speculative_state = target_verify and input_ids.shape[1] > 1
+        embeddings = self.ple_embedding(
+            input_ids,
+            cache,
+            capture_speculative_state=capture_speculative_state,
+        )
         keys = self.norm_key(
             _target_verify_linear(self.key_proj, embeddings, target_verify)
         ).reshape(*hidden_states.shape[:-1], self.hc_count, self.hidden_size)
@@ -2756,7 +2834,11 @@ class Qwen4ExpPLELayer(nn.Module):
         if mask is not None and isinstance(mask, mx.array) and mask.ndim == 2:
             gated_values = mx.where(mask[..., None], gated_values, 0)
             normed = mx.where(mask[..., None], normed, 0)
-        return gated_values + self._short_conv(normed, cache)
+        return gated_values + self._short_conv(
+            normed,
+            cache,
+            capture_speculative_state=capture_speculative_state,
+        )
 
 
 class Qwen4ExpDecoderLayer(nn.Module):
@@ -3289,3 +3371,181 @@ class LanguageModel(Qwen3_5LanguageModel):
             else:
                 caches.append(QSAKVCache())
         return caches
+
+    @staticmethod
+    def _normalize_accepted_counts(accepted) -> list[int]:
+        if isinstance(accepted, int):
+            return [accepted]
+        if isinstance(accepted, mx.array):
+            return [int(value) for value in accepted.reshape(-1).tolist()]
+        return [int(value) for value in accepted]
+
+    @staticmethod
+    def _discard_ple_snapshots(caches) -> None:
+        for cache in caches:
+            if getattr(cache, "_qwen4_exp_ple_speculative_state", None) is not None:
+                cache._qwen4_exp_ple_speculative_state = None
+
+    @staticmethod
+    def _validate_ple_snapshot(
+        snapshot: _PLESpeculativeState,
+        accepted_values: list[int],
+        block_size: int,
+    ) -> None:
+        """Preflight one PLE restore without changing any cache tensor."""
+
+        if not snapshot.complete:
+            raise _PLESpeculativeRollbackError(
+                "PLE speculative snapshot is incomplete "
+                "(target-verify forward did not finish both captures)"
+            )
+        if snapshot.history.ndim != 2 or snapshot.input_ids.ndim != 2:
+            raise _PLESpeculativeRollbackError(
+                "PLE speculative snapshot history/input_ids are not rank-2"
+            )
+        batch, window = snapshot.input_ids.shape
+        if window < 1:
+            raise _PLESpeculativeRollbackError(
+                "PLE speculative snapshot has an empty verify window"
+            )
+        if int(block_size) != int(window):
+            raise _PLESpeculativeRollbackError(
+                "PLE speculative snapshot window does not match rollback block size"
+            )
+        if snapshot.history.shape[0] != batch:
+            raise _PLESpeculativeRollbackError(
+                "PLE speculative snapshot batch mismatch (history vs input_ids)"
+            )
+        if len(accepted_values) not in (1, batch):
+            raise _PLESpeculativeRollbackError(
+                "PLE speculative rollback accepted count does not match batch size"
+            )
+        if any(value < 0 or value >= window for value in accepted_values):
+            raise _PLESpeculativeRollbackError(
+                "PLE speculative rollback accepted count is outside the verify window"
+            )
+        if snapshot.conv_state is None or snapshot.conv_inputs is None:
+            raise _PLESpeculativeRollbackError(
+                "PLE speculative snapshot short-conv capture is incomplete"
+            )
+        if (
+            snapshot.conv_state.ndim != 3
+            or snapshot.conv_inputs.ndim != 3
+            or snapshot.conv_state.shape[0] != batch
+            or snapshot.conv_inputs.shape[0] != batch
+            or snapshot.conv_inputs.shape[1] != window
+            or snapshot.conv_state.shape[-1] != snapshot.conv_inputs.shape[-1]
+        ):
+            raise _PLESpeculativeRollbackError(
+                "PLE speculative snapshot short-conv capture is malformed"
+            )
+
+    @staticmethod
+    def _prepare_ple_restore(
+        snapshot: _PLESpeculativeState,
+        accepted_values: list[int],
+    ) -> tuple[mx.array, mx.array]:
+        """Build the two committed PLE slots without mutating their cache."""
+
+        batch = snapshot.input_ids.shape[0]
+        values = (
+            accepted_values * batch
+            if len(accepted_values) == 1
+            else accepted_values
+        )
+        retained = mx.array(values, dtype=mx.int32) + 1
+
+        history_len = snapshot.history.shape[1]
+        history = mx.concatenate([snapshot.history, snapshot.input_ids], axis=1)
+        history_positions = retained[:, None] + mx.arange(
+            history_len, dtype=mx.int32
+        )[None, :]
+        restored_history = mx.contiguous(
+            mx.take_along_axis(history, history_positions, axis=1)
+        )
+
+        state_len = snapshot.conv_state.shape[1]
+        if state_len:
+            conv_input = mx.concatenate(
+                [snapshot.conv_state, snapshot.conv_inputs], axis=1
+            )
+            conv_positions = retained[:, None] + mx.arange(
+                state_len, dtype=mx.int32
+            )[None, :]
+            conv_positions = mx.broadcast_to(
+                conv_positions[..., None],
+                (batch, state_len, snapshot.conv_state.shape[-1]),
+            )
+            restored_conv = mx.contiguous(
+                mx.take_along_axis(conv_input, conv_positions, axis=1)
+            )
+        else:
+            restored_conv = snapshot.conv_state
+        return restored_conv, restored_history
+
+    def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
+        """Transactionally restore PLE alongside inherited QSA/GDN rollback.
+
+        Qwen4 PLE owns two recurrent slots beyond Qwen3.5's GDN state: the
+        n-gram token history (slot 3) and the dilated short-convolution state
+        (slot 2).  A target verifier advances both through every draft.  On a
+        rejection, this override selects the state after the confirmed token
+        plus each row's accepted draft prefix.
+
+        Every PLE snapshot is validated and both replacement tensors are built
+        before the inherited rollback mutates QSA/GDN.  Malformed or mixed-
+        epoch snapshots therefore fail closed, letting the caller rebuild from
+        the committed token stream rather than exposing a partially restored
+        model state.
+        """
+
+        try:
+            accepted_values = self._normalize_accepted_counts(accepted)
+        except (TypeError, ValueError) as exc:
+            self._discard_ple_snapshots(caches)
+            raise _PLESpeculativeRollbackError(
+                f"PLE speculative accepted counts are malformed: {exc}"
+            ) from exc
+        pending: list[tuple[Any, mx.array, mx.array]] = []
+        try:
+            for cache in caches:
+                snapshot = getattr(cache, "_qwen4_exp_ple_speculative_state", None)
+                if snapshot is None:
+                    continue
+                self._validate_ple_snapshot(snapshot, accepted_values, block_size)
+                restored_conv, restored_history = self._prepare_ple_restore(
+                    snapshot,
+                    accepted_values,
+                )
+                pending.append((cache, restored_conv, restored_history))
+        except (
+            AttributeError,
+            TypeError,
+            ValueError,
+            _PLESpeculativeRollbackError,
+        ) as exc:
+            self._discard_ple_snapshots(caches)
+            if isinstance(exc, _PLESpeculativeRollbackError):
+                raise
+            raise _PLESpeculativeRollbackError(
+                f"PLE speculative snapshot preflight failed: {exc}"
+            ) from exc
+
+        try:
+            result = super().rollback_speculative_cache(
+                caches,
+                gdn_states,
+                accepted,
+                block_size,
+            )
+        except Exception:
+            self._discard_ple_snapshots(caches)
+            raise
+
+        try:
+            for cache, restored_conv, restored_history in pending:
+                cache[2] = restored_conv
+                cache[3] = restored_history
+        finally:
+            self._discard_ple_snapshots(caches)
+        return result

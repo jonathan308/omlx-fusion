@@ -1230,6 +1230,293 @@ def test_qwen4_verify_matches_singleton_greedy_and_rolls_back_qsa():
     assert qsa_cache.index_position_ids.shape[-1] == 4
 
 
+def _assert_ple_state_matches(actual_cache, expected_cache):
+    mx.eval(
+        actual_cache[2],
+        actual_cache[3],
+        expected_cache[2],
+        expected_cache[3],
+    )
+    assert mx.array_equal(actual_cache[3], expected_cache[3]).item()
+    assert mx.allclose(
+        actual_cache[2],
+        expected_cache[2],
+        rtol=1e-3,
+        atol=1e-3,
+    ).item()
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4, 6])
+def test_qwen4_ple_restore_selection_covers_every_depth_and_batch_row(batch):
+    """The transactional selector is exact for every depth 0..8.
+
+    Rotating the accepted vector makes every row in B1/B2/B4/B6 exercise
+    every retained-prefix depth, including mixed accept counts in one batch.
+    This isolates the selection math from the much heavier end-to-end model
+    checks below.
+    """
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp import language
+
+    window = 9
+    history_len = 2
+    state_len = 6
+    width = 5
+    history = mx.arange(batch * history_len, dtype=mx.int64).reshape(
+        batch, history_len
+    )
+    input_ids = (
+        100
+        + mx.arange(batch * window, dtype=mx.int64).reshape(batch, window)
+    )
+    conv_state = mx.arange(
+        batch * state_len * width, dtype=mx.float32
+    ).reshape(batch, state_len, width)
+    conv_inputs = (
+        1000
+        + mx.arange(batch * window * width, dtype=mx.float32).reshape(
+            batch, window, width
+        )
+    )
+    snapshot = language._PLESpeculativeState(
+        history=history,
+        input_ids=input_ids,
+        conv_state=conv_state,
+        conv_inputs=conv_inputs,
+        complete=True,
+    )
+
+    all_history = mx.concatenate([history, input_ids], axis=1)
+    all_conv = mx.concatenate([conv_state, conv_inputs], axis=1)
+    for rotation in range(window):
+        accepted = [(rotation + row) % window for row in range(batch)]
+        language.LanguageModel._validate_ple_snapshot(
+            snapshot,
+            accepted,
+            window,
+        )
+        actual_conv, actual_history = (
+            language.LanguageModel._prepare_ple_restore(snapshot, accepted)
+        )
+        expected_history = mx.stack(
+            [
+                all_history[row, depth + 1 : depth + 1 + history_len]
+                for row, depth in enumerate(accepted)
+            ]
+        )
+        expected_conv = mx.stack(
+            [
+                all_conv[row, depth + 1 : depth + 1 + state_len]
+                for row, depth in enumerate(accepted)
+            ]
+        )
+        mx.eval(actual_conv, actual_history, expected_conv, expected_history)
+        assert mx.array_equal(actual_history, expected_history).item()
+        assert mx.array_equal(actual_conv, expected_conv).item()
+
+
+@pytest.mark.parametrize("accepted", range(9))
+def test_qwen4_ple_b1_partial_rollback_matches_committed_replay(accepted):
+    """A real target verifier restores B1 PLE at every depth 0..8."""
+
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+
+    model = LanguageModel(config.text_config, config)
+    verify_cache = model.make_cache()
+    replay_cache = model.make_cache()
+    prefix = mx.array([[2, 3, 4]], dtype=mx.int32)
+    verify_tokens = mx.arange(5, 14, dtype=mx.int32)[None]
+    model(prefix, cache=verify_cache)
+    model(prefix, cache=replay_cache)
+
+    verified = model(verify_tokens, cache=verify_cache, return_hidden=True)
+    model(verify_tokens[:, : accepted + 1], cache=replay_cache)
+    model.rollback_speculative_cache(
+        verify_cache,
+        verified.gdn_states,
+        accepted=accepted,
+        block_size=verify_tokens.shape[1],
+    )
+
+    _assert_ple_state_matches(verify_cache[0], replay_cache[0])
+    assert getattr(
+        verify_cache[0], "_qwen4_exp_ple_speculative_state", None
+    ) is None
+    probe = mx.array([[50]], dtype=mx.int32)
+    actual_next = model(probe, cache=verify_cache).logits
+    expected_next = model(probe, cache=replay_cache).logits
+    mx.eval(actual_next, expected_next)
+    assert mx.allclose(actual_next, expected_next, rtol=1e-3, atol=1e-3).item()
+    assert mx.array_equal(
+        mx.argmax(actual_next[:, -1], axis=-1),
+        mx.argmax(expected_next[:, -1], axis=-1),
+    ).item()
+
+
+@pytest.mark.parametrize(
+    "accepted",
+    [
+        [0, 8],
+        [0, 2, 5, 8],
+        [0, 1, 3, 4, 6, 8],
+    ],
+    ids=["b2", "b4", "b6"],
+)
+def test_qwen4_ple_batched_partial_rollback_is_row_exact(accepted):
+    """One mixed accepted vector restores every request-owned PLE row."""
+
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+
+    model = LanguageModel(config.text_config, config)
+    batch = len(accepted)
+    prefixes = [
+        mx.array([[2 + row, 12 + row, 22 + row]], dtype=mx.int32)
+        for row in range(batch)
+    ]
+    verify_rows = [
+        mx.arange(30 + row, 39 + row, dtype=mx.int32)[None]
+        for row in range(batch)
+    ]
+    row_caches = []
+    replay_caches = []
+    for prefix in prefixes:
+        row_cache = model.make_cache()
+        replay_cache = model.make_cache()
+        model(prefix, cache=row_cache)
+        model(prefix, cache=replay_cache)
+        row_caches.append(row_cache)
+        replay_caches.append(replay_cache)
+
+    batch_cache = [
+        type(layer_rows[0]).merge(layer_rows)
+        for layer_rows in zip(*row_caches)
+    ]
+    verify_tokens = mx.concatenate(verify_rows, axis=0)
+    verified = model(verify_tokens, cache=batch_cache, return_hidden=True)
+    for row, depth in enumerate(accepted):
+        model(verify_rows[row][:, : depth + 1], cache=replay_caches[row])
+
+    model.rollback_speculative_cache(
+        batch_cache,
+        verified.gdn_states,
+        accepted=accepted,
+        block_size=verify_tokens.shape[1],
+    )
+
+    for row, expected_cache in enumerate(replay_caches):
+        actual_ple = batch_cache[0].extract(row)
+        _assert_ple_state_matches(actual_ple, expected_cache[0])
+    assert getattr(
+        batch_cache[0], "_qwen4_exp_ple_speculative_state", None
+    ) is None
+    probe = mx.arange(50, 50 + batch, dtype=mx.int32)[:, None]
+    actual_next = model(probe, cache=batch_cache).logits
+    expected_next = mx.concatenate(
+        [
+            model(probe[row : row + 1], cache=replay_caches[row]).logits
+            for row in range(batch)
+        ],
+        axis=0,
+    )
+    mx.eval(actual_next, expected_next)
+    assert mx.allclose(actual_next, expected_next, rtol=1e-3, atol=1e-3).item()
+    assert mx.array_equal(
+        mx.argmax(actual_next[:, -1], axis=-1),
+        mx.argmax(expected_next[:, -1], axis=-1),
+    ).item()
+
+
+def test_qwen4_ple_ordinary_forward_disarms_fully_accepted_snapshot():
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+
+    model = LanguageModel(config.text_config, config)
+    cache = model.make_cache()
+    ple_cache = cache[0]
+    model(mx.array([[2, 3, 4]], dtype=mx.int32), cache=cache)
+    model(mx.array([[5, 6]], dtype=mx.int32), cache=cache, return_hidden=True)
+    assert getattr(ple_cache, "_qwen4_exp_ple_speculative_state", None) is not None
+
+    model(mx.array([[7]], dtype=mx.int32), cache=cache)
+    assert getattr(ple_cache, "_qwen4_exp_ple_speculative_state", None) is None
+
+
+@pytest.mark.parametrize(
+    ("mutation", "accepted", "block_size", "message"),
+    [
+        ("incomplete", [0], 2, "incomplete"),
+        ("history-rank", [0], 2, "not rank-2"),
+        ("history-batch", [0], 2, "batch mismatch"),
+        ("accepted-batch", [0, 0], 2, "does not match batch size"),
+        ("accepted-negative", [-1], 2, "outside the verify window"),
+        ("accepted-overflow", [2], 2, "outside the verify window"),
+        ("block-size", [0], 3, "does not match rollback block size"),
+        ("missing-conv", [0], 2, "capture is incomplete"),
+        ("conv-rank", [0], 2, "capture is malformed"),
+        ("conv-window", [0], 2, "capture is malformed"),
+    ],
+)
+def test_qwen4_ple_rollback_snapshot_validation_fails_closed(
+    mutation,
+    accepted,
+    block_size,
+    message,
+):
+    """Malformed transactions are rejected before inherited cache mutation."""
+
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import (
+        LanguageModel,
+        _PLESpeculativeRollbackError,
+    )
+
+    model = LanguageModel(config.text_config, config)
+    cache = model.make_cache()
+    model(mx.array([[2, 3, 4]], dtype=mx.int32), cache=cache)
+    verified = model(
+        mx.array([[5, 6]], dtype=mx.int32),
+        cache=cache,
+        return_hidden=True,
+    )
+    ple_cache = cache[0]
+    qsa_cache = cache[1]
+    snapshot = ple_cache._qwen4_exp_ple_speculative_state
+    before_history = ple_cache[3] * 1
+    before_conv = ple_cache[2] * 1
+    before_qsa = tuple(value * 1 for value in qsa_cache.state)
+
+    if mutation == "incomplete":
+        snapshot.complete = False
+    elif mutation == "history-rank":
+        snapshot.history = snapshot.history.reshape(-1)
+    elif mutation == "history-batch":
+        snapshot.history = mx.concatenate([snapshot.history, snapshot.history])
+    elif mutation == "missing-conv":
+        snapshot.conv_inputs = None
+    elif mutation == "conv-rank":
+        snapshot.conv_state = snapshot.conv_state.reshape(-1)
+    elif mutation == "conv-window":
+        snapshot.conv_inputs = snapshot.conv_inputs[:, :-1]
+
+    with pytest.raises(_PLESpeculativeRollbackError, match=message):
+        model.rollback_speculative_cache(
+            cache,
+            verified.gdn_states,
+            accepted=accepted,
+            block_size=block_size,
+        )
+
+    mx.eval(before_history, before_conv, *before_qsa)
+    assert mx.array_equal(ple_cache[3], before_history).item()
+    assert mx.array_equal(ple_cache[2], before_conv).item()
+    for actual, before in zip(qsa_cache.state, before_qsa):
+        assert mx.array_equal(actual, before).item()
+    assert getattr(ple_cache, "_qwen4_exp_ple_speculative_state", None) is None
+
+
 def test_qwen4_lightning_mtp_rejects_nextn_only_layout(tmp_path):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import configure_mtp_runtime
