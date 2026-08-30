@@ -349,6 +349,15 @@
                     hot_cache_size_bytes: 0,
                     hot_cache_entries: 0,
                     hot_cache_max_bytes: 0,
+                    exact_resident_entries: 0,
+                    exact_resident_size_bytes: 0,
+                    exact_resident_max_entries: 0,
+                    exact_resident_max_bytes: 0,
+                    exact_resident_hits: 0,
+                    exact_resident_misses: 0,
+                    exact_resident_active_leases: 0,
+                    exact_resident_fallbacks: 0,
+                    exact_resident_evictions: 0,
                     disk_max_bytes: 0,
                 },
             },
@@ -9374,9 +9383,24 @@
             },
 
             get runtimeHotCachePercent() {
+                const maxBytes = this.runtimeMemoryCacheMaxBytes;
+                if (!maxBytes) return 0;
+                return Math.min(100, (this.runtimeMemoryCacheSizeBytes / maxBytes) * 100);
+            },
+
+            get runtimeMemoryCacheSizeBytes() {
                 const rc = this.stats.runtime_cache;
-                if (!rc || !rc.hot_cache_max_bytes) return 0;
-                return Math.min(100, (rc.hot_cache_size_bytes / rc.hot_cache_max_bytes) * 100);
+                return (rc?.hot_cache_size_bytes || 0) + (rc?.exact_resident_size_bytes || 0);
+            },
+
+            get runtimeMemoryCacheMaxBytes() {
+                const rc = this.stats.runtime_cache;
+                return (rc?.hot_cache_max_bytes || 0) + (rc?.exact_resident_max_bytes || 0);
+            },
+
+            get runtimeMemoryCacheEntries() {
+                const rc = this.stats.runtime_cache;
+                return (rc?.hot_cache_entries || 0) + (rc?.exact_resident_entries || 0);
             },
 
             get runtimeSsdCachePercent() {

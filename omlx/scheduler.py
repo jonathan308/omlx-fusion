@@ -47,6 +47,7 @@ from mlx_lm.models.cache import (
 )
 from mlx_lm.sample_utils import make_logits_processors
 
+from .cache.exact_resident import ExactResidentPrefixCache
 from .cache.observability import CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
@@ -1831,6 +1832,12 @@ class SchedulerConfig:
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
     hot_cache_budget: Any | None = None  # Shared process-wide hot cache budget
+    # Experimental hot-only exact terminal handoff. Disabled by default until
+    # detached-clone + delayed-durable persistence is physically proven.
+    # Opt-in retains the newest exact terminal cache in RAM and leaves the
+    # existing older paged/SSD chain as its crash/concurrent-claim fallback.
+    exact_resident_cache_slots: int = 0
+    exact_resident_cache_max_bytes: int = 8 * 1024**3
     # Store top-level ArraysCache recurrent state as SSD sidecars while the
     # ordinary block retains only KV/sliceable payloads.
     gdn_ssd_split_enabled: bool = False
@@ -2343,6 +2350,40 @@ class Scheduler:
         # blocking the scheduler step that continues existing decode/prefill.
         self._cache_freshness_waits: dict[str, _CacheFreshnessWait] = {}
         self._prefix_cache_prepared: set[str] = set()
+        self._exact_resident_cache = ExactResidentPrefixCache(
+            max_entries=max(
+                0,
+                _env_int(
+                    "OMLX_EXACT_RESIDENT_MAX_ENTRIES",
+                    _env_int(
+                        "OMLX_EXACT_RESIDENT_CACHE_SLOTS",
+                        int(self.config.exact_resident_cache_slots),
+                    ),
+                ),
+            ),
+            max_bytes=max(
+                0,
+                _env_int(
+                    "OMLX_EXACT_RESIDENT_MAX_BYTES",
+                    _env_int(
+                        "OMLX_EXACT_RESIDENT_CACHE_MAX_BYTES",
+                        int(self.config.exact_resident_cache_max_bytes),
+                    ),
+                ),
+            ),
+        )
+        self._exact_resident_leases: set[str] = set()
+        self._exact_resident_pool_invalidations = 0
+        self._exact_resident_pool_invalidated_bytes = 0
+        self._exact_resident_pool_invalidation_ms = 0.0
+        if self._exact_resident_cache.max_entries > 0:
+            logger.warning(
+                "Experimental exact resident cache enabled: entries=%d "
+                "max_bytes=%.2fGiB; newest terminal state is hot-only and "
+                "the older paged/SSD chain remains the durable fallback",
+                self._exact_resident_cache.max_entries,
+                self._exact_resident_cache.max_bytes / 1024**3,
+            )
 
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: dict[str, int] = {}
@@ -4761,6 +4802,9 @@ class Scheduler:
         self._cache_freshness_waits.pop(request_id, None)
         self._prefix_cache_prepared.discard(request_id)
         self._throttle_notified_requests.discard(request_id)
+        leases = getattr(self, "_exact_resident_leases", None)
+        if leases is not None:
+            leases.discard(request_id)
         self._clear_memory_admission_blocker(request_id)
         self._clear_store_cache_admission_blocker(request_id)
 
@@ -8260,8 +8304,573 @@ class Scheduler:
         )
         return True
 
+    @staticmethod
+    def _resident_cache_leaf_objects(cache_list: list[Any]):
+        """Yield cache leaves while treating composite caches as containers."""
+
+        stack = list(reversed(cache_list))
+        while stack:
+            cache_obj = stack.pop()
+            sub_caches = getattr(cache_obj, "caches", None)
+            if isinstance(sub_caches, (list, tuple)):
+                stack.extend(reversed(sub_caches))
+            else:
+                yield cache_obj
+
+    def _resident_cache_spec_decode_active(self) -> bool:
+        """Fail closed while speculative decode can leave a verified queue.
+
+        Lightning MTP may have target KV/recurrent state ahead of the emitted
+        ``all_tokens`` queue.  Matching public offsets is not enough to prove
+        that positionless Arrays/GDN state represents the visible terminal
+        token.  Exact resident reuse stays disabled until the MTP path exposes
+        and tests an explicit terminal queue rollback/drain contract.
+        """
+
+        if getattr(self, "_vlm_mtp_drafter", None) is not None:
+            return True
+        model = getattr(self, "model", None)
+        candidates = [model]
+        for attr in ("language_model", "_language_model"):
+            inner = getattr(model, attr, None)
+            if inner is not None and inner is not model:
+                candidates.append(inner)
+        return any(
+            bool(
+                getattr(candidate, "_omlx_mtp_decode_enabled", False)
+                or getattr(candidate, "_omlx_dspark_decode_enabled", False)
+            )
+            for candidate in candidates
+            if candidate is not None
+        )
+
+    @classmethod
+    def _resident_cache_nbytes(cls, cache_list: list[Any]) -> int | None:
+        """Count concrete resident arrays once, including QSA auxiliaries."""
+
+        seen_cache_objects: set[int] = set()
+        seen_containers: set[int] = set()
+        seen_arrays: set[int] = set()
+        total = 0
+
+        def visit(value: Any) -> None:
+            nonlocal total
+            if isinstance(value, mx.array):
+                identity = id(value)
+                if identity not in seen_arrays:
+                    seen_arrays.add(identity)
+                    total += int(value.nbytes)
+                return
+            if value is None or isinstance(value, (str, bytes, int, float, bool)):
+                return
+            if isinstance(value, dict):
+                identity = id(value)
+                if identity in seen_containers:
+                    return
+                seen_containers.add(identity)
+                for item in value.values():
+                    visit(item)
+                return
+            if isinstance(value, (list, tuple)):
+                identity = id(value)
+                if identity in seen_containers:
+                    return
+                seen_containers.add(identity)
+                for item in value:
+                    visit(item)
+            # Do not recurse into arbitrary objects referenced by a cache
+            # (notably QSA's pooled-indexer tag, which is a model module).
+            # Root cache objects are expanded explicitly below.
+
+        def visit_cache_object(cache_obj: Any) -> bool:
+            identity = id(cache_obj)
+            if identity in seen_cache_objects:
+                return True
+            seen_cache_objects.add(identity)
+            try:
+                attributes = vars(cache_obj)
+            except TypeError:
+                return False
+            for name, value in attributes.items():
+                if name == "_pooled_index_tag":
+                    continue
+                if name == "_inner":
+                    if not visit_cache_object(value):
+                        return False
+                else:
+                    visit(value)
+            return True
+
+        for cache_obj in cls._resident_cache_leaf_objects(cache_list):
+            if not visit_cache_object(cache_obj):
+                return None
+        return total if seen_arrays else None
+
+    @classmethod
+    def _invalidate_resident_derived_state(
+        cls, cache_list: list[Any]
+    ) -> tuple[bool, int]:
+        """Drop QSA's rebuildable pooled bank before retaining or leasing it."""
+
+        dropped_bytes = 0
+        for cache_obj in cls._resident_cache_leaf_objects(cache_list):
+            class_name = type(cache_obj).__name__
+            if class_name not in {"QSAKVCache", "QSAQuantizedKVCache"}:
+                continue
+            invalidate = getattr(cache_obj, "_invalidate_pooled_indexer", None)
+            if not callable(invalidate):
+                return False, dropped_bytes
+            try:
+                pooled = getattr(cache_obj, "_pooled_index_keys", None)
+                if isinstance(pooled, mx.array):
+                    dropped_bytes += int(pooled.nbytes)
+                invalidate()
+                cache_obj._omlx_text_position_ids_qualified = False
+            except Exception:
+                return False, dropped_bytes
+        return True, dropped_bytes
+
+    def _invalidate_resident_pool_with_telemetry(
+        self,
+        cache_list: list[Any],
+        *,
+        phase: str,
+    ) -> bool:
+        started = time.perf_counter()
+        ok, dropped_bytes = self._invalidate_resident_derived_state(cache_list)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if dropped_bytes > 0:
+            self._exact_resident_pool_invalidations = int(
+                getattr(self, "_exact_resident_pool_invalidations", 0)
+            ) + 1
+            self._exact_resident_pool_invalidated_bytes = int(
+                getattr(self, "_exact_resident_pool_invalidated_bytes", 0)
+            ) + dropped_bytes
+            self._exact_resident_pool_invalidation_ms = float(
+                getattr(self, "_exact_resident_pool_invalidation_ms", 0.0)
+            ) + elapsed_ms
+            logger.info(
+                "Exact resident QSA pool invalidated (%s): %.2fMiB in %.3fms; "
+                "first decode rebuild is included in physical TTFT A/B",
+                phase,
+                dropped_bytes / 1024**2,
+                elapsed_ms,
+            )
+        return ok
+
+    @classmethod
+    def _resident_cache_matches_token_count(
+        cls,
+        cache_list: list[Any],
+        token_count: int,
+    ) -> bool:
+        """Prove every readable cache timeline is the exact terminal state."""
+
+        if not cache_list or token_count <= 0:
+            return False
+        def axis_two_length(value: Any) -> int | None:
+            if isinstance(value, mx.array):
+                return int(value.shape[2]) if value.ndim >= 3 else None
+            if isinstance(value, (list, tuple)) and value:
+                lengths = [axis_two_length(item) for item in value]
+                if any(length is None for length in lengths):
+                    return None
+                return (
+                    lengths[0]
+                    if all(length == lengths[0] for length in lengths)
+                    else None
+                )
+            return None
+
+        def validate_qsa(cache_obj: Any) -> bool:
+            offset = getattr(cache_obj, "offset", None)
+            if type(offset) is not int or offset != token_count:
+                return False
+            keys_len = axis_two_length(getattr(cache_obj, "keys", None))
+            values_len = axis_two_length(getattr(cache_obj, "values", None))
+            if keys_len != token_count or values_len != token_count:
+                return False
+
+            raw_keys = getattr(cache_obj, "_index_keys", None)
+            raw_positions = getattr(cache_obj, "_index_position_ids", None)
+            raw_offset = getattr(cache_obj, "_index_offset", None)
+            if (
+                not isinstance(raw_keys, mx.array)
+                or raw_keys.ndim != 3
+                or raw_keys.shape[0] != 1
+                or not isinstance(raw_positions, mx.array)
+                or raw_positions.ndim not in {2, 3}
+                or raw_offset != token_count
+                or raw_keys.shape[1] < token_count
+                or raw_positions.shape[-1] < token_count
+            ):
+                return False
+            logical_keys = getattr(cache_obj, "index_keys", None)
+            logical_positions = getattr(cache_obj, "index_position_ids", None)
+            if (
+                not isinstance(logical_keys, mx.array)
+                or logical_keys.shape[1] != token_count
+                or not isinstance(logical_positions, mx.array)
+                or logical_positions.shape[-1] != token_count
+            ):
+                return False
+
+            public_index_offset = getattr(cache_obj, "index_offset", None)
+            if public_index_offset is not None and public_index_offset != token_count:
+                return False
+
+            # Resident entries are text-only.  A VLM-shaped three-plane
+            # position history is admissible only when all planes are exactly
+            # equal, the same proof used by Qwen4's text verify qualification.
+            expected_positions = mx.arange(token_count, dtype=mx.int32)
+            if logical_positions.ndim == 2:
+                if logical_positions.shape[0] != 1 or not bool(
+                    mx.array_equal(
+                        logical_positions[0].astype(mx.int32),
+                        expected_positions,
+                    ).item()
+                ):
+                    return False
+            elif (
+                logical_positions.ndim != 3
+                or logical_positions.shape[:2] != (3, 1)
+                or not bool(
+                    (
+                        mx.all(logical_positions[0] == logical_positions[1])
+                        & mx.all(logical_positions[0] == logical_positions[2])
+                    ).item()
+                )
+                or not bool(
+                    mx.array_equal(
+                        logical_positions[0, 0].astype(mx.int32),
+                        expected_positions,
+                    ).item()
+                )
+            ):
+                return False
+            raw_prefix = raw_positions[..., :token_count]
+            if not bool(
+                mx.array_equal(
+                    raw_prefix.astype(mx.int32),
+                    logical_positions.astype(mx.int32),
+                ).item()
+            ):
+                return False
+            qualified = getattr(
+                cache_obj, "_omlx_text_position_ids_qualified", False
+            )
+            if qualified is not False and qualified is not True:
+                return False
+
+            pooled = getattr(cache_obj, "_pooled_index_keys", None)
+            pooled_offset = getattr(cache_obj, "_pooled_index_offset", None)
+            pooled_ratio = getattr(cache_obj, "_pooled_index_ratio", None)
+            pooled_tag = getattr(cache_obj, "_pooled_index_tag", None)
+            if pooled is None:
+                return (
+                    pooled_offset == 0
+                    and pooled_ratio is None
+                    and pooled_tag is None
+                )
+            if (
+                not isinstance(pooled, mx.array)
+                or pooled.ndim != 3
+                or pooled.shape[0] != 1
+                or type(pooled_ratio) is not int
+                or pooled_ratio <= 0
+                or pooled_offset != token_count // pooled_ratio
+                or pooled.shape[1] < pooled_offset
+                or pooled_tag is None
+            ):
+                return False
+            # Content is derived from model-owned normalization/RoPE modules
+            # and cannot be proven from offsets alone.  Staging/acquisition
+            # invalidates this bank, so reaching a non-empty bank here means
+            # the invalidation contract did not run.
+            return False
+
+        offsets: list[int] = []
+        validated_leaves = 0
+        positionless_exact_types = frozenset({"ArraysCache", "SizedArraysCache"})
+        for cache_obj in cls._resident_cache_leaf_objects(cache_list):
+            # A speculative rollback snapshot means this is not a committed
+            # terminal cache even if its public offset happens to match.
+            if any(
+                getattr(cache_obj, attr, None) is not None
+                for attr in (
+                    "rollback_state",
+                    "_qwen4_exp_ple_speculative_state",
+                    "_mtp_undo",
+                )
+            ):
+                return False
+            class_name = type(cache_obj).__name__
+            if class_name in {"QSAKVCache", "QSAQuantizedKVCache"}:
+                if not validate_qsa(cache_obj):
+                    return False
+                offsets.append(token_count)
+                validated_leaves += 1
+                continue
+            if "QSA" in class_name:
+                # A new/foreign QSA family needs an explicit auxiliary-state
+                # proof before it may retain mutable resident state.
+                return False
+            offset = getattr(cache_obj, "offset", None)
+            if type(offset) is int:
+                offsets.append(offset)
+                validated_leaves += 1
+            elif offset is not None and getattr(offset, "size", 0) == 1:
+                try:
+                    offsets.append(int(offset.reshape(()).item()))
+                    validated_leaves += 1
+                except Exception:
+                    return False
+            elif class_name in positionless_exact_types:
+                state = getattr(cache_obj, "cache", None)
+                if not isinstance(state, list) or not state or any(
+                    item is None for item in state
+                ):
+                    return False
+                if class_name == "SizedArraysCache" and getattr(
+                    cache_obj, "_token_count", None
+                ) != token_count:
+                    return False
+                validated_leaves += 1
+            else:
+                # Unknown positionless state cannot prove which token prefix
+                # it summarizes.  The paged cache remains the safe fallback.
+                return False
+        return (
+            validated_leaves > 0
+            and bool(offsets)
+            and all(offset == token_count for offset in offsets)
+        )
+
+    @staticmethod
+    def _request_is_text_only_for_resident_cache(request: Request) -> bool:
+        """Media state is keyed separately and must never enter this text tier."""
+
+        return not (
+            request.images
+            or request.videos
+            or request.vlm_inputs_embeds is not None
+            or request.vlm_extra_keys_for_cache
+            or request.vlm_extra_key_ranges_for_cache
+        )
+
+    def _stage_exact_resident_cache(
+        self,
+        request: Request,
+        cache_list: Any,
+        cache_tokens: Any,
+    ) -> None:
+        """Attach a validated terminal cache candidate to ``request``.
+
+        Cleanup attempts the bounded L0 insertion *before* deciding whether
+        to skip the latest durable extension.  A disabled/oversize/rejected
+        insertion therefore keeps the ordinary SSD store path.  A successful
+        insertion is hot-only and immediately claimable; the same mutable
+        arrays are never handed to the asynchronous writer.
+        """
+
+        if (
+            getattr(self, "_exact_resident_cache", None) is None
+            or self._exact_resident_cache.max_entries <= 0
+            or self._exact_resident_cache.max_bytes <= 0
+            or request.specprefill_indices is not None
+            or getattr(request, "skip_cache_store", False)
+            or self._resident_cache_spec_decode_active()
+            or not self._request_is_text_only_for_resident_cache(request)
+            or not isinstance(cache_list, list)
+            or not cache_list
+            or not isinstance(cache_tokens, (list, tuple))
+            or not cache_tokens
+        ):
+            return
+        # In non-speculative mlx-lm GenerationBatch.next(), ``_step`` appends
+        # the forwarded token to both the physical cache and ``all_tokens``
+        # before Response.prompt_cache is extracted.  Those two fields are
+        # therefore one exact terminal transaction.  Parser stops detach the
+        # same pair through BatchGenerator.extract_cache().  The MTP gate
+        # above is load-bearing: its verified emit queue breaks this contract
+        # until an explicit terminal rollback/drain is available.
+        tokens = [int(token) for token in cache_tokens]
+        if not self._invalidate_resident_pool_with_telemetry(
+            cache_list, phase="publish"
+        ):
+            return
+        if not self._resident_cache_matches_token_count(cache_list, len(tokens)):
+            logger.debug(
+                "Skipping exact resident cache for %s: cache offsets do not "
+                "prove the %d-token terminal state",
+                request.request_id,
+                len(tokens),
+            )
+            return
+        cache_nbytes = self._resident_cache_nbytes(cache_list)
+        if cache_nbytes is None or cache_nbytes <= 0:
+            logger.debug(
+                "Skipping exact resident cache for %s: concrete cache bytes "
+                "could not be measured",
+                request.request_id,
+            )
+            return
+        if cache_nbytes > self._exact_resident_cache.max_bytes:
+            logger.info(
+                "Exact resident cache bypass for %s: %.2fGiB exceeds %.2fGiB "
+                "budget; retaining normal durable store",
+                request.request_id,
+                cache_nbytes / 1024**3,
+                self._exact_resident_cache.max_bytes / 1024**3,
+            )
+            return
+        request._exact_resident_candidate = (
+            tokens,
+            cache_list,
+            cache_nbytes,
+        )
+
+    def _publish_exact_resident_cache(
+        self,
+        request: Request,
+    ) -> bool:
+        candidate = getattr(request, "_exact_resident_candidate", None)
+        request._exact_resident_candidate = None
+        if not (
+            isinstance(candidate, tuple)
+            and len(candidate) == 3
+            and isinstance(candidate[0], list)
+            and isinstance(candidate[1], list)
+        ):
+            return False
+        tokens, cache_list, cache_nbytes = candidate
+        if not self._resident_cache_matches_token_count(cache_list, len(tokens)):
+            return False
+        if self._exact_resident_cache.put(
+            tokens,
+            cache_list,
+            cache_nbytes=cache_nbytes,
+        ):
+            logger.info(
+                "Exact resident cache staged for %s: tokens=%d size=%.2fGiB "
+                "durability=prior-paged-tier",
+                request.request_id,
+                len(tokens),
+                cache_nbytes / 1024**3,
+            )
+            return True
+        return False
+
+    def _restore_exact_resident_cache(self, request: Request) -> bool:
+        """Transfer one exact terminal cache directly into ``request``."""
+
+        if (
+            self._resident_cache_spec_decode_active()
+            or not self._request_is_text_only_for_resident_cache(request)
+        ):
+            return False
+        resident_cache = getattr(self, "_exact_resident_cache", None)
+        if (
+            resident_cache is None
+            or resident_cache.max_entries <= 0
+            or resident_cache.max_bytes <= 0
+        ):
+            return False
+        prompt_tokens = request.prompt_token_ids or []
+        started = time.perf_counter()
+        with self._phase_timer("exact_resident_lookup"):
+            hit = resident_cache.acquire_prefix(prompt_tokens)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if hit is None:
+            return False
+        if not self._invalidate_resident_pool_with_telemetry(
+            hit.cache, phase="lease"
+        ):
+            return False
+        if not self._resident_cache_matches_token_count(
+            hit.cache, hit.cached_tokens
+        ):
+            logger.warning(
+                "Exact resident cache failed terminal-offset validation for %s; "
+                "falling back to paged prefix cache",
+                request.request_id,
+            )
+            return False
+
+        request.prompt_cache = hit.cache
+        request.cached_tokens = hit.cached_tokens
+        request.remaining_tokens = prompt_tokens[hit.cached_tokens :]
+        request.shared_prefix_blocks = 0
+        request.block_table = None
+        request._exact_resident_hit = True
+        leases = getattr(self, "_exact_resident_leases", None)
+        if leases is None:
+            leases = set()
+            self._exact_resident_leases = leases
+        leases.add(request.request_id)
+        logger.info(
+            "Prefix cache restore for %s: source=exact-resident cached=%d "
+            "suffix=%d lookup=%.3fms retained=%.2fGiB",
+            request.request_id,
+            hit.cached_tokens,
+            len(request.remaining_tokens),
+            elapsed_ms,
+            hit.cache_nbytes / 1024**3,
+        )
+        return True
+
+    def _exact_resident_stats(self) -> dict[str, int]:
+        resident_cache = getattr(self, "_exact_resident_cache", None)
+        stats = resident_cache.stats() if resident_cache is not None else {}
+        stats["active_leases"] = len(
+            getattr(self, "_exact_resident_leases", ())
+        )
+        # Explicit aliases make dashboard/operator interpretation clear.
+        stats["leases_total"] = int(stats.get("hits", 0))
+        stats["fallbacks_total"] = int(stats.get("misses", 0))
+        stats["pool_invalidations"] = int(
+            getattr(self, "_exact_resident_pool_invalidations", 0)
+        )
+        stats["pool_invalidated_bytes"] = int(
+            getattr(self, "_exact_resident_pool_invalidated_bytes", 0)
+        )
+        stats["pool_invalidation_ms"] = float(
+            getattr(self, "_exact_resident_pool_invalidation_ms", 0.0)
+        )
+        return stats
+
     def _prepare_prefix_cache_for_request(self, request: Request) -> None:
         if request.request_id in self._prefix_cache_prepared:
+            return
+
+        # Fastest exact path: the preceding turn's already-detached live
+        # cache.  Ownership is exclusive and token identity is proven before
+        # use.  Any miss falls through to the durable block cache unchanged.
+        if self._restore_exact_resident_cache(request):
+            try:
+                from .patches.mlx_lm_mtp import prompt_priming
+
+                prompt_priming.prepare_prefix_context(
+                    self.model,
+                    request_id=request.request_id,
+                    prompt_tokens=request.prompt_token_ids,
+                    cached_tokens=request.cached_tokens,
+                    prefix_cache=self.block_aware_cache,
+                    extra_keys=request.vlm_extra_keys_for_cache,
+                    extra_key_token_start=(
+                        request.vlm_extra_key_token_start_for_cache
+                    ),
+                    extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "MTP resident-prefix preparation failed closed for %s: %s",
+                    request.request_id,
+                    exc,
+                )
+            self._log_prefix_divergence(request)
+            self._try_specprefill_scoring(request)
+            self._prefix_cache_prepared.add(request.request_id)
             return
 
         # Check prefix cache for cached KV state
@@ -9339,6 +9948,13 @@ class Scheduler:
         if not self._pending_pressure_clear:
             return False
         self._pending_pressure_clear = False
+        dropped = self._exact_resident_cache.clear()
+        if dropped:
+            logger.info(
+                "Hard-pressure reclaim dropped %d exact resident cache entr%s",
+                dropped,
+                "y" if dropped == 1 else "ies",
+            )
         return True
 
     def _process_pending_reclaim(self) -> None:
@@ -9358,6 +9974,8 @@ class Scheduler:
         if self.running or self.prefilling or self.waiting:
             return
         self._pending_reclaim_request = False
+        self._exact_resident_cache.clear()
+        self._exact_resident_leases.clear()
         before = self._current_usage_bytes()
         # Wrapped in try-except because this can be the first step after an
         # engine-loop error recovery, when Metal may already be in an error
@@ -11116,9 +11734,47 @@ class Scheduler:
                                 request.output_text = output.output_text
                                 break
 
-                # Extract cache for future reuse.
-                # In the new API, prompt_cache is a direct value (not callable).
+                # Retain the exact detached terminal cache + the token list
+                # that mlx-lm says is physically represented by it.  Parser-
+                # initiated stops do not populate Response.prompt_cache, but
+                # the row is still live here and can be detached explicitly.
+                # This resident candidate is separate from the durable store
+                # below: its token identity may include protocol delimiters
+                # hidden from the API response, which is precisely why a
+                # future prompt must match it exactly before reuse.
                 raw_cache = getattr(response, "prompt_cache", None)
+                resident_tokens = getattr(response, "all_tokens", None)
+                resident_cache = raw_cache
+                if (
+                    resident_cache is None
+                    and parser_session is not None
+                    and self.batch_generator is not None
+                ):
+                    try:
+                        detached = self.batch_generator.extract_cache([response.uid])
+                        resident_cache, resident_tokens = detached.get(
+                            response.uid, (None, None)
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "Could not detach parser-stop resident cache for %s: %s",
+                            request_id,
+                            exc,
+                        )
+                self._stage_exact_resident_cache(
+                    request,
+                    resident_cache,
+                    resident_tokens,
+                )
+
+                # Extract cache for durable/block reuse.  Only the response-
+                # owned terminal cache uses the existing store path.  A cache
+                # detached solely for a parser stop can contain hidden
+                # protocol tokens that request.output_token_ids intentionally
+                # omits; pairing it with that shorter sequence would be an
+                # unsafe durable cache entry, so the prompt-boundary fallback
+                # remains authoritative for that case.
+                # In the new API, prompt_cache is a direct value (not callable).
                 if raw_cache is not None:
                     try:
                         # SpecPrefill: sparse KV data can't be stored in
@@ -11220,6 +11876,23 @@ class Scheduler:
 
         for request_id in finished_ids:
             request = self.running.get(request_id)
+            singleton_resident_eligible = bool(
+                request is not None
+                and len(finished_ids) == 1
+                and len(self.running) == 1
+                and not self.prefilling
+            )
+            resident_handoff = False
+            if singleton_resident_eligible:
+                resident_handoff = self._publish_exact_resident_cache(request)
+            elif request is not None and getattr(
+                request, "_exact_resident_candidate", None
+            ) is not None:
+                logger.info(
+                    "Exact resident handoff bypass for %s: concurrent/batched "
+                    "completion keeps normal durable persistence",
+                    request_id,
+                )
 
             # Store cache for future reuse (G2-async): submit to background
             # executor so the post-finish 28GB+ memcpy doesn't block response
@@ -11236,7 +11909,21 @@ class Scheduler:
                     # prep, no host memcpy, no SSD write. They still take
                     # the block leak-guard branch below so their paged
                     # blocks are released for eviction.
-                    skip_store = getattr(request, "skip_cache_store", False)
+                    skip_store = (
+                        getattr(request, "skip_cache_store", False)
+                        or resident_handoff
+                    )
+                    if resident_handoff:
+                        # Do not let the async durable writer read arrays held
+                        # by the immediately claimable resident lease.  Older
+                        # paged/SSD blocks remain the exact fallback; this
+                        # newest terminal state is intentionally hot-only
+                        # until a serialized idle-store design lands.
+                        logger.info(
+                            "Deferring latest durable cache extension for %s: "
+                            "exact resident handoff is immediately claimable",
+                            request_id,
+                        )
                     if skip_store or (
                         hasattr(request, "_extracted_cache")
                         and request._extracted_cache is not None
@@ -11658,6 +12345,8 @@ class Scheduler:
         # Clear caches
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
+        self._exact_resident_cache.clear()
+        self._exact_resident_leases.clear()
         self._cache_rate_tracker.clear()
 
         # Clear UID mappings
@@ -12357,6 +13046,7 @@ class Scheduler:
         # Include cache stats
         if self.block_aware_cache is not None:
             stats["ssd_cache"] = self.block_aware_cache.get_stats()
+        stats["exact_resident_cache"] = self._exact_resident_stats()
         return stats
 
     def get_cache_stats(self) -> dict[str, Any] | None:
@@ -12429,6 +13119,8 @@ class Scheduler:
         # Clear caches
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
+        self._exact_resident_cache.clear()
+        self._exact_resident_leases.clear()
         self._cache_rate_tracker.clear()
 
         # Clear detokenizers
@@ -12554,6 +13246,8 @@ class Scheduler:
         self._close_specprefill_draft_cache_manager()
         self._draft_prefix_cache = None
         self._specprefill_draft_model = None
+        self._exact_resident_cache.clear()
+        self._exact_resident_leases.clear()
         if self.paged_ssd_cache_manager is not None:
             self.paged_ssd_cache_manager.close()
             self.paged_ssd_cache_manager = None
@@ -13442,6 +14136,8 @@ class Scheduler:
                     }
                 )
             stats["specprefill_cache"] = specprefill_cache_stats
+
+        stats["exact_resident_cache"] = self._exact_resident_stats()
 
         counters = self._collect_cache_counters()
         if counters:
