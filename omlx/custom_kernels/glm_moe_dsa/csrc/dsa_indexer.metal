@@ -67,6 +67,8 @@ instantiate_dsa_indexer_score(bfloat16, bfloat16_t, 8, 64, 16, 1, 2);
 // tile; BM64 remains the production prefill route.
 instantiate_qwen4_qsa_indexer_score(float16, half, 8, 64, 16, 1, 2);
 instantiate_qwen4_qsa_indexer_score(bfloat16, bfloat16_t, 8, 64, 16, 1, 2);
+instantiate_qwen4_qsa_indexer_score(float16, half, 16, 64, 16, 1, 2);
+instantiate_qwen4_qsa_indexer_score(bfloat16, bfloat16_t, 16, 64, 16, 1, 2);
 instantiate_qwen4_qsa_indexer_score(float16, half, 64, 64, 16, 2, 2);
 instantiate_qwen4_qsa_indexer_score(bfloat16, bfloat16_t, 64, 64, 16, 2, 2);
 

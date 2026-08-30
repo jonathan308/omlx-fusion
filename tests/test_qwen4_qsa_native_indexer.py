@@ -188,7 +188,7 @@ def test_qwen4_qsa_native_scores_and_topk_match_fp32_reference(dtype):
     assert mx.array_equal(_topk_sets(actual, 64), _topk_sets(expected, 64)).item()
 
 
-@pytest.mark.parametrize("rows", [1, 6, 8])
+@pytest.mark.parametrize("rows", [1, 6, 8, 9, 16])
 @pytest.mark.skipif(
     not _native_available(),
     reason="native Qwen4 QSA indexer-score ABI is unavailable",

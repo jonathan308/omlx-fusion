@@ -407,8 +407,9 @@ class Qwen4QSAIndexerScoresPrimitive : public Primitive {
     // makes that wasted work grow with the full QSA index.  BK and the MMA
     // fragment reduction order stay identical; only the unused M tiles are
     // removed, so retained FP32 scores are bit-for-bit equal.
-    const bool verify_tile = q.shape(2) <= 8;
-    const int bm = verify_tile ? 8 : 64;
+    const bool narrow_verify_tile = q.shape(2) <= 8;
+    const bool verify_tile = q.shape(2) <= 16;
+    const int bm = narrow_verify_tile ? 8 : (verify_tile ? 16 : 64);
     constexpr int bn = 64;
     constexpr int bk = 16;
     const int wm = verify_tile ? 1 : 2;
