@@ -41,6 +41,7 @@ _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
 _HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
 _HC_FUSED_VERIFY_WIDTHS = frozenset({2, 3, 4, 5, 6})
+_QSA_DIRECT_VERIFY_MIN_TOKENS = 65_536
 _DECODE_PROFILE_LOCAL = threading.local()
 _DECODE_PROFILE_LOCK = threading.Lock()
 _DECODE_PROFILE_CALLS = 0
@@ -1510,10 +1511,12 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             ):
                 return False
 
-        prospective_blocks = (
-            cache.offset + x.shape[1]
-        ) // self.indexer.compress_ratio
-        return prospective_blocks > self.indexer.block_topk
+        prospective_tokens = cache.offset + x.shape[1]
+        prospective_blocks = prospective_tokens // self.indexer.compress_ratio
+        return bool(
+            prospective_tokens >= _QSA_DIRECT_VERIFY_MIN_TOKENS
+            and prospective_blocks > self.indexer.block_topk
+        )
 
     def _gathered_text_prefill(
         self,

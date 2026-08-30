@@ -115,6 +115,7 @@ def test_qwen4_verify_window_uses_direct_qsa_and_matches_official(monkeypatch):
     import mlx_vlm.models.qwen4_exp.language as language
 
     attention = language.Qwen4ExpAttention(config)
+    monkeypatch.setattr(language, "_QSA_DIRECT_VERIFY_MIN_TOKENS", 0)
     mx.eval(attention.parameters())
     fast_cache = language.QSAKVCache()
     reference_cache = language.QSAKVCache()
@@ -169,11 +170,12 @@ def test_qwen4_verify_window_uses_direct_qsa_and_matches_official(monkeypatch):
         assert mx.array_equal(fast_value, reference_value).item()
 
 
-def test_qwen4_verify_window_eligibility_fails_closed():
+def test_qwen4_verify_window_eligibility_fails_closed(monkeypatch):
     config = _tiny_text_config()
     import mlx_vlm.models.qwen4_exp.language as language
 
     attention = language.Qwen4ExpAttention(config)
+    monkeypatch.setattr(language, "_QSA_DIRECT_VERIFY_MIN_TOKENS", 0)
     cache = language.QSAKVCache()
     prefix = mx.random.normal((1, 10, config.hidden_size))
     mx.eval(attention(prefix, mask="causal", cache=cache))
