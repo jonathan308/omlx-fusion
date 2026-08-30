@@ -27,6 +27,8 @@ IndexRoPE = Callable[[mx.array, mx.array], mx.array]
 
 _NATIVE_QSA_SCORE_DISABLED = False
 _NATIVE_QSA_SCORE_PROVEN = False
+_NATIVE_QSA_PACKED_SCORE_DISABLED = False
+_NATIVE_QSA_PACKED_SCORE_PROVEN = False
 _NATIVE_QSA_TOPK_DISABLED = False
 _NATIVE_QSA_TOPK_PROVEN = False
 _NATIVE_QSA_MAIN_DISABLED = False
@@ -135,8 +137,7 @@ def _native_indexer_scores(
     """Use the narrow native M3 score ABI or fail closed to the MLX path."""
 
     global _NATIVE_QSA_SCORE_DISABLED, _NATIVE_QSA_SCORE_PROVEN
-    if _NATIVE_QSA_SCORE_DISABLED:
-        return None
+    global _NATIVE_QSA_PACKED_SCORE_DISABLED, _NATIVE_QSA_PACKED_SCORE_PROVEN
     if (
         queries.ndim != 4
         or queries.shape[0] != 1
@@ -150,6 +151,64 @@ def _native_indexer_scores(
         or compress_ratio != 4
         or mask_q_offset < 0
     ):
+        return None
+
+    # Scalar decode and bounded Lightning-MTP verification carry only one to
+    # nine query rows.  The additive packed ABI evaluates their four indexer
+    # heads in one BK16 Steel GEMM instead of reloading the pooled-key panel
+    # once per head.  It consumes the caller's natural [B,M,H,D] layout and
+    # preserves the exact FP32 score sheet.  Larger prompt chunks retain the
+    # established H-major kernel: packing their 4*M rows into BM32 tiles would
+    # increase pooled-key panel traffic and could regress flat prefill.
+    if queries.shape[1] <= 9 and not _NATIVE_QSA_PACKED_SCORE_DISABLED:
+        try:
+            from omlx.custom_kernels.glm_moe_dsa import fast
+
+            if fast.is_native_available() and fast.has_symbol(
+                "qwen4_qsa_indexer_scores_packed"
+            ):
+                scores = fast.qwen4_qsa_indexer_scores_packed(
+                    queries,
+                    pooled_keys[:, None],
+                    mask_ratio=compress_ratio,
+                    mask_q_offset=mask_q_offset,
+                )
+                if not _NATIVE_QSA_PACKED_SCORE_PROVEN:
+                    # Prove the scheduling-only claim against the established
+                    # native ABI on this exact Metal/compiler pair.  A rebuilt
+                    # extension always carries both symbols; stale or partial
+                    # builds fail closed before the candidate can enter model
+                    # cache state.  Compare the raw FP32 bits so signed zero or
+                    # a one-ULP drift cannot silently pass the lossless gate.
+                    if not fast.has_symbol("qwen4_qsa_indexer_scores"):
+                        _NATIVE_QSA_PACKED_SCORE_DISABLED = True
+                        raise RuntimeError(
+                            "packed QSA score proof requires the established ABI"
+                        )
+                    reference = fast.qwen4_qsa_indexer_scores(
+                        queries.transpose(0, 2, 1, 3),
+                        pooled_keys[:, None],
+                        mask_ratio=compress_ratio,
+                        mask_q_offset=mask_q_offset,
+                    )
+                    mx.eval(scores, reference)
+                    if not bool(
+                        mx.array_equal(
+                            scores.view(mx.uint32),
+                            reference.view(mx.uint32),
+                        ).item()
+                    ):
+                        _NATIVE_QSA_PACKED_SCORE_DISABLED = True
+                        return reference
+                    _NATIVE_QSA_PACKED_SCORE_PROVEN = True
+                return scores
+            _NATIVE_QSA_PACKED_SCORE_DISABLED = True
+        except Exception:
+            # A stale extension must fall through to the already-proven native
+            # ABI rather than revoking native QSA scoring for the process.
+            _NATIVE_QSA_PACKED_SCORE_DISABLED = True
+
+    if _NATIVE_QSA_SCORE_DISABLED:
         return None
 
     try:

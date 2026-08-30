@@ -249,6 +249,8 @@ qwen4_qsa_indexer_score(
   using loader_b_t = typename gemm_kernel::loader_b_t;
   using mma_t = typename gemm_kernel::mma_t;
 
+  static_assert(BM % 4 == 0, "packed QSA rows must contain complete heads");
+
   const int tid_y = ((tid.y) << params->swizzle_log) +
       ((tid.x) & ((1 << params->swizzle_log) - 1));
   const int tid_x = (tid.x) >> params->swizzle_log;
@@ -346,6 +348,130 @@ qwen4_qsa_indexer_score(
         ai++;
       }
     }
+  }
+}
+
+// Exact packed-head score path for scalar decode and bounded MTP verify.
+//
+// The portable Qwen4 expression naturally lays queries out as [M,H,D] before
+// flattening M*H into one GEMM.  The established native kernel instead loops
+// over H and pads every head's M rows independently.  For M<=9 that repeats
+// the pooled-key load four times and, at M=1, executes 32 MMA rows for four
+// useful dot products.  This additive kernel restores the natural [M,H,D]
+// packing: every individual dot retains the same BK16 Steel accumulation,
+// then adjacent h0..h3 rows are reduced in the original ordered FP32 epilogue.
+// The reduced score sheet is therefore eligible for the unchanged exact radix
+// selector; no approximate score or selected-set reuse enters this path.
+template <typename T, int BM, int BN, int BK, int WM, int WN>
+[[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void
+qwen4_qsa_packed_indexer_score(
+    const device T* Q [[buffer(0)]],
+    const device T* K [[buffer(1)]],
+    device float* O [[buffer(2)]],
+    const constant GEMMParams* params [[buffer(3)]],
+    const constant int& mask_ratio [[buffer(4)]],
+    const constant int& mask_q_offset [[buffer(5)]],
+    const constant float& score_divisor [[buffer(6)]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]]) {
+  using gemm_kernel = GEMMKernel<
+      T,
+      T,
+      BM,
+      BN,
+      BK,
+      WM,
+      WN,
+      false,
+      true,
+      true,
+      true,
+      float>;
+  using loader_a_t = typename gemm_kernel::loader_a_t;
+  using loader_b_t = typename gemm_kernel::loader_b_t;
+  using mma_t = typename gemm_kernel::mma_t;
+
+  const int tid_y = ((tid.y) << params->swizzle_log) +
+      ((tid.x) & ((1 << params->swizzle_log) - 1));
+  const int tid_x = (tid.x) >> params->swizzle_log;
+  if (params->tiles_n <= tid_x || params->tiles_m <= tid_y) {
+    return;
+  }
+
+  constexpr int H = 4;
+  const int packed_M = params->M;
+  const int logical_M = packed_M / H;
+  const int N = params->N;
+  const int D = params->K;
+  const int c_packed_row = tid_y * BM;
+  const int c_col = tid_x * BN;
+  const short tgp_bm = short(metal::min(BM, packed_M - c_packed_row));
+  const short tgp_bn = short(metal::min(BN, N - c_col));
+
+  Q += size_t(tid.z) * packed_M * D + size_t(c_packed_row) * D;
+  K += size_t(tid.z) * N * D + size_t(c_col) * D;
+  O += size_t(tid.z) * logical_M * N +
+      size_t(c_packed_row / H) * N + c_col;
+
+  threadgroup T As[gemm_kernel::tgp_mem_size_a];
+  threadgroup T Bs[gemm_kernel::tgp_mem_size_b];
+  threadgroup float Cs[BM * BN];
+  thread mma_t mma_op(simd_group_id, simd_lane_id);
+  mma_op.Ctile.clear();
+
+  thread loader_a_t loader_a(
+      Q, params->lda, As, simd_group_id, simd_lane_id);
+  thread loader_b_t loader_b(
+      K, params->ldb, Bs, simd_group_id, simd_lane_id);
+  for (int d = 0; d < params->gemm_k_iterations_aligned; ++d) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tgp_bm == BM) {
+      loader_a.load_unsafe();
+    } else {
+      loader_a.load_safe(short2(BK, tgp_bm));
+    }
+    if (tgp_bn == BN) {
+      loader_b.load_unsafe();
+    } else {
+      loader_b.load_safe(short2(BK, tgp_bn));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mma_op.mma(As, Bs);
+    loader_a.next();
+    loader_b.next();
+  }
+  threadgroup_barrier(mem_flags::mem_none);
+
+  threadgroup float* c_dst =
+      Cs + size_t(mma_op.sm) * BN + mma_op.sn;
+  mma_op.Ctile.template store<float, WM, WN, BN, 1>(c_dst);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const float pooled_sentinel = as_type<float>(uint(0xFF7FFFFF));
+  const int logical_tile_rows = tgp_bm / H;
+  const int output_count = logical_tile_rows * int(tgp_bn);
+  constexpr int threads = WM * WN * 32;
+  for (int output_index = int(lid.x); output_index < output_count;
+       output_index += threads) {
+    const int local_row = output_index / int(tgp_bn);
+    const int local_col = output_index - local_row * int(tgp_bn);
+    const int packed_row = local_row * H;
+    float accum = metal::max(Cs[(packed_row + 0) * BN + local_col], 0.0f);
+    accum = accum +
+        metal::max(Cs[(packed_row + 1) * BN + local_col], 0.0f);
+    accum = accum +
+        metal::max(Cs[(packed_row + 2) * BN + local_col], 0.0f);
+    accum = accum +
+        metal::max(Cs[(packed_row + 3) * BN + local_col], 0.0f);
+
+    const int row = c_packed_row / H + local_row;
+    const int col = c_col + local_col;
+    const bool pooled_masked =
+        col >= (mask_q_offset + row + 1) / mask_ratio;
+    O[size_t(local_row) * N + local_col] =
+        pooled_masked ? pooled_sentinel : accum / score_divisor;
   }
 }
 

@@ -488,6 +488,136 @@ class Qwen4QSAIndexerScoresPrimitive : public Primitive {
   int mask_q_offset_;
 };
 
+class Qwen4QSAPackedIndexerScoresPrimitive : public Primitive {
+ public:
+  Qwen4QSAPackedIndexerScoresPrimitive(
+      Stream stream,
+      int mask_ratio,
+      int mask_q_offset)
+      : Primitive(stream),
+        mask_ratio_(mask_ratio),
+        mask_q_offset_(mask_q_offset) {}
+
+  static bool unsupported(const array& q, const array& k, Stream s) {
+    if (s.device == Device::cpu || q.dtype() != k.dtype()) {
+      return true;
+    }
+    if (q.dtype() != float16 && q.dtype() != bfloat16) {
+      return true;
+    }
+    if (!row_contiguous(q) || !row_contiguous(k)) {
+      return true;
+    }
+    if (q.ndim() != 4 || k.ndim() != 4) {
+      return true;
+    }
+    // This additive ABI is deliberately bounded to scalar decode and the
+    // largest supported Lightning-MTP verification window. Prompt chunks stay
+    // on the established H-major score kernel, whose BM64 geometry is better
+    // suited to their much larger M dimension.
+    return q.shape(0) != 1 || q.shape(1) < 1 || q.shape(1) > 9 ||
+        q.shape(2) != 4 || q.shape(3) != 128 || k.shape(0) != 1 ||
+        k.shape(1) != 1 || k.shape(2) <= 0 || k.shape(3) != 128;
+  }
+
+  void eval_cpu(
+      const std::vector<array>& /* inputs */,
+      std::vector<array>& /* outputs */) override {
+    throw std::runtime_error(
+        "Qwen4QSAPackedIndexerScoresPrimitive has no CPU path.");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    auto& out = outputs[0];
+    const auto& q = inputs[0];
+    const auto& k = inputs[1];
+
+    out.set_data(allocator::malloc(out.nbytes()));
+
+    constexpr int heads = 4;
+    const int logical_m = q.shape(1);
+    const int packed_m = logical_m * heads;
+    const int bm = packed_m <= 8 ? 8 : (packed_m <= 16 ? 16 : 32);
+    constexpr int bn = 64;
+    constexpr int bk = 16;
+    const int wm = packed_m <= 8 ? 1 : (packed_m <= 16 ? 2 : 4);
+    constexpr int wn = 2;
+    const int B = q.shape(0);
+    const int N = k.shape(2);
+    const int D = q.shape(3);
+    const int tiles_m = (packed_m + bm - 1) / bm;
+    const int tiles_n = (N + bn - 1) / bn;
+
+    mlx::steel::GEMMParams params{
+        /* const int M = */ packed_m,
+        /* const int N = */ N,
+        /* const int K = */ D,
+        /* const int lda = */ D,
+        /* const int ldb = */ D,
+        /* const int ldd = */ N,
+        /* const int tiles_n = */ tiles_n,
+        /* const int tiles_m = */ tiles_m,
+        /* const int64_t batch_stride_a = */ int64_t(packed_m) * D,
+        /* const int64_t batch_stride_b = */ int64_t(N) * D,
+        /* const int64_t batch_stride_d = */ int64_t(logical_m) * N,
+        /* const int swizzle_log = */ 0,
+        /* const int gemm_k_iterations_aligned = */ D / bk,
+        /* const int batch_ndim = */ 1};
+
+    std::string base_name;
+    concatenate(
+        base_name,
+        "qwen4_qsa_packed_indexer_score_",
+        type_to_name(q),
+        "_bm",
+        bm,
+        "_bn",
+        bn,
+        "_bk",
+        bk,
+        "_wm",
+        wm,
+        "_wn",
+        wn);
+
+    auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
+    auto kernel = d.get_kernel(base_name, lib);
+    auto& encoder = metal::get_command_encoder(s);
+    encoder.set_compute_pipeline_state(kernel);
+    encoder.set_input_array(q, 0);
+    encoder.set_input_array(k, 1);
+    encoder.set_output_array(out, 2);
+    encoder.set_bytes(params, 3);
+    encoder.set_bytes(mask_ratio_, 4);
+    encoder.set_bytes(mask_q_offset_, 5);
+    const float score_divisor = std::sqrt(static_cast<float>(D));
+    encoder.set_bytes(score_divisor, 6);
+    encoder.dispatch_threadgroups(
+        MTL::Size(tiles_n, tiles_m, B),
+        MTL::Size(wm * wn * 32, 1, 1));
+  }
+
+  DEFINE_NAME(OMLXQwen4QSAPackedIndexerScores)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs =
+        static_cast<const Qwen4QSAPackedIndexerScoresPrimitive&>(other);
+    return mask_ratio_ == rhs.mask_ratio_ &&
+        mask_q_offset_ == rhs.mask_q_offset_;
+  }
+  auto state() const {
+    return std::make_tuple(mask_ratio_, mask_q_offset_);
+  }
+
+ private:
+  int mask_ratio_;
+  int mask_q_offset_;
+};
+
 // ── v25 M2 MMA score kernel (mma_dsa_indexer_score.h) ───────────────────────
 // Split dispatch: the interior instantiation runs the unmodified hot loop on
 // fully-interior tiles; the boundary instantiation handles partial edge tiles
@@ -1251,6 +1381,53 @@ array qwen4_qsa_indexer_scores(
       std::move(out_shape),
       float32,
       std::make_shared<Qwen4QSAIndexerScoresPrimitive>(
+          stream, mask_ratio, mask_q_offset),
+      std::vector<array>{q, k});
+}
+
+array qwen4_qsa_indexer_scores_packed(
+    const array& queries,
+    const array& pooled_keys,
+    int mask_ratio,
+    int mask_q_offset,
+    StreamOrDevice s) {
+  if (queries.ndim() != 4 || pooled_keys.ndim() != 4) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.qwen4_qsa_indexer_scores_packed] expected "
+        << "q/k rank 4, got " << queries.shape() << " and "
+        << pooled_keys.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (queries.dtype() != pooled_keys.dtype() ||
+      (queries.dtype() != float16 && queries.dtype() != bfloat16)) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.qwen4_qsa_indexer_scores_packed] q/k must have "
+        "matching float16 or bfloat16 dtype.");
+  }
+  if (mask_ratio != 4 || mask_q_offset < 0) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.qwen4_qsa_indexer_scores_packed] requires "
+        << "mask_ratio=4 and a non-negative mask_q_offset, got "
+        << mask_ratio << " and " << mask_q_offset << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto stream = to_stream(s);
+  auto q = ensure_row_contiguous(queries, stream);
+  auto k = ensure_row_contiguous(pooled_keys, stream);
+  if (Qwen4QSAPackedIndexerScoresPrimitive::unsupported(q, k, stream)) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.qwen4_qsa_indexer_scores_packed] unsupported "
+        << "shape or layout; expected q [1,M<=9,4,128] and k "
+        << "[1,1,N,128], got " << q.shape() << " and " << k.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  Shape out_shape{1, q.shape(1), k.shape(2)};
+  return array(
+      std::move(out_shape),
+      float32,
+      std::make_shared<Qwen4QSAPackedIndexerScoresPrimitive>(
           stream, mask_ratio, mask_q_offset),
       std::vector<array>{q, k});
 }

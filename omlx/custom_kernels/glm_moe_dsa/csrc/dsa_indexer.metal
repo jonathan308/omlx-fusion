@@ -31,6 +31,13 @@ struct OMLXDSATopKParams {
       "_bm" #bm "_bn" #bn "_bk" #bk "_wm" #wm "_wn" #wn,                \
       qwen4_qsa_indexer_score, itype, bm, bn, bk, wm, wn)
 
+#define instantiate_qwen4_qsa_packed_indexer_score(                         \
+    iname, itype, bm, bn, bk, wm, wn)                                       \
+  instantiate_kernel(                                                        \
+      "qwen4_qsa_packed_indexer_score_" #iname                              \
+      "_bm" #bm "_bn" #bn "_bk" #bk "_wm" #wm "_wn" #wn,                \
+      qwen4_qsa_packed_indexer_score, itype, bm, bn, bk, wm, wn)
+
 #define instantiate_dsa_topk_indices(iname, itype, topk, threads)       \
   instantiate_kernel(                                                   \
       "steel_dsa_topk_indices_" #iname "_topk" #topk "_t" #threads,    \
@@ -71,6 +78,24 @@ instantiate_qwen4_qsa_indexer_score(float16, half, 16, 64, 16, 1, 2);
 instantiate_qwen4_qsa_indexer_score(bfloat16, bfloat16_t, 16, 64, 16, 1, 2);
 instantiate_qwen4_qsa_indexer_score(float16, half, 64, 64, 16, 2, 2);
 instantiate_qwen4_qsa_indexer_score(bfloat16, bfloat16_t, 64, 64, 16, 2, 2);
+
+// Decode/verify query heads are adjacent in the caller's natural [M,H,D]
+// layout. BM8 covers widths 1-2, BM16 covers widths 3-4, and BM32 covers
+// widths 5-9 (width 9 dispatches two tiles). Per-dot BK16 arithmetic and the
+// ordered FP32 head reduction are identical to the H-major ABI above, while
+// every tile stages pooled K once.
+instantiate_qwen4_qsa_packed_indexer_score(
+    float16, half, 8, 64, 16, 1, 2);
+instantiate_qwen4_qsa_packed_indexer_score(
+    bfloat16, bfloat16_t, 8, 64, 16, 1, 2);
+instantiate_qwen4_qsa_packed_indexer_score(
+    float16, half, 16, 64, 16, 2, 2);
+instantiate_qwen4_qsa_packed_indexer_score(
+    bfloat16, bfloat16_t, 16, 64, 16, 2, 2);
+instantiate_qwen4_qsa_packed_indexer_score(
+    float16, half, 32, 64, 16, 4, 2);
+instantiate_qwen4_qsa_packed_indexer_score(
+    bfloat16, bfloat16_t, 32, 64, 16, 4, 2);
 
 instantiate_dsa_topk_indices(float16, half, 2048, 1024);
 instantiate_dsa_topk_indices(bfloat16, bfloat16_t, 2048, 1024);

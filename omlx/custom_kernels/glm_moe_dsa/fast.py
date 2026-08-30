@@ -146,6 +146,7 @@ NATIVE_SYMBOLS = (
     "dsa_decode_scores",
     "dsa_indexer_scores",
     "qwen4_qsa_indexer_scores",
+    "qwen4_qsa_indexer_scores_packed",
     "qwen4_qsa_topk_indices",
     "qwen4_qsa_sparse_gqa_attention",
     "dsa_topk_indices",
@@ -374,6 +375,38 @@ def qwen4_qsa_indexer_scores(
             "exposes the Qwen4 QSA score kernel"
         )
     return _ext.qwen4_qsa_indexer_scores(
+        queries,
+        pooled_keys,
+        mask_ratio=mask_ratio,
+        mask_q_offset=mask_q_offset,
+        **_native_stream_kwargs(stream),
+    )
+
+
+def qwen4_qsa_indexer_scores_packed(
+    queries: mx.array,
+    pooled_keys: mx.array,
+    mask_ratio: int = 4,
+    mask_q_offset: int = 0,
+    *,
+    stream=None,
+) -> mx.array:
+    """Exact packed-head Qwen4 QSA scores for decode and MTP verify.
+
+    ``queries`` is the natural contiguous ``[1, M, 4, 128]`` view with
+    ``1 <= M <= 9``.  The native kernel treats its adjacent query/head rows as
+    one ``[4*M, 128]`` Steel GEMM, then performs the same ordered FP32
+    ReLU/head reduction as :func:`qwen4_qsa_indexer_scores`.  The additive ABI
+    lets callers fail closed to the established H-major kernel when paired
+    with an older extension.
+    """
+
+    if _ext is None or not hasattr(_ext, "qwen4_qsa_indexer_scores_packed"):
+        raise RuntimeError(
+            "qwen4_qsa_indexer_scores_packed requires a rebuilt local "
+            "extension"
+        )
+    return _ext.qwen4_qsa_indexer_scores_packed(
         queries,
         pooled_keys,
         mask_ratio=mask_ratio,

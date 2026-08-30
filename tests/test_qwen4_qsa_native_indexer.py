@@ -22,6 +22,12 @@ def _native_available() -> bool:
     )
 
 
+def _packed_native_available() -> bool:
+    return fast.is_native_available() and fast.has_symbol(
+        "qwen4_qsa_indexer_scores_packed"
+    )
+
+
 def _reference_scores(q, k, *, mask_ratio=4, mask_q_offset=2048):
     # Native q is [B,H,M,D]; the portable QSA expression uses [B,M,H,D].
     q_bmhd = q.transpose(0, 2, 1, 3)
@@ -40,22 +46,35 @@ def _topk_sets(scores, topk):
 
 def test_qwen4_qsa_symbol_is_part_of_the_extension_abi():
     assert "qwen4_qsa_indexer_scores" in fast.NATIVE_SYMBOLS
+    assert "qwen4_qsa_indexer_scores_packed" in fast.NATIVE_SYMBOLS
 
 
 def test_qwen4_qsa_production_geometry_routes_to_native_abi(monkeypatch):
     q = mx.zeros((1, 7, 4, 128), dtype=mx.bfloat16)
     k = mx.zeros((1, 19, 128), dtype=mx.bfloat16)
     seen = []
+    reference_seen = []
 
-    def scores(queries, pooled_keys, **kwargs):
+    def packed_scores(queries, pooled_keys, **kwargs):
         seen.append((queries.shape, pooled_keys.shape, kwargs))
+        return mx.zeros((1, 7, 19), dtype=mx.float32)
+
+    def established_scores(queries, pooled_keys, **kwargs):
+        reference_seen.append((queries.shape, pooled_keys.shape, kwargs))
         return mx.zeros((1, 7, 19), dtype=mx.float32)
 
     monkeypatch.setattr(fast, "is_native_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
-    monkeypatch.setattr(fast, "qwen4_qsa_indexer_scores", scores)
+    monkeypatch.setattr(
+        fast,
+        "qwen4_qsa_indexer_scores_packed",
+        packed_scores,
+    )
+    monkeypatch.setattr(fast, "qwen4_qsa_indexer_scores", established_scores)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_SCORE_DISABLED", False)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_SCORE_PROVEN", False)
+    monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_PACKED_SCORE_DISABLED", False)
+    monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_PACKED_SCORE_PROVEN", False)
 
     actual = qsa_fast._native_indexer_scores(
         q,
@@ -67,38 +86,183 @@ def test_qwen4_qsa_production_geometry_routes_to_native_abi(monkeypatch):
     assert actual is not None
     assert seen == [
         (
+            (1, 7, 4, 128),
+            (1, 1, 19, 128),
+            {"mask_ratio": 4, "mask_q_offset": 4096},
+        )
+    ]
+    assert reference_seen == [
+        (
             (1, 4, 7, 128),
             (1, 1, 19, 128),
             {"mask_ratio": 4, "mask_q_offset": 4096},
         )
     ]
-    assert qsa_fast._NATIVE_QSA_SCORE_PROVEN is True
+    assert qsa_fast._NATIVE_QSA_PACKED_SCORE_PROVEN is True
+    assert qsa_fast._NATIVE_QSA_SCORE_PROVEN is False
 
 
-def test_qwen4_native_dispatch_rejection_latches_to_portable(monkeypatch):
-    q = mx.zeros((1, 3, 4, 128), dtype=mx.bfloat16)
+def test_qwen4_packed_raw_score_mismatch_fails_closed(monkeypatch):
+    q = mx.zeros((1, 1, 4, 128), dtype=mx.bfloat16)
     k = mx.zeros((1, 16, 128), dtype=mx.bfloat16)
-    calls = 0
+    packed_calls = 0
+    established_calls = 0
 
-    def reject(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        raise RuntimeError("stale native extension")
+    def packed_scores(*args, **kwargs):
+        nonlocal packed_calls
+        packed_calls += 1
+        return mx.ones((1, 1, 16), dtype=mx.float32)
+
+    def established_scores(*args, **kwargs):
+        nonlocal established_calls
+        established_calls += 1
+        return mx.zeros((1, 1, 16), dtype=mx.float32)
 
     monkeypatch.setattr(fast, "is_native_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
-    monkeypatch.setattr(fast, "qwen4_qsa_indexer_scores", reject)
+    monkeypatch.setattr(
+        fast,
+        "qwen4_qsa_indexer_scores_packed",
+        packed_scores,
+    )
+    monkeypatch.setattr(fast, "qwen4_qsa_indexer_scores", established_scores)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_SCORE_DISABLED", False)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_SCORE_PROVEN", False)
+    monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_PACKED_SCORE_DISABLED", False)
+    monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_PACKED_SCORE_PROVEN", False)
 
     kwargs = dict(
         head_dim=128,
         compress_ratio=4,
         mask_q_offset=2048,
     )
-    assert qsa_fast._native_indexer_scores(q, k, **kwargs) is None
-    assert qsa_fast._native_indexer_scores(q, k, **kwargs) is None
-    assert calls == 1
+    first = qsa_fast._native_indexer_scores(q, k, **kwargs)
+    second = qsa_fast._native_indexer_scores(q, k, **kwargs)
+    mx.eval(first, second)
+
+    assert mx.array_equal(first, mx.zeros_like(first)).item()
+    assert mx.array_equal(second, mx.zeros_like(second)).item()
+    assert packed_calls == 1
+    assert established_calls == 2
+    assert qsa_fast._NATIVE_QSA_PACKED_SCORE_DISABLED is True
+    assert qsa_fast._NATIVE_QSA_PACKED_SCORE_PROVEN is False
+
+
+def test_qwen4_packed_score_miss_falls_back_to_established_abi(monkeypatch):
+    q = mx.zeros((1, 3, 4, 128), dtype=mx.bfloat16)
+    k = mx.zeros((1, 16, 128), dtype=mx.bfloat16)
+    seen = []
+
+    def established_scores(queries, pooled_keys, **kwargs):
+        seen.append((queries.shape, pooled_keys.shape, kwargs))
+        return mx.zeros((1, 3, 16), dtype=mx.float32)
+
+    monkeypatch.setattr(fast, "is_native_available", lambda: True)
+    monkeypatch.setattr(
+        fast,
+        "has_symbol",
+        lambda name: name != "qwen4_qsa_indexer_scores_packed",
+    )
+    monkeypatch.setattr(fast, "qwen4_qsa_indexer_scores", established_scores)
+    monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_SCORE_DISABLED", False)
+    monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_SCORE_PROVEN", False)
+    monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_PACKED_SCORE_DISABLED", False)
+    monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_PACKED_SCORE_PROVEN", False)
+
+    actual = qsa_fast._native_indexer_scores(
+        q,
+        k,
+        head_dim=128,
+        compress_ratio=4,
+        mask_q_offset=2048,
+    )
+    assert actual is not None
+    assert seen == [
+        (
+            (1, 4, 3, 128),
+            (1, 1, 16, 128),
+            {"mask_ratio": 4, "mask_q_offset": 2048},
+        )
+    ]
+    assert qsa_fast._NATIVE_QSA_PACKED_SCORE_DISABLED is True
+    assert qsa_fast._NATIVE_QSA_SCORE_PROVEN is True
+
+
+def test_qwen4_large_score_chunk_retains_established_abi(monkeypatch):
+    q = mx.zeros((1, 10, 4, 128), dtype=mx.bfloat16)
+    k = mx.zeros((1, 16, 128), dtype=mx.bfloat16)
+    seen = []
+
+    def packed_scores(*args, **kwargs):
+        raise AssertionError("large prompt chunks must not enter packed scoring")
+
+    def established_scores(queries, pooled_keys, **kwargs):
+        seen.append((queries.shape, pooled_keys.shape, kwargs))
+        return mx.zeros((1, 10, 16), dtype=mx.float32)
+
+    monkeypatch.setattr(fast, "is_native_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(
+        fast,
+        "qwen4_qsa_indexer_scores_packed",
+        packed_scores,
+    )
+    monkeypatch.setattr(fast, "qwen4_qsa_indexer_scores", established_scores)
+    monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_SCORE_DISABLED", False)
+    monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_SCORE_PROVEN", False)
+    monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_PACKED_SCORE_DISABLED", False)
+    monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_PACKED_SCORE_PROVEN", False)
+
+    actual = qsa_fast._native_indexer_scores(
+        q,
+        k,
+        head_dim=128,
+        compress_ratio=4,
+        mask_q_offset=2048,
+    )
+    assert actual is not None
+    assert seen[0][0] == (1, 4, 10, 128)
+    assert qsa_fast._NATIVE_QSA_PACKED_SCORE_PROVEN is False
+
+
+def test_qwen4_packed_dispatch_rejection_latches_to_established(monkeypatch):
+    q = mx.zeros((1, 3, 4, 128), dtype=mx.bfloat16)
+    k = mx.zeros((1, 16, 128), dtype=mx.bfloat16)
+    packed_calls = 0
+    established_calls = 0
+
+    def reject_packed(*args, **kwargs):
+        nonlocal packed_calls
+        packed_calls += 1
+        raise RuntimeError("stale native extension")
+
+    def established_scores(*args, **kwargs):
+        nonlocal established_calls
+        established_calls += 1
+        return mx.zeros((1, 3, 16), dtype=mx.float32)
+
+    monkeypatch.setattr(fast, "is_native_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(
+        fast,
+        "qwen4_qsa_indexer_scores_packed",
+        reject_packed,
+    )
+    monkeypatch.setattr(fast, "qwen4_qsa_indexer_scores", established_scores)
+    monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_SCORE_DISABLED", False)
+    monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_SCORE_PROVEN", False)
+    monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_PACKED_SCORE_DISABLED", False)
+    monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_PACKED_SCORE_PROVEN", False)
+
+    kwargs = dict(
+        head_dim=128,
+        compress_ratio=4,
+        mask_q_offset=2048,
+    )
+    assert qsa_fast._native_indexer_scores(q, k, **kwargs) is not None
+    assert qsa_fast._native_indexer_scores(q, k, **kwargs) is not None
+    assert packed_calls == 1
+    assert established_calls == 2
 
 
 def test_gathered_qsa_native_score_hook_matches_portable_path(monkeypatch):
@@ -155,6 +319,131 @@ def test_gathered_qsa_native_score_hook_matches_portable_path(monkeypatch):
 
     assert seen_offsets == [0, 7, 14]
     assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("rows", [1, 2, 6, 8, 9])
+@pytest.mark.skipif(
+    not (_native_available() and _packed_native_available()),
+    reason="packed-head Qwen4 QSA score ABI is unavailable",
+)
+def test_qwen4_qsa_packed_scores_are_raw_array_equal(dtype, rows):
+    """Packing changes scheduling only; every FP32 score bit must match."""
+
+    mx.random.seed(2600 + rows)
+    q_bmhd = (mx.random.normal((1, rows, 4, 128)) * 0.25).astype(dtype)
+    q_bhmd = mx.contiguous(q_bmhd.transpose(0, 2, 1, 3))
+    k = (mx.random.normal((1, 1, 521, 128)) * 0.25).astype(dtype)
+    mask_q_offset = 2048
+
+    packed = fast.qwen4_qsa_indexer_scores_packed(
+        q_bmhd,
+        k,
+        mask_ratio=4,
+        mask_q_offset=mask_q_offset,
+    )
+    established = fast.qwen4_qsa_indexer_scores(
+        q_bhmd,
+        k,
+        mask_ratio=4,
+        mask_q_offset=mask_q_offset,
+    )
+    reference = _reference_scores(
+        q_bhmd,
+        k,
+        mask_ratio=4,
+        mask_q_offset=mask_q_offset,
+    )
+    mx.eval(packed, established, reference)
+
+    assert packed.shape == established.shape == reference.shape
+    assert packed.dtype == established.dtype == reference.dtype == mx.float32
+    assert mx.array_equal(
+        packed.view(mx.uint32), established.view(mx.uint32)
+    ).item()
+    assert mx.array_equal(
+        packed.view(mx.uint32), reference.view(mx.uint32)
+    ).item()
+    assert mx.array_equal(
+        _topk_sets(packed, 512),
+        _topk_sets(reference, 512),
+    ).item()
+
+
+@pytest.mark.skipif(
+    not (_native_available() and _packed_native_available()),
+    reason="packed-head Qwen4 QSA score ABI is unavailable",
+)
+def test_qwen4_qsa_packed_scores_keep_exact_causal_sentinel():
+    q_bmhd = mx.ones((1, 5, 4, 128), dtype=mx.bfloat16)
+    q_bhmd = mx.contiguous(q_bmhd.transpose(0, 2, 1, 3))
+    k = mx.ones((1, 1, 11, 128), dtype=mx.bfloat16)
+    offset = 8
+
+    packed = fast.qwen4_qsa_indexer_scores_packed(
+        q_bmhd,
+        k,
+        mask_ratio=4,
+        mask_q_offset=offset,
+    )
+    established = fast.qwen4_qsa_indexer_scores(
+        q_bhmd,
+        k,
+        mask_ratio=4,
+        mask_q_offset=offset,
+    )
+    mx.eval(packed, established)
+
+    assert mx.array_equal(
+        packed.view(mx.uint32), established.view(mx.uint32)
+    ).item()
+    valid = mx.arange(11)[None, None, :] < (
+        offset + mx.arange(5)[None, :, None] + 1
+    ) // 4
+    invalid = mx.where(valid, mx.finfo(mx.float32).min, packed)
+    assert mx.array_equal(
+        invalid,
+        mx.full(packed.shape, mx.finfo(mx.float32).min),
+    ).item()
+
+
+@pytest.mark.skipif(
+    not (_native_available() and _packed_native_available()),
+    reason="packed-head Qwen4 QSA score ABI is unavailable",
+)
+def test_qwen4_qsa_packed_zero_ties_keep_highest_block_indices():
+    q = mx.zeros((1, 1, 4, 128), dtype=mx.bfloat16)
+    k = mx.ones((1, 1, 521, 128), dtype=mx.bfloat16)
+    scores = fast.qwen4_qsa_indexer_scores_packed(
+        q,
+        k,
+        mask_ratio=4,
+        mask_q_offset=4096,
+    )
+    selected = mx.sort(
+        fast.qwen4_qsa_topk_indices(scores, topk=512).astype(mx.int32),
+        axis=-1,
+    )
+    expected = mx.arange(9, 521, dtype=mx.int32)[None, None]
+    mx.eval(scores, selected, expected)
+
+    assert mx.array_equal(
+        scores.view(mx.uint32), mx.zeros_like(scores).view(mx.uint32)
+    ).item()
+    assert mx.array_equal(selected, expected).item()
+
+
+@pytest.mark.skipif(
+    not _packed_native_available(),
+    reason="packed-head Qwen4 QSA score ABI is unavailable",
+)
+def test_qwen4_qsa_packed_abi_rejects_out_of_domain_width():
+    with pytest.raises(ValueError, match="M<=9"):
+        fast.qwen4_qsa_indexer_scores_packed(
+            mx.zeros((1, 10, 4, 128), dtype=mx.bfloat16),
+            mx.zeros((1, 1, 16, 128), dtype=mx.bfloat16),
+            mask_q_offset=64,
+        )
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
