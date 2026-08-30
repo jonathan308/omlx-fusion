@@ -94,6 +94,12 @@ instantiate_kernel(
     512,
     256,
     true);
+instantiate_kernel(
+    "qwen4_qsa_fp32_topk_indices_topk512_t1024",
+    dspark_fp32_topk_indices,
+    512,
+    1024,
+    true);
 
 // ── DC-1: fused decode indexer scan ──────────────────────────────────────────
 // One thread per key position: score(key) = sum_h w_h * relu(q_h · k_key), fp32

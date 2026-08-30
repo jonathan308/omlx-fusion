@@ -31,16 +31,20 @@ def test_qwen4_qsa_topk_symbol_is_part_of_the_extension_abi():
     not _native_available(),
     reason="native Qwen4 QSA top-k ABI is unavailable",
 )
+@pytest.mark.parametrize("rows", [4, 9, 16])
 @pytest.mark.parametrize("blocks", [12_500, 25_000])
-def test_qwen4_qsa_topk_matches_argpartition_at_50k_100k_equivalent(blocks):
+def test_qwen4_qsa_topk_matches_argpartition_at_50k_100k_equivalent(
+    blocks,
+    rows,
+):
     """50K/100K tokens at Qwen4's four-token compression ratio."""
     rng = np.random.default_rng(41 + blocks)
-    scores = rng.standard_normal((1, 4, blocks), dtype=np.float32)
+    scores = rng.standard_normal((1, rows, blocks), dtype=np.float32)
     actual = fast.qwen4_qsa_topk_indices(mx.array(scores))
     expected = _reference_indices(mx.array(scores))
     mx.eval(actual, expected)
 
-    assert actual.shape == (1, 4, TOPK)
+    assert actual.shape == (1, rows, TOPK)
     assert actual.dtype == mx.uint32
     assert mx.array_equal(_sorted_sets(actual), _sorted_sets(expected)).item()
 
