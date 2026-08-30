@@ -465,10 +465,17 @@ def test_sanitize_and_oq_keep_sensitive_parameters_in_fp32():
             (2,), dtype=mx.bfloat16
         ),
         "model.language_model.layers.0.hc_attn_alpha": mx.ones((2,), dtype=mx.bfloat16),
+        "model.language_model.layers.0.self_attn.f_a_proj.scales": mx.ones(
+            (2, 2), dtype=mx.bfloat16
+        ),
+        "model.language_model.layers.0.self_attn.f_a_proj.biases": mx.zeros(
+            (2, 2), dtype=mx.bfloat16
+        ),
         "model.language_model.mtp.fc.weight": mx.ones((2, 2)),
         "model.language_model.layers.1.self_attn.kv_b_proj.weight": mx.ones(
             (32, 8), dtype=mx.bfloat16
         ),
+        "vision_tower.post_layernorm.weight": mx.ones((2,), dtype=mx.bfloat16),
     }
     sanitized = sanitizer(weights)
 
@@ -476,6 +483,15 @@ def test_sanitize_and_oq_keep_sensitive_parameters_in_fp32():
     hc = "language_model.model.layers.0.attn_hc.alpha"
     assert sanitized[a_log].dtype == mx.float32
     assert sanitized[hc].dtype == mx.float32
+    assert (
+        "language_model.model.layers.0.self_attn.forget_gate.f_a_proj.scales"
+        in sanitized
+    )
+    assert (
+        "language_model.model.layers.0.self_attn.forget_gate.f_a_proj.biases"
+        in sanitized
+    )
+    assert "vision_model.post_layernorm.weight" in sanitized
     assert sanitized[
         "language_model.model.layers.1.self_attn.embed_q.weight"
     ].shape == (2, 8, 8)

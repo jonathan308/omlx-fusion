@@ -946,7 +946,6 @@ class LanguageModel(nn.Module):
 
         remapped = {}
         conv_parts = {}
-        fg_parts = ("A_log", "dt_bias", "f_a_proj.weight", "f_b_proj.weight")
         for k, v in weights.items():
             nk = k.replace(".hc_attn_", ".attn_hc.").replace(".hc_ffn_", ".ffn_hc.")
 
@@ -961,10 +960,19 @@ class LanguageModel(nn.Module):
             if fused:
                 continue
 
-            for p in fg_parts:
-                suffix = ".self_attn." + p
+            for projection in ("f_a_proj", "f_b_proj"):
+                marker = f".self_attn.{projection}."
+                if marker in nk:
+                    nk = nk.replace(
+                        marker,
+                        f".self_attn.forget_gate.{projection}.",
+                        1,
+                    )
+                    break
+            for state_name in ("A_log", "dt_bias"):
+                suffix = ".self_attn." + state_name
                 if nk.endswith(suffix):
-                    nk = nk[: -len(p)] + "forget_gate." + p
+                    nk = nk[: -len(state_name)] + "forget_gate." + state_name
                     break
 
             remapped[nk] = v
