@@ -161,7 +161,7 @@ def test_qwen4_exact_verify_fused_width_allowlist(bits):
     module = _production_module(bits)
     streams = {
         width: mx.random.normal((1, width, 10240)).astype(mx.bfloat16)
-        for width in (*range(2, 7), 7, 64)
+        for width in (*range(2, 9), 9, 64)
     }
     canonical = {
         width: module._forward(stream, target_verify=True)
@@ -170,7 +170,7 @@ def test_qwen4_exact_verify_fused_width_allowlist(bits):
     mx.eval(*[value for output in canonical.values() for value in output])
     assert language.fuse_hyper_connection_projections(module) == 1
 
-    for width in range(2, 7):
+    for width in range(2, 9):
         actual = module._forward(streams[width], target_verify=True)
         mx.eval(*actual)
         assert all(
@@ -185,7 +185,7 @@ def test_qwen4_exact_verify_fused_width_allowlist(bits):
             raise AssertionError("unqualified width entered fused HC copy")
 
     module._omlx_exact_verify_fused_projection = Bomb()
-    for width in (7, 64):
+    for width in (9, 64):
         actual = module._forward(streams[width], target_verify=True)
         mx.eval(*actual)
         assert all(
@@ -208,7 +208,7 @@ def test_qwen4_mtp_trunk_and_head_hc_parity(bits, monkeypatch):
         module = _production_module(bits)
         rows = {
             width: mx.random.normal((1, width, 10240)).astype(mx.bfloat16)
-            for width in range(1, 7)
+            for width in range(1, 9)
         }
         outputs = {
             width: module._forward(value, target_verify=target_verify)

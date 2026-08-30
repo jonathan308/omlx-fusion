@@ -40,7 +40,7 @@ from .qsa_fast import (
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
 _HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
-_HC_FUSED_VERIFY_WIDTHS = frozenset({2, 3, 4, 5, 6})
+_HC_FUSED_VERIFY_WIDTHS = frozenset({2, 3, 4, 5, 6, 7, 8})
 _QSA_DIRECT_VERIFY_MIN_TOKENS = 65_536
 _DECODE_PROFILE_LOCAL = threading.local()
 _DECODE_PROFILE_LOCK = threading.Lock()
@@ -2048,7 +2048,7 @@ def fuse_hyper_connection_projections(model: nn.Module) -> int:
 
     The raw 320-row low-rank and four-row injection banks remain authoritative.
     Scalar decode uses their exact hybrid kernel. A separate concatenated copy
-    is retained only for raw-array-qualified sequence widths 2..6; all other
+    is retained only for raw-array-qualified sequence widths 2..8; all other
     widths, including long prefill, execute the canonical split banks.
     """
     targets = [
