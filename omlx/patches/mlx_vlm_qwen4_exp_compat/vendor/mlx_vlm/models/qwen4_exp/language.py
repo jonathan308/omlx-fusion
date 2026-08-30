@@ -380,6 +380,7 @@ class _QSAIndexerCache:
         self._index_position_ids = None
         self._index_offset = 0
         self._index_capacity_managed = True
+        self._omlx_text_position_ids_qualified = False
         self._invalidate_pooled_indexer()
 
     @property
@@ -419,6 +420,7 @@ class _QSAIndexerCache:
         self._index_position_ids = position_ids
         self._index_offset = 0 if keys is None else int(keys.shape[1])
         self._index_capacity_managed = False
+        self._omlx_text_position_ids_qualified = False
         self._invalidate_pooled_indexer()
 
     @staticmethod
@@ -474,6 +476,11 @@ class _QSAIndexerCache:
         length = int(keys.shape[1])
         if position_ids.shape[-1] != length:
             raise ValueError("QSA index update keys and positions are misaligned")
+        # A general 3-D update may carry genuine image/video MRoPE.  Revoke a
+        # prior text qualification; the target-verify route deliberately
+        # collapses its already-qualified equal planes to 2-D before append.
+        if position_ids.ndim == 3:
+            self._omlx_text_position_ids_qualified = False
 
         if self._index_position_ids is not None:
             if self._index_position_ids.ndim == 3 and position_ids.ndim == 2:
@@ -738,6 +745,51 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
     @property
     def nbytes(self):
         return super().nbytes + self.indexer_nbytes
+
+
+def _qualified_text_verify_position_ids(
+    position_ids: Optional[mx.array],
+    cache: Optional[Any],
+) -> Optional[mx.array]:
+    """Collapse equal 3-plane text MRoPE only after exact history proof.
+
+    mlx-vlm can carry ordinary text positions in the VLM-shaped
+    ``[3, 1, L]`` container.  Qwen4's direct verify path is text-only, so a
+    rank check alone rejects that valid case.  Qualify the current positions
+    and the complete cached QSA position history once; genuine multimodal
+    planes remain divergent and fail closed.  The cache marker survives normal
+    verify appends and is revoked by any later general 3-D index update.
+    """
+
+    if not (
+        isinstance(position_ids, mx.array)
+        and position_ids.ndim == 3
+        and position_ids.shape[0] == 3
+        and position_ids.shape[1] == 1
+        and type(cache) is QSAKVCache
+    ):
+        return position_ids
+    if getattr(cache, "_omlx_text_position_ids_qualified", False):
+        return position_ids[0]
+
+    cached = cache.index_position_ids
+    if cached is None:
+        return position_ids
+    current_equal = mx.all(position_ids[0] == position_ids[1]) & mx.all(
+        position_ids[0] == position_ids[2]
+    )
+    if cached.ndim == 2:
+        history_equal = mx.array(True)
+    elif cached.ndim == 3 and cached.shape[0] == 3 and cached.shape[1] == 1:
+        history_equal = mx.all(cached[0] == cached[1]) & mx.all(
+            cached[0] == cached[2]
+        )
+    else:
+        return position_ids
+    if not bool((current_equal & history_equal).item()):
+        return position_ids
+    cache._omlx_text_position_ids_qualified = True
+    return position_ids[0]
 
 
 class BatchQSAKVCache:
@@ -2912,6 +2964,12 @@ class Qwen4ExpModel(nn.Module):
             hidden_states = _profile_stage(profile, "embed+mask", embed_and_tile)
         if cache is None:
             cache = [None] * len(self.layers)
+
+        if gdn_sink is not None and cache:
+            position_ids = _qualified_text_verify_position_ids(
+                position_ids,
+                cache[self.fa_idx],
+            )
 
         if profile is None:
             fa_mask = _create_qwen3_5_attention_mask(
