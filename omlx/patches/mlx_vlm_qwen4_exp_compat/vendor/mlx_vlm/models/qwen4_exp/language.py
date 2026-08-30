@@ -575,7 +575,23 @@ class _QSAIndexerCache:
 
     def _trim_indexer(self, length: int):
         self._index_offset = min(self._index_offset, max(0, int(length)))
-        self._invalidate_pooled_indexer()
+        # Speculative rollback changes only a suffix of the raw index state.
+        # Completed blocks strictly before the new logical end are immutable,
+        # so retain their normalized/RoPE-rotated rows.  Rewind to the last
+        # complete block: a partially retained block may contain rejected
+        # verify tokens and must be recomputed on the next append.
+        if (
+            self._pooled_index_keys is None
+            or self._pooled_index_ratio is None
+            or self._pooled_index_ratio <= 0
+        ):
+            self._invalidate_pooled_indexer()
+            return
+        complete_blocks = self._index_offset // self._pooled_index_ratio
+        self._pooled_index_offset = min(
+            self._pooled_index_offset,
+            complete_blocks,
+        )
 
     @property
     def indexer_nbytes(self):

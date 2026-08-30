@@ -169,7 +169,7 @@ def test_gathered_qsa_one_shot_and_incremental_appends_are_exact(chunks, monkeyp
     assert mx.array_equal(actual, expected).item()
 
 
-def test_qsa_ephemeral_pool_rebuilds_after_restore_extract_and_trim():
+def test_qsa_ephemeral_pool_rebuilds_after_restore_extract_and_rewinds_trim():
     cache = language.QSAKVCache()
     raw = mx.sin(mx.arange(13 * 8, dtype=mx.float32)).reshape(1, 13, 8)
     _append(cache, raw, 0, 13)
@@ -197,11 +197,19 @@ def test_qsa_ephemeral_pool_rebuilds_after_restore_extract_and_trim():
     assert mx.array_equal(extracted_pool, pooled).item()
 
     assert cache.trim(3) == 3
-    assert cache._pooled_index_keys is None
+    pooled_backing = cache._pooled_index_keys
+    assert pooled_backing is not None
+    assert cache._pooled_index_offset == 2
     replacement = mx.cos(mx.arange(3 * 8, dtype=mx.float32)).reshape(1, 3, 8)
     _append(cache, mx.concatenate([raw[:, :10], replacement], axis=1), 10, 13)
+    block_calls = []
+
+    def tracked_norm(x):
+        block_calls.append(int(x.shape[1]))
+        return x
+
     rebuilt = cache.pooled_indexer_keys(
-        4, lambda x: x, _identity_rope, cache_tag=cache
+        4, tracked_norm, _identity_rope, cache_tag=cache
     )
     expected = qsa_fast.pool_completed_index_keys(
         cache.index_keys,
@@ -211,6 +219,8 @@ def test_qsa_ephemeral_pool_rebuilds_after_restore_extract_and_trim():
         apply_index_rope=_identity_rope,
     )
     mx.eval(rebuilt, expected)
+    assert cache._pooled_index_keys is pooled_backing
+    assert block_calls == [1]
     assert mx.array_equal(rebuilt, expected).item()
 
 
