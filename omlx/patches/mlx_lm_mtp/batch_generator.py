@@ -169,7 +169,7 @@ def _record_mtp_runtime_stats(stats: "_MtpStats", finish_reason: str) -> None:
         _MTP_RUNTIME_TOTALS["last_finish_reason"] = str(finish_reason)[:64]
 
 
-def _set_verify_qmm_armed(flag: bool, *, exact: bool = False) -> None:
+def _set_verify_qmm_armed(flag: bool) -> None:
     """Arm the verify-shape qmm routing for the duration of an MTP forward.
 
     Import is deferred and failure-tolerant: the kernel module is optional
@@ -178,7 +178,7 @@ def _set_verify_qmm_armed(flag: bool, *, exact: bool = False) -> None:
     try:
         from ..qwen35_verify_qmm import set_verify_qmm_armed
 
-        set_verify_qmm_armed(flag, exact=exact)
+        set_verify_qmm_armed(flag)
     except Exception:
         pass
 
@@ -705,9 +705,6 @@ _FIXED_DEPTH_ENV = "OMLX_MTP_FIXED_DEPTH"
 _LOCKSTEP_DEPTH_ENV = "OMLX_MTP_DISTRIBUTED_LOCKSTEP_DEPTH"
 _QWEN4_ACCEPTANCE_DEPTH_ENV = "OMLX_QWEN4_ACCEPTANCE_LOCKSTEP_DEPTH"
 _QWEN4_EVIDENCE_DEPTH_ENV = "OMLX_QWEN4_EVIDENCE_DEPTH"
-_QWEN4_VERIFY_PARITY_PATH_ENV = "OMLX_QWEN4_VERIFY_PARITY_PATH"
-_QWEN4_VERIFY_PARITY_CYCLES_ENV = "OMLX_QWEN4_VERIFY_PARITY_CYCLES"
-_QWEN4_VERIFY_PARITY_PREFILL_STEP_ENV = "OMLX_QWEN4_VERIFY_PARITY_PREFILL_STEP"
 
 
 def _fixed_depth_override(max_depth: int) -> Optional[int]:
@@ -2444,19 +2441,7 @@ def _call_backbone(
     _rollback_mod.set_undo_armed(True)
     # The affine verify qmm kernel is a Qwen-specific optimization. Keep the
     # DeepSeek target on its architecture-native quantized linear path.
-    verify_qmm_armed = not dspark_verify
-    _set_verify_qmm_armed(
-        verify_qmm_armed,
-        # Qwen4's lossless gate requires the canonical stock projection
-        # reduction.  The alternate verify-QMM kernel explicitly permits
-        # BF16 tail-ULP drift, which can flip a low-margin greedy token even
-        # though target verification itself succeeded.
-        exact=bool(
-            verify_qmm_armed
-            and n_confirmed
-            and _is_qwen4_exp_model(model)
-        ),
-    )
+    _set_verify_qmm_armed(not dspark_verify)
     _set_dspark_target_verify(model, dspark_verify)
     try:
         result = model(inputs, **kwargs)
@@ -4433,115 +4418,6 @@ def _materialize_distributed_hidden_sibling(
     return distributed
 
 
-def _positive_env_int(name: str, default: int) -> int:
-    try:
-        return max(1, int(os.environ.get(name, str(default))))
-    except (TypeError, ValueError):
-        return default
-
-
-def _maybe_probe_qwen4_verify_parity(
-    gen_batch: Any,
-    state: "_MtpState",
-    inputs: Any,
-) -> bool:
-    """Replay an observed Qwen4 verify window against scalar target decode.
-
-    The gate is deliberately an explicit file path rather than a boolean.  An
-    unset environment performs no import, token copy, host synchronization, or
-    filesystem access.  The diagnostic replays against fresh caches and never
-    mutates the active target/MTP transaction.  It is expensive real-model
-    work and is intended only for a coordinated offline maintenance run.
-
-    Returns ``True`` when a probe was attempted so the caller can exclude its
-    wall time from adaptive-controller economics.
-    """
-
-    output_path = os.environ.get(_QWEN4_VERIFY_PARITY_PATH_ENV, "").strip()
-    if not output_path:
-        return False
-    if (
-        not _is_qwen4_exp_model(getattr(gen_batch, "model", None))
-        or getattr(gen_batch, "_omlx_rowwise_mtp", False)
-        or len(getattr(gen_batch, "uids", ()) or ()) != 1
-    ):
-        return False
-
-    cycle_index = int(getattr(state.stats, "cycles", 0))
-    if cycle_index >= _positive_env_int(_QWEN4_VERIFY_PARITY_CYCLES_ENV, 1):
-        return False
-
-    streamed = list(getattr(gen_batch, "tokens", [[]])[0])
-    try:
-        verify_tokens = [int(token) for token in inputs.reshape(-1).tolist()]
-        if len(streamed) < 2 or not verify_tokens:
-            raise ValueError("active token timeline is too short for a verify probe")
-        if streamed[-1] != verify_tokens[0]:
-            raise ValueError(
-                "active pipeline tail does not match the first verify input "
-                f"({streamed[-1]} != {verify_tokens[0]})"
-            )
-        committed_prefix = streamed[:-1]
-        active_offset = _qwen4_target_offset(gen_batch.prompt_cache)
-        if active_offset != len(committed_prefix):
-            raise ValueError(
-                "active target cache does not represent the committed probe prefix "
-                f"({active_offset} != {len(committed_prefix)})"
-            )
-
-        from ..mlx_vlm_qwen4_exp_compat.verify_parity import (
-            append_report,
-            compare_qwen4_verify_window,
-        )
-
-        report = compare_qwen4_verify_window(
-            gen_batch.model,
-            committed_prefix_tokens=committed_prefix,
-            verify_tokens=verify_tokens,
-            prefill_step=_positive_env_int(
-                _QWEN4_VERIFY_PARITY_PREFILL_STEP_ENV,
-                4096,
-            ),
-        )
-        report.update(
-            {
-                "uid": str(gen_batch.uids[0]),
-                "cycle": cycle_index,
-                "active_target_offset": active_offset,
-                "active_streamed_tokens": len(streamed),
-            }
-        )
-        append_report(output_path, report)
-        logger.warning(
-            "Qwen4 verify parity probe cycle=%d width=%d argmax=%s "
-            "first_token_row=%s first_hidden_layer=%s cache_bitwise=%s",
-            cycle_index,
-            len(verify_tokens),
-            report["argmax_parity"],
-            report["first_token_mismatch_row"],
-            report["first_hidden_mismatch_layer"],
-            report["cache_bitwise_equal"],
-        )
-    except Exception as exc:
-        logger.exception("Qwen4 verify parity probe failed: %s", exc)
-        try:
-            from ..mlx_vlm_qwen4_exp_compat.verify_parity import append_report
-
-            append_report(
-                output_path,
-                {
-                    "schema_version": 1,
-                    "created_unix": time.time(),
-                    "uid": str((getattr(gen_batch, "uids", ()) or ("?",))[0]),
-                    "cycle": cycle_index,
-                    "error": f"{type(exc).__name__}: {exc}",
-                },
-            )
-        except Exception:
-            logger.debug("Qwen4 verify parity error report failed", exc_info=True)
-    return True
-
-
 # ---------------------------------------------------------------------------
 # Post-init: run one extra backbone forward + MTP forward; queue the two
 # emitted tokens; stash a draft for the first verify cycle.
@@ -5400,11 +5276,6 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
             )
 
     inputs = mx.concatenate([state.next_main, state.drafts])  # (k+1,)
-    if _maybe_probe_qwen4_verify_parity(gen_batch, state, inputs):
-        # Diagnostic replay is not part of target-cycle economics.  Excluding
-        # it prevents an explicitly requested trace from poisoning the
-        # adaptive depth controller's cost evidence.
-        cycle_t0 = time.perf_counter()
 
     # Token buffer per input position (mirrors PR 990 _step_backbone). Row j's
     # processor prefix is everything before that input position.
