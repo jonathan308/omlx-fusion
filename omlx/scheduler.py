@@ -11829,6 +11829,13 @@ class Scheduler:
                             )
                         elif isinstance(detached, (list, tuple)):
                             resident_cache = detached
+                            if resident_tokens is None:
+                                uids = list(
+                                    getattr(self.batch_generator, "uids", ())
+                                )
+                                tokens = getattr(self.batch_generator, "tokens", None)
+                                if response.uid in uids and tokens is not None:
+                                    resident_tokens = tokens[uids.index(response.uid)]
                     except (TypeError, AttributeError, KeyError, ValueError):
                         # GenerationBatch exposes the older integer-index
                         # extraction API, while mlx-lm BatchGenerator accepts
