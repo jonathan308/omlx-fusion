@@ -105,6 +105,32 @@ def _cache_leaves(caches: Sequence[Any]) -> list[tuple[str, Any]]:
     return leaves
 
 
+def _active_qsa_position_ids(
+    caches: Sequence[Any] | None,
+    expected_length: int,
+) -> Any | None:
+    """Return one exact stored QSA position history from a live cache clone."""
+
+    import mlx.core as mx
+
+    pending = list(caches or ())
+    while pending:
+        cache = pending.pop(0)
+        pending[0:0] = list(getattr(cache, "caches", ()) or ())
+        positions = getattr(cache, "index_position_ids", None)
+        if positions is None:
+            continue
+        if positions.shape[-1] != expected_length:
+            raise ValueError(
+                "active QSA position history does not match committed prefix "
+                f"({positions.shape[-1]} != {expected_length})"
+            )
+        detached = positions + mx.zeros((), dtype=positions.dtype)
+        mx.eval(detached)
+        return detached
+    return None
+
+
 def snapshot_cache_leaves(caches: Sequence[Any]) -> list[tuple[str, Any]]:
     """Detach and materialize cache state under type-independent leaf names."""
 
@@ -263,6 +289,7 @@ def _prefill(
     *,
     step: int,
     scalar_tail: int,
+    position_ids: Any | None = None,
 ) -> None:
     """Build target state without projecting every prompt row through lm_head.
 
@@ -287,11 +314,15 @@ def _prefill(
     spans.extend((index, index + 1) for index in range(bulk_stop, len(values)))
     for start, stop in spans:
         chunk = mx.array([values[start:stop]], dtype=mx.int32)
-        positions = mx.arange(
-            start,
-            start + int(chunk.shape[1]),
-            dtype=mx.int32,
-        )[None]
+        positions = (
+            position_ids[..., start:stop]
+            if position_ids is not None
+            else mx.arange(
+                start,
+                start + int(chunk.shape[1]),
+                dtype=mx.int32,
+            )[None]
+        )
         with prompt_priming.suppress_capture():
             hidden = module(
                 chunk,
@@ -364,6 +395,10 @@ def prepare_qwen4_active_verify_probe(
         raise ValueError("Qwen4 parity probe prefill step must be positive")
 
     language_model = _resolve_language_model(model)
+    replay_position_ids = _active_qsa_position_ids(
+        active_prefix_cache,
+        len(prefix),
+    )
     batched_cache = language_model.make_cache()
     scalar_cache = language_model.make_cache()
     _prefill(
@@ -372,6 +407,7 @@ def prepare_qwen4_active_verify_probe(
         batched_cache,
         step=prefill_step,
         scalar_tail=prefill_scalar_tail,
+        position_ids=replay_position_ids,
     )
     _prefill(
         language_model,
@@ -379,6 +415,7 @@ def prepare_qwen4_active_verify_probe(
         scalar_cache,
         step=prefill_step,
         scalar_tail=prefill_scalar_tail,
+        position_ids=replay_position_ids,
     )
     fresh_prefix_leaves = snapshot_cache_leaves(scalar_cache)
     active_prefix_leaves = (
@@ -482,6 +519,14 @@ def prepare_qwen4_active_verify_probe(
         "prefill_step": int(prefill_step),
         "prefill_scalar_tail": int(prefill_scalar_tail),
         "prefix_token_ids_sha256": _token_sha256(prefix),
+        "replay_position_ids": (
+            None
+            if replay_position_ids is None
+            else {
+                "shape": list(replay_position_ids.shape),
+                "dtype": str(replay_position_ids.dtype),
+            }
+        ),
         "verify_token_ids": window,
         "verify_token_ids_sha256": _token_sha256(window),
         "verify_width": len(window),
