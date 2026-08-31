@@ -690,6 +690,7 @@ _ROWWISE_BATCH_MTP_ENV = "OMLX_MTP_ROWWISE_BATCH"
 
 _FIXED_DEPTH_ENV = "OMLX_MTP_FIXED_DEPTH"
 _LOCKSTEP_DEPTH_ENV = "OMLX_MTP_DISTRIBUTED_LOCKSTEP_DEPTH"
+_QWEN4_ACCEPTANCE_DEPTH_ENV = "OMLX_QWEN4_ACCEPTANCE_LOCKSTEP_DEPTH"
 _QWEN4_EVIDENCE_DEPTH_ENV = "OMLX_QWEN4_EVIDENCE_DEPTH"
 
 
@@ -723,6 +724,18 @@ def _qwen4_evidence_depth_enabled(model: Any) -> bool:
     """Opt in to the experimental evidence policy for Qwen4 only."""
 
     enabled = os.environ.get(_QWEN4_EVIDENCE_DEPTH_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    return enabled and _is_qwen4_exp_model(model)
+
+
+def _qwen4_acceptance_depth_enabled(model: Any) -> bool:
+    """Opt in to the zero-clock acceptance policy for Qwen4 only."""
+
+    enabled = os.environ.get(_QWEN4_ACCEPTANCE_DEPTH_ENV, "").strip().lower() in (
         "1",
         "true",
         "yes",
@@ -3965,7 +3978,7 @@ class _LockstepAcceptanceDepthController:
 
 
 def _new_depth_controller(model: Any, max_depth: int) -> Any:
-    if _lockstep_depth_enabled():
+    if _lockstep_depth_enabled() or _qwen4_acceptance_depth_enabled(model):
         return _LockstepAcceptanceDepthController(max_depth)
     controller_type = (
         _EvidenceDepthController

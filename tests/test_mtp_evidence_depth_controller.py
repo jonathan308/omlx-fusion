@@ -646,6 +646,21 @@ def test_lockstep_override_remains_authoritative(monkeypatch):
     assert type(controller) is _LockstepAcceptanceDepthController
 
 
+def test_qwen4_acceptance_policy_is_model_scoped(monkeypatch):
+    monkeypatch.setenv("OMLX_QWEN4_ACCEPTANCE_LOCKSTEP_DEPTH", "1")
+    qwen = _new_depth_controller(_model("qwen4_exp"), 5)
+    other = _new_depth_controller(_model("qwen3_5_moe"), 5)
+    assert type(qwen) is _LockstepAcceptanceDepthController
+    assert type(other) is _DepthController
+
+
+def test_qwen4_acceptance_policy_precedes_evidence_policy(monkeypatch):
+    monkeypatch.setenv("OMLX_QWEN4_ACCEPTANCE_LOCKSTEP_DEPTH", "1")
+    monkeypatch.setenv("OMLX_QWEN4_EVIDENCE_DEPTH", "1")
+    controller = _new_depth_controller(_model("qwen4_exp"), 5)
+    assert type(controller) is _LockstepAcceptanceDepthController
+
+
 def test_mature_perfect_acceptance_exploitation_converges_to_one():
     controller = _EvidenceDepthController(5)
     controller._warmup = []
