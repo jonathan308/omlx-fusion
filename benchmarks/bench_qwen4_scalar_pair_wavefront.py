@@ -34,6 +34,41 @@ def _language_model(model: Any):
     raise RuntimeError("loaded model has no Qwen4 scalar_pair primitive")
 
 
+def _load_qwen4_vlm(model_path: Path):
+    """Mirror the production Qwen4 VLM+mmap loader without starting an engine."""
+
+    from mlx_vlm.utils import load as vlm_load
+
+    from omlx.engine import vlm as engine_vlm
+    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+    settings = SimpleNamespace(
+        mtp_enabled=False,
+        mtp_num_draft_tokens=0,
+        qwen4_ple_ssd_offload=True,
+        trust_remote_code=False,
+    )
+    maybe_apply_pre_load_patches(
+        str(model_path),
+        model_settings=settings,
+        for_vlm=True,
+    )
+    with (
+        engine_vlm._strip_audio_config_if_orphaned(model_path),
+        engine_vlm._drop_gemma4_mlx_shared_kv_extras_on_load(model_path),
+        engine_vlm._force_minimax_m3_moe_sanitize_on_load(model_path),
+        engine_vlm._force_qwen4_exp_sanitize_on_load(model_path),
+        engine_vlm._remap_nested_visual_on_load(model_path),
+        engine_vlm._transpose_qwen35_mlx_vision_patch_embed_on_load(model_path),
+        engine_vlm._load_optiq_vision_sidecar_on_load(model_path),
+    ):
+        return vlm_load(
+            str(model_path),
+            lazy=True,
+            trust_remote_code=False,
+        )
+
+
 def _arrays(value):
     if isinstance(value, mx.array):
         yield value
@@ -318,16 +353,7 @@ def main():
     if args.samples < 1 or args.warmup < 1 or args.chunk_size < 1:
         raise SystemExit("--samples, --warmup, and --chunk-size must be positive")
 
-    from omlx.utils.model_loading import load_text_model
-
-    loaded, _tokenizer = load_text_model(
-        str(args.model),
-        model_settings=SimpleNamespace(
-            mtp_enabled=False,
-            mtp_num_draft_tokens=0,
-            trust_remote_code=False,
-        ),
-    )
+    loaded, _processor = _load_qwen4_vlm(args.model)
     model = _language_model(loaded)
     contexts = [int(value) for value in args.contexts.split(",")]
     results = [
