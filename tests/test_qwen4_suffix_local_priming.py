@@ -182,7 +182,6 @@ def _greedy(logprobs):
 
 
 _greedy.temp = 0.0
-_greedy._omlx_exact_argmax = True
 
 
 def _target_continuation(model, history, count):

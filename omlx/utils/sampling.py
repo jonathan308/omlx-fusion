@@ -192,8 +192,4 @@ def make_sampler(
     sampler.min_p = min_p
     sampler.top_k = top_k
     sampler.min_tokens_to_keep = min_tokens_to_keep
-    if temp == 0:
-        # Narrow capability marker for verifier paths that must substitute a
-        # lazy ``mx.argmax`` without invoking an opaque sampler callable.
-        sampler._omlx_exact_argmax = True
     return sampler
