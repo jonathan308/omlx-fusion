@@ -86,6 +86,10 @@ write_launch_agent() {
   local run_at_load='<false/>'
   [[ "${OMLX_DEV_RUN_AT_LOAD:-0}" == "1" ]] && run_at_load='<true/>'
   local temporary=${plist_file}.tmp.$$
+  # The admin restart endpoint deliberately terminates the server only when
+  # its environment names a supervisor that will bring it back. KeepAlive is
+  # therefore part of the same contract as these identity variables. An
+  # explicit `omlx-dev stop` still removes the job with launchctl bootout.
   command cat >"${temporary}" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -104,11 +108,15 @@ write_launch_agent() {
   <dict>
     <key>OMLX_DEV_ENV_FILE</key>
     <string>${env_file}</string>
+    <key>OMLX_SUPERVISED</key>
+    <string>launchd</string>
+    <key>OMLX_SUPERVISOR_ID</key>
+    <string>${label}</string>
   </dict>
   <key>RunAtLoad</key>
   ${run_at_load}
   <key>KeepAlive</key>
-  <false/>
+  <true/>
   <key>ProcessType</key>
   <string>Interactive</string>
   <key>StandardOutPath</key>

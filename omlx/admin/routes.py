@@ -3697,13 +3697,11 @@ def _schedule_self_terminate(delay: float = 0.5) -> None:
 
 @router.post("/api/server/restart")
 async def restart_server(is_admin: bool = Depends(require_admin)):
-    """Trigger a server restart via the menubar supervisor.
+    """Trigger a server restart via the process supervisor.
 
     The handler does not perform the restart itself — it returns 202 and
     schedules ``os.kill(os.getpid(), SIGTERM)`` 500ms after the response
-    is queued. The menubar app's ``ServerManager._health_check_loop``
-    detects the process exit and respawns the server with a short
-    backoff (~5s).
+    is queued. The menubar app or a launchd job then respawns the server.
 
     Gated by the ``OMLX_SUPERVISED`` environment variable so plain
     ``omlx serve`` (no supervisor) returns 503 rather than killing the
@@ -3720,17 +3718,26 @@ async def restart_server(is_admin: bool = Depends(require_admin)):
             ),
         )
 
+    supervisor_id = os.environ.get("OMLX_SUPERVISOR_ID")
     _schedule_self_terminate(0.5)
-    logger.warning("Server restart requested (supervisor=%s)", supervisor)
+    logger.warning(
+        "Server restart requested (supervisor=%s, id=%s)",
+        supervisor,
+        supervisor_id or "unknown",
+    )
 
-    # 5s backoff in ServerManager + ~1-2s startup = ~7s downtime budget.
+    # The menubar path has a 5s backoff; launchd is normally faster. Keep the
+    # existing conservative budget so both supervisors fit the same UI flow.
+    content: dict[str, Any] = {
+        "status": "restarting",
+        "supervisor": supervisor,
+        "expected_downtime_seconds": 7,
+    }
+    if supervisor_id:
+        content["supervisor_id"] = supervisor_id
     return JSONResponse(
         status_code=202,
-        content={
-            "status": "restarting",
-            "supervisor": supervisor,
-            "expected_downtime_seconds": 7,
-        },
+        content=content,
     )
 
 

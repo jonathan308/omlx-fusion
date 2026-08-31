@@ -1088,7 +1088,7 @@
                         <div class="flex items-center gap-3 shrink-0">
                             <button type="button"
                                     @click="restartServerStart()"
-                                    :disabled="restartServer.status === 'restarting' || restartServer.status === 'waiting'"
+                                    :disabled="saving || restartServer.status === 'restarting' || restartServer.status === 'waiting'"
                                     class="inline-flex items-center justify-center gap-2 px-6 py-3 bg-white text-neutral-700 text-sm font-semibold
                                            border border-neutral-300 rounded-full hover:bg-neutral-50 focus:outline-none focus:ring-2
                                            focus:ring-neutral-300 focus:ring-offset-2 transition-all duration-200

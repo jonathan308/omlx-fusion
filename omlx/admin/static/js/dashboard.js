@@ -6712,6 +6712,7 @@
                 this.saving = true;
                 this.saveSuccess = false;
                 this.saveError = '';
+                let saved = false;
 
                 // Validate required fields
                 const errors = [];
@@ -6732,7 +6733,7 @@
                 if (errors.length > 0) {
                     this.saveError = window.t('js.error.required_fields').replace('{fields}', errors.join(', '));
                     this.saving = false;
-                    return;
+                    return false;
                 }
 
                 // Validate API key if provided
@@ -6740,12 +6741,12 @@
                     if (s.auth.api_key.length < 4) {
                         this.saveError = window.t('js.error.api_key_min_length');
                         this.saving = false;
-                        return;
+                        return false;
                     }
                     if (/\s/.test(s.auth.api_key)) {
                         this.saveError = window.t('js.error.api_key_no_whitespace');
                         this.saving = false;
-                        return;
+                        return false;
                     }
                 }
 
@@ -6809,6 +6810,7 @@
 
                     if (response.ok) {
                         const data = await response.json();
+                        saved = true;
                         this.saveSuccess = true;
                         this.saveMessage = data.message || 'Settings saved successfully';
                         // Refresh stats and model list (cache changes unload models)
@@ -6831,6 +6833,7 @@
                 } finally {
                     this.saving = false;
                 }
+                return saved;
             },
 
             // Sub key management
@@ -8853,10 +8856,29 @@
 
             async restartServerStart() {
                 if (this.restartServer.status === 'restarting'
-                    || this.restartServer.status === 'waiting') {
+                    || this.restartServer.status === 'waiting'
+                    || this.saving) {
                     return;
                 }
                 if (!window.confirm(window.t('settings.server.restart_confirm'))) {
+                    return;
+                }
+
+                this.restartServer = {
+                    status: 'restarting',
+                    message: window.t('settings.save.saving'),
+                };
+
+                // Restart-scoped controls live in the same form as this
+                // button. Persist the current form first so a successful
+                // process bounce cannot silently restore the old values.
+                const saved = await this.saveGlobalSettings();
+                if (!saved) {
+                    this.restartServer = {
+                        status: 'error',
+                        message: this.saveError
+                            || window.t('js.error.save_settings_failed'),
+                    };
                     return;
                 }
 
@@ -8869,8 +8891,10 @@
                 try {
                     response = await fetch('/admin/api/server/restart', { method: 'POST' });
                 } catch (err) {
-                    // Network errors mid-restart are expected if the server
-                    // dies before sending the 202; fall through to polling.
+                    // A connection drop can still mean the delayed restart was
+                    // accepted before the 202 reached the browser. The poller
+                    // only succeeds after a down -> up transition and reports
+                    // a timeout if the request never landed.
                     this.restartServer = {
                         status: 'waiting',
                         message: window.t('settings.server.restart_status_waiting'),
