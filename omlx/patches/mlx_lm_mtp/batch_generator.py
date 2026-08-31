@@ -1410,6 +1410,23 @@ class _MtpBatchState:
 # controller's acceptance and cycle-cost model.
 _MTP_REENTRY_INITIAL_COOLDOWN_TOKENS = 128
 _MTP_REENTRY_MAX_COOLDOWN_TOKENS = 4096
+_MTP_REENTRY_INITIAL_COOLDOWN_ENV = "OMLX_MTP_REENTRY_INITIAL_COOLDOWN_TOKENS"
+
+
+def _mtp_reentry_initial_cooldown_tokens() -> int:
+    """Resolve one request's initial re-entry cooldown, bounded and safe."""
+
+    raw = os.environ.get(_MTP_REENTRY_INITIAL_COOLDOWN_ENV, "").strip()
+    if not raw:
+        return _MTP_REENTRY_INITIAL_COOLDOWN_TOKENS
+    try:
+        value = int(raw)
+    except ValueError:
+        return _MTP_REENTRY_INITIAL_COOLDOWN_TOKENS
+    return max(
+        _MTP_REENTRY_INITIAL_COOLDOWN_TOKENS,
+        min(_MTP_REENTRY_MAX_COOLDOWN_TOKENS, value),
+    )
 
 
 @dataclass
@@ -1442,6 +1459,17 @@ class _MtpParkState:
     def defer_probe(self) -> None:
         """Yield a probe for a batch-shape handoff without penalizing it."""
         self.tokens_remaining = 0
+
+
+def _new_mtp_park_state(uid: Any) -> _MtpParkState:
+    """Create request-owned park state from the current operator setting."""
+
+    initial = _mtp_reentry_initial_cooldown_tokens()
+    return _MtpParkState(
+        uid=uid,
+        cooldown_tokens=initial,
+        tokens_remaining=initial,
+    )
 
 
 def _mtp_park_state_for_batch(gen_batch: Any) -> Optional[_MtpParkState]:
@@ -6030,7 +6058,7 @@ def _park_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
     if state.reentry_probe and park_state is not None:
         park_state.restart_after_failed_probe()
     else:
-        park_state = _MtpParkState(uid=state.uid)
+        park_state = _new_mtp_park_state(state.uid)
         gen_batch._omlx_mtp_park_state = park_state
     if state.controller is not None:
         _arm_std_tax_probe(gen_batch, state.controller.t.get(0), state.uid)

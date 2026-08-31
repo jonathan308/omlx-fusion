@@ -2168,6 +2168,23 @@ class TestBatchGeneratorDispatch:
         assert batch._next_tokens.tolist() == [5]
         assert not hasattr(batch, "_omlx_mtp_state")
 
+    def test_performance_park_resolves_configured_cooldown_at_creation(
+        self,
+        monkeypatch,
+    ):
+        import mlx.core as mx
+
+        monkeypatch.setenv("OMLX_MTP_REENTRY_INITIAL_COOLDOWN_TOKENS", "4096")
+        bg, batch, state, _ = self._make_handoff_batch(
+            monkeypatch,
+            queue_entries=[],
+            next_main=mx.array([7], dtype=mx.uint32),
+        )
+
+        assert bg._park_mtp_to_standard(batch, state) is True
+        park = batch._omlx_mtp_park_state
+        assert (park.cooldown_tokens, park.tokens_remaining) == (4096, 4096)
+
     def test_failed_reentry_probe_doubles_cooldown(self, monkeypatch):
         import mlx.core as mx
 
@@ -3448,6 +3465,50 @@ class TestReversiblePerformancePark:
             uids=list(uids),
             logits_processors=None,
         )
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (None, 128),
+            ("", 128),
+            ("512", 512),
+            ("4096", 4096),
+            ("1", 128),
+            ("8192", 4096),
+            ("invalid", 128),
+            ("12.5", 128),
+        ],
+    )
+    def test_initial_cooldown_env_resolution(self, monkeypatch, value, expected):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        if value is None:
+            monkeypatch.delenv(
+                "OMLX_MTP_REENTRY_INITIAL_COOLDOWN_TOKENS",
+                raising=False,
+            )
+        else:
+            monkeypatch.setenv(
+                "OMLX_MTP_REENTRY_INITIAL_COOLDOWN_TOKENS",
+                value,
+            )
+        assert batch_generator._mtp_reentry_initial_cooldown_tokens() == expected
+
+    def test_initial_cooldown_is_resolved_per_request(self, monkeypatch):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.setenv("OMLX_MTP_REENTRY_INITIAL_COOLDOWN_TOKENS", "4096")
+        first = batch_generator._new_mtp_park_state(uid=7)
+        assert (first.cooldown_tokens, first.tokens_remaining) == (4096, 4096)
+        first.restart_after_failed_probe()
+        assert first.tokens_remaining == 4096
+
+        monkeypatch.setenv("OMLX_MTP_REENTRY_INITIAL_COOLDOWN_TOKENS", "256")
+        second = batch_generator._new_mtp_park_state(uid=8)
+        assert (second.cooldown_tokens, second.tokens_remaining) == (256, 256)
+        second.restart_after_failed_probe()
+        assert second.tokens_remaining == 512
+        assert first.tokens_remaining == 4096
 
     def test_cooldown_blocks_then_releases_same_uid(self, monkeypatch):
         from omlx.patches.mlx_lm_mtp import batch_generator
