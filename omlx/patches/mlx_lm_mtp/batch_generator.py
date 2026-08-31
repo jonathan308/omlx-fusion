@@ -710,6 +710,7 @@ def _mtp_common_eligible(gen_batch: Any) -> bool:
 _ROWWISE_BATCH_MTP_ENV = "OMLX_MTP_ROWWISE_BATCH"
 
 _FIXED_DEPTH_ENV = "OMLX_MTP_FIXED_DEPTH"
+_FORCE_DEPTH_ZERO_ENV = "OMLX_MTP_FORCE_DEPTH_ZERO"
 _LOCKSTEP_DEPTH_ENV = "OMLX_MTP_DISTRIBUTED_LOCKSTEP_DEPTH"
 _QWEN4_ACCEPTANCE_DEPTH_ENV = "OMLX_QWEN4_ACCEPTANCE_LOCKSTEP_DEPTH"
 _QWEN4_EVIDENCE_DEPTH_ENV = "OMLX_QWEN4_EVIDENCE_DEPTH"
@@ -724,8 +725,14 @@ def _fixed_depth_override(max_depth: int) -> Optional[int]:
     ``OMLX_MTP_FIXED_DEPTH=N`` (clamped to 1..max_depth) disables the
     _DepthController so every cycle drafts exactly N tokens. Used to
     measure true per-depth economics (acceptance and cycle cost) without
-    the controller's hysteresis/probing masking them. Unset = adaptive.
+    the controller's hysteresis/probing masking them.  Depth zero remains
+    inaccessible through that setting; the explicit
+    ``OMLX_MTP_FORCE_DEPTH_ZERO=1`` diagnostic selects scalar target cycles
+    while leaving MTP activation and head-history maintenance intact.
+    Unset = adaptive.
     """
+    if os.environ.get(_FORCE_DEPTH_ZERO_ENV, "").strip() == "1":
+        return 0
     raw = os.environ.get(_FIXED_DEPTH_ENV, "").strip()
     if not raw:
         return None
@@ -4810,14 +4817,13 @@ def _post_init_mtp(gen_batch: Any) -> None:
         state.chain = True
         state.depth = depth
         state.head_clone = head_clone
-        if depth > 1:
-            fixed = _fixed_depth_override(depth)
-            if fixed is not None:
-                state.depth = fixed
-            else:
-                state.controller = _new_depth_controller(
-                    gen_batch.model, depth
-                )
+        fixed = _fixed_depth_override(depth)
+        if fixed is not None:
+            state.depth = fixed
+        elif depth > 1:
+            state.controller = _new_depth_controller(
+                gen_batch.model, depth
+            )
         primed = _prompt_priming.take_primed(
             gen_batch.model, gen_batch.prompt_cache, main_tok
         )

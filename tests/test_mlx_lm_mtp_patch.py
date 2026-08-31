@@ -1124,6 +1124,37 @@ class TestBatchGeneratorDispatch:
         assert model.mtp_forward is mtp_forward
         assert model._omlx_mtp_decode_enabled is True
 
+    def test_force_depth_zero_keeps_mtp_eligible_and_selects_scalar_cycles(
+        self, monkeypatch
+    ):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        model = SimpleNamespace(
+            mtp=object(),
+            mtp_forward=lambda *args, **kwargs: None,
+            _omlx_mtp_decode_enabled=True,
+        )
+        gen_batch = SimpleNamespace(
+            model=model,
+            uids=[0],
+            logits_processors=None,
+        )
+
+        monkeypatch.delenv("OMLX_MTP_FORCE_STANDARD", raising=False)
+        monkeypatch.delenv("OMLX_MTP_FORCE_DEPTH_ZERO", raising=False)
+        monkeypatch.delenv("OMLX_MTP_FIXED_DEPTH", raising=False)
+        assert batch_generator._fixed_depth_override(6) is None
+
+        # The ordinary fixed-depth diagnostic cannot accidentally select 0.
+        monkeypatch.setenv("OMLX_MTP_FIXED_DEPTH", "0")
+        assert batch_generator._fixed_depth_override(6) == 1
+
+        monkeypatch.setenv("OMLX_MTP_FORCE_DEPTH_ZERO", "1")
+        assert batch_generator._fixed_depth_override(6) == 0
+        assert batch_generator._mtp_common_eligible(gen_batch) is True
+        assert model.mtp is not None
+        assert model._omlx_mtp_decode_enabled is True
+
     def test_decode_marker_is_found_on_wrapped_language_model(self):
         from omlx.patches.mlx_lm_mtp import batch_generator
 
