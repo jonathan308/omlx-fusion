@@ -705,6 +705,9 @@ _FIXED_DEPTH_ENV = "OMLX_MTP_FIXED_DEPTH"
 _LOCKSTEP_DEPTH_ENV = "OMLX_MTP_DISTRIBUTED_LOCKSTEP_DEPTH"
 _QWEN4_ACCEPTANCE_DEPTH_ENV = "OMLX_QWEN4_ACCEPTANCE_LOCKSTEP_DEPTH"
 _QWEN4_EVIDENCE_DEPTH_ENV = "OMLX_QWEN4_EVIDENCE_DEPTH"
+_QWEN4_VERIFY_PARITY_PATH_ENV = "OMLX_QWEN4_VERIFY_PARITY_PATH"
+_QWEN4_VERIFY_PARITY_CYCLES_ENV = "OMLX_QWEN4_VERIFY_PARITY_CYCLES"
+_QWEN4_VERIFY_PARITY_PREFILL_STEP_ENV = "OMLX_QWEN4_VERIFY_PARITY_PREFILL_STEP"
 
 
 def _fixed_depth_override(max_depth: int) -> Optional[int]:
@@ -4418,6 +4421,308 @@ def _materialize_distributed_hidden_sibling(
     return distributed
 
 
+def _positive_env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _qwen4_probe_transaction_snapshot(
+    gen_batch: Any,
+    state: "_MtpState",
+) -> dict[str, Any]:
+    qsa = []
+    recurrent_counts = []
+    rollback = []
+    pending_caches = list(getattr(gen_batch, "prompt_cache", ()) or ())
+    while pending_caches:
+        cache = pending_caches.pop(0)
+        pending_caches[0:0] = list(getattr(cache, "caches", ()) or ())
+        name = type(cache).__name__
+        if name in _QWEN4_QSA_CACHE_TYPES:
+            qsa.append({"type": name, "offsets": _qwen4_qsa_offsets(cache)})
+        count = getattr(cache, "_token_count", None)
+        if type(count) is int:
+            recurrent_counts.append(count)
+        markers = [
+            attr
+            for attr in (
+                "rollback_state",
+                "_qwen4_exp_ple_speculative_state",
+                "_mtp_undo",
+                "_mtp_draft_stash",
+            )
+            if getattr(cache, attr, None) is not None
+        ]
+        if markers:
+            rollback.append({"type": name, "markers": markers})
+
+    pending = getattr(state, "pending_commit", None)
+    pending_report = None
+    if pending is not None:
+        pending_report = {
+            "kind": pending.kind,
+            "target_base_offset": pending.target_base_offset,
+            "verify_width": pending.verify_width,
+            "accepted": pending.accepted,
+            "emitted": pending.emitted,
+            "source_map": list(pending.source_map),
+            "token_map": list(pending.token_map),
+        }
+    return {
+        "target_offset": _qwen4_target_offset(gen_batch.prompt_cache),
+        "streamed_tokens": len(getattr(gen_batch, "tokens", [[]])[0]),
+        "hist_offset": int(getattr(state, "hist_offset", 0)),
+        "queue": [
+            {"token": int(token), "source": source}
+            for token, _logprobs, source in getattr(state, "queue", ())
+        ],
+        "pending_commit": pending_report,
+        "pending_emit": getattr(state, "pending_emit", None),
+        "qsa": qsa,
+        "recurrent_counts": recurrent_counts,
+        "rollback": rollback,
+    }
+
+
+def _record_qwen4_probe_timeline_event(
+    gen_batch: Any,
+    state: "_MtpState",
+    event: str,
+) -> None:
+    if not os.environ.get(_QWEN4_VERIFY_PARITY_PATH_ENV, "").strip():
+        return
+    events = getattr(state, "_omlx_verify_parity_timeline", None)
+    if events is None:
+        events = []
+        state._omlx_verify_parity_timeline = events
+    if len(events) < 12:
+        events.append(
+            {
+                "event": event,
+                "state": _qwen4_probe_transaction_snapshot(gen_batch, state),
+            }
+        )
+
+
+def _maybe_probe_qwen4_verify_parity(
+    gen_batch: Any,
+    state: "_MtpState",
+    inputs: Any,
+) -> bool:
+    """Replay an observed Qwen4 verify window against scalar target decode.
+
+    The gate is deliberately an explicit file path rather than a boolean.  An
+    unset environment performs no import, token copy, host synchronization, or
+    filesystem access.  The diagnostic replays against fresh caches and never
+    mutates the active target/MTP transaction.  It is expensive real-model
+    work and is intended only for a coordinated offline maintenance run.
+
+    Returns ``True`` when a probe was attempted so the caller can exclude its
+    wall time from adaptive-controller economics.
+    """
+
+    output_path = os.environ.get(_QWEN4_VERIFY_PARITY_PATH_ENV, "").strip()
+    if not output_path:
+        return False
+    if (
+        not _is_qwen4_exp_model(getattr(gen_batch, "model", None))
+        or getattr(gen_batch, "_omlx_rowwise_mtp", False)
+        or len(getattr(gen_batch, "uids", ()) or ()) != 1
+    ):
+        return False
+
+    cycle_index = int(getattr(state.stats, "cycles", 0))
+    if cycle_index >= _positive_env_int(_QWEN4_VERIFY_PARITY_CYCLES_ENV, 1):
+        return False
+
+    streamed = list(getattr(gen_batch, "tokens", [[]])[0])
+    try:
+        verify_tokens = [int(token) for token in inputs.reshape(-1).tolist()]
+        if len(streamed) < 2 or not verify_tokens:
+            raise ValueError("active token timeline is too short for a verify probe")
+        if streamed[-1] != verify_tokens[0]:
+            raise ValueError(
+                "active pipeline tail does not match the first verify input "
+                f"({streamed[-1]} != {verify_tokens[0]})"
+            )
+        committed_prefix = streamed[:-1]
+        active_offset = _qwen4_target_offset(gen_batch.prompt_cache)
+        if active_offset != len(committed_prefix):
+            raise ValueError(
+                "active target cache does not represent the committed probe prefix "
+                f"({active_offset} != {len(committed_prefix)})"
+            )
+
+        from ..mlx_vlm_qwen4_exp_compat.verify_parity import (
+            prepare_qwen4_active_verify_probe,
+        )
+
+        extract = getattr(gen_batch, "extract_cache", None)
+        active_prefix_cache = (
+            extract(0) if callable(extract) else gen_batch.prompt_cache
+        )
+        probe = prepare_qwen4_active_verify_probe(
+            gen_batch.model,
+            committed_prefix_tokens=committed_prefix,
+            verify_tokens=verify_tokens,
+            prefill_step=_positive_env_int(
+                _QWEN4_VERIFY_PARITY_PREFILL_STEP_ENV,
+                4096,
+            ),
+            active_prefix_cache=active_prefix_cache,
+        )
+        probe.report.update(
+            {
+                "uid": str(gen_batch.uids[0]),
+                "cycle": cycle_index,
+                "active_target_offset": active_offset,
+                "active_streamed_tokens": len(streamed),
+                "active_pre_transaction": _qwen4_probe_transaction_snapshot(
+                    gen_batch,
+                    state,
+                ),
+                "init_transaction_timeline": list(
+                    getattr(state, "_omlx_verify_parity_timeline", ())
+                ),
+            }
+        )
+        state._omlx_active_verify_parity_probe = probe
+    except Exception as exc:
+        logger.exception("Qwen4 verify parity probe failed: %s", exc)
+        try:
+            from ..mlx_vlm_qwen4_exp_compat.verify_parity import append_report
+
+            append_report(
+                output_path,
+                {
+                    "schema_version": 1,
+                    "created_unix": time.time(),
+                    "uid": str((getattr(gen_batch, "uids", ()) or ("?",))[0]),
+                    "cycle": cycle_index,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+        except Exception:
+            logger.debug("Qwen4 verify parity error report failed", exc_info=True)
+    return True
+
+
+def _capture_qwen4_active_verify_parity(
+    gen_batch: Any,
+    state: "_MtpState",
+    rows: Any,
+) -> None:
+    probe = getattr(state, "_omlx_active_verify_parity_probe", None)
+    if probe is None:
+        return
+    try:
+        from ..mlx_vlm_qwen4_exp_compat.verify_parity import (
+            capture_qwen4_active_verify_result,
+        )
+
+        extract = getattr(gen_batch, "extract_cache", None)
+        active_cache = extract(0) if callable(extract) else gen_batch.prompt_cache
+        report = capture_qwen4_active_verify_result(
+            probe,
+            active_logits=rows,
+            active_cache=active_cache,
+        )
+        report["active_post_forward_transaction"] = (
+            _qwen4_probe_transaction_snapshot(gen_batch, state)
+        )
+    except Exception as exc:
+        probe.report["active_capture_error"] = f"{type(exc).__name__}: {exc}"
+        logger.exception("Qwen4 active verify parity capture failed: %s", exc)
+
+
+def _finish_qwen4_active_verify_parity(
+    gen_batch: Any,
+    state: "_MtpState",
+    *,
+    target_ids: Optional[List[int]],
+    draft_ids: List[int],
+    accepted: int,
+    emitted_id: int,
+) -> None:
+    probe = getattr(state, "_omlx_active_verify_parity_probe", None)
+    if probe is None:
+        return
+    report = probe.report
+    decision: dict[str, Any] = {
+        "target_ids": target_ids,
+        "draft_ids": list(draft_ids),
+        "accepted": int(accepted),
+        "emitted_id": int(emitted_id),
+    }
+    active_rows = ((report.get("active") or {}).get("rows") or [])
+    active_ids = [row["active"]["top1_id"] for row in active_rows]
+    if (
+        target_ids is not None
+        and len(active_ids) >= len(draft_ids) + 1
+        and draft_ids
+    ):
+        expected_accepted = 0
+        for target, draft in zip(active_ids[:-1], draft_ids):
+            if target != draft:
+                break
+            expected_accepted += 1
+        expected_emitted = active_ids[
+            expected_accepted if expected_accepted < len(draft_ids) else len(draft_ids)
+        ]
+        decision.update(
+            {
+                "active_target_ids": active_ids,
+                "expected_accepted": expected_accepted,
+                "expected_emitted_id": expected_emitted,
+                "alignment_valid": bool(
+                    int(accepted) == expected_accepted
+                    and int(emitted_id) == expected_emitted
+                ),
+            }
+        )
+    report["decision"] = decision
+    report["active_post_decision_transaction"] = (
+        _qwen4_probe_transaction_snapshot(gen_batch, state)
+    )
+    try:
+        from ..mlx_vlm_qwen4_exp_compat.verify_parity import append_report
+
+        append_report(
+            os.environ[_QWEN4_VERIFY_PARITY_PATH_ENV],
+            report,
+        )
+        logger.warning(
+            "Qwen4 active verify probe cycle=%s fresh_argmax=%s "
+            "active_scalar=%s pre_cache=%s post_cache=%s alignment=%s",
+            report.get("cycle"),
+            report.get("argmax_parity"),
+            all(
+                row.get("active_vs_scalar_argmax")
+                for row in active_rows
+            ),
+            (report.get("active_pre_vs_fresh_prefix_cache") or {}).get(
+                "bitwise_equal"
+            ),
+            ((report.get("active") or {}).get("post_cache_vs_scalar") or {}).get(
+                "bitwise_equal"
+            ),
+            decision.get("alignment_valid"),
+        )
+    except Exception as exc:
+        logger.exception("Qwen4 active verify parity report failed: %s", exc)
+    finally:
+        try:
+            delattr(state, "_omlx_active_verify_parity_probe")
+        except AttributeError:
+            pass
+        try:
+            delattr(state, "_omlx_verify_parity_timeline")
+        except AttributeError:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Post-init: run one extra backbone forward + MTP forward; queue the two
 # emitted tokens; stash a draft for the first verify cycle.
@@ -4557,6 +4862,11 @@ def _post_init_mtp(gen_batch: Any) -> None:
                     align > 0 and final_count % align == 0
                 ),
                 final_source="init-tail",
+            )
+            _record_qwen4_probe_timeline_event(
+                gen_batch,
+                state,
+                "post-init",
             )
         gen_batch._omlx_mtp_state = state
         return
@@ -5070,10 +5380,20 @@ def _batch_generator_mtp_post_emit(
         return _MtpPostEmitResult(reason="no-qwen4-transaction")
 
     try:
+        _record_qwen4_probe_timeline_event(
+            gen_batch,
+            state,
+            f"scheduler-ack-before:{'terminal' if terminal else 'continue'}",
+        )
         result = _qwen4_post_emit_transaction(
             gen_batch,
             state,
             terminal=terminal,
+        )
+        _record_qwen4_probe_timeline_event(
+            gen_batch,
+            state,
+            f"scheduler-ack-after:{result.reason}",
         )
     except Exception as exc:
         logger.warning("Qwen4 scheduler post-emit commit failed closed: %s", exc)
@@ -5276,6 +5596,11 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
             )
 
     inputs = mx.concatenate([state.next_main, state.drafts])  # (k+1,)
+    if _maybe_probe_qwen4_verify_parity(gen_batch, state, inputs):
+        # Diagnostic replay is not part of target-cycle economics.  Excluding
+        # it prevents an explicitly requested trace from poisoning the
+        # adaptive depth controller's cost evidence.
+        cycle_t0 = time.perf_counter()
 
     # Token buffer per input position (mirrors PR 990 _step_backbone). Row j's
     # processor prefix is everything before that input position.
@@ -5305,6 +5630,7 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
             verify_width=k + 1,
         )
     rows = _mtp_prepare_logits(gen_batch, logits[0])  # (k+1, vocab)
+    _capture_qwen4_active_verify_parity(gen_batch, state, rows)
     row_snaps: List[Optional[Any]] = [None] * (k + 1)
     if procs is not None:
         applied = []
@@ -5321,6 +5647,7 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
     combined_lp = _mtp_logprobs(gen_batch, rows)  # (k+1, V)
 
     adapter = _mtp_vocab_coordinator(gen_batch)
+    greedy_target_ids: Optional[List[int]] = None
 
     if k == 0:
         # Depth-0 cycle (controller escape hatch): the forward above was a
@@ -5403,6 +5730,7 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         ).tolist()
         m = int(host[0])
         target_ids = host[1 : k + 2]
+        greedy_target_ids = target_ids
         draft_ids = host[k + 2 :]
         state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
         t0 = time.perf_counter()
@@ -5624,6 +5952,14 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
             state,
             was_warmup=was_warmup,
         )
+    _finish_qwen4_active_verify_parity(
+        gen_batch,
+        state,
+        target_ids=greedy_target_ids,
+        draft_ids=draft_ids,
+        accepted=m,
+        emitted_id=emit_last_id,
+    )
 
 
 def _materialize_mtp_boundary_emit(gen_batch: Any, state: _MtpState) -> None:
