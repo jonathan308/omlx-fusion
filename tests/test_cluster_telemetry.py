@@ -1128,6 +1128,10 @@ def test_cluster_request_start_keepwarm_is_payload_driven_and_rank_symmetric(
         _Marker(), heartbeat_interval=0, control_plane=control
     ):
         generator = mlx_server.ResponseGenerator()
+        # First-use is intentionally cold. Seed one completed request boundary;
+        # the next cached turn is where latent keepwarm is permitted to run.
+        generator._share_object(("prior-request", {"max_tokens": 1}))
+        assert generator._share_object(None) is None
         queue, request, args = generator._share_request(
             (target, "request", {"max_tokens": 7})
         )
@@ -1135,9 +1139,9 @@ def test_cluster_request_start_keepwarm_is_payload_driven_and_rank_symmetric(
     assert queue._queue is target
     assert request == "request"
     assert args == {"max_tokens": 7}
-    assert control.messages[0]["kind"] == "omlx.keepwarm"
-    assert control.messages[0]["action"]["kind"] == "request_start"
-    assert control.messages[0]["payload"] == ("request", {"max_tokens": 7})
+    assert control.messages[-1]["kind"] == "omlx.keepwarm"
+    assert control.messages[-1]["action"]["kind"] == "request_start"
+    assert control.messages[-1]["payload"] == ("request", {"max_tokens": 7})
     assert events == [("metal", "request_start"), ("dataplane", 0, 2)]
 
 
@@ -1182,6 +1186,9 @@ def test_cluster_idle_keepwarm_never_appears_as_a_user_request(monkeypatch):
         marker, heartbeat_interval=0, control_plane=control
     ):
         generator = mlx_server.ResponseGenerator()
+        # Arm only after a completed real-request boundary; startup alone must
+        # not generate an idle Metal/RDMA transaction.
+        generator._share_object(("prior-request", {"max_tokens": 1}))
         assert generator._share_object(None) is None
 
     assert control.message["kind"] == "omlx.keepwarm"

@@ -4,7 +4,9 @@
 The controller in this module is deliberately framework-neutral.  Single-node
 engines execute its actions on their private serialized MLX executor, while
 cluster ranks execute them from MLX-LM's synchronized generation thread.  No
-keepwarm path owns a second Metal or collective worker.
+keepwarm path owns a second Metal or collective worker.  The local state
+machine is adapted from ThunderMLX's Apache-2.0 keepwarm implementation and
+adds oMLX-specific admission, cache-clear, shutdown, and live-settings gates.
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Callable
 
 
@@ -74,16 +76,10 @@ class KeepwarmConfig:
             interval_seconds=_float(
                 "OMLX_KEEPWARM_INTERVAL_SECONDS", 10.0, minimum=0.25
             ),
-            idle_after_seconds=_float(
-                "OMLX_KEEPWARM_IDLE_AFTER_SECONDS", 2.0
-            ),
-            matrix_size=_int(
-                "OMLX_KEEPWARM_MATRIX_SIZE", 1, minimum=1, maximum=1024
-            ),
+            idle_after_seconds=_float("OMLX_KEEPWARM_IDLE_AFTER_SECONDS", 2.0),
+            matrix_size=_int("OMLX_KEEPWARM_MATRIX_SIZE", 1, minimum=1, maximum=1024),
             repeats=_int("OMLX_KEEPWARM_REPEATS", 1, minimum=1, maximum=16),
-            request_start_enabled=_enabled(
-                "OMLX_KEEPWARM_REQUEST_START", True
-            ),
+            request_start_enabled=_enabled("OMLX_KEEPWARM_REQUEST_START", True),
             request_start_idle_seconds=_float(
                 "OMLX_KEEPWARM_REQUEST_START_IDLE_SECONDS", 2.0
             ),
@@ -93,9 +89,7 @@ class KeepwarmConfig:
                 minimum=1,
                 maximum=1024,
             ),
-            post_response_enabled=_enabled(
-                "OMLX_KEEPWARM_POST_RESPONSE", True
-            ),
+            post_response_enabled=_enabled("OMLX_KEEPWARM_POST_RESPONSE", True),
             post_response_delay_seconds=_float(
                 "OMLX_KEEPWARM_POST_RESPONSE_DELAY_SECONDS", 5.0
             ),
@@ -105,23 +99,15 @@ class KeepwarmConfig:
                 minimum=1,
                 maximum=1024,
             ),
-            large_cache_tokens=_int(
-                "OMLX_KEEPWARM_LARGE_CACHE_TOKENS", 8192
-            ),
+            large_cache_tokens=_int("OMLX_KEEPWARM_LARGE_CACHE_TOKENS", 8192),
             large_cache_interval_seconds=_float(
                 "OMLX_KEEPWARM_LARGE_CACHE_INTERVAL_SECONDS",
                 60.0,
                 minimum=0.25,
             ),
-            slow_threshold_seconds=_float(
-                "OMLX_KEEPWARM_SLOW_THRESHOLD_SECONDS", 1.0
-            ),
-            slow_backoff_seconds=_float(
-                "OMLX_KEEPWARM_SLOW_BACKOFF_SECONDS", 60.0
-            ),
-            dataplane_ping=_enabled(
-                "OMLX_CLUSTER_KEEPWARM_DATAPLANE_PING", True
-            ),
+            slow_threshold_seconds=_float("OMLX_KEEPWARM_SLOW_THRESHOLD_SECONDS", 1.0),
+            slow_backoff_seconds=_float("OMLX_KEEPWARM_SLOW_BACKOFF_SECONDS", 60.0),
+            dataplane_ping=_enabled("OMLX_CLUSTER_KEEPWARM_DATAPLANE_PING", True),
         )
 
 
@@ -135,7 +121,7 @@ class KeepwarmAction:
 
 
 class KeepwarmController:
-    """Thread-safe idle/request-boundary policy and bounded telemetry."""
+    """Thread-safe request/idle state machine with bounded telemetry."""
 
     def __init__(
         self,
@@ -151,12 +137,34 @@ class KeepwarmController:
         self._last_touch_at = float("-inf")
         self._slow_until = float("-inf")
         self._request_active = False
+        self._cache_armed = False
+        self._cache_tokens = 0
+        self._clear_inhibited = False
         self._post_response_pending = False
+        self._closed = False
         self._count = 0
         self._failures = 0
         self._skips = 0
         self._slow_count = 0
         self._last_event: dict[str, Any] | None = None
+
+    def configure(self, enabled: bool) -> None:
+        """Apply the master switch live without replacing request state."""
+
+        with self._lock:
+            self.config = replace(self.config, enabled=bool(enabled))
+            if not enabled:
+                self._post_response_pending = False
+
+    def should_execute(self, action: KeepwarmAction) -> bool:
+        """Final gate for an action selected before a live state change."""
+
+        with self._lock:
+            if self._closed or not self.config.enabled:
+                return False
+            if action.kind == "request_start":
+                return self._request_active
+            return self._cache_armed and not self._request_active
 
     def request_start_action(self) -> KeepwarmAction | None:
         now = float(self._clock())
@@ -166,7 +174,9 @@ class KeepwarmController:
             self._post_response_pending = False
             self._last_activity_at = now
             if (
-                not self.config.enabled
+                self._closed
+                or not self.config.enabled
+                or not self._cache_armed
                 or not self.config.request_start_enabled
                 or idle < self.config.request_start_idle_seconds
                 or now < self._slow_until
@@ -177,28 +187,77 @@ class KeepwarmController:
                 matrix_size=self.config.request_start_matrix_size,
                 repeats=self.config.repeats,
                 idle_seconds=idle,
+                cache_tokens=self._cache_tokens,
             )
 
-    def observe_request_state(self, active: bool) -> None:
-        """Record active->idle transitions without depending on request objects."""
+    def observe_request_state(
+        self,
+        active: bool,
+        *,
+        cache_tokens: int | None = None,
+    ) -> None:
+        """Record real request transitions and arm only after useful activity."""
 
         now = float(self._clock())
         with self._lock:
+            if self._closed:
+                return
+            if cache_tokens is not None:
+                self._cache_tokens = max(0, int(cache_tokens))
+                if self._cache_tokens > 0 and not self._clear_inhibited:
+                    self._cache_armed = True
             if active:
                 self._request_active = True
                 self._post_response_pending = False
                 return
             if self._request_active:
                 self._request_active = False
+                # A completed real request is enough to arm Metal warming even
+                # when prefix caching is disabled. Cache accounting, when
+                # available, only selects the safer long-context cadence.
+                self._clear_inhibited = False
+                self._cache_armed = True
                 self._post_response_pending = True
                 self._last_activity_at = now
 
-    def idle_action(self, *, cache_tokens: int = 0) -> KeepwarmAction | None:
-        now = float(self._clock())
-        cache_tokens = max(0, int(cache_tokens))
+    def cancel_unstarted_request(self) -> None:
+        """Roll back an exclusive admission that failed before scheduler entry."""
+
         with self._lock:
+            self._request_active = False
+            self._post_response_pending = False
+
+    def disarm_cache(self) -> None:
+        """Stop latent warming after an explicit hot-cache clear."""
+
+        with self._lock:
+            self._cache_armed = False
+            self._cache_tokens = 0
+            self._clear_inhibited = True
+            self._post_response_pending = False
+
+    def shutdown(self) -> None:
+        """Make every future action a no-op before engine teardown."""
+
+        with self._lock:
+            self._closed = True
+            self._request_active = False
+            self._cache_armed = False
+            self._cache_tokens = 0
+            self._clear_inhibited = True
+            self._post_response_pending = False
+
+    def idle_action(self, *, cache_tokens: int | None = None) -> KeepwarmAction | None:
+        now = float(self._clock())
+        with self._lock:
+            if cache_tokens is not None:
+                self._cache_tokens = max(0, int(cache_tokens))
+                if self._cache_tokens > 0 and not self._clear_inhibited:
+                    self._cache_armed = True
             if (
-                not self.config.enabled
+                self._closed
+                or not self.config.enabled
+                or not self._cache_armed
                 or self._request_active
                 or now < self._slow_until
             ):
@@ -215,12 +274,12 @@ class KeepwarmController:
                     matrix_size=self.config.post_response_matrix_size,
                     repeats=self.config.repeats,
                     idle_seconds=idle,
-                    cache_tokens=cache_tokens,
+                    cache_tokens=self._cache_tokens,
                 )
             interval = self.config.interval_seconds
             if (
                 self.config.large_cache_tokens > 0
-                and cache_tokens >= self.config.large_cache_tokens
+                and self._cache_tokens >= self.config.large_cache_tokens
             ):
                 interval = self.config.large_cache_interval_seconds
             if (
@@ -233,7 +292,7 @@ class KeepwarmController:
                 matrix_size=self.config.matrix_size,
                 repeats=self.config.repeats,
                 idle_seconds=idle,
-                cache_tokens=cache_tokens,
+                cache_tokens=self._cache_tokens,
             )
 
     def record(
@@ -265,6 +324,8 @@ class KeepwarmController:
             self._count += 1
             if not ok:
                 self._failures += 1
+                self._slow_until = now + self.config.slow_backoff_seconds
+                event["failure_backoff_seconds"] = self.config.slow_backoff_seconds
             if elapsed_seconds >= self.config.slow_threshold_seconds:
                 self._slow_count += 1
                 self._slow_until = now + self.config.slow_backoff_seconds
@@ -287,6 +348,10 @@ class KeepwarmController:
                 "enabled": self.config.enabled,
                 "policy": asdict(self.config),
                 "request_active": self._request_active,
+                "cache_armed": self._cache_armed,
+                "cache_tokens": self._cache_tokens,
+                "clear_inhibited": self._clear_inhibited,
+                "closed": self._closed,
                 "count": self._count,
                 "failures": self._failures,
                 "skips": self._skips,

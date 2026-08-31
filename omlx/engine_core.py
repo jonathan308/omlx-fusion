@@ -384,15 +384,54 @@ class EngineCore:
         with self._pending_admissions_lock:
             return self._pending_admissions
 
-    def _run_keepwarm_action(self, action: KeepwarmAction) -> bool:
-        """Run one local touch on this engine's sole MLX execution lane."""
+    def configure_keepwarm(self, enabled: bool) -> None:
+        """Apply the experimental master switch to this loaded engine."""
 
+        self._keepwarm.configure(enabled)
+        self.config.keepwarm_config = self._keepwarm.config
+        self._wake_engine_loop()
+
+    def disarm_keepwarm_cache(self) -> None:
+        """Stop idle touches after an explicit in-memory cache clear."""
+
+        self._keepwarm.disarm_cache()
+
+    def _resident_cache_tokens(self) -> int:
+        """Best-effort current prefix-cache size, read on the MLX lane."""
+
+        prefix_cache = getattr(self.scheduler, "block_aware_cache", None)
+        paged_cache = getattr(prefix_cache, "paged_cache", None)
+        try:
+            stats = getattr(paged_cache, "stats", None)
+            return max(0, int(getattr(stats, "total_tokens_cached", 0) or 0))
+        except Exception:
+            logger.debug("Unable to read cache size for keepwarm", exc_info=True)
+            return 0
+
+    def _run_keepwarm_action(self, action: KeepwarmAction) -> bool:
+        """Run one touch on this engine's existing serialized MLX lane."""
+
+        if not self._keepwarm.should_execute(action):
+            self._keepwarm.skip("disabled, closed, or request state changed")
+            return False
+        pending = self._pending_admission_count()
+        scheduler_busy = self.scheduler.has_requests()
+        if action.kind == "request_start" and (pending != 1 or scheduler_busy):
+            self._keepwarm.observe_request_state(True)
+            self._keepwarm.skip("request-start lost exclusive admission")
+            return False
+        if action.kind != "request_start" and (pending or scheduler_busy):
+            self._keepwarm.observe_request_state(True)
+            self._keepwarm.skip("admission or scheduler became busy")
+            return False
+        started = time.monotonic()
         try:
             elapsed = metal_warmup_touch(mx, action, stream=self._mlx_stream)
-        except Exception as exc:  # keep a local model usable if warming fails
+        except Exception as exc:  # keep a model usable if experimental warming fails
+            elapsed = max(0.0, time.monotonic() - started)
             self._keepwarm.record(
                 action,
-                elapsed_seconds=0.0,
+                elapsed_seconds=elapsed,
                 ok=False,
                 error=f"{type(exc).__name__}: {exc}",
             )
@@ -414,25 +453,28 @@ class EngineCore:
         return True
 
     def _admit_request(self, request: Request) -> None:
-        """Warm after a long idle gap, then insert on the same MLX lane."""
+        """Optionally warm after idle, then admit on the same MLX lane."""
 
         keepwarm = getattr(self, "_keepwarm", None)
-        has_requests = getattr(self.scheduler, "has_requests", None)
-        if keepwarm is None or not callable(has_requests):
-            # Compatibility for lightweight embedders/test doubles that
-            # construct EngineCore without the optional keepwarm controller.
+        if keepwarm is None:
             self.scheduler.add_request(request)
             return
         pending = self._pending_admission_count()
-        if pending == 1 and not has_requests():
+        exclusive_idle_admission = pending == 1 and not self.scheduler.has_requests()
+        if exclusive_idle_admission:
             action = keepwarm.request_start_action()
             if action is not None:
                 self._run_keepwarm_action(action)
         else:
-            keepwarm.observe_request_state(True)
             if self.config.keepwarm_config.enabled:
                 keepwarm.skip("concurrent admission or scheduler busy")
-        self.scheduler.add_request(request)
+        try:
+            self.scheduler.add_request(request)
+        except BaseException:
+            if exclusive_idle_admission:
+                keepwarm.cancel_unstarted_request()
+            raise
+        keepwarm.observe_request_state(True)
 
     def _idle_keepwarm_if_due(self) -> None:
         """Re-check quiescence on the MLX lane and skip rather than queue."""
@@ -440,7 +482,8 @@ class EngineCore:
         if self._pending_admission_count() or self.scheduler.has_requests():
             self._keepwarm.observe_request_state(True)
             return
-        action = self._keepwarm.idle_action()
+        cache_tokens = self._resident_cache_tokens()
+        action = self._keepwarm.idle_action(cache_tokens=cache_tokens)
         if action is not None:
             self._run_keepwarm_action(action)
 
@@ -1196,7 +1239,11 @@ class EngineCore:
             "steps_executed": self._steps_executed,
             "active_requests": len(self._output_collectors),
             "stream_interval": self.config.stream_interval,
-            "keepwarm": self._keepwarm.snapshot(),
+            "keepwarm": (
+                self._keepwarm.snapshot()
+                if getattr(self, "_keepwarm", None) is not None
+                else None
+            ),
             **scheduler_stats,
         }
 
@@ -1221,6 +1268,10 @@ class EngineCore:
         """
         if self._closed:
             return
+
+        keepwarm = getattr(self, "_keepwarm", None)
+        if keepwarm is not None:
+            keepwarm.shutdown()
 
         # Release model ownership BEFORE setting _closed
         # (_release_model checks not self._closed)

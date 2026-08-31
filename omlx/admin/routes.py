@@ -41,7 +41,12 @@ from ..model_settings import (
     MAX_LIGHTNING_MTP_DRAFT_TOKENS,
     merge_chat_template_kwargs,
 )
-from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
+from ..settings import (
+    BURST_DECODE_MODES,
+    SubKeyEntry,
+    burst_decode_env,
+    latent_metal_keepwarm_env,
+)
 from ..utils.release_check import normalize_update_channel, select_latest_release
 from ..websearch import (
     DDGS_TEXT_BACKENDS,
@@ -360,6 +365,7 @@ class GlobalSettingsRequest(BaseModel):
     auto_start_on_launch: bool | None = None
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
     preserve_mid_system_cache: bool | None = None
+    latent_metal_keepwarm_enabled: bool | None = None
     distributed_inference_enabled: bool | None = None
     max_audio_upload_size: str | None = None
 
@@ -3772,6 +3778,11 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
                 "preserve_mid_system_cache",
                 True,
             ),
+            "latent_metal_keepwarm_enabled": getattr(
+                global_settings.server,
+                "latent_metal_keepwarm_enabled",
+                False,
+            ),
             "distributed_inference_enabled": getattr(
                 global_settings.server,
                 "distributed_inference_enabled",
@@ -4026,6 +4037,31 @@ async def update_global_settings(
             request.preserve_mid_system_cache
         )
         runtime_applied.append("preserve_mid_system_cache")
+    if request.latent_metal_keepwarm_enabled is not None:
+        enabled = bool(request.latent_metal_keepwarm_enabled)
+        global_settings.server.latent_metal_keepwarm_enabled = enabled
+        # Future Batched/VLM engines snapshot this environment-backed policy.
+        for _key, _value in latent_metal_keepwarm_env(enabled).items():
+            os.environ[_key] = _value
+
+        # Loaded engines retain request/cache history while the controller
+        # swaps only the master bit. No model reload or cache rewrite occurs.
+        from ..server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is not None:
+            configure_pool = getattr(
+                pool,
+                "configure_latent_metal_keepwarm",
+                None,
+            )
+            if callable(configure_pool):
+                configure_pool(enabled)
+        runtime_applied.append("latent_metal_keepwarm_enabled")
+        logger.info(
+            "Latent Metal keepwarm %s",
+            "enabled" if enabled else "disabled",
+        )
     if request.distributed_inference_enabled is not None:
         # Route exposure and Bonjour publication are fixed at process startup,
         # so this intentionally takes effect after the normal settings restart.
@@ -6350,6 +6386,9 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
             )
             distributed_failures.append(f"{model_id}: {exc}")
     for model_id, scheduler, core in _iter_loaded_scheduler_records():
+        disarm_keepwarm = getattr(core, "disarm_keepwarm_cache", None)
+        if callable(disarm_keepwarm):
+            disarm_keepwarm()
         resident_cache = getattr(scheduler, "_exact_resident_cache", None)
         if resident_cache is not None and hasattr(resident_cache, "clear"):
             try:
