@@ -2149,6 +2149,72 @@ class TestStreamingHelperFunctions:
         assert calls[0]["id"] == "call_scheduler"
 
     @pytest.mark.asyncio
+    async def test_disabled_early_capability_preserves_terminal_parser_semantics(self):
+        """The Qwen early gate must not tighten unrelated terminal parsing."""
+        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+        from omlx.server import stream_chat_completion
+
+        engine = MockBaseEngine()  # explicit early-stream capability is false
+        engine.tokenizer.has_tool_calling = True
+        engine.tokenizer.tool_call_start = "<tool_call>"
+        engine.tokenizer.tool_call_end = "</tool_call>"
+        engine.tokenizer.tool_parser = parse_tool_call
+        raw = (
+            "<tool_call><function=legacy_terminal_name>"
+            "<parameter=value>1</parameter></function></tool_call>"
+        )
+        engine.set_stream_outputs(
+            [
+                MockGenerationOutput(
+                    text=raw,
+                    new_text=raw,
+                    completion_tokens=1,
+                    finished=False,
+                ),
+                MockGenerationOutput(
+                    text=raw,
+                    new_text="",
+                    completion_tokens=1,
+                    finished=True,
+                    finish_reason="stop",
+                ),
+            ]
+        )
+        tools = [{"type": "function", "function": {"name": "registered_name"}}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="run")],
+            stream=True,
+            tools=tools,
+        )
+
+        calls = []
+        seen_before_finish = False
+        async for event in stream_chat_completion(
+            engine,
+            [{"role": "user", "content": "run"}],
+            request,
+            tools=tools,
+        ):
+            if not event.startswith("data: {"):
+                continue
+            payload = json.loads(event[6:-2])
+            choices = payload.get("choices") or []
+            chunk_calls = (
+                choices[0].get("delta", {}).get("tool_calls") if choices else None
+            )
+            if chunk_calls:
+                calls.extend(chunk_calls)
+                seen_before_finish |= not engine.last_stream_output_finished
+
+        assert not seen_before_finish
+        assert [call["function"]["name"] for call in calls] == [
+            "legacy_terminal_name"
+        ]
+
+    @pytest.mark.asyncio
     async def test_unknown_envelope_makes_later_early_sequence_terminal_only(self):
         """Unknown/malformed siblings cannot create a partial early sequence."""
         from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call

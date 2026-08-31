@@ -5294,13 +5294,15 @@ async def stream_chat_completion(
     streamed_tool_calls = []
     stream_tool_sequence_safe = True
     stream_completed_qwen_tools = False
+    qwen_tool_envelope_streaming_capable = False
     registered_tool_names: set[str] = set()
     stream_content = True
     if has_tools:
         registered_tool_names = _registered_tool_names(kwargs.get("tools"))
-        stream_completed_qwen_tools = bool(
+        qwen_tool_envelope_streaming_capable = bool(
             registered_tool_names and _chat_can_stream_qwen_tool_envelopes(engine)
         )
+        stream_completed_qwen_tools = qwen_tool_envelope_streaming_capable
         _content_filter = ToolCallStreamFilter(
             engine.tokenizer,
             capture_ordered_segments=stream_completed_qwen_tools,
@@ -5586,9 +5588,11 @@ async def stream_chat_completion(
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
         cleaned_thinking = extraction.cleaned_thinking
-        if tool_calls:
+        if tool_calls and qwen_tool_envelope_streaming_capable:
             # Raw-text parsing is never allowed to promote malformed or
-            # unregistered functions. Engine-native structured calls above are
+            # unregistered functions on the explicitly capability-gated qwen
+            # early-stream path. Other parser families retain their existing
+            # terminal semantics; engine-native structured calls above are
             # authoritative and intentionally bypass this API-layer filter.
             tool_calls = [
                 tool_call
