@@ -1230,6 +1230,80 @@ def test_qwen4_verify_matches_singleton_greedy_and_rolls_back_qsa():
     assert qsa_cache.index_position_ids.shape[-1] == 4
 
 
+def test_qwen4_scalar_return_hidden_is_canonical_and_mtp_compatible():
+    """L=1 hidden capture preserves ordinary target math and raw HC width."""
+
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import (
+        LanguageModel,
+        Qwen4ExpMTPModule,
+    )
+
+    model = LanguageModel(config.text_config, config)
+    model.mtp = Qwen4ExpMTPModule(config.text_config)
+    canonical_cache = model.make_cache()
+    hidden_cache = model.make_cache()
+    raw_cache = model.make_cache()
+    prefix = mx.array([[2, 3, 4, 5, 6]], dtype=mx.int32)
+    prefix_positions = mx.arange(prefix.shape[1], dtype=mx.int32)[None]
+    for cache in (canonical_cache, hidden_cache, raw_cache):
+        model(prefix, cache=cache, position_ids=prefix_positions)
+
+    token = mx.array([[7]], dtype=mx.int32)
+    token_position = mx.array([[prefix.shape[1]]], dtype=mx.int32)
+    canonical = model(
+        token,
+        cache=canonical_cache,
+        position_ids=token_position,
+    )
+    with_hidden = model(
+        token,
+        cache=hidden_cache,
+        position_ids=token_position,
+        return_hidden=True,
+    )
+    raw_sink = []
+    raw_mixed = model.model(
+        token,
+        cache=raw_cache,
+        position_ids=token_position,
+        capture_layer_ids=[],
+        hidden_sink=raw_sink,
+        gdn_sink=None,
+    )
+    mx.eval(canonical.logits, with_hidden.logits, raw_mixed, *raw_sink)
+
+    assert with_hidden.gdn_states is None
+    assert len(with_hidden.hidden_states) == len(raw_sink) == 1
+    assert with_hidden.hidden_states[0].shape == (1, 1, 64)
+    assert mx.array_equal(canonical.logits, with_hidden.logits).item()
+    assert mx.array_equal(with_hidden.hidden_states[0], raw_sink[0]).item()
+
+    for canonical_layer, hidden_layer, raw_layer in zip(
+        canonical_cache,
+        hidden_cache,
+        raw_cache,
+    ):
+        for canonical_value, hidden_value, raw_value in zip(
+            canonical_layer.state,
+            hidden_layer.state,
+            raw_layer.state,
+        ):
+            mx.eval(canonical_value, hidden_value, raw_value)
+            assert mx.array_equal(canonical_value, hidden_value).item()
+            assert mx.array_equal(hidden_value, raw_value).item()
+
+    mtp_logits, mtp_hidden = model.mtp_forward(
+        with_hidden.hidden_states[0],
+        mx.array([[8]], dtype=mx.int32),
+        model.make_mtp_cache(),
+        return_hidden=True,
+    )
+    mx.eval(mtp_logits, mtp_hidden)
+    assert mtp_logits.shape == (1, 1, config.text_config.vocab_size)
+    assert mtp_hidden.shape == (1, 1, 64)
+
+
 def _assert_ple_state_matches(actual_cache, expected_cache):
     mx.eval(
         actual_cache[2],

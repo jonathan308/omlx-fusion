@@ -10,6 +10,7 @@ import threading
 import time
 import weakref
 from bisect import bisect_right
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -47,6 +48,10 @@ _DECODE_PROFILE_LOCK = threading.Lock()
 _DECODE_PROFILE_CALLS = 0
 _COARSE_PROFILE_LOCK = threading.Lock()
 _COARSE_PROFILE_CALLS = 0
+_SCALAR_MTP_HIDDEN_SINK: ContextVar[list | None] = ContextVar(
+    "qwen4_scalar_mtp_hidden_sink",
+    default=None,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -3040,6 +3045,16 @@ class Qwen4ExpModel(nn.Module):
         **kwargs,
     ):
         del kwargs
+        # Qwen4 Lightning MTP consumes the raw residual streams before the
+        # final hyper-connection mixer.  A scalar activation/depth-0/tail
+        # forward still needs that tensor, but it has no speculative suffix
+        # and therefore must not create GDN/PLE rollback state.  The outer
+        # LanguageModel scopes this sink only around its implicit scalar
+        # ``return_hidden`` contract, leaving explicit capture requests alone.
+        scalar_mtp_hidden_sink = _SCALAR_MTP_HIDDEN_SINK.get()
+        if scalar_mtp_hidden_sink is not None:
+            hidden_sink = scalar_mtp_hidden_sink
+            capture_layer_ids = []
         profile = _current_decode_profile()
         model_started = time.perf_counter_ns() if profile is not None else 0
         if profile is None:
@@ -3107,7 +3122,7 @@ class Qwen4ExpModel(nn.Module):
                     )
                 )
 
-        if inputs_embeds is None and gdn_sink is None:
+        if inputs_embeds is None and hidden_sink is None and gdn_sink is None:
             host_ref = getattr(self, "_omlx_mtp_prime_host", None)
             host = host_ref() if host_ref is not None else None
             if host is not None:
@@ -3287,7 +3302,15 @@ class LanguageModel(Qwen3_5LanguageModel):
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
         return_hidden = bool(kwargs.get("return_hidden", False))
-        mtp_capture = return_hidden and kwargs.get("capture_layer_ids") is None
+        automatic_mtp_capture = bool(
+            return_hidden and kwargs.get("capture_layer_ids") is None
+        )
+        scalar_mtp_capture = bool(
+            automatic_mtp_capture
+            and inputs.ndim == 2
+            and inputs.shape[1] == 1
+        )
+        mtp_capture = automatic_mtp_capture and not scalar_mtp_capture
         if mtp_capture:
             kwargs["capture_layer_ids"] = []
         profile = _new_decode_profile_sample(
@@ -3314,6 +3337,12 @@ class LanguageModel(Qwen3_5LanguageModel):
         elif coarse_profile is not None:
             mx.synchronize()
             build_started = time.perf_counter_ns()
+        scalar_hidden_sink = [] if scalar_mtp_capture else None
+        scalar_capture_token = (
+            _SCALAR_MTP_HIDDEN_SINK.set(scalar_hidden_sink)
+            if scalar_hidden_sink is not None
+            else None
+        )
         try:
             output = super().__call__(inputs, inputs_embeds, mask, cache, **kwargs)
             if profile is not None:
@@ -3331,6 +3360,15 @@ class LanguageModel(Qwen3_5LanguageModel):
                     del _DECODE_PROFILE_LOCAL.sample
                 else:
                     _DECODE_PROFILE_LOCAL.sample = previous_profile
+            if scalar_capture_token is not None:
+                _SCALAR_MTP_HIDDEN_SINK.reset(scalar_capture_token)
+        if scalar_hidden_sink is not None:
+            if len(scalar_hidden_sink) != 1:
+                raise RuntimeError(
+                    "Qwen4 scalar MTP hidden capture did not produce exactly "
+                    "one raw residual tensor."
+                )
+            output.hidden_states = scalar_hidden_sink
         if mtp_capture and output.hidden_states:
             output.hidden_states = [output.hidden_states[0]]
         if profile is not None:
