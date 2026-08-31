@@ -11789,9 +11789,28 @@ class Scheduler:
                         # the response already carries a raw cache.  Keep
                         # ``raw_cache`` unchanged for the durable block writer.
                         detached = self.batch_generator.extract_cache([response.uid])
-                        resident_cache, resident_tokens = detached.get(
-                            response.uid, (None, None)
-                        )
+                        if isinstance(detached, dict):
+                            resident_cache, resident_tokens = detached.get(
+                                response.uid, (None, None)
+                            )
+                        elif isinstance(detached, (list, tuple)):
+                            resident_cache = detached
+                    except (TypeError, AttributeError, KeyError, ValueError):
+                        # GenerationBatch exposes the older integer-index
+                        # extraction API, while mlx-lm BatchGenerator accepts
+                        # a UID list and returns a mapping.  A paged-prefix
+                        # restore commonly leaves the active row in the
+                        # former representation; normalize that row to the
+                        # singleton cache tree before validation.
+                        try:
+                            uids = list(getattr(self.batch_generator, "uids", ()))
+                            index = uids.index(response.uid)
+                            resident_cache = self.batch_generator.extract_cache(index)
+                            tokens = getattr(self.batch_generator, "tokens", None)
+                            if tokens is not None:
+                                resident_tokens = tokens[index]
+                        except (TypeError, AttributeError, KeyError, ValueError):
+                            resident_cache = None
                     except Exception as exc:
                         logger.debug(
                             "Could not detach singleton resident cache for %s: %s",
