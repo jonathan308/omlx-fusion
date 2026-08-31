@@ -723,12 +723,22 @@ _QWEN4_VERIFY_PARITY_CYCLES_ENV = "OMLX_QWEN4_VERIFY_PARITY_CYCLES"
 _QWEN4_VERIFY_PARITY_PREFILL_STEP_ENV = "OMLX_QWEN4_VERIFY_PARITY_PREFILL_STEP"
 _QWEN4_SEQUENTIAL_VERIFY_ENV = "OMLX_QWEN4_SEQUENTIAL_VERIFY"
 _QWEN4_SEQUENTIAL_POOLED_REQUIRED_TOKENS = 32
+_QWEN4_PLE_WINDOW_PREFETCH_ENV = "OMLX_QWEN4_PLE_WINDOW_PREFETCH"
 
 
 def _qwen4_sequential_verify_enabled() -> bool:
     """Opt in to the B1 greedy full-model scalar verification oracle."""
 
     return os.environ.get(_QWEN4_SEQUENTIAL_VERIFY_ENV, "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _qwen4_ple_window_prefetch_enabled() -> bool:
+    return os.environ.get(_QWEN4_PLE_WINDOW_PREFETCH_ENV, "0").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -2771,6 +2781,41 @@ def _qwen4_language_model(model: Any) -> Any:
             if child is not None and child is not candidate:
                 pending.append(child)
     return None
+
+
+def _start_qwen4_ple_window_prefetch(
+    language_model: Any,
+    prompt_cache: List[Any],
+    target_input_ids: Tuple[int, ...],
+) -> Tuple[Any, Any] | None:
+    """Prepare and scope one best-effort immutable PLE lookup window."""
+
+    if (
+        not _qwen4_ple_window_prefetch_enabled()
+        or not 2 <= len(target_input_ids) <= 6
+    ):
+        return None
+    prepare = getattr(language_model, "prepare_ple_window_prefetch", None)
+    begin = getattr(language_model, "begin_ple_window_prefetch", None)
+    if not all(
+        callable(method)
+        for method in (
+            prepare,
+            begin,
+            getattr(language_model, "activate_ple_prefetch_row", None),
+            getattr(language_model, "finish_ple_prefetch_row", None),
+            getattr(language_model, "end_ple_window_prefetch", None),
+        )
+    ):
+        return None
+    try:
+        payload = prepare(prompt_cache, target_input_ids)
+        if payload is None:
+            return None
+        return payload, begin(payload)
+    except Exception as exc:
+        logger.debug("Qwen4 PLE window prefetch setup failed closed: %s", exc)
+        return None
 
 
 def _qwen4_detach_snapshot_value(value: Any, arrays: List[Any]) -> Any:
@@ -6552,6 +6597,11 @@ def _run_qwen4_sequential_target(
     token_buffer_base_size = (
         int(getattr(token_buffer, "_size", 0)) if token_buffer is not None else None
     )
+    ple_prefetch_scope = _start_qwen4_ple_window_prefetch(
+        snapshot.language_model,
+        gen_batch.prompt_cache,
+        target_input_ids,
+    )
     try:
         _set_singleton_mrope_delta(gen_batch)
         for row, token_id in enumerate(target_input_ids):
@@ -6561,12 +6611,34 @@ def _run_qwen4_sequential_target(
                 prev_buf = gen_batch._token_context[0].update_and_fetch(
                     token.reshape(1)
                 )
-            logits, hidden, _ = _call_backbone(
-                gen_batch.model,
-                token,
-                gen_batch.prompt_cache,
-                n_confirmed=0,
-            )
+            prefetch_row_active = False
+            if ple_prefetch_scope is not None:
+                payload, _context_token = ple_prefetch_scope
+                activate = getattr(
+                    snapshot.language_model,
+                    "activate_ple_prefetch_row",
+                    None,
+                )
+                if callable(activate):
+                    prefetch_row_active = bool(
+                        activate(payload, row, token_id, token)
+                    )
+            try:
+                logits, hidden, _ = _call_backbone(
+                    gen_batch.model,
+                    token,
+                    gen_batch.prompt_cache,
+                    n_confirmed=0,
+                )
+            finally:
+                if ple_prefetch_scope is not None and prefetch_row_active:
+                    finish = getattr(
+                        snapshot.language_model,
+                        "finish_ple_prefetch_row",
+                        None,
+                    )
+                    if callable(finish):
+                        finish(payload)
             if hidden is None or hidden.ndim < 3 or hidden.shape[1] != 1:
                 raise _MtpStepFallback(
                     "Qwen4 sequential target did not return one raw hidden row"
@@ -6643,6 +6715,22 @@ def _run_qwen4_sequential_target(
         raise _Qwen4SequentialRecoveredFallback(
             f"Qwen4 sequential target failed: {type(exc).__name__}: {exc}"
         ) from exc
+    finally:
+        if ple_prefetch_scope is not None:
+            _payload, context_token = ple_prefetch_scope
+            end = getattr(
+                snapshot.language_model,
+                "end_ple_window_prefetch",
+                None,
+            )
+            if callable(end):
+                try:
+                    end(context_token)
+                except Exception as exc:
+                    logger.warning(
+                        "Qwen4 PLE window prefetch context cleanup failed: %s",
+                        exc,
+                    )
 
     return _Qwen4SequentialVerifyResult(
         snapshot=snapshot,

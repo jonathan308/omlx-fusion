@@ -60,6 +60,10 @@ _TOKENWISE_LM_HEAD_HIDDEN_SINK: ContextVar[list | None] = ContextVar(
     "qwen4_tokenwise_lm_head_hidden_sink",
     default=None,
 )
+_PLE_WINDOW_PREFETCH: ContextVar["_PLEWindowPrefetch | None"] = ContextVar(
+    "qwen4_ple_window_prefetch",
+    default=None,
+)
 _EXACT_HC_VERIFY_ENV = "OMLX_QWEN4_EXACT_HC_VERIFY"
 _EXACT_HC_VERIFY_LOGGED = False
 _TOKENWISE_GDN_VERIFY_ENV = "OMLX_QWEN4_TOKENWISE_GDN_VERIFY"
@@ -72,6 +76,111 @@ _TOKENWISE_PLE_VERIFY_LOGGED = False
 _TOKENWISE_MOE_VERIFY_ENV = "OMLX_QWEN4_TOKENWISE_MOE_VERIFY"
 _TOKENWISE_MOE_VERIFY_WIDTHS = frozenset(range(2, 10))
 _TOKENWISE_MOE_VERIFY_LOGGED = False
+
+
+@dataclass
+class _PLEPrefetchEntry:
+    module: Any
+    cache: Any
+    ngram_ids: mx.array
+    embeddings: mx.array
+    expected_history: Any
+    next_row: int = 0
+
+
+@dataclass
+class _PLEWindowPrefetch:
+    token_ids: tuple[int, ...]
+    entries: dict[tuple[int, int], _PLEPrefetchEntry]
+    active_row: int = -1
+    active_token: int | None = None
+    active_input: Any = None
+    consumed: set[tuple[int, int]] | None = None
+    disabled: bool = False
+
+
+def _begin_ple_window_prefetch(payload: _PLEWindowPrefetch):
+    return _PLE_WINDOW_PREFETCH.set(payload)
+
+
+def _activate_ple_prefetch_row(
+    payload: _PLEWindowPrefetch,
+    row: int,
+    token_id: int,
+    input_ids: mx.array,
+) -> bool:
+    if (
+        _PLE_WINDOW_PREFETCH.get() is not payload
+        or payload.disabled
+        or payload.active_row != -1
+        or row < 0
+        or row >= len(payload.token_ids)
+        or int(token_id) != payload.token_ids[row]
+        or input_ids.shape != (1, 1)
+    ):
+        payload.disabled = True
+        return False
+    payload.active_row = int(row)
+    payload.active_token = int(token_id)
+    payload.active_input = input_ids
+    payload.consumed = set()
+    return True
+
+
+def _finish_ple_prefetch_row(payload: _PLEWindowPrefetch) -> bool:
+    if _PLE_WINDOW_PREFETCH.get() is not payload or payload.active_row < 0:
+        payload.disabled = True
+        return False
+    complete = bool(
+        not payload.disabled
+        and payload.consumed is not None
+        and len(payload.consumed) == len(payload.entries)
+    )
+    if not complete:
+        payload.disabled = True
+    payload.active_row = -1
+    payload.active_token = None
+    payload.active_input = None
+    payload.consumed = None
+    return complete
+
+
+def _end_ple_window_prefetch(token) -> None:
+    _PLE_WINDOW_PREFETCH.reset(token)
+
+
+def _consume_ple_prefetched_embedding(
+    module,
+    cache,
+    input_ids: mx.array,
+    previous_context: mx.array,
+) -> mx.array | None:
+    payload = _PLE_WINDOW_PREFETCH.get()
+    if payload is None or payload.disabled:
+        return None
+    key = (id(module), id(cache))
+    entry = payload.entries.get(key)
+    row = payload.active_row
+    if (
+        entry is None
+        or entry.module is not module
+        or entry.cache is not cache
+        or row < 0
+        or row >= len(payload.token_ids)
+        or payload.active_token != payload.token_ids[row]
+        or input_ids is not payload.active_input
+        or input_ids.shape != (1, 1)
+        or previous_context is not entry.expected_history
+        or entry.next_row != row
+        or payload.consumed is None
+        or key in payload.consumed
+    ):
+        payload.disabled = True
+        return None
+    payload.consumed.add(key)
+    entry.next_row += 1
+    entry.expected_history = cache[3]
+    return mx.contiguous(entry.embeddings[:, row : row + 1])
 
 
 def _tokenwise_ple_verify_enabled() -> bool:
@@ -3254,39 +3363,25 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         valid = (position_in_segment >= shift) & (source_positions[None] >= 0)
         return mx.where(valid, shifted, self.eos_token_id)
 
-    def __call__(
+    def _previous_context(
         self,
         input_ids: mx.array,
         cache: Optional[ArraysCache],
-        *,
-        capture_speculative_state: bool = False,
-    ):
-        input_ids = input_ids.astype(mx.int64)
+    ) -> mx.array:
         batch = input_ids.shape[0]
         if cache is not None and cache[3] is not None:
-            previous_context = cache[3]
-        else:
-            previous_context = mx.full(
-                (batch, self.context_len), self.eos_token_id, dtype=mx.int64
-            )
+            return cache[3]
+        return mx.full(
+            (batch, self.context_len),
+            self.eos_token_id,
+            dtype=mx.int64,
+        )
 
-        if cache is not None:
-            if capture_speculative_state:
-                # Start a new transaction for this target-verify window.  The
-                # paired PLE convolution capture marks it complete below.
-                cache._qwen4_exp_ple_speculative_state = _PLESpeculativeState(
-                    history=previous_context,
-                    input_ids=input_ids,
-                )
-            elif getattr(cache, "_qwen4_exp_ple_speculative_state", None) is not None:
-                # A fully accepted verifier does not call rollback.  Its old
-                # snapshot cannot describe this ordinary committed forward.
-                cache._qwen4_exp_ple_speculative_state = None
-
-        token_history = mx.concatenate([previous_context, input_ids], axis=-1)
-        if cache is not None:
-            cache[3] = mx.contiguous(token_history[:, -self.context_len :])
-
+    def _ngram_ids_from_history(
+        self,
+        token_history: mx.array,
+        input_width: int,
+    ) -> mx.array:
         shifted_tokens = [
             self._shift_right_ignore_eos(token_history, shift)
             for shift in range(self.ngram_size)
@@ -3305,10 +3400,127 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             offsets = self.ngram_heads_offsets[start:end]
             ngram_ids = mixed_ids[..., None] % sizes[None, None]
             blocks.append(ngram_ids + offsets[None, None])
+        return mx.concatenate(blocks, axis=-1)[:, -int(input_width) :]
 
-        ngram_ids = mx.concatenate(blocks, axis=-1)[:, -input_ids.shape[1] :]
+    def prefetch_window(
+        self,
+        input_ids: mx.array,
+        cache: Optional[ArraysCache],
+    ) -> tuple[mx.array, mx.array]:
+        """Read a complete immutable PLE window without advancing ``cache``."""
+
+        input_ids = input_ids.astype(mx.int64)
+        previous_context = self._previous_context(input_ids, cache)
+        token_history = mx.concatenate([previous_context, input_ids], axis=-1)
+        ngram_ids = self._ngram_ids_from_history(
+            token_history,
+            input_ids.shape[1],
+        )
+        embeddings = self.ngram_embedding(ngram_ids)
+        embeddings = embeddings.reshape(*embeddings.shape[:-2], -1)
+        mx.eval(ngram_ids, embeddings)
+        return ngram_ids, embeddings
+
+    def __call__(
+        self,
+        input_ids: mx.array,
+        cache: Optional[ArraysCache],
+        *,
+        capture_speculative_state: bool = False,
+    ):
+        raw_input_ids = input_ids
+        input_ids = input_ids.astype(mx.int64)
+        previous_context = self._previous_context(input_ids, cache)
+
+        if cache is not None:
+            if capture_speculative_state:
+                # Start a new transaction for this target-verify window.  The
+                # paired PLE convolution capture marks it complete below.
+                cache._qwen4_exp_ple_speculative_state = _PLESpeculativeState(
+                    history=previous_context,
+                    input_ids=input_ids,
+                )
+            elif getattr(cache, "_qwen4_exp_ple_speculative_state", None) is not None:
+                # A fully accepted verifier does not call rollback.  Its old
+                # snapshot cannot describe this ordinary committed forward.
+                cache._qwen4_exp_ple_speculative_state = None
+
+        token_history = mx.concatenate([previous_context, input_ids], axis=-1)
+        if cache is not None:
+            cache[3] = mx.contiguous(token_history[:, -self.context_len :])
+
+        prefetched = _consume_ple_prefetched_embedding(
+            self,
+            cache,
+            raw_input_ids,
+            previous_context,
+        )
+        if prefetched is not None:
+            return prefetched
+        ngram_ids = self._ngram_ids_from_history(
+            token_history,
+            input_ids.shape[1],
+        )
         embeddings = self.ngram_embedding(ngram_ids)
         return embeddings.reshape(*embeddings.shape[:-2], -1)
+
+
+def _prepare_ple_window_prefetch(
+    language_model,
+    cache,
+    token_ids: tuple[int, ...],
+) -> _PLEWindowPrefetch | None:
+    """Build one immutable PLE lookup window for the scalar target oracle."""
+
+    if (
+        len(token_ids) < 2
+        or len(token_ids) > 6
+        or cache is None
+        or len(cache) != len(language_model.model.layers)
+    ):
+        return None
+    tokens = mx.array([list(map(int, token_ids))], dtype=mx.int64)
+    entries: dict[tuple[int, int], _PLEPrefetchEntry] = {}
+    try:
+        for layer, layer_cache in zip(language_model.model.layers, cache):
+            if "ple" not in layer:
+                continue
+            module = layer.ple.ple_embedding
+            layer_state = getattr(layer_cache, "state", None)
+            if (
+                layer_cache is None
+                or not isinstance(layer_state, (list, tuple))
+                or len(layer_state) < 4
+            ):
+                return None
+            history = layer_cache[3]
+            if not isinstance(history, mx.array) or history.shape != (
+                1,
+                module.context_len,
+            ):
+                return None
+            ngram_ids, embeddings = module.prefetch_window(tokens, layer_cache)
+            if layer_cache[3] is not history:
+                raise RuntimeError("Qwen4 PLE prefetch mutated live history")
+            key = (id(module), id(layer_cache))
+            if key in entries:
+                raise RuntimeError("Qwen4 PLE prefetch key is duplicated")
+            entries[key] = _PLEPrefetchEntry(
+                module=module,
+                cache=layer_cache,
+                ngram_ids=ngram_ids,
+                embeddings=embeddings,
+                expected_history=history,
+            )
+    except Exception as exc:
+        logger.debug("Qwen4 PLE window prefetch failed closed: %s", exc)
+        return None
+    if not entries:
+        return None
+    return _PLEWindowPrefetch(
+        token_ids=tuple(map(int, token_ids)),
+        entries=entries,
+    )
 
 
 class Qwen4ExpPLELayer(nn.Module):
@@ -3975,6 +4187,34 @@ class LanguageModel(Qwen3_5LanguageModel):
         owner_ref = getattr(self, "_omlx_qwen4_mtp_owner", None)
         owner = owner_ref() if owner_ref is not None else None
         return getattr(owner, "mtp", None) if owner is not None else None
+
+    def prepare_ple_window_prefetch(self, cache, token_ids):
+        return _prepare_ple_window_prefetch(
+            self,
+            cache,
+            tuple(map(int, token_ids)),
+        )
+
+    @staticmethod
+    def begin_ple_window_prefetch(payload):
+        return _begin_ple_window_prefetch(payload)
+
+    @staticmethod
+    def activate_ple_prefetch_row(
+        payload,
+        row: int,
+        token_id: int,
+        input_ids: mx.array,
+    ) -> bool:
+        return _activate_ple_prefetch_row(payload, row, token_id, input_ids)
+
+    @staticmethod
+    def finish_ple_prefetch_row(payload) -> bool:
+        return _finish_ple_prefetch_row(payload)
+
+    @staticmethod
+    def end_ple_window_prefetch(token) -> None:
+        _end_ple_window_prefetch(token)
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
         return_hidden = bool(kwargs.get("return_hidden", False))
