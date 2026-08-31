@@ -38,6 +38,11 @@ at bf16 tail-ULP level. Greedy outputs can therefore occasionally diverge
 from the unrouted path (the token is still trunk-verified — the divergence
 class is the same as any kernel change).
 
+Callers that require canonical token identity arm ``exact=True``.  Exact mode
+runs every verify row through the original one-token projection and joins the
+results afterward.  This is a hard gate, not a logit-margin heuristic: no
+wide-M or alternate-reduction verify QMM is admitted.
+
 Supported: 4-bit and 8-bit affine, group_size in {32, 64, 128}, bf16/fp16
 activations, M in 3..6, K % 64 == 0, N % 4 == 0. Everything else falls
 back to stock.
@@ -443,6 +448,7 @@ def vk_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> bo
 # ---------------------------------------------------------------------------
 
 _QL_PATCHED = False
+_EXACT_LOGGED = False
 
 
 def apply_verify_qmm_patch() -> bool:
@@ -468,6 +474,28 @@ def apply_verify_qmm_patch() -> bool:
     orig_call = cls.__call__
 
     def patched_call(self, x):
+        global _EXACT_LOGGED
+        if (
+            _is_armed()
+            and _is_exact()
+            and x.ndim == 3
+            and x.shape[0] == 1
+            and 2 <= x.shape[1] <= 9
+        ):
+            # Exact Qwen4 control: preserve the stock M=1 projection's kernel
+            # and reduction order independently for every verify position.
+            # Building the rows lazily keeps one target call at the scheduler
+            # seam while forbidding both stock wide-M and vk-QMM numerics.
+            if not _EXACT_LOGGED:
+                _EXACT_LOGGED = True
+                logger.info(
+                    "MTP verify qmm exact singleton-row gate active (M=%d)",
+                    x.shape[1],
+                )
+            return mx.concatenate(
+                [orig_call(self, x[:, row : row + 1]) for row in range(x.shape[1])],
+                axis=1,
+            )
         if (
             _is_armed()
             and x.ndim == 3
