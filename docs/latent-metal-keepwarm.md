@@ -35,17 +35,17 @@ The optional environment controls are:
 | Variable | Default | Purpose |
 | --- | ---: | --- |
 | `OMLX_KEEPWARM` | `0` | Master switch |
-| `OMLX_KEEPWARM_INTERVAL_SECONDS` | `10` | Periodic idle cadence |
+| `OMLX_KEEPWARM_INTERVAL_SECONDS` | local `2`; cluster `10` | Periodic idle cadence |
 | `OMLX_KEEPWARM_IDLE_AFTER_SECONDS` | `2` | Idle time before periodic touch |
 | `OMLX_KEEPWARM_MATRIX_SIZE` | `1` | Periodic matrix width |
 | `OMLX_KEEPWARM_REQUEST_START` | `1` | Request-boundary warm after idle |
 | `OMLX_KEEPWARM_REQUEST_START_IDLE_SECONDS` | `2` | Request-boundary idle gate |
 | `OMLX_KEEPWARM_REQUEST_START_MATRIX_SIZE` | `128` | Request-boundary width |
 | `OMLX_KEEPWARM_POST_RESPONSE` | `1` | Follow-up-turn warm |
-| `OMLX_KEEPWARM_POST_RESPONSE_DELAY_SECONDS` | `5` | Follow-up warm delay |
+| `OMLX_KEEPWARM_POST_RESPONSE_DELAY_SECONDS` | local `1`; cluster `5` | Follow-up warm delay |
 | `OMLX_KEEPWARM_POST_RESPONSE_MATRIX_SIZE` | `128` | Follow-up width |
 | `OMLX_KEEPWARM_LARGE_CACHE_TOKENS` | `8192` | Long-cache cadence threshold |
-| `OMLX_KEEPWARM_LARGE_CACHE_INTERVAL_SECONDS` | `60` | Long-cache cadence |
+| `OMLX_KEEPWARM_LARGE_CACHE_INTERVAL_SECONDS` | local `2`; cluster `60` | Long-cache cadence |
 | `OMLX_KEEPWARM_SLOW_THRESHOLD_SECONDS` | `1` | Slow-operation threshold |
 | `OMLX_KEEPWARM_SLOW_BACKOFF_SECONDS` | `60` | Backoff after a failed/slow touch |
 | `OMLX_CLUSTER_KEEPWARM_DATAPLANE_PING` | `1` | Cluster-only rank data-plane ping |

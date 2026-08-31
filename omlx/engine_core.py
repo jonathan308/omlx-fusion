@@ -163,7 +163,9 @@ class EngineConfig:
     step_interval: float = 0.05  # Idle wait timeout; requests wake the loop
     stream_interval: int = 1  # Tokens to batch before streaming (1=every token)
     prefill_eviction_callback: Optional[Callable[[Any], Awaitable[bool]]] = None
-    keepwarm_config: KeepwarmConfig = field(default_factory=KeepwarmConfig.from_env)
+    keepwarm_config: KeepwarmConfig = field(
+        default_factory=KeepwarmConfig.for_local_engine
+    )
     # Decode burst: run several scheduler.step() calls per run_in_executor
     # hand-off instead of one. Each decode token otherwise bounces back to the
     # event loop, ping-ponging the GIL with the asyncio loop + uvicorn on the

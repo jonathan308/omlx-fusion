@@ -110,6 +110,33 @@ class KeepwarmConfig:
             dataplane_ping=_enabled("OMLX_CLUSTER_KEEPWARM_DATAPLANE_PING", True),
         )
 
+    @classmethod
+    def for_local_engine(cls) -> "KeepwarmConfig":
+        """Resolve the physically qualified asynchronous local cadence.
+
+        Cluster ranks still use :meth:`from_env` and their conservative
+        synchronous 10s/5s/60s defaults. Local engines submit an eight-byte,
+        one-thread pulse asynchronously, so a 2s periodic cadence and 1s
+        post-response arm keep Metal out of its measured idle cliff without
+        blocking inference. Explicit environment values remain authoritative
+        for both paths.
+        """
+
+        return replace(
+            cls.from_env(),
+            interval_seconds=_float(
+                "OMLX_KEEPWARM_INTERVAL_SECONDS", 2.0, minimum=0.25
+            ),
+            post_response_delay_seconds=_float(
+                "OMLX_KEEPWARM_POST_RESPONSE_DELAY_SECONDS", 1.0
+            ),
+            large_cache_interval_seconds=_float(
+                "OMLX_KEEPWARM_LARGE_CACHE_INTERVAL_SECONDS",
+                2.0,
+                minimum=0.25,
+            ),
+        )
+
 
 @dataclass(frozen=True)
 class KeepwarmAction:

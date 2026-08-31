@@ -55,6 +55,41 @@ def test_keepwarm_is_default_off(monkeypatch):
     assert KeepwarmConfig.from_env().enabled is False
 
 
+def test_local_async_defaults_are_faster_than_cluster_sync_defaults(monkeypatch):
+    for name in (
+        "OMLX_KEEPWARM_INTERVAL_SECONDS",
+        "OMLX_KEEPWARM_POST_RESPONSE_DELAY_SECONDS",
+        "OMLX_KEEPWARM_LARGE_CACHE_INTERVAL_SECONDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    cluster = KeepwarmConfig.from_env()
+    local = KeepwarmConfig.for_local_engine()
+
+    assert (
+        cluster.interval_seconds,
+        cluster.post_response_delay_seconds,
+        cluster.large_cache_interval_seconds,
+    ) == (10.0, 5.0, 60.0)
+    assert (
+        local.interval_seconds,
+        local.post_response_delay_seconds,
+        local.large_cache_interval_seconds,
+    ) == (2.0, 1.0, 2.0)
+
+
+def test_local_async_cadence_keeps_explicit_environment_overrides(monkeypatch):
+    monkeypatch.setenv("OMLX_KEEPWARM_INTERVAL_SECONDS", "3")
+    monkeypatch.setenv("OMLX_KEEPWARM_POST_RESPONSE_DELAY_SECONDS", "1.5")
+    monkeypatch.setenv("OMLX_KEEPWARM_LARGE_CACHE_INTERVAL_SECONDS", "4")
+
+    local = KeepwarmConfig.for_local_engine()
+
+    assert local.interval_seconds == 3.0
+    assert local.post_response_delay_seconds == 1.5
+    assert local.large_cache_interval_seconds == 4.0
+
+
 def test_idle_touch_does_not_arm_before_a_real_request_or_cache():
     clock = Clock()
     controller = KeepwarmController(config(), clock=clock)
