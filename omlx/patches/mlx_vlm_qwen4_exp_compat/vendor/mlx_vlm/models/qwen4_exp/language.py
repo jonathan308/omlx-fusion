@@ -45,6 +45,8 @@ _HC_FUSED_VERIFY_WIDTHS = frozenset({2, 3, 4, 5, 6, 7, 8, 9})
 _QSA_DIRECT_VERIFY_MIN_TOKENS = 32_768
 _QSA_VERIFY_MATCH_DECODE_ENV = "OMLX_QWEN4_VERIFY_MATCH_DECODE_QSA"
 _QSA_VERIFY_MATCH_DECODE_LOGGED = False
+_TOKENWISE_QSA_VERIFY_ENV = "OMLX_QWEN4_TOKENWISE_QSA_VERIFY"
+_TOKENWISE_QSA_VERIFY_LOGGED = False
 _DECODE_PROFILE_LOCAL = threading.local()
 _DECODE_PROFILE_LOCK = threading.Lock()
 _DECODE_PROFILE_CALLS = 0
@@ -87,6 +89,17 @@ def _qsa_verify_match_decode_enabled() -> bool:
     """Whether target verification may use scalar decode's QSA crossover."""
 
     return os.environ.get(_QSA_VERIFY_MATCH_DECODE_ENV, "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _tokenwise_qsa_verify_enabled() -> bool:
+    """Diagnostic gate for ordinary scalar QSA target verification."""
+
+    return os.environ.get(_TOKENWISE_QSA_VERIFY_ENV, "0").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -1839,6 +1852,152 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             and position_ids.shape == (1, length)
         )
 
+    def _tokenwise_text_verify_eligible(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[Any],
+        position_ids: Optional[mx.array],
+        position_embeddings: Optional[tuple[mx.array, mx.array]],
+        target_verify: bool,
+    ) -> bool:
+        """Admit only a restorable B1 text verifier with aligned QSA state."""
+
+        supported_mask = (
+            mask is None
+            or (isinstance(mask, str) and mask == "causal")
+            or isinstance(mask, mx.array)
+        )
+        if not (
+            target_verify
+            and _tokenwise_qsa_verify_enabled()
+            and x.ndim == 3
+            and x.shape[0] == 1
+            and 2 <= x.shape[1] <= 9
+            and supported_mask
+            and type(cache) is QSAKVCache
+            and isinstance(cache.offset, int)
+            and position_embeddings is None
+            and self._batch_one_text_position_ids(position_ids, x.shape[1])
+        ):
+            return False
+
+        if cache.offset:
+            if cache.index_keys is None or cache.index_position_ids is None:
+                return False
+            if (
+                cache.index_keys.shape[1] != cache.offset
+                or cache.index_position_ids.shape[-1] != cache.offset
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _slice_tokenwise_verify_mask(
+        mask,
+        *,
+        row: int,
+        width: int,
+        visible_tokens: int,
+    ):
+        if mask is None or isinstance(mask, str):
+            return mask
+        if not isinstance(mask, mx.array):
+            raise ValueError("Qwen4 tokenwise QSA received an unsupported mask")
+        if mask.ndim == 2:
+            if mask.shape == (1, width):
+                return mask[:, row : row + 1]
+            if mask.shape[0] == width and mask.shape[1] >= visible_tokens:
+                return mask[row : row + 1, :visible_tokens]
+            raise ValueError("Qwen4 tokenwise QSA rank-two mask is not row aligned")
+        if mask.ndim not in {3, 4} or mask.shape[-2] not in {1, width}:
+            raise ValueError("Qwen4 tokenwise QSA attention mask is not row aligned")
+        if mask.shape[-1] < visible_tokens:
+            raise ValueError("Qwen4 tokenwise QSA attention mask has a short key axis")
+        row_mask = mask if mask.shape[-2] == 1 else mask[..., row : row + 1, :]
+        return row_mask[..., :visible_tokens]
+
+    @staticmethod
+    def _restore_tokenwise_qsa_offset(cache: QSAKVCache, start_offset: int) -> None:
+        if cache.offset < start_offset:
+            raise RuntimeError("Qwen4 tokenwise QSA cache rewound below its start")
+        advanced = cache.offset - start_offset
+        if advanced:
+            trimmed = cache.trim(advanced)
+            if trimmed != advanced:
+                raise RuntimeError("Qwen4 tokenwise QSA cache trim was incomplete")
+        elif getattr(cache, "_index_offset", start_offset) > start_offset:
+            cache._trim_indexer(start_offset)
+        if cache.offset != start_offset or getattr(
+            cache, "_index_offset", start_offset
+        ) != start_offset:
+            raise RuntimeError("Qwen4 tokenwise QSA cache failed to restore")
+
+    def _tokenwise_text_verify(
+        self,
+        x: mx.array,
+        mask,
+        cache: QSAKVCache,
+        position_ids: Optional[mx.array],
+    ) -> mx.array | None:
+        """Run one ordinary scalar QSA call per verifier row transactionally."""
+
+        width = x.shape[1]
+        start_offset = cache.offset
+        try:
+            row_positions = [
+                None
+                if position_ids is None
+                else position_ids[:, row : row + 1]
+                for row in range(width)
+            ]
+            row_masks = [
+                self._slice_tokenwise_verify_mask(
+                    mask,
+                    row=row,
+                    width=width,
+                    visible_tokens=start_offset + row + 1,
+                )
+                for row in range(width)
+            ]
+            outputs = [
+                self(
+                    x[:, row : row + 1],
+                    mask=row_masks[row],
+                    cache=cache,
+                    position_ids=row_positions[row],
+                    position_embeddings=None,
+                    target_verify=False,
+                )
+                for row in range(width)
+            ]
+            expected_offset = start_offset + width
+            if (
+                cache.offset != expected_offset
+                or cache.index_keys is None
+                or cache.index_position_ids is None
+                or cache.index_keys.shape[1] != expected_offset
+                or cache.index_position_ids.shape[-1] != expected_offset
+            ):
+                raise RuntimeError("Qwen4 tokenwise QSA rows advanced unevenly")
+            output = mx.concatenate(outputs, axis=1)
+        except Exception as exc:
+            self._restore_tokenwise_qsa_offset(cache, start_offset)
+            logger.debug(
+                "Qwen4 tokenwise QSA target-verify diagnostic failed closed: %s",
+                exc,
+            )
+            return None
+
+        global _TOKENWISE_QSA_VERIFY_LOGGED
+        if not _TOKENWISE_QSA_VERIFY_LOGGED:
+            _TOKENWISE_QSA_VERIFY_LOGGED = True
+            logger.info(
+                "Qwen4 tokenwise QSA target-verify diagnostic active (M=%d)",
+                width,
+            )
+        return output
+
     def _gathered_text_prefill_eligible(
         self,
         x: mx.array,
@@ -2174,6 +2333,23 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
         target_verify: bool = False,
     ) -> mx.array:
+        if self._tokenwise_text_verify_eligible(
+            x,
+            mask,
+            cache,
+            position_ids,
+            position_embeddings,
+            target_verify,
+        ):
+            tokenwise = self._tokenwise_text_verify(
+                x,
+                mask,
+                cache,
+                position_ids,
+            )
+            if tokenwise is not None:
+                return tokenwise
+
         if self._gathered_text_verify_eligible(
             x,
             mask,
