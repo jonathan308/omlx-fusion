@@ -14,6 +14,7 @@ from omlx.keepwarm import (
     KeepwarmAction,
     KeepwarmConfig,
     KeepwarmController,
+    MetalKeepwarmTouchResult,
     distributed_dataplane_ping,
 )
 
@@ -440,7 +441,10 @@ class SyntheticFast:
             self.owner.kernel_calls.append(call_kwargs)
             if self.owner.invocation_fails:
                 raise RuntimeError("JIT invocation failed")
-            return [SyntheticArray(self.owner.output_value)]
+            output = SyntheticArray(self.owner.output_value)
+            output.shape = self.owner.output_shape
+            output.dtype = self.owner.output_dtype
+            return [output]
 
         return kernel
 
@@ -453,11 +457,19 @@ class SyntheticMX:
         *,
         creation_fails: bool = False,
         invocation_fails: bool = False,
+        async_fails: bool = False,
+        synchronize_fails: bool = False,
         output_value: float = 1.0 + 1e-7,
+        output_shape: tuple[int, ...] = (1,),
+        output_dtype: str = "float32",
     ) -> None:
         self.creation_fails = creation_fails
         self.invocation_fails = invocation_fails
+        self.async_fails = async_fails
+        self.synchronize_fails = synchronize_fails
         self.output_value = output_value
+        self.output_shape = output_shape
+        self.output_dtype = output_dtype
         self.fast = SyntheticFast(self)
         self.array_allocations = 0
         self.kernel_creations = 0
@@ -465,6 +477,9 @@ class SyntheticMX:
         self.kernel_options: list[dict] = []
         self.kernel_calls: list[dict] = []
         self.evaluated: list[SyntheticArray] = []
+        self.async_eval_calls = 0
+        self.latest_async_output: SyntheticArray | None = None
+        self.synchronize_calls: list[object] = []
         self.stream_entries: list[object] = []
         self.stream_creations: list[tuple[object, str]] = []
         self.execution_threads: list[str] = []
@@ -478,6 +493,19 @@ class SyntheticMX:
     def eval(self, value):
         self.execution_threads.append(threading.current_thread().name)
         self.evaluated.append(value)
+
+    def async_eval(self, value):
+        self.execution_threads.append(threading.current_thread().name)
+        self.async_eval_calls += 1
+        if self.async_fails:
+            raise RuntimeError("async submission failed")
+        self.latest_async_output = value
+
+    def synchronize(self, stream):
+        self.execution_threads.append(threading.current_thread().name)
+        self.synchronize_calls.append(stream)
+        if self.synchronize_fails:
+            raise RuntimeError("stream synchronization failed")
 
     @staticmethod
     def default_device():
@@ -498,10 +526,13 @@ def test_metal_pulse_jits_once_during_idle_then_request_start_reuses_it():
     fake_mx = SyntheticMX()
     touch = CompiledMetalKeepwarmTouch(fake_mx, stream="engine-stream")
 
-    touch.touch(KeepwarmAction("idle", 1, 1, 2.0))
-    touch.touch(KeepwarmAction("request_start", 128, 1, 2.0))
-    touch.touch(KeepwarmAction("post_response", 128, 2, 2.0))
+    prepared = touch.touch(KeepwarmAction("idle", 1, 1, 2.0))
+    request = touch.touch(KeepwarmAction("request_start", 128, 1, 2.0))
+    post = touch.touch(KeepwarmAction("post_response", 128, 2, 2.0))
 
+    assert prepared.execution_mode == "async_prepared"
+    assert request.execution_mode == "async_submitted"
+    assert post.execution_mode == "async_submitted"
     assert fake_mx.array_allocations == 1
     assert fake_mx.kernel_creations == 1
     assert fake_mx.kernel_runs == 4
@@ -514,9 +545,11 @@ def test_metal_pulse_jits_once_during_idle_then_request_start_reuses_it():
     for call in fake_mx.kernel_calls:
         assert call["grid"] == (1, 1, 1)
         assert call["threadgroup"] == (1, 1, 1)
-    # Only the first, JIT-preparation output crosses to a host scalar.
-    outputs = fake_mx.evaluated[1:]
-    assert [output.item_calls for output in outputs] == [1, 0, 0, 0]
+    # No production pulse performs a synchronous eval, scalar read, or drain.
+    assert fake_mx.evaluated == []
+    assert fake_mx.async_eval_calls == 4
+    assert fake_mx.latest_async_output.item_calls == 0
+    assert fake_mx.synchronize_calls == []
 
 
 def test_request_start_miss_skips_without_allocation_or_jit():
@@ -544,6 +577,24 @@ def test_metal_pulse_lazily_creates_and_reuses_one_dedicated_stream():
     assert fake_mx.stream_creations == [("gpu", threading.current_thread().name)]
     assert fake_mx.stream_entries == ["dedicated-stream-1"] * 2
     assert touch._stream == "dedicated-stream-1"
+
+
+def test_hot_pulses_keep_only_latest_four_byte_output_without_sync_or_list_growth():
+    fake_mx = SyntheticMX()
+    touch = CompiledMetalKeepwarmTouch(fake_mx)
+    touch.touch(KeepwarmAction("idle", 1, 1, 2.0))
+    sync_eval_count = len(fake_mx.evaluated)
+
+    for _ in range(100):
+        result = touch.touch(KeepwarmAction("request_start", 128, 1, 2.0))
+        assert result.execution_mode == "async_submitted"
+
+    assert fake_mx.async_eval_calls == 101
+    assert len(fake_mx.evaluated) == sync_eval_count
+    assert fake_mx.synchronize_calls == []
+    assert touch._latest_output is fake_mx.latest_async_output
+    assert touch._latest_output.nbytes == 4
+    assert not isinstance(touch._latest_output, list)
 
 
 def test_metal_pulse_create_use_and_close_share_one_executor_thread():
@@ -599,17 +650,42 @@ def test_missing_metal_kernel_and_jit_failure_never_fall_back_to_matmul():
     assert failing._prepared is False
 
 
-def test_metal_pulse_rejects_an_inexact_first_output_and_drops_partial_jit():
-    fake_mx = SyntheticMX(output_value=7.0)
+def test_missing_or_failed_async_eval_is_nonfatal_and_drops_prepared_refs():
+    unavailable_mx = SyntheticMX()
+    unavailable = CompiledMetalKeepwarmTouch(unavailable_mx)
+    unavailable.touch(KeepwarmAction("idle", 1, 1, 2.0))
+    unavailable_mx.async_eval = None
+    failing_mx = SyntheticMX()
+    failing = CompiledMetalKeepwarmTouch(failing_mx)
+    failing.touch(KeepwarmAction("idle", 1, 1, 2.0))
+    failing_mx.async_fails = True
+
+    for touch in (unavailable, failing):
+        try:
+            touch.touch(KeepwarmAction("request_start", 128, 1, 2.0))
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("async pulse failure must reach outer backoff")
+        assert touch._prepared is False
+        assert touch._input is None
+        assert touch._kernel is None
+        assert touch._latest_output is None
+
+
+def test_metal_pulse_rejects_wrong_output_metadata_without_a_host_read():
+    fake_mx = SyntheticMX(output_shape=(2,))
     touch = CompiledMetalKeepwarmTouch(fake_mx)
 
     try:
         touch.touch(KeepwarmAction("idle", 1, 1, 2.0))
     except RuntimeError as exc:
-        assert "unexpected result" in str(exc)
+        assert "unexpected output shape" in str(exc)
     else:
-        raise AssertionError("inexact Metal pulse output must fail closed")
+        raise AssertionError("wrong Metal pulse metadata must fail closed")
 
+    assert "out[elem] = inp[elem] + (T)1e-7;" in touch.KERNEL_SOURCE
+    assert fake_mx.evaluated == []
     assert touch._input is None
     assert touch._kernel is None
     assert touch._prepared is False
@@ -641,16 +717,20 @@ def test_metal_pulse_retains_exactly_one_four_byte_input_and_close_drops_it():
     fake_mx = SyntheticMX()
     touch = CompiledMetalKeepwarmTouch(fake_mx, stream="engine-stream")
     touch.touch(KeepwarmAction("idle", 1, 1, 2.0))
+    touch.touch(KeepwarmAction("request_start", 128, 1, 2.0))
 
     assert touch._input is not None
     assert touch._input.nbytes == 4
     assert touch._kernel is not None
-    assert not hasattr(touch, "_output")
+    assert touch._latest_output is not None
+    assert touch._latest_output.nbytes == 4
 
     touch.close()
 
+    assert fake_mx.synchronize_calls == ["engine-stream"]
     assert touch._input is None
     assert touch._kernel is None
+    assert touch._latest_output is None
     assert touch._mx is None
     assert touch._stream is None
     try:
@@ -659,6 +739,27 @@ def test_metal_pulse_retains_exactly_one_four_byte_input_and_close_drops_it():
         pass
     else:
         raise AssertionError("closed Metal pulse must not allocate again")
+
+
+def test_close_clears_every_reference_even_when_exact_stream_drain_fails():
+    fake_mx = SyntheticMX(synchronize_fails=True)
+    touch = CompiledMetalKeepwarmTouch(fake_mx)
+    touch.touch(KeepwarmAction("idle", 1, 1, 2.0))
+    touch.touch(KeepwarmAction("request_start", 128, 1, 2.0))
+    pulse_stream = touch._stream
+
+    try:
+        touch.close()
+    except RuntimeError as exc:
+        assert "synchronization failed" in str(exc)
+    else:
+        raise AssertionError("exact-stream drain failure must be observable")
+
+    assert fake_mx.synchronize_calls == [pulse_stream]
+    assert touch._stream is None
+    assert touch._input is None
+    assert touch._kernel is None
+    assert touch._latest_output is None
 
 
 def test_engine_compiled_touch_failure_is_nonfatal_to_inference():
@@ -687,3 +788,21 @@ def test_engine_request_start_pulse_miss_is_a_skip_not_a_failure():
     snapshot = core._keepwarm.snapshot()
     assert snapshot["skips"] == 1
     assert snapshot["failures"] == 0
+
+
+def test_engine_telemetry_marks_hot_pulse_as_async_submission():
+    core = core_with_scheduler(Scheduler())
+    core._compiled_metal_keepwarm = SimpleNamespace(
+        touch=lambda _action: MetalKeepwarmTouchResult(
+            elapsed_seconds=0.0002,
+            execution_mode="async_submitted",
+        )
+    )
+    core._keepwarm.observe_request_state(True)
+    core._keepwarm.observe_request_state(False, cache_tokens=4096)
+    action = KeepwarmAction("idle", 1, 1, 2.0, cache_tokens=4096)
+
+    assert core._run_keepwarm_action(action) is True
+    event = core._keepwarm.snapshot()["last_event"]
+    assert event["execution_mode"] == "async_submitted"
+    assert event["elapsed_ms"] == 0.2

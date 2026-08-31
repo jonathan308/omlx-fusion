@@ -453,10 +453,11 @@ class EngineCore:
                 # Never reintroduce the allocation-heavy local matmul fallback.
                 self._keepwarm.skip("local Metal pulse is unavailable")
                 return False
-            elapsed = compiled_touch.touch(action)
-            if elapsed is None:
+            touch_result = compiled_touch.touch(action)
+            if touch_result is None:
                 self._keepwarm.skip("request-start Metal pulse is not prepared")
                 return False
+            elapsed = touch_result.elapsed_seconds
         except Exception as exc:  # keep a model usable if experimental warming fails
             elapsed = max(0.0, time.monotonic() - started)
             self._keepwarm.record(
@@ -467,17 +468,32 @@ class EngineCore:
             )
             logger.warning("Local keepwarm %s failed: %s", action.kind, exc)
             return False
-        self._keepwarm.record(action, elapsed_seconds=elapsed, ok=True)
+        self._keepwarm.record(
+            action,
+            elapsed_seconds=elapsed,
+            ok=True,
+            execution_mode=touch_result.execution_mode,
+        )
         if elapsed >= self.config.keepwarm_config.slow_threshold_seconds:
             logger.warning(
-                "Local keepwarm %s was slow (%.1f ms); backing off",
+                "Local keepwarm %s %s was slow (%.1f ms); backing off",
                 action.kind,
+                (
+                    "async submission"
+                    if touch_result.execution_mode == "async_submitted"
+                    else "asynchronous preparation"
+                ),
                 elapsed * 1000.0,
             )
         else:
             logger.debug(
-                "Local keepwarm %s completed in %.1f ms",
+                "Local keepwarm %s %s in %.1f ms",
                 action.kind,
+                (
+                    "submitted asynchronously"
+                    if touch_result.execution_mode == "async_submitted"
+                    else "prepared asynchronously"
+                ),
                 elapsed * 1000.0,
             )
         return True
@@ -1309,9 +1325,11 @@ class EngineCore:
             # asyncio task cancellation cannot interrupt an executor call that
             # already started. FIFO this close behind any in-flight touch, then
             # release its stream-owned arrays before scheduler/model teardown.
-            if compiled_touch is not None:
-                compiled_touch.close()
-            self.scheduler.shutdown()
+            try:
+                if compiled_touch is not None:
+                    compiled_touch.close()
+            finally:
+                self.scheduler.shutdown()
 
         # Release model ownership BEFORE setting _closed
         # (_release_model checks not self._closed)

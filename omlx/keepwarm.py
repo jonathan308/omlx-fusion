@@ -11,7 +11,6 @@ adds oMLX-specific admission, cache-clear, shutdown, and live-settings gates.
 
 from __future__ import annotations
 
-import math
 import os
 import threading
 import time
@@ -119,6 +118,12 @@ class KeepwarmAction:
     repeats: int
     idle_seconds: float
     cache_tokens: int = 0
+
+
+@dataclass(frozen=True)
+class MetalKeepwarmTouchResult:
+    elapsed_seconds: float
+    execution_mode: str
 
 
 class KeepwarmController:
@@ -303,6 +308,7 @@ class KeepwarmController:
         elapsed_seconds: float,
         ok: bool,
         dataplane_ping: bool = False,
+        execution_mode: str | None = None,
         error: str | None = None,
     ) -> None:
         now = float(self._clock())
@@ -320,6 +326,8 @@ class KeepwarmController:
         }
         if error:
             event["error"] = str(error)[:500]
+        if execution_mode:
+            event["execution_mode"] = str(execution_mode)[:50]
         with self._lock:
             self._last_touch_at = now
             self._count += 1
@@ -378,8 +386,6 @@ class CompiledMetalKeepwarmTouch:
     MAX_MATRIX_SIZE = 1024
     MIN_REPEATS = 1
     MAX_REPEATS = 16
-    EXPECTED_OUTPUT = 1.0 + 1e-7
-    OUTPUT_ABS_TOLERANCE = 2e-7
     KERNEL_SOURCE = """
         uint elem = thread_position_in_grid.x;
         out[elem] = inp[elem] + (T)1e-7;
@@ -397,6 +403,7 @@ class CompiledMetalKeepwarmTouch:
         self._clock = clock
         self._input: Any | None = None
         self._kernel: Callable[..., Any] | None = None
+        self._latest_output: Any | None = None
         self._prepared = False
         self._closed = False
 
@@ -418,13 +425,11 @@ class CompiledMetalKeepwarmTouch:
             raise ValueError(f"unsupported keepwarm action: {action.kind}")
         return matrix_size, repeats
 
-    def _invoke(
+    def _make_output(
         self,
         kernel: Callable[..., Any],
         input_value: Any,
-        *,
-        validate: bool,
-    ) -> None:
+    ) -> Any:
         mx_module = self._mx
         if mx_module is None or self._closed:
             raise RuntimeError("Metal keepwarm pulse is closed")
@@ -438,22 +443,37 @@ class CompiledMetalKeepwarmTouch:
         )
         if not outputs:
             raise RuntimeError("Metal keepwarm pulse returned no output")
-        output = outputs[0]
-        # eval(output) is the completion fence for this exact command. Avoid a
-        # second mx.synchronize() and avoid host copies after first validation.
-        mx_module.eval(output)
-        if validate:
-            actual = float(output.item())
-            if not math.isclose(
-                actual,
-                self.EXPECTED_OUTPUT,
-                rel_tol=0.0,
-                abs_tol=self.OUTPUT_ABS_TOLERANCE,
-            ):
-                raise RuntimeError(
-                    "Metal keepwarm pulse produced an unexpected result: "
-                    f"expected approximately {self.EXPECTED_OUTPUT}, got {actual}"
-                )
+        return outputs[0]
+
+    @staticmethod
+    def _validate_output_metadata(output: Any, input_value: Any) -> None:
+        if tuple(output.shape) != tuple(input_value.shape):
+            raise RuntimeError(
+                "Metal keepwarm pulse returned an unexpected output shape"
+            )
+        if output.dtype != input_value.dtype:
+            raise RuntimeError(
+                "Metal keepwarm pulse returned an unexpected output dtype"
+            )
+
+    def _submit_async(
+        self,
+        kernel: Callable[..., Any],
+        input_value: Any,
+    ) -> None:
+        mx_module = self._mx
+        if mx_module is None or self._closed:
+            raise RuntimeError("Metal keepwarm pulse is closed")
+        async_eval = getattr(mx_module, "async_eval", None)
+        if not callable(async_eval):
+            raise RuntimeError("mx.async_eval is unavailable")
+        output = self._make_output(kernel, input_value)
+        self._validate_output_metadata(output, input_value)
+        async_eval(output)
+        # Keep exactly one four-byte output alive. Replacing a prior reference
+        # never inserts a global or stream fence; the bounded cadence gives the
+        # preceding one-thread command ample time to retire independently.
+        self._latest_output = output
 
     def _prepare(self) -> None:
         mx_module = self._mx
@@ -465,7 +485,6 @@ class CompiledMetalKeepwarmTouch:
             raise RuntimeError("mx.fast.metal_kernel is unavailable")
 
         input_value = mx_module.array([1.0], dtype=mx_module.float32)
-        mx_module.eval(input_value)
         kernel = metal_kernel(
             name="omlx_keepwarm_pulse",
             input_names=["inp"],
@@ -476,9 +495,10 @@ class CompiledMetalKeepwarmTouch:
             atomic_outputs=False,
             compile_options={"math_mode": "safe"},
         )
-        # The first invocation performs JIT. Validate it before publication so
-        # request_start can never observe a partial or incorrect kernel.
-        self._invoke(kernel, input_value, validate=True)
+        # Fixed source/template plus shape/dtype metadata are validated without
+        # a host read or completion fence. Unit and isolated integration tests
+        # validate the exact 1 + 1e-7 value; production never blocks here.
+        self._submit_async(kernel, input_value)
         self._input = input_value
         self._kernel = kernel
         self._prepared = True
@@ -497,8 +517,8 @@ class CompiledMetalKeepwarmTouch:
             self._stream = new_stream(mx_module.default_device())
         return self._stream
 
-    def touch(self, action: KeepwarmAction) -> float | None:
-        """Run a pulse, or return None for an unprepared request-start."""
+    def touch(self, action: KeepwarmAction) -> MetalKeepwarmTouchResult | None:
+        """Prepare synchronously off-path or submit a bounded async pulse."""
 
         _matrix_size, repeats = self._validate_action(action)
         if self._closed:
@@ -520,28 +540,43 @@ class CompiledMetalKeepwarmTouch:
                 input_value = self._input
                 if kernel is None or input_value is None:
                     raise RuntimeError("Metal keepwarm pulse was not prepared")
-                # _prepare() already emitted and evaluated the first pulse.
+                # _prepare() already submitted the first pulse. Every later
+                # pulse is also submission-only.
                 remaining = repeats - 1 if prepared_now else repeats
                 for _ in range(remaining):
-                    self._invoke(kernel, input_value, validate=False)
+                    self._submit_async(kernel, input_value)
         except Exception:
             # Do not retain or repeatedly call a partial/broken JIT. The outer
             # controller records failure and applies bounded retry backoff.
             self._prepared = False
             self._kernel = None
             self._input = None
+            self._latest_output = None
             raise
-        return max(0.0, float(self._clock()) - started)
+        return MetalKeepwarmTouchResult(
+            elapsed_seconds=max(0.0, float(self._clock()) - started),
+            execution_mode=("async_prepared" if prepared_now else "async_submitted"),
+        )
 
     def close(self) -> None:
         """Drop every synthetic array/function reference before teardown."""
 
         self._closed = True
-        self._prepared = False
-        self._kernel = None
-        self._input = None
-        self._stream = None
-        self._mx = None
+        mx_module = self._mx
+        pulse_stream = self._stream
+        try:
+            if mx_module is not None and pulse_stream is not None:
+                synchronize = getattr(mx_module, "synchronize", None)
+                if not callable(synchronize):
+                    raise RuntimeError("mx.synchronize is unavailable")
+                synchronize(pulse_stream)
+        finally:
+            self._prepared = False
+            self._kernel = None
+            self._input = None
+            self._latest_output = None
+            self._stream = None
+            self._mx = None
 
 
 def metal_warmup_touch(
