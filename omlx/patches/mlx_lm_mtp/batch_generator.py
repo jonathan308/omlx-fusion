@@ -219,6 +219,10 @@ def apply() -> bool:
 
         def patched_init(self, *args, **kwargs):
             original_init(self, *args, **kwargs)
+            # Stock GenerationBatch owns an exact one-token pipeline. Qwen4
+            # MTP clears this marker before its first extra target forward and
+            # restores it only after an exact reconcile/park/handoff.
+            self._omlx_standard_target_exact_v1 = True
             # Do not activate MTP here. Fresh singleton batches created by
             # PromptProcessingBatch.generate() may still be merged into a larger
             # continuous batch; mutating their cache in __init__ can corrupt the
@@ -293,10 +297,13 @@ def apply() -> bool:
                     )
                 if park_state is not None:
                     _record_parked_standard_step(self)
-                return result
-            return _standard_multirow_next(
+                return _stamp_qwen4_standard_terminal_responses(self, result)
+            return _stamp_qwen4_standard_terminal_responses(
                 self,
-                lambda: original_next(self, *args, **kwargs),
+                _standard_multirow_next(
+                    self,
+                    lambda: original_next(self, *args, **kwargs),
+                ),
             )
 
         def patched_extend(self, batch, *args, **kwargs):
@@ -388,6 +395,7 @@ def apply() -> bool:
             return original_bg_next(self, *args, **kwargs)
 
         BatchGenerator._next = patched_bg_next
+        BatchGenerator.omlx_mtp_post_emit = _batch_generator_mtp_post_emit
         BatchGenerator._omlx_mtp_patched = True
     return True
 
@@ -423,6 +431,60 @@ def _model_mtp_decode_enabled(model: Any) -> bool:
         bool(getattr(candidate, "_omlx_mtp_decode_enabled", False))
         for candidate in candidates
     )
+
+
+def _model_qwen4_terminal_commit_enabled(model: Any) -> bool:
+    """Return the explicit Qwen4 two-phase target-cache capability.
+
+    Model-type inference is deliberately insufficient: a foreign qwen4_exp
+    implementation may not preserve PLE/QSA rollback state across scheduler
+    emission.  Only the vendored runtime that owns the transaction contract
+    stamps this marker.
+    """
+
+    candidates = [model]
+    for attr in ("language_model", "_language_model", "model"):
+        candidate = getattr(model, attr, None)
+        if candidate is not None and candidate not in candidates:
+            candidates.append(candidate)
+    for wrapper in list(candidates):
+        inner = getattr(wrapper, "model", None)
+        if inner is not None and inner not in candidates:
+            candidates.append(inner)
+    return any(
+        getattr(candidate, "_omlx_mtp_terminal_commit_v1", False) is True
+        for candidate in candidates
+    )
+
+
+def _stamp_qwen4_standard_terminal_responses(
+    gen_batch: Any,
+    responses: Any,
+) -> Any:
+    """Prove parked/reconciled Qwen4 standard responses have no MTP queue.
+
+    This helper is reached only after the patched MTP and row-wise branches
+    have either returned or reconciled and dropped their private state.  Stock
+    ``GenerationBatch.next`` then owns the usual exact cache/token transaction.
+    The scheduler still validates every physical cache timeline before reuse.
+    """
+
+    if not _model_qwen4_terminal_commit_enabled(getattr(gen_batch, "model", None)):
+        return responses
+    if (
+        getattr(gen_batch, "_omlx_mtp_state", None) is not None
+        or getattr(gen_batch, "_omlx_mtp_batch_state", None) is not None
+        or getattr(gen_batch, "_omlx_standard_target_exact_v1", False) is not True
+    ):
+        return responses
+    for response in responses or ():
+        if (
+            getattr(response, "finish_reason", None) is not None
+            and isinstance(getattr(response, "prompt_cache", None), list)
+            and isinstance(getattr(response, "all_tokens", None), list)
+        ):
+            response._omlx_qwen4_standard_terminal_v1 = True
+    return responses
 
 
 def _model_mtp_tokenwise_verify_enabled(model: Any) -> bool:
@@ -571,6 +633,19 @@ def _singleton_mtp_handoff_ready(gen_batch: Any) -> bool:
     state = getattr(gen_batch, "_omlx_mtp_state", None)
     if not _mtp_state_valid_for_batch(gen_batch, state):
         return False
+    if state.pending_emit is not None:
+        return False
+    pending = state.pending_commit
+    if pending is not None:
+        safe_tail = bool(
+            len(state.queue) == 1
+            and (
+                (pending.kind == "init" and pending.emitted == 1)
+                or (pending.kind == "tail" and pending.emitted == 0)
+            )
+        )
+        if not safe_tail:
+            return False
     return len(state.queue) <= 1
 
 
@@ -1083,6 +1158,80 @@ class _MtpState:
     # Accept-rate / throughput counters. Surfaced via logger.info on finish.
     stats: _MtpStats = field(default_factory=_MtpStats)
 
+    # Qwen4 Lightning-MTP advances the target verifier by a whole draft
+    # window, then returns those verified tokens to the scheduler one at a
+    # time.  Until the scheduler has accepted each response (including its
+    # parser and text-stop checks), the verifier update is a transaction, not
+    # a cache commit.  Other model families retain their existing eager
+    # behavior and leave this slot unset.
+    pending_commit: Optional["_MtpPendingCommit"] = None
+    # Queue position handed to the scheduler but not yet acknowledged through
+    # the parser/text-stop post-emit hook: (position, token, source).
+    pending_emit: Optional[Tuple[int, int, str]] = None
+    # Adaptive depth may decide to park after the first response from a
+    # verifier window.  Qwen4 cannot hand the target cache to standard decode
+    # until every already-verified response has passed the scheduler.  Latch
+    # that decision and execute it at the exact final ACK boundary.
+    park_after_commit: bool = False
+
+
+@dataclass(frozen=True)
+class _Qwen4QSARollbackSnapshot:
+    """Small structural proof for one QSA verifier update.
+
+    The large K/V and raw-index arrays stay in their live cache.  Their
+    logical offsets are sufficient because QSA rollback is suffix-only; this
+    record proves that the same cache advanced by exactly ``verify_width``
+    before a terminal prefix is selected.
+    """
+
+    cache: Any
+    base_offset: int
+    full_offset: int
+    base_index_offset: int
+    full_index_offset: int
+
+
+@dataclass
+class _MtpPendingCommit:
+    """One scheduler-visible Lightning-MTP target transaction.
+
+    ``kind=\"init\"`` covers the separate two-token activation queue: its
+    first token is already resident and its second token is the ordinary
+    one-token pipeline tail.  ``kind=\"verify\"`` covers one depth-k target
+    window.  A verify transaction keeps the original GDN/PLE rollback inputs
+    alive and does not trim/clear the target until the scheduler reports
+    whether the just-emitted queue position was terminal.
+
+    The resident cache intentionally contains only target-backbone state.
+    MTP-head state is discarded on terminal and reconstructed losslessly by
+    Qwen4's verified suffix-local priming on a later cache hit.
+    """
+
+    kind: str
+    target_base_offset: int
+    head_base_offset: int
+    verify_width: int
+    accepted: int
+    source_map: Tuple[str, ...]
+    token_map: Tuple[int, ...]
+    head_committed_offset: Optional[int] = None
+    emitted: int = 0
+    gdn_states: Optional[List[Any]] = None
+    ple_snapshots: Tuple[Tuple[Any, Any], ...] = ()
+    qsa_snapshots: Tuple[_Qwen4QSARollbackSnapshot, ...] = ()
+    deferred_boundary: bool = False
+    final_source: str = ""
+    committed: bool = False
+
+
+@dataclass(frozen=True)
+class _MtpPostEmitResult:
+    handled: bool = False
+    exact_terminal: bool = False
+    prompt_cache: Optional[List[Any]] = None
+    all_tokens: Optional[List[int]] = None
+
 
 @dataclass
 class _MtpBatchState:
@@ -1400,6 +1549,7 @@ def _make_row_batch(
         _token_context=[gen_batch._token_context[idx]],
         _num_tokens=[gen_batch._num_tokens[idx]],
         _matcher_states=[gen_batch._matcher_states[idx]],
+        _omlx_rowwise_mtp=True,
     )
     if state is not None:
         row._omlx_mtp_state = state
@@ -1532,6 +1682,7 @@ def _prepare_mtp_batch_state_for_next(gen_batch: Any) -> Optional[_MtpBatchState
 
     batch_state = _MtpBatchState(states=states)
     gen_batch._omlx_mtp_batch_state = batch_state
+    gen_batch._omlx_standard_target_exact_v1 = False
     logger.info(
         "MTP row-wise batch path activated for %d sequences",
         len(gen_batch.uids),
@@ -1579,6 +1730,7 @@ def _reconcile_mtp_batch_to_standard(gen_batch: Any) -> bool:
             gen_batch._next_logprobs = next_logprobs
         for idx, token_context in token_context_updates.items():
             gen_batch._token_context[idx] = token_context
+        gen_batch._omlx_standard_target_exact_v1 = True
         return True
     except Exception as exc:
         logger.warning("MTP batch reconcile failed: %s", exc)
@@ -1721,6 +1873,7 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         gen_batch.prompt_cache = new_cache
         gen_batch._next_tokens = next_tok
         gen_batch._next_logprobs = [next_lp]
+        gen_batch._omlx_standard_target_exact_v1 = True
         if procs is not None:
             from mlx_lm.models.cache import TokenBuffer
 
@@ -2138,9 +2291,264 @@ def _clear_rollback(prompt_cache: List[Any]) -> None:
             c._mtp_draft_stash = None
         if getattr(c, "_mtp_undo", None) is not None:
             c._mtp_undo = None
+        if getattr(c, "_qwen4_exp_ple_speculative_state", None) is not None:
+            c._qwen4_exp_ple_speculative_state = None
         if getattr(c, "_undo", None) is not None:
             c._undo = None
             c._undo_chain = False
+
+
+def _iter_mtp_cache_leaves(cache_list: List[Any]):
+    pending = list(reversed(cache_list))
+    while pending:
+        cache = pending.pop()
+        children = getattr(cache, "caches", None)
+        if isinstance(children, (list, tuple)):
+            pending.extend(reversed(children))
+        else:
+            yield cache
+
+
+def _qwen4_target_offset(prompt_cache: List[Any]) -> Optional[int]:
+    """Return a uniform absolute Qwen4 target offset or fail closed."""
+
+    offset = _prompt_priming.target_cache_offset(prompt_cache)
+    if type(offset) is not int or offset < 1:
+        return None
+    return offset
+
+
+_QWEN4_QSA_CACHE_TYPES = frozenset(
+    {"QSAKVCache", "QSAQuantizedKVCache", "BatchQSAKVCache"}
+)
+
+
+def _qwen4_scalar_offset(value: Any) -> Optional[int]:
+    """Read an int or a B1 size-one MLX offset without accepting B2 state."""
+
+    if type(value) is int:
+        return value
+    if value is not None and getattr(value, "size", 0) == 1:
+        try:
+            return int(value.reshape(()).item())
+        except Exception:
+            return None
+    return None
+
+
+def _qwen4_qsa_offsets(cache: Any) -> Optional[Tuple[int, int]]:
+    """Return exact B1 KV/index offsets for singleton or batch QSA caches."""
+
+    if type(cache).__name__ not in _QWEN4_QSA_CACHE_TYPES:
+        return None
+    offset = _qwen4_scalar_offset(getattr(cache, "offset", None))
+    index_offset = _qwen4_scalar_offset(
+        getattr(
+            cache,
+            "_index_offset",
+            getattr(cache, "index_offset", None),
+        )
+    )
+    if offset is None or index_offset is None:
+        return None
+    left_padding = getattr(cache, "left_padding", None)
+    if left_padding is not None:
+        try:
+            if getattr(left_padding, "size", 0) != 1:
+                return None
+            if int(left_padding.reshape(()).item()) != 0:
+                return None
+        except Exception:
+            return None
+    return offset, index_offset
+
+
+def _capture_qwen4_verify_snapshots(
+    prompt_cache: List[Any],
+    *,
+    base_offset: int,
+    verify_width: int,
+) -> Tuple[Tuple[Tuple[Any, Any], ...], Tuple[_Qwen4QSARollbackSnapshot, ...]]:
+    """Capture the lightweight PLE/QSA proof for one untouched verifier.
+
+    GDN state is returned directly by the backbone and is retained separately
+    on ``_MtpPendingCommit``.  PLE owns its own immutable pre-window tensors.
+    QSA needs no tensor copy: the verifier appends a suffix and its trim path
+    owns all four logical components, so base/full offsets prove the epoch.
+    """
+
+    ple: List[Tuple[Any, Any]] = []
+    qsa: List[_Qwen4QSARollbackSnapshot] = []
+    expected_full = int(base_offset) + int(verify_width)
+    for cache in _iter_mtp_cache_leaves(prompt_cache):
+        snapshot = getattr(cache, "_qwen4_exp_ple_speculative_state", None)
+        if snapshot is not None:
+            if getattr(snapshot, "complete", False) is not True:
+                raise _MtpStepFallback("Qwen4 PLE verify snapshot is incomplete")
+            ple.append((cache, snapshot))
+
+        if type(cache).__name__ not in _QWEN4_QSA_CACHE_TYPES:
+            continue
+        offsets = _qwen4_qsa_offsets(cache)
+        if offsets is None:
+            raise _MtpStepFallback("Qwen4 QSA verifier offsets are not scalar")
+        offset, index_offset = offsets
+        if offset != expected_full or index_offset != expected_full:
+            raise _MtpStepFallback(
+                "Qwen4 QSA verifier did not advance by the exact window "
+                f"(base={base_offset}, width={verify_width}, kv={offset}, "
+                f"index={index_offset})"
+            )
+        qsa.append(
+            _Qwen4QSARollbackSnapshot(
+                cache=cache,
+                base_offset=int(base_offset),
+                full_offset=offset,
+                base_index_offset=int(base_offset),
+                full_index_offset=index_offset,
+            )
+        )
+    if not ple or not qsa:
+        raise _MtpStepFallback(
+            "Qwen4 terminal commit requires both PLE and QSA transaction state"
+        )
+    return tuple(ple), tuple(qsa)
+
+
+def _validate_qwen4_qsa_epoch(
+    pending: _MtpPendingCommit,
+    *,
+    expected_offset: int,
+) -> bool:
+    if not pending.qsa_snapshots:
+        return False
+    for snapshot in pending.qsa_snapshots:
+        cache = snapshot.cache
+        if (
+            snapshot.base_offset != pending.target_base_offset
+            or snapshot.base_index_offset != pending.target_base_offset
+            or snapshot.full_offset
+            != pending.target_base_offset + pending.verify_width
+            or snapshot.full_index_offset != snapshot.full_offset
+        ):
+            return False
+        offsets = _qwen4_qsa_offsets(cache)
+        if offsets != (expected_offset, expected_offset):
+            return False
+        logical_keys = getattr(cache, "index_keys", None)
+        logical_positions = getattr(cache, "index_position_ids", None)
+        if (
+            logical_keys is None
+            or logical_positions is None
+            or int(logical_keys.shape[1]) != expected_offset
+            or int(logical_positions.shape[-1]) != expected_offset
+        ):
+            return False
+    return True
+
+
+def _pending_ple_epoch_is_exact(pending: _MtpPendingCommit) -> bool:
+    """Prove every PLE cache still owns the captured verifier transaction."""
+
+    if not pending.ple_snapshots:
+        return False
+    for cache, snapshot in pending.ple_snapshots:
+        current = getattr(cache, "_qwen4_exp_ple_speculative_state", None)
+        if current is not snapshot:
+            return False
+        if getattr(snapshot, "complete", False) is not True:
+            return False
+    return True
+
+
+def _set_qwen4_target_expected_offset(
+    state: _MtpState,
+    prompt_cache: List[Any],
+    expected: int,
+) -> bool:
+    observed = _qwen4_target_offset(prompt_cache)
+    if observed != expected:
+        return False
+    if state.suffix_local_priming:
+        state.target_expected_offset = expected
+    return True
+
+
+def _qwen4_rollback_full_verify_to(
+    gen_batch: Any,
+    state: _MtpState,
+    pending: _MtpPendingCommit,
+    *,
+    accepted: int,
+) -> bool:
+    """Select one target prefix from the still-full verifier transaction."""
+
+    drafts = pending.verify_width - 1
+    if accepted < 0 or accepted > drafts:
+        return False
+    full_offset = pending.target_base_offset + pending.verify_width
+    if not _validate_qwen4_qsa_epoch(pending, expected_offset=full_offset):
+        return False
+
+    if accepted == drafts:
+        _clear_rollback(gen_batch.prompt_cache)
+    else:
+        if pending.gdn_states is None:
+            return False
+        if not _pending_ple_epoch_is_exact(pending):
+            return False
+        rollback = getattr(gen_batch.model, "rollback_speculative_cache", None)
+        if not callable(rollback):
+            return False
+        try:
+            rollback(
+                gen_batch.prompt_cache,
+                pending.gdn_states,
+                accepted,
+                pending.verify_width,
+            )
+        except Exception as exc:
+            logger.warning("Qwen4 terminal target rollback failed: %s", exc)
+            return False
+
+    expected = pending.target_base_offset + accepted + 1
+    if not _validate_qwen4_qsa_epoch(pending, expected_offset=expected):
+        return False
+    if not _set_qwen4_target_expected_offset(
+        state, gen_batch.prompt_cache, expected
+    ):
+        return False
+    pending.committed = True
+    return True
+
+
+def _qwen4_materialize_target_tail(
+    gen_batch: Any,
+    state: _MtpState,
+    token_id: int,
+) -> bool:
+    """Commit one already-emitted pipeline-tail token to the target only."""
+
+    import mlx.core as mx
+
+    before = _qwen4_target_offset(gen_batch.prompt_cache)
+    if before is None:
+        return False
+    token = mx.array([int(token_id)], dtype=mx.uint32)
+    try:
+        logits, _hidden, _ = _call_backbone(
+            gen_batch.model,
+            token[:, None],
+            gen_batch.prompt_cache,
+        )
+        mx.eval(logits, *[cache.state for cache in gen_batch.prompt_cache])
+        _clear_rollback(gen_batch.prompt_cache)
+    except Exception as exc:
+        logger.warning("Qwen4 terminal one-token target commit failed: %s", exc)
+        return False
+    return _set_qwen4_target_expected_offset(
+        state, gen_batch.prompt_cache, before + 1
+    )
 
 
 def _ensure_uint32(arr):
@@ -3180,6 +3588,10 @@ def _post_init_mtp(gen_batch: Any) -> None:
         # next() call will be a no-op anyway; leave the patch inert.
         return
 
+    qwen4_terminal = _model_qwen4_terminal_commit_enabled(gen_batch.model)
+    if qwen4_terminal:
+        gen_batch._omlx_standard_target_exact_v1 = False
+
     sampler = _resolve_sampler(gen_batch)
     procs = _proc_list(gen_batch)
 
@@ -3215,6 +3627,11 @@ def _post_init_mtp(gen_batch: Any) -> None:
         # are the first draft's distribution; the rest of the chain follows.
         mx.eval(main_tok, next_main_tok)
         state = _MtpState(uid=gen_batch.uids[0])
+        if qwen4_terminal:
+            # Publish ownership before fallible head/transaction setup so a
+            # partial activation can be reconciled rather than resuming stock
+            # decode against an already-advanced target cache.
+            gen_batch._omlx_mtp_state = state
         state.chain = True
         state.depth = depth
         state.head_clone = head_clone
@@ -3236,10 +3653,13 @@ def _post_init_mtp(gen_batch: Any) -> None:
         ):
             state.mtp_cache = gen_batch.model.make_mtp_cache()
         state.next_main = _ensure_uint32(next_main_tok)
-        state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
+        main_id = int(main_tok.tolist()[0])
+        next_main_id = int(next_main_tok.tolist()[0])
+        state.queue.append((main_id, main_lp, "init"))
         state.queue.append(
-            (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
+            (next_main_id, next_main_lp.squeeze(0), "init")
         )
+        head_base_offset = int(state.hist_offset)
         _chain_next_drafts(
             gen_batch,
             state,
@@ -3247,6 +3667,31 @@ def _post_init_mtp(gen_batch: Any) -> None:
             state.next_main,
             prev_buf,
         )
+        if (
+            qwen4_terminal
+            and not getattr(gen_batch, "_omlx_rowwise_mtp", False)
+        ):
+            target_offset = _qwen4_target_offset(gen_batch.prompt_cache)
+            if target_offset is None:
+                raise _MtpStepFallback(
+                    "Qwen4 activation target cache has no uniform offset"
+                )
+            align = int(getattr(gen_batch.model, "_omlx_mtp_commit_align", 0) or 0)
+            final_count = len(gen_batch.tokens[0]) + 2
+            state.pending_commit = _MtpPendingCommit(
+                kind="init",
+                target_base_offset=target_offset,
+                head_base_offset=head_base_offset,
+                verify_width=0,
+                accepted=0,
+                source_map=("init-resident", "init-tail"),
+                token_map=(main_id, next_main_id),
+                head_committed_offset=int(state.hist_offset),
+                deferred_boundary=bool(
+                    align > 0 and final_count % align == 0
+                ),
+                final_source="init-tail",
+            )
         gen_batch._omlx_mtp_state = state
         return
 
@@ -3451,6 +3896,7 @@ def _feed_next_main_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         logger.debug("MTP feed-to-standard handoff failed: %s", exc)
         return False
     _clear_rollback(gen_batch.prompt_cache)
+    gen_batch._omlx_standard_target_exact_v1 = True
     return True
 
 
@@ -3509,6 +3955,7 @@ def _handoff_mtp_for_late_join(gen_batch: Any, state: _MtpState) -> bool:
         gen_batch._next_tokens = mx.array([int(token_id)], dtype=mx.uint32)
         gen_batch._next_logprobs = [logprobs_1d]
         _clear_rollback(gen_batch.prompt_cache)
+        gen_batch._omlx_standard_target_exact_v1 = True
     elif not _feed_next_main_to_standard(gen_batch, state):
         return False
     if state.reentry_probe:
@@ -3520,11 +3967,234 @@ def _handoff_mtp_for_late_join(gen_batch: Any, state: _MtpState) -> bool:
     return True
 
 
+def _mark_qwen4_pending_emit(
+    state: _MtpState,
+    token_id: int,
+    source: str,
+) -> None:
+    pending = state.pending_commit
+    if pending is None:
+        return
+    if state.pending_emit is not None:
+        raise _MtpStepFallback("Qwen4 emitted a second token before scheduler ACK")
+    position = pending.emitted
+    if position >= len(pending.token_map):
+        raise _MtpStepFallback("Qwen4 pending commit source map is exhausted")
+    expected_source = pending.source_map[position]
+    source_matches = expected_source == source or (
+        expected_source.startswith("init-") and source == "init"
+    )
+    if not source_matches or pending.token_map[position] != int(token_id):
+        raise _MtpStepFallback(
+            "Qwen4 pending commit does not match emitted queue position"
+        )
+    state.pending_emit = (position, int(token_id), source)
+
+
+def _qwen4_post_emit_transaction(
+    gen_batch: Any,
+    state: _MtpState,
+    *,
+    terminal: bool,
+) -> _MtpPostEmitResult:
+    """Resolve one Qwen4 queue position after scheduler stop decisions."""
+
+    pending = state.pending_commit
+    receipt = state.pending_emit
+    if pending is None or receipt is None:
+        return _MtpPostEmitResult()
+    if (
+        pending.head_committed_offset is not None
+        and int(state.hist_offset) != pending.head_committed_offset
+    ):
+        raise _MtpStepFallback(
+            "Qwen4 MTP-head transaction offset changed before scheduler ACK"
+        )
+    position, token_id, _source = receipt
+    if position != pending.emitted or position >= len(pending.token_map):
+        return _MtpPostEmitResult(handled=True)
+
+    exact = True
+    if terminal:
+        if pending.kind == "verify":
+            if position < pending.accepted:
+                # Terminal on accepted draft j: retain confirmed next_main and
+                # exactly drafts d1..d(j+1), discarding every later verified
+                # row before it ever becomes resident-visible.
+                exact = _qwen4_rollback_full_verify_to(
+                    gen_batch,
+                    state,
+                    pending,
+                    accepted=position + 1,
+                )
+            elif position == pending.accepted:
+                # The correction/bonus is predicted by the verifier but is not
+                # one of its input rows. Select the accepted prefix once, then
+                # append this terminal token with an ordinary L=1 target call.
+                exact = _qwen4_rollback_full_verify_to(
+                    gen_batch,
+                    state,
+                    pending,
+                    accepted=pending.accepted,
+                ) and _qwen4_materialize_target_tail(
+                    gen_batch,
+                    state,
+                    token_id,
+                )
+            else:
+                exact = False
+        elif pending.kind == "init":
+            if position == 0:
+                exact = _qwen4_target_offset(gen_batch.prompt_cache) == (
+                    pending.target_base_offset
+                )
+            elif position == 1:
+                exact = _qwen4_materialize_target_tail(
+                    gen_batch,
+                    state,
+                    token_id,
+                )
+            else:
+                exact = False
+        elif pending.kind == "tail" and position == 0:
+            exact = _qwen4_materialize_target_tail(
+                gen_batch,
+                state,
+                token_id,
+            )
+        else:
+            exact = False
+
+        state.pending_emit = None
+        state.pending_commit = None
+        state.queue.clear()
+        state.drafts = None
+        state.draft_lps.clear()
+        state.draft_accept_lps.clear()
+
+        all_tokens = list(gen_batch.tokens[0])
+        if exact:
+            exact = _qwen4_target_offset(gen_batch.prompt_cache) == len(all_tokens)
+        if not exact:
+            _clear_rollback(gen_batch.prompt_cache)
+            return _MtpPostEmitResult(handled=True)
+        return _MtpPostEmitResult(
+            handled=True,
+            exact_terminal=True,
+            prompt_cache=gen_batch.extract_cache(0),
+            all_tokens=all_tokens,
+        )
+
+    # Nonterminal acknowledgement. Only the last queue position is allowed to
+    # mutate target state; earlier responses simply reveal another prefix of
+    # the still-private verifier transaction.
+    pending.emitted += 1
+    state.pending_emit = None
+    if pending.emitted < len(pending.token_map):
+        return _MtpPostEmitResult(handled=True)
+    if state.queue:
+        return _MtpPostEmitResult(handled=True)
+
+    if pending.kind == "verify":
+        exact = _qwen4_rollback_full_verify_to(
+            gen_batch,
+            state,
+            pending,
+            accepted=pending.accepted,
+        )
+        state.pending_commit = None
+        if exact and pending.deferred_boundary:
+            exact = _materialize_qwen4_deferred_boundary(
+                gen_batch,
+                state,
+                token_id,
+            )
+    else:
+        # init/tail queues end in the ordinary one-token target skew expected
+        # by the next verify input. Their terminal case above is the only path
+        # that materializes the tail immediately, except when that final token
+        # is itself a paged-cache boundary.
+        state.pending_commit = None
+        if pending.deferred_boundary:
+            exact = _materialize_qwen4_deferred_boundary(
+                gen_batch,
+                state,
+                token_id,
+            )
+    if not exact:
+        raise _MtpStepFallback("Qwen4 scheduler target commit failed")
+    if state.park_after_commit:
+        state.park_after_commit = False
+        if not _park_mtp_to_standard(gen_batch, state):
+            raise _MtpStepFallback("Qwen4 deferred adaptive park failed")
+    return _MtpPostEmitResult(handled=True)
+
+
+def _batch_generator_mtp_post_emit(
+    batch_generator: Any,
+    uid: Any,
+    *,
+    terminal: bool,
+    finish_reason: Optional[str] = None,
+) -> _MtpPostEmitResult:
+    """Scheduler hook: resolve parser/text stops before filtering the row."""
+
+    gen_batch = getattr(batch_generator, "_generation_batch", None)
+    if gen_batch is None:
+        return _MtpPostEmitResult()
+    uids = list(getattr(gen_batch, "uids", ()) or ())
+    if len(uids) != 1 or not uids or uids[0] != uid:
+        # Target-only ExactResident is intentionally B1. Row-wise MTP keeps
+        # the existing path and remains behind the resident-cache gate.
+        return _MtpPostEmitResult()
+    state = getattr(gen_batch, "_omlx_mtp_state", None)
+    if state is None or not _model_qwen4_terminal_commit_enabled(gen_batch.model):
+        return _MtpPostEmitResult()
+
+    try:
+        result = _qwen4_post_emit_transaction(
+            gen_batch,
+            state,
+            terminal=terminal,
+        )
+    except Exception as exc:
+        logger.warning("Qwen4 scheduler post-emit commit failed closed: %s", exc)
+        if not terminal:
+            if not _reconcile_mtp_to_standard(gen_batch, state):
+                # Continuing with a verifier-ahead target would violate the
+                # lossless gate. Let the engine's request-error path stop this
+                # row instead of sampling from unproved state.
+                raise RuntimeError(
+                    "Qwen4 target commit and exact standard reconcile both failed"
+                ) from exc
+            _drop_mtp_state(gen_batch, "post-emit-reconciled")
+        result = _MtpPostEmitResult(handled=True)
+
+    if terminal:
+        state._finish_reason = finish_reason or "terminal"
+        _log_mtp_stats(uid, state.stats, state._finish_reason)
+        # Exact cache/tokens were detached above before filtering. A failed
+        # proof still removes the row but returns no cache, so neither L0 nor
+        # durable output-cache publication can consume speculative state.
+        try:
+            delattr(gen_batch, "_omlx_mtp_state")
+        except AttributeError:
+            pass
+        gen_batch.filter([])
+    return result
+
+
 def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
     """Emit one token; run a verify cycle if the queue is empty."""
+    if state.pending_emit is not None:
+        # Direct GenerationBatch consumers do not have oMLX's parser hook. A
+        # subsequent next() proves the prior response was nonterminal, so ACK
+        # it here. The production scheduler normally clears this immediately.
+        _qwen4_post_emit_transaction(gen_batch, state, terminal=False)
     if state.queue:
         token_id, logprobs_1d, source = state.queue.popleft()
         _bump_emit_stat(state, source)
+        _mark_qwen4_pending_emit(state, token_id, source)
         return _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
 
     _run_verify_cycle(gen_batch, state)
@@ -3536,15 +4206,21 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
 
     token_id, logprobs_1d, source = state.queue.popleft()
     _bump_emit_stat(state, source)
+    _mark_qwen4_pending_emit(state, token_id, source)
     should_exit = False
     if state.chain and state.controller is not None:
         should_exit = state.controller.should_exit()
         if not getattr(state.controller, "rank_lockstep", False):
             should_exit = _mtp_sync_flag(gen_batch, should_exit)
-    if should_exit and not state.queue:
-        # Emit this cycle's token either way; on a successful handoff the
-        # next next() call runs the standard step with _next_tokens set.
-        _park_mtp_to_standard(gen_batch, state)
+    if should_exit:
+        if not state.queue and state.pending_commit is None:
+            # Emit this cycle's token either way; on a successful handoff the
+            # next next() call runs the standard step with _next_tokens set.
+            _park_mtp_to_standard(gen_batch, state)
+        elif state.pending_commit is not None:
+            # The verifier is still private while its queue drains. Preserve
+            # the controller decision and park at the scheduler-ACK seam.
+            state.park_after_commit = True
     return _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
 
 
@@ -3649,6 +4325,23 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
     # tokens this cycle — the verify window follows the actual drafts.
     k = int(state.drafts.shape[0])
     cycle_t0 = time.perf_counter()
+    two_phase_qwen4 = bool(
+        len(getattr(gen_batch, "uids", ()) or ()) == 1
+        and _model_qwen4_terminal_commit_enabled(gen_batch.model)
+        and not getattr(gen_batch, "_omlx_rowwise_mtp", False)
+    )
+    target_base_offset: Optional[int] = None
+    head_base_offset = int(state.hist_offset)
+    if two_phase_qwen4:
+        if state.pending_commit is not None or state.pending_emit is not None:
+            raise _MtpStepFallback(
+                "Qwen4 verifier started before the prior scheduler commit"
+            )
+        target_base_offset = _qwen4_target_offset(gen_batch.prompt_cache)
+        if target_base_offset is None:
+            raise _MtpStepFallback(
+                "Qwen4 verifier target cache has no uniform base offset"
+            )
 
     inputs = mx.concatenate([state.next_main, state.drafts])  # (k+1,)
 
@@ -3670,6 +4363,15 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         n_confirmed=1,
     )
     _materialize_distributed_hidden_sibling(logits, hidden, mx_module=mx)
+    ple_snapshots: Tuple[Tuple[Any, Any], ...] = ()
+    qsa_snapshots: Tuple[_Qwen4QSARollbackSnapshot, ...] = ()
+    if two_phase_qwen4 and k > 0:
+        assert target_base_offset is not None
+        ple_snapshots, qsa_snapshots = _capture_qwen4_verify_snapshots(
+            gen_batch.prompt_cache,
+            base_offset=target_base_offset,
+            verify_width=k + 1,
+        )
     rows = _mtp_prepare_logits(gen_batch, logits[0])  # (k+1, vocab)
     row_snaps: List[Optional[Any]] = [None] * (k + 1)
     if procs is not None:
@@ -3880,28 +4582,73 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         state.stats.rejects += 1
     state.stats.sample_ms += (time.perf_counter() - t0) * 1000
 
-    # --- commit: queue emits + cache rollback ---
+    # --- stage queue; Qwen4 defers the target commit to scheduler post-emit ---
     t0 = time.perf_counter()
     for j in range(m):
         state.queue.append((int(draft_ids[j]), state.draft_lps[j], "draft"))
     if m == k:
         state.queue.append((int(emit_last_id), emit_last_lp, "bonus"))
-        _clear_rollback(gen_batch.prompt_cache)
     else:
         state.queue.append((int(emit_last_id), emit_last_lp, "verify"))
-        if not _chain_rollback(
-            gen_batch.model, gen_batch.prompt_cache, m, k, gdn_states
-        ):
-            if procs is not None:
-                _trim_token_buffer(gen_batch, k - m)
-            raise _MtpStepFallback("cache layer rejects chain rollback")
         if procs is not None:
             _trim_token_buffer(gen_batch, k - m)
+
+    if two_phase_qwen4:
+        assert target_base_offset is not None
+        if k == 0:
+            # The width-one depth-0 forward committed ``next_main`` and
+            # sampled exactly one pipeline-tail token. No speculative target
+            # state exists, but terminal emission of that tail still needs an
+            # L=1 target-only commit.
+            expected = target_base_offset + 1
+            if not _set_qwen4_target_expected_offset(
+                state, gen_batch.prompt_cache, expected
+            ):
+                raise _MtpStepFallback(
+                    "Qwen4 depth-zero target commit offset mismatch"
+                )
+            state.pending_commit = _MtpPendingCommit(
+                kind="tail",
+                target_base_offset=expected,
+                head_base_offset=head_base_offset,
+                verify_width=0,
+                accepted=0,
+                source_map=("bonus",),
+                token_map=(int(emit_last_id),),
+                deferred_boundary=materialize_boundary_emit,
+                final_source="bonus",
+            )
+        else:
+            sources = tuple(["draft"] * m + ["bonus" if m == k else "verify"])
+            tokens = tuple(
+                [int(draft_ids[j]) for j in range(m)] + [int(emit_last_id)]
+            )
+            state.pending_commit = _MtpPendingCommit(
+                kind="verify",
+                target_base_offset=target_base_offset,
+                head_base_offset=head_base_offset,
+                verify_width=k + 1,
+                accepted=m,
+                source_map=sources,
+                token_map=tokens,
+                gdn_states=gdn_states,
+                ple_snapshots=ple_snapshots,
+                qsa_snapshots=qsa_snapshots,
+                deferred_boundary=materialize_boundary_emit,
+                final_source=sources[-1],
+            )
+    else:
+        if m == k:
+            _clear_rollback(gen_batch.prompt_cache)
+        elif not _chain_rollback(
+            gen_batch.model, gen_batch.prompt_cache, m, k, gdn_states
+        ):
+            raise _MtpStepFallback("cache layer rejects chain rollback")
+        # Target verification committed exactly m accepted drafts plus the
+        # confirmed input row. Keep its absolute timeline independent from
+        # the suffix-local draft-head offset.
+        _advance_suffix_local_target(state, gen_batch.prompt_cache, m + 1)
     state.stats.cache_ops_ms += (time.perf_counter() - t0) * 1000
-    # Target verification committed exactly m accepted drafts plus the
-    # correction/bonus token. Keep its absolute timeline independent from the
-    # suffix-local draft-head offset.
-    _advance_suffix_local_target(state, gen_batch.prompt_cache, m + 1)
 
     # --- MTP-head history + next draft chain (async-dispatched) ---
     t0 = time.perf_counter()
@@ -3917,8 +4664,10 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         prev_buf = gen_batch._token_context[0].tokens
     _chain_next_drafts(gen_batch, state, hidden_rows, committed, prev_buf)
     state.next_main = next_main
+    if two_phase_qwen4 and state.pending_commit is not None:
+        state.pending_commit.head_committed_offset = int(state.hist_offset)
     state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
-    if materialize_boundary_emit:
+    if materialize_boundary_emit and not two_phase_qwen4:
         _materialize_mtp_boundary_emit(gen_batch, state)
     if state.controller is not None:
         was_warmup = bool(state.controller._warmup)
@@ -3996,6 +4745,91 @@ def _materialize_mtp_boundary_emit(gen_batch: Any, state: _MtpState) -> None:
     next_id = int(next_tok.tolist()[0])
     state.next_main = next_tok
     state.queue.append((next_id, next_lp_2d.squeeze(0), "bonus"))
+
+
+def _materialize_qwen4_deferred_boundary(
+    gen_batch: Any,
+    state: _MtpState,
+    boundary_id: int,
+) -> bool:
+    """Materialize an accepted boundary only after scheduler nonterminal ACK.
+
+    Unlike ``_materialize_mtp_boundary_emit`` this is called after the
+    boundary token has actually left the queue.  It creates a fresh one-token
+    tail transaction for the sampled successor, preserving exact terminal
+    handling if that successor itself stops.
+    """
+
+    import time
+
+    import mlx.core as mx
+
+    if state.queue:
+        return False
+    boundary_tok = mx.array([int(boundary_id)], dtype=mx.uint32)
+    procs = _proc_list(gen_batch)
+    prev_buf = None
+    if procs is not None:
+        prev_buf = gen_batch._token_context[0].update_and_fetch(boundary_tok)
+
+    target_before = _qwen4_target_offset(gen_batch.prompt_cache)
+    if target_before is None:
+        return False
+    t0 = time.perf_counter()
+    try:
+        logits, hidden, _ = _call_backbone(
+            gen_batch.model,
+            boundary_tok[:, None],
+            gen_batch.prompt_cache,
+        )
+        _clear_rollback(gen_batch.prompt_cache)
+        if not _set_qwen4_target_expected_offset(
+            state, gen_batch.prompt_cache, target_before + 1
+        ):
+            return False
+        next_logits = _mtp_prepare_logits(gen_batch, logits[:, -1, :])
+        next_logits = _apply_processors(procs, prev_buf, next_logits)
+        next_lp_2d = _mtp_logprobs(gen_batch, next_logits)
+        next_tok = _ensure_uint32(
+            _mtp_sample(gen_batch, _resolve_sampler(gen_batch), next_lp_2d)
+        )
+        mx.eval(next_tok)
+    except Exception as exc:
+        logger.warning("Qwen4 deferred boundary materialization failed: %s", exc)
+        return False
+    state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
+
+    head_before = int(state.hist_offset)
+    t0 = time.perf_counter()
+    try:
+        if not state.head_clone:
+            _trim_committed_mtp_head(state)
+        _chain_next_drafts(
+            gen_batch,
+            state,
+            hidden[:, -1:],
+            next_tok,
+            prev_buf,
+        )
+    except Exception as exc:
+        logger.warning("Qwen4 deferred boundary head rebuild failed: %s", exc)
+        return False
+    state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
+    next_id = int(next_tok.tolist()[0])
+    state.next_main = next_tok
+    state.queue.append((next_id, next_lp_2d.squeeze(0), "bonus"))
+    state.pending_commit = _MtpPendingCommit(
+        kind="tail",
+        target_base_offset=target_before + 1,
+        head_base_offset=head_before,
+        verify_width=0,
+        accepted=0,
+        source_map=("bonus",),
+        token_map=(next_id,),
+        head_committed_offset=int(state.hist_offset),
+        final_source="bonus",
+    )
+    return True
 
 
 def _chain_rollback(
@@ -4336,6 +5170,28 @@ def _emit_response(
         finish_reason = "stop"
 
     if finish_reason is not None:
+        # Qwen4's two-phase target transaction must remain attached until the
+        # scheduler has also evaluated protocol-parser and text-stop rules.
+        # The post-emit hook reconciles the exact terminal prefix, detaches it,
+        # and filters the row. Other MTP families keep the historical eager
+        # finish behavior below.
+        defer_terminal = bool(
+            state := getattr(gen_batch, "_omlx_mtp_state", None)
+        ) and _model_qwen4_terminal_commit_enabled(gen_batch.model)
+        if defer_terminal:
+            return [
+                Response(
+                    uid=gen_batch.uids[0],
+                    token=token_id,
+                    logprobs=logprobs_1d,
+                    finish_reason=finish_reason,
+                    current_state=current_state,
+                    match_sequence=match_sequence,
+                    prompt_cache=None,
+                    all_tokens=None,
+                )
+            ]
+
         prompt_cache = gen_batch.extract_cache(0)
         all_tokens = gen_batch.tokens[0]
         response = Response(

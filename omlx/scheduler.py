@@ -8331,8 +8331,9 @@ class Scheduler:
         Lightning MTP may have target KV/recurrent state ahead of the emitted
         ``all_tokens`` queue.  Matching public offsets is not enough to prove
         that positionless Arrays/GDN state represents the visible terminal
-        token.  Exact resident reuse stays disabled until the MTP path exposes
-        and tests an explicit terminal queue rollback/drain contract.
+        token. Exact resident reuse stays disabled by default. The only
+        current exception is the request-local ``qwen4-target-only-v1`` proof
+        produced after its terminal queue rollback/drain contract succeeds.
         """
 
         if getattr(self, "_vlm_mtp_drafter", None) is not None:
@@ -8348,6 +8349,33 @@ class Scheduler:
                 getattr(candidate, "_omlx_mtp_decode_enabled", False)
                 or getattr(candidate, "_omlx_dspark_decode_enabled", False)
             )
+            for candidate in candidates
+            if candidate is not None
+        )
+
+    def _resident_cache_qwen4_target_only_enabled(self) -> bool:
+        """Whether exact target-only reuse can rebuild this model's MTP head."""
+
+        if getattr(self, "_vlm_mtp_drafter", None) is not None:
+            return False
+        model = getattr(self, "model", None)
+        candidates = [model]
+        for attr in ("language_model", "_language_model", "model"):
+            candidate = getattr(model, attr, None)
+            if candidate is not None and candidate not in candidates:
+                candidates.append(candidate)
+        for wrapper in list(candidates):
+            inner = getattr(wrapper, "model", None)
+            if inner is not None and inner not in candidates:
+                candidates.append(inner)
+        return any(
+            getattr(candidate, "_omlx_mtp_terminal_commit_v1", False) is True
+            and getattr(
+                candidate,
+                "_omlx_mtp_suffix_local_capability",
+                None,
+            )
+            == "qwen4-verified-text-v1"
             for candidate in candidates
             if candidate is not None
         )
@@ -8609,6 +8637,8 @@ class Scheduler:
                     "rollback_state",
                     "_qwen4_exp_ple_speculative_state",
                     "_mtp_undo",
+                    "_mtp_draft_stash",
+                    "_undo",
                 )
             ):
                 return False
@@ -8687,7 +8717,14 @@ class Scheduler:
             or self._exact_resident_cache.max_bytes <= 0
             or request.specprefill_indices is not None
             or getattr(request, "skip_cache_store", False)
-            or self._resident_cache_spec_decode_active()
+            or (
+                self._resident_cache_spec_decode_active()
+                and not (
+                    getattr(request, "_mtp_exact_terminal_proved", None)
+                    == "qwen4-target-only-v1"
+                    and self._resident_cache_qwen4_target_only_enabled()
+                )
+            )
             or not self._request_is_text_only_for_resident_cache(request)
             or not isinstance(cache_list, list)
             or not cache_list
@@ -8699,9 +8736,9 @@ class Scheduler:
         # the forwarded token to both the physical cache and ``all_tokens``
         # before Response.prompt_cache is extracted.  Those two fields are
         # therefore one exact terminal transaction.  Parser stops detach the
-        # same pair through BatchGenerator.extract_cache().  The MTP gate
-        # above is load-bearing: its verified emit queue breaks this contract
-        # until an explicit terminal rollback/drain is available.
+        # same pair through BatchGenerator.extract_cache(). The MTP gate above
+        # stays load-bearing except for the Qwen4 target-only transaction
+        # proof stamped by the scheduler post-emit hook.
         tokens = [int(token) for token in cache_tokens]
         if not self._invalidate_resident_pool_with_telemetry(
             cache_list, phase="publish"
@@ -8773,7 +8810,10 @@ class Scheduler:
         """Transfer one exact terminal cache directly into ``request``."""
 
         if (
-            self._resident_cache_spec_decode_active()
+            (
+                self._resident_cache_spec_decode_active()
+                and not self._resident_cache_qwen4_target_only_enabled()
+            )
             or not self._request_is_text_only_for_resident_cache(request)
         ):
             return False
@@ -11646,6 +11686,56 @@ class Scheduler:
                             new_text = ""
                         break
 
+            # Native Qwen4 Lightning-MTP verifies a block before its tokens
+            # reach this loop. Resolve that target-cache transaction only now,
+            # after protocol-parser and text-stop decisions are final. This is
+            # the first point that knows whether the just-emitted queue
+            # position is terminal. A successful terminal result contains an
+            # exact target-only cache; the MTP head is intentionally rebuilt
+            # later through verified suffix-local priming.
+            qwen4_terminal_cache_proved = False
+            mtp_post_emit = (
+                getattr(
+                    type(self.batch_generator),
+                    "omlx_mtp_post_emit",
+                    None,
+                )
+                if self.batch_generator is not None
+                else None
+            )
+            if callable(mtp_post_emit):
+                mtp_commit = mtp_post_emit(
+                    self.batch_generator,
+                    response.uid,
+                    terminal=is_finished,
+                    finish_reason=response.finish_reason,
+                )
+                if getattr(mtp_commit, "handled", False) and is_finished:
+                    response.prompt_cache = getattr(
+                        mtp_commit, "prompt_cache", None
+                    )
+                    response.all_tokens = getattr(mtp_commit, "all_tokens", None)
+                    qwen4_terminal_cache_proved = bool(
+                        getattr(mtp_commit, "exact_terminal", False)
+                    )
+                    request._mtp_exact_terminal_proved = (
+                        "qwen4-target-only-v1"
+                        if qwen4_terminal_cache_proved
+                        else None
+                    )
+                elif (
+                    is_finished
+                    and getattr(
+                        response,
+                        "_omlx_qwen4_standard_terminal_v1",
+                        False,
+                    )
+                    is True
+                    and self._resident_cache_qwen4_target_only_enabled()
+                ):
+                    qwen4_terminal_cache_proved = True
+                    request._mtp_exact_terminal_proved = "qwen4-target-only-v1"
+
             # Prepend <think> tag for first chunk if this is a reasoning model.
             # Protocol parsers may expose a normalized prefix when their prompt
             # uses a model-specific open-think marker (e.g. MiniMax <mm:think>).
@@ -11841,6 +11931,27 @@ class Scheduler:
                     resident_cache,
                     resident_tokens,
                 )
+
+                if (
+                    raw_cache is not None
+                    and qwen4_terminal_cache_proved
+                ):
+                    # Exact-resident ownership is keyed by the verifier's raw
+                    # token timeline, which may include a parser/EOS delimiter
+                    # hidden from the public response.  The durable writer is
+                    # keyed by the scheduler ledger instead.  Never pair the
+                    # terminal cache with that shorter/different sequence;
+                    # retain the independently validated hot handoff above and
+                    # let the existing prompt-boundary store be the fallback.
+                    durable_ledger = list(request.prompt_token_ids or []) + list(
+                        request.output_token_ids or []
+                    )
+                    try:
+                        raw_token_ledger = [int(token) for token in resident_tokens]
+                    except (TypeError, ValueError):
+                        raw_token_ledger = []
+                    if raw_token_ledger != durable_ledger:
+                        raw_cache = None
 
                 # Extract cache for durable/block reuse.  Only the response-
                 # owned terminal cache uses the existing store path.  A cache

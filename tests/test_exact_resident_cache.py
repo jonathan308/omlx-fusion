@@ -366,6 +366,35 @@ def test_scheduler_cancelled_lease_is_not_reinserted():
     )
 
 
+def test_scheduler_accepts_only_explicit_qwen4_target_terminal_proof():
+    scheduler = _scheduler()
+    scheduler.model = type(
+        "MtpModel", (), {"_omlx_mtp_decode_enabled": True}
+    )()
+    tokens = [1, 2, 3, 4]
+    cache = [QSAKVCache(4), ArraysCache()]
+
+    wrong = _request(tokens)
+    wrong._mtp_exact_terminal_proved = True
+    scheduler._stage_exact_resident_cache(wrong, cache, tokens)
+    assert not hasattr(wrong, "_exact_resident_candidate")
+
+    exact = _request(tokens)
+    exact._mtp_exact_terminal_proved = "qwen4-target-only-v1"
+    scheduler._stage_exact_resident_cache(exact, cache, tokens)
+    assert not hasattr(exact, "_exact_resident_candidate")
+
+    scheduler.model._omlx_mtp_terminal_commit_v1 = True
+    scheduler.model._omlx_mtp_suffix_local_capability = "qwen4-verified-text-v1"
+    scheduler._stage_exact_resident_cache(exact, cache, tokens)
+    assert exact._exact_resident_candidate[0] == tokens
+    assert scheduler._publish_exact_resident_cache(exact)
+    next_turn = _request([*tokens, 5, 6])
+    assert scheduler._restore_exact_resident_cache(next_turn)
+    assert next_turn.cached_tokens == len(tokens)
+    assert next_turn.remaining_tokens == [5, 6]
+
+
 def test_scheduler_rejects_unknown_positionless_leaf():
     scheduler = _scheduler()
     request = _request([1, 2, 3])

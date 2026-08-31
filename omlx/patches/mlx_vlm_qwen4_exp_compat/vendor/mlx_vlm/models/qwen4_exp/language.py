@@ -3271,6 +3271,11 @@ class LanguageModel(Qwen3_5LanguageModel):
         # backbone prefix has no matching in-memory MTP sidecar. Generic/DS4
         # hosts never receive this narrow capability marker.
         self._omlx_mtp_suffix_local_capability = "qwen4-verified-text-v1"
+        # The oMLX scheduler may defer a verifier window's cache commit until
+        # parser/text-stop resolution, then export an exact target-only
+        # resident prefix.  This explicit marker keeps that transaction seam
+        # fail-closed for every other MTP architecture.
+        self._omlx_mtp_terminal_commit_v1 = True
 
     def get_mtp_module(self):
         module = getattr(self, "mtp", None)

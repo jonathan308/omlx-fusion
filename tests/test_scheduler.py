@@ -6073,6 +6073,11 @@ class TestOutputParserSmoke:
         assert outputs[-1].output_token_ids == []
 
     def test_parser_stop_sets_finish_reason(self, mock_model):
+        from omlx.patches import mlx_vlm_qwen4_exp_compat as qwen4_compat
+
+        qwen4_compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+        from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+
         tokenizer = self._GemmaTokenizer({11: "<|return|>"})
         scheduler = Scheduler(
             model=mock_model,
@@ -6097,6 +6102,11 @@ class TestOutputParserSmoke:
         scheduler.requests[request.request_id] = request
         scheduler.uid_to_request_id[99] = request.request_id
         scheduler.request_id_to_uid[request.request_id] = 99
+        scheduler.model = SimpleNamespace(
+            _omlx_mtp_decode_enabled=True,
+            _omlx_mtp_terminal_commit_v1=True,
+            _omlx_mtp_suffix_local_capability="qwen4-verified-text-v1",
+        )
         detached_cache = [
             SimpleNamespace(
                 offset=4,
@@ -6104,18 +6114,29 @@ class TestOutputParserSmoke:
                 buffer=mx.zeros((8,), dtype=mx.uint8),
             )
         ]
-        scheduler.batch_generator = MagicMock()
-        scheduler.batch_generator.extract_cache.return_value = {
-            99: (detached_cache, [1, 2, 3, 11])
-        }
-        raw_batch_cache = [
-            SimpleNamespace(
-                offset=mx.array([4]),
-                rollback_state=None,
-                buffer=mx.zeros((8,), dtype=mx.uint8),
-            )
-        ]
+        class _RecordingBatchGenerator:
+            def __init__(self):
+                self.post_emit_calls = []
 
+            def omlx_mtp_post_emit(
+                self, uid, *, terminal, finish_reason=None
+            ):
+                self.post_emit_calls.append((uid, terminal, finish_reason))
+                return SimpleNamespace(handled=False, exact_terminal=False)
+
+            def extract_cache(self, _uids):
+                return {99: (detached_cache, [1, 2, 3, 11])}
+
+        scheduler.batch_generator = _RecordingBatchGenerator()
+
+        raw_qsa = QSAKVCache()
+        raw_qsa.state = (
+            mx.zeros((1, 2, 4, 8)),
+            mx.ones((1, 2, 4, 8)),
+            mx.zeros((1, 4, 8)),
+            mx.arange(4)[None],
+        )
+        raw_batch_qsa = raw_qsa.to_batch([0])
         responses = [
             type(
                 "Resp",
@@ -6124,8 +6145,12 @@ class TestOutputParserSmoke:
                     "uid": 99,
                     "token": 11,
                     "finish_reason": None,
-                    "prompt_cache": raw_batch_cache,
+                    # Reconstructed-prefix completion can surface a one-row
+                    # BatchQSA here. Resident L0 must prefer the explicit
+                    # singleton extraction below; durable storage keeps raw.
+                    "prompt_cache": [raw_batch_qsa],
                     "all_tokens": [1, 2, 3, 11],
+                    "_omlx_qwen4_standard_terminal_v1": True,
                 },
             )(),
         ]
@@ -6135,11 +6160,21 @@ class TestOutputParserSmoke:
         assert finished_ids == {"parser-stop-req"}
         assert outputs[-1].finished is True
         assert outputs[-1].finish_reason == "stop"
+        assert request.prompt_token_ids == [1, 2, 3]
+        assert request.output_token_ids == []
+        assert request._mtp_exact_terminal_proved == "qwen4-target-only-v1"
         # The resident tier keys the physical cache by BatchGenerator's raw
         # token timeline, not the parser-filtered API output.
         assert request._exact_resident_candidate[0] == [1, 2, 3, 11]
         assert request._exact_resident_candidate[1] is detached_cache
-        assert request._exact_resident_candidate[1] is not raw_batch_cache
+        assert type(responses[0].prompt_cache[0]).__name__ == "BatchQSAKVCache"
+        # The parser hides token 11 from the scheduler's public output ledger.
+        # It remains valid for exact-resident matching, but must not be paired
+        # with the shorter token list in the durable cache writer.
+        assert getattr(request, "_extracted_cache", None) is None
+        # The MTP transaction seam runs only after parser_session.process_token
+        # has promoted this otherwise nonterminal response to a stop.
+        assert scheduler.batch_generator.post_emit_calls == [(99, True, "stop")]
 
     def test_deepseek_v4_tool_block_end_stops_batch_row(self, mock_model):
         mock_model.config.model_type = "deepseek_v4"
@@ -6535,6 +6570,37 @@ class TestStopStringOutputBuffer:
 
         assert len(outputs) == 1
         assert outputs[0].new_text == "body\n"
+
+    def test_text_level_stop_decision_precedes_mtp_post_emit_hook(self, mock_model):
+        scheduler = self._setup(mock_model)
+        scheduler._output_parser_factory = None
+        request = scheduler.running["stop-output"]
+        request.sampling_params.stop = ["STOP"]
+        detokenizer = scheduler._get_detokenizer("stop-output")
+        detokenizer._tokenizer.pieces = dict(detokenizer._tokenizer.pieces)
+        detokenizer._tokenizer.pieces[77] = "bodySTOP"
+        scheduler.tokenizer.pieces = dict(scheduler.tokenizer.pieces)
+        scheduler.tokenizer.pieces[77] = "bodySTOP"
+        detokenizer.reset()
+
+        class _RecordingBatchGenerator:
+            def __init__(self):
+                self.calls = []
+
+            def omlx_mtp_post_emit(
+                self, uid, *, terminal, finish_reason=None
+            ):
+                self.calls.append((uid, terminal, finish_reason))
+                return SimpleNamespace(handled=False, exact_terminal=False)
+
+        scheduler.batch_generator = _RecordingBatchGenerator()
+        outputs, finished = scheduler._process_batch_responses(
+            [self._response(77)]
+        )
+
+        assert finished == {"stop-output"}
+        assert outputs[-1].output_text == "body"
+        assert scheduler.batch_generator.calls == [(99, True, "stop")]
 
     def test_partial_stop_prefix_is_flushed_on_eos(self, mock_model):
         scheduler = self._setup(mock_model)
