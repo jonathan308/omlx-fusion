@@ -21,7 +21,6 @@ import mlx.nn as nn
 import numpy as np
 
 from .cache import ArraysCache, BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
-from ..base import LanguageModelOutput
 from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
 from ..qwen3_5.language import (
     Qwen3_5Attention,
@@ -37,8 +36,6 @@ from .qsa_fast import (
     contiguous_causal_gathered_qsa,
     contiguous_causal_gathered_qsa_decode,
     pool_completed_index_keys,
-    qsa_decode_from_selected_blocks,
-    qsa_decode_selected_blocks,
 )
 
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
@@ -333,10 +330,6 @@ def _tokenwise_lm_head_verify_enabled() -> bool:
         "yes",
         "on",
     }
-
-
-def _scalar_pair_world_size() -> int:
-    return int(mx.distributed.init().size())
 
 
 def _capture_tokenwise_lm_head_hidden(
@@ -2440,166 +2433,6 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         output = output.reshape(batch, length, -1)
         return self.o_proj(output * mx.sigmoid(gate))
 
-    def _prepare_scalar_pair_decode_row(
-        self,
-        x: mx.array,
-        cache: QSAKVCache,
-        position_ids: Optional[mx.array],
-    ) -> tuple[mx.array, mx.array, mx.array]:
-        """Run canonical M=1 projections and append one QSA cache row."""
-
-        batch, length, _ = x.shape
-        if (batch, length) != (1, 1):
-            raise ValueError("Qwen4 scalar-pair attention requires [1,1,H] rows")
-        q_proj_output, new_keys, new_values = _target_verify_linears(
-            (self.q_proj, self.k_proj, self.v_proj),
-            x,
-            False,
-        )
-        queries, gate = mx.split(
-            q_proj_output.reshape(batch, length, self.num_attention_heads, -1),
-            2,
-            axis=-1,
-        )
-        gate = gate.reshape(batch, length, -1)
-        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
-        new_keys = self.k_norm(
-            new_keys.reshape(
-                batch,
-                length,
-                self.num_key_value_heads,
-                self.head_dim,
-            )
-        ).transpose(0, 2, 1, 3)
-        new_values = new_values.reshape(
-            batch,
-            length,
-            self.num_key_value_heads,
-            self.head_dim,
-        ).transpose(0, 2, 1, 3)
-
-        past_len = cache.offset
-        if position_ids is None:
-            text_position_ids = mx.arange(
-                past_len,
-                past_len + 1,
-                dtype=mx.int32,
-            )[None]
-            rotary_position_ids = mx.broadcast_to(
-                text_position_ids,
-                (3, batch, length),
-            )
-        else:
-            text_position_ids = position_ids
-            rotary_position_ids = position_ids
-        queries, new_keys = self.rotary_emb.apply_rotary(
-            queries,
-            new_keys,
-            rotary_position_ids,
-            unsqueeze_dim=1,
-        )
-        cache.update_and_fetch(new_keys, new_values)
-
-        projected = self.indexer.index_qk_proj(x).reshape(
-            batch,
-            length,
-            self.indexer.n_heads + self.indexer.kv_heads,
-            self.indexer.head_dim,
-        )
-        index_queries = self.indexer.q_layernorm(
-            projected[:, :, : self.indexer.n_heads]
-        ).transpose(0, 2, 1, 3)
-        raw_index_keys = projected[:, :, self.indexer.n_heads :].squeeze(2)
-        cache.update_indexer(raw_index_keys, text_position_ids)
-        index_queries = self.indexer._apply_rope(
-            index_queries,
-            text_position_ids,
-        ).transpose(0, 2, 1, 3)
-        return queries, gate, index_queries
-
-    def scalar_pair(
-        self,
-        rows: tuple[mx.array, mx.array],
-        cache: QSAKVCache,
-        position_rows: tuple[Optional[mx.array], Optional[mx.array]],
-        *,
-        use_batched_selector: bool = False,
-        prove_selector_parity: bool = False,
-    ) -> tuple[mx.array, mx.array]:
-        """Run two chronological scalar decodes with an optional shared selector."""
-
-        if type(cache) is not QSAKVCache or not isinstance(cache.offset, int):
-            raise ValueError("Qwen4 scalar-pair QSA requires a compact B1 cache")
-        query_start = cache.offset
-        if (
-            (query_start + 1) // self.indexer.compress_ratio
-            <= self.indexer.block_topk
-        ):
-            raise ValueError("Qwen4 scalar-pair QSA requires sparse scalar decode")
-        prepared = [
-            self._prepare_scalar_pair_decode_row(row, cache, positions)
-            for row, positions in zip(rows, position_rows)
-        ]
-        if cache.offset != query_start + 2:
-            raise RuntimeError("Qwen4 scalar-pair QSA cache did not advance twice")
-        pooled = cache.pooled_indexer_keys(
-            self.indexer.compress_ratio,
-            self.indexer.k_layernorm,
-            self.indexer._apply_rope,
-            cache_tag=self.indexer,
-        )
-        queries = mx.concatenate([value[0] for value in prepared], axis=2)
-        gates = [value[1] for value in prepared]
-        index_queries = mx.concatenate([value[2] for value in prepared], axis=1)
-        scalar_selected = mx.concatenate(
-            [
-                qsa_decode_selected_blocks(
-                    index_queries[:, row : row + 1],
-                    pooled,
-                    indexer_head_dim=self.indexer.head_dim,
-                    compress_ratio=self.indexer.compress_ratio,
-                    token_budget=self.indexer.token_budget,
-                    query_start=query_start + row,
-                )
-                for row in range(2)
-            ],
-            axis=1,
-        )
-        batched_selected = qsa_decode_selected_blocks(
-            index_queries,
-            pooled,
-            indexer_head_dim=self.indexer.head_dim,
-            compress_ratio=self.indexer.compress_ratio,
-            token_budget=self.indexer.token_budget,
-            query_start=query_start,
-        )
-        selector_parity = False
-        if prove_selector_parity:
-            mx.eval(scalar_selected, batched_selected)
-            selector_parity = bool(
-                mx.array_equal(scalar_selected, batched_selected).item()
-            )
-            self._omlx_scalar_pair_selector_parity = selector_parity
-        selected = (
-            batched_selected
-            if use_batched_selector and selector_parity
-            else scalar_selected
-        )
-        output = qsa_decode_from_selected_blocks(
-            queries,
-            cache.keys[..., : cache.offset, :],
-            cache.values[..., : cache.offset, :],
-            selected,
-            head_dim=self.head_dim,
-            compress_ratio=self.indexer.compress_ratio,
-            query_start=query_start,
-        )
-        results = []
-        for row in range(2):
-            scalar = output[:, row : row + 1].reshape(1, 1, -1)
-            results.append(self.o_proj(scalar * mx.sigmoid(gates[row])))
-        return results[0], results[1]
-
     def __call__(
         self,
         x: mx.array,
@@ -3977,81 +3810,6 @@ class Qwen4ExpDecoderLayer(nn.Module):
         injection = branch[..., None, :] * injection_weights[..., None]
         return hyper_input + injection.reshape(*hyper_input.shape)
 
-    def scalar_pair(
-        self,
-        hidden_rows: tuple[mx.array, mx.array],
-        input_rows: tuple[mx.array, mx.array],
-        cache: Any,
-        position_rows: tuple[Optional[mx.array], Optional[mx.array]],
-        *,
-        use_batched_selector: bool = False,
-        prove_selector_parity: bool = False,
-    ) -> tuple[mx.array, mx.array]:
-        """Execute two M=1 rows adjacently while preserving cache chronology."""
-
-        if self.is_linear:
-            first = self(
-                hidden_rows[0],
-                input_rows[0],
-                mask=None,
-                cache=cache,
-                position_ids=position_rows[0],
-                target_verify=False,
-            )
-            second = self(
-                hidden_rows[1],
-                input_rows[1],
-                mask=None,
-                cache=cache,
-                position_ids=position_rows[1],
-                target_verify=False,
-            )
-            return first, second
-
-        rows = list(hidden_rows)
-        if "ple" in self:
-            rows = [
-                hidden
-                + self.ple(
-                    hidden,
-                    token,
-                    cache,
-                    None,
-                    target_verify=False,
-                )
-                for hidden, token in zip(rows, input_rows)
-            ]
-        attn_parts = [
-            self.attn_hyper_connection(hidden, target_verify=False)
-            for hidden in rows
-        ]
-        branches = self.self_attn.scalar_pair(
-            (attn_parts[0][0], attn_parts[1][0]),
-            cache,
-            position_rows,
-            use_batched_selector=use_batched_selector,
-            prove_selector_parity=prove_selector_parity,
-        )
-        rows = [
-            hyper_input
-            + (branch[..., None, :] * injection_weights[..., None]).reshape(
-                *hyper_input.shape
-            )
-            for branch, (_mixed, hyper_input, injection_weights) in zip(
-                branches,
-                attn_parts,
-            )
-        ]
-        mlp_parts = [
-            self.mlp_hyper_connection(hidden, target_verify=False) for hidden in rows
-        ]
-        outputs = []
-        for mixed, hyper_input, injection_weights in mlp_parts:
-            branch = _qwen4_moe_forward(self.mlp, mixed, False)
-            injection = branch[..., None, :] * injection_weights[..., None]
-            outputs.append(hyper_input + injection.reshape(*hyper_input.shape))
-        return outputs[0], outputs[1]
-
     def _profiled_call(
         self,
         profile,
@@ -4138,12 +3896,6 @@ class Qwen4ExpDecoderLayer(nn.Module):
         return _profile_stage(profile, "mlp_residual", apply_mlp_residual)
 
 
-@dataclass(frozen=True)
-class _ScalarPairQualification:
-    model: Any
-    qsa_entries: tuple[tuple[Any, ...], ...]
-
-
 class Qwen4ExpModel(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -4160,199 +3912,6 @@ class Qwen4ExpModel(nn.Module):
         self.fa_idx = next(
             (i for i, layer in enumerate(self.layers) if not layer.is_linear), 0
         )
-
-    def qualify_scalar_pair_cache(self, cache) -> _ScalarPairQualification:
-        """Prove text history once and bind an opaque token to exact QSA state."""
-
-        qsa_entries = []
-        proofs = []
-        for layer, entry in zip(self.layers, cache):
-            if layer.is_linear:
-                continue
-            if type(entry) is not QSAKVCache or not isinstance(entry.offset, int):
-                raise ValueError("Qwen4 scalar_pair qualification requires B1 QSA")
-            offset = entry.offset
-            positions = entry.index_position_ids
-            if positions is None:
-                raise ValueError("Qwen4 scalar_pair qualification needs positions")
-            if positions.ndim == 2 and positions.shape == (1, offset):
-                canonical = mx.array(True)
-                text_axis = positions
-            elif positions.ndim == 3 and positions.shape == (3, 1, offset):
-                canonical = mx.all(positions[0] == positions[1]) & mx.all(
-                    positions[0] == positions[2]
-                )
-                text_axis = positions[0]
-            else:
-                raise ValueError("Qwen4 scalar_pair qualification is not text")
-            if offset > 1:
-                canonical = canonical & mx.all(
-                    text_axis[:, 1:] - text_axis[:, :-1] == 1
-                )
-            proofs.append(canonical)
-            qsa_entries.append(
-                (
-                    entry,
-                    offset,
-                    entry.keys,
-                    entry.values,
-                    entry._index_keys,
-                    entry._index_position_ids,
-                    entry._pooled_index_keys,
-                )
-            )
-        if not qsa_entries:
-            raise ValueError("Qwen4 scalar_pair qualification found no QSA layers")
-        mx.eval(*proofs)
-        if not all(bool(proof.item()) for proof in proofs):
-            raise ValueError("Qwen4 scalar_pair qualification is not canonical text")
-        return _ScalarPairQualification(self, tuple(qsa_entries))
-
-    def scalar_pair(
-        self,
-        inputs: mx.array,
-        *,
-        cache,
-        position_ids: Optional[mx.array] = None,
-        qualification: Optional[_ScalarPairQualification] = None,
-        use_batched_selector: bool = False,
-        prove_selector_parity: bool = False,
-    ) -> tuple[mx.array, mx.array]:
-        """Run a disconnected two-row layer-major scalar wavefront."""
-
-        if inputs.ndim != 2 or inputs.shape != (1, 2):
-            raise ValueError("Qwen4 scalar_pair requires token IDs shaped [1,2]")
-        if cache is None or len(cache) != len(self.layers):
-            raise ValueError("Qwen4 scalar_pair requires one cache per model layer")
-        if _scalar_pair_world_size() != 1:
-            raise ValueError("Qwen4 scalar_pair requires world size one")
-        if position_ids is not None and not (
-            position_ids.ndim == 2 and position_ids.shape == (1, 2)
-        ):
-            raise ValueError("Qwen4 scalar_pair requires 2-D text positions")
-        if qualification is None:
-            qualification = self.qualify_scalar_pair_cache(cache)
-        if qualification.model is not self:
-            raise ValueError("Qwen4 scalar_pair qualification has the wrong owner")
-        qualified_entries = iter(qualification.qsa_entries)
-        for layer, entry in zip(self.layers, cache):
-            if layer.is_linear:
-                inner = vars(entry).get("_inner", entry)
-                if type(inner).__name__ != "ArraysCache":
-                    raise ValueError("Qwen4 scalar_pair requires singleton ArraysCache")
-                if getattr(inner, "left_padding", None) is not None or getattr(
-                    inner, "lengths", None
-                ) is not None:
-                    raise ValueError("Qwen4 scalar_pair does not support padded caches")
-                state = getattr(inner, "state", None)
-                if not isinstance(state, (list, tuple)) or len(state) not in (2, 4):
-                    raise ValueError("Qwen4 scalar_pair recurrent cache is incomplete")
-                if any(
-                    value is not None
-                    and (getattr(value, "ndim", 0) < 1 or value.shape[0] != 1)
-                    for value in state
-                ):
-                    raise ValueError("Qwen4 scalar_pair recurrent cache is not B1")
-                continue
-
-            if type(entry) is not QSAKVCache or not isinstance(entry.offset, int):
-                raise ValueError("Qwen4 scalar_pair requires compact singleton QSA")
-            offset = entry.offset
-            try:
-                qualified = next(qualified_entries)
-            except StopIteration as exc:
-                raise ValueError("Qwen4 scalar_pair qualification is incomplete") from exc
-            if (
-                qualified[0] is not entry
-                or qualified[1] != offset
-                or qualified[2] is not entry.keys
-                or qualified[3] is not entry.values
-                or qualified[4] is not entry._index_keys
-                or qualified[5] is not entry._index_position_ids
-                or qualified[6] is not entry._pooled_index_keys
-            ):
-                raise ValueError("Qwen4 scalar_pair qualification is stale")
-            attention = layer.self_attn
-            ratio = attention.indexer.compress_ratio
-            if (offset + 1) // ratio <= attention.indexer.block_topk:
-                raise ValueError("Qwen4 scalar_pair QSA row zero is not sparse")
-            if (
-                entry.keys is None
-                or entry.values is None
-                or entry.keys.ndim != 4
-                or entry.values.ndim != 4
-                or entry.values.shape != entry.keys.shape
-                or entry.keys.shape[0] != 1
-                or entry.keys.shape[1] != attention.num_key_value_heads
-                or entry.keys.shape[-1] != attention.head_dim
-                or entry.keys.dtype != entry.values.dtype
-                or int(entry.keys.shape[2]) < offset + 2
-                or int(entry.values.shape[2]) < offset + 2
-                or entry.index_keys is None
-                or entry.index_position_ids is None
-                or entry._index_keys is None
-                or entry._index_position_ids is None
-                or entry._index_keys.ndim != 3
-                or entry._index_keys.shape[0] != 1
-                or entry._index_keys.shape[-1] != attention.indexer.head_dim
-                or entry._index_keys.dtype != entry.keys.dtype
-                or int(entry.index_keys.shape[1]) != offset
-                or int(entry.index_position_ids.shape[-1]) != offset
-                or int(entry._index_offset) != offset
-                or int(entry._index_keys.shape[1]) < offset + 2
-                or int(entry._index_position_ids.shape[-1]) < offset + 2
-            ):
-                raise ValueError("Qwen4 scalar_pair QSA cache is misaligned")
-            required_blocks = (offset + 2) // ratio
-            if (
-                entry._pooled_index_keys is None
-                or entry._pooled_index_keys.ndim != 3
-                or entry._pooled_index_keys.shape[0] != 1
-                or entry._pooled_index_keys.shape[-1] != attention.indexer.head_dim
-                or entry._pooled_index_keys.dtype != entry._index_keys.dtype
-                or entry._pooled_index_ratio != ratio
-                or entry._pooled_index_tag is not attention.indexer
-                or int(entry._pooled_index_offset) != offset // ratio
-                or int(entry._pooled_index_keys.shape[1]) < required_blocks
-            ):
-                raise ValueError("Qwen4 scalar_pair pooled QSA cache is incomplete")
-
-        try:
-            next(qualified_entries)
-        except StopIteration:
-            pass
-        else:
-            raise ValueError("Qwen4 scalar_pair qualification has extra entries")
-
-        input_rows = (inputs[:, :1], inputs[:, 1:2])
-        if position_ids is None:
-            position_rows = (None, None)
-        elif position_ids.ndim == 2 and position_ids.shape == (1, 2):
-            position_rows = (
-                position_ids[..., :1],
-                position_ids[..., 1:2],
-            )
-        else:
-            raise ValueError("Qwen4 scalar_pair positions must end in two rows")
-        hidden_rows = tuple(
-            mx.tile(self.embed_tokens(row), (1, 1, self.args.hc_count))
-            for row in input_rows
-        )
-        for layer, entry in zip(self.layers, cache):
-            hidden_rows = layer.scalar_pair(
-                hidden_rows,
-                input_rows,
-                entry,
-                position_rows,
-                use_batched_selector=use_batched_selector,
-                prove_selector_parity=prove_selector_parity,
-            )
-        raw_hidden = mx.concatenate(hidden_rows, axis=1)
-        outputs = tuple(
-            self.hyper_connection_mixer(hidden, target_verify=False)
-            for hidden in hidden_rows
-        )
-        return mx.concatenate(outputs, axis=1), raw_hidden
 
     def __call__(
         self,
@@ -4770,65 +4329,6 @@ class LanguageModel(Qwen3_5LanguageModel):
         elif coarse_profile is not None:
             _log_coarse_profile(coarse_profile, build_ns, eval_ns)
         return output
-
-    def qualify_scalar_pair_cache(self, cache) -> _ScalarPairQualification:
-        return self.model.qualify_scalar_pair_cache(cache)
-
-    def scalar_pair(
-        self,
-        inputs: mx.array,
-        *,
-        cache,
-        position_ids: Optional[mx.array] = None,
-        qualification: Optional[_ScalarPairQualification] = None,
-        use_batched_selector: bool = False,
-        prove_selector_parity: bool = False,
-    ) -> LanguageModelOutput:
-        """Disconnected exact W=2 layer-major verifier primitive."""
-
-        if position_ids is None and self._rope_deltas is not None:
-            base = cache[self.model.fa_idx].offset
-            if not isinstance(base, int):
-                raise ValueError("Qwen4 scalar_pair requires one scalar cache offset")
-            delta = mx.array(base + self._rope_deltas)
-            if delta.ndim == 0:
-                delta = delta.reshape(1, 1)
-            position_ids = mx.arange(2, dtype=mx.int32)[None] + delta[:1]
-        elif position_ids is None and self._position_ids is not None:
-            base = cache[self.model.fa_idx].offset
-            if (
-                isinstance(base, int)
-                and self._position_ids.ndim == 2
-                and self._position_ids.shape[0] == 1
-                and self._position_ids.shape[-1] >= base + 2
-            ):
-                position_ids = self._position_ids[:, base : base + 2]
-            else:
-                raise ValueError(
-                    "Qwen4 scalar_pair cannot infer canonical 2-D text positions"
-                )
-        output, raw_hidden = self.model.scalar_pair(
-            inputs,
-            cache=cache,
-            position_ids=position_ids,
-            qualification=qualification,
-            use_batched_selector=use_batched_selector,
-            prove_selector_parity=prove_selector_parity,
-        )
-        logits = []
-        for row in range(2):
-            hidden = output[:, row : row + 1]
-            logits.append(
-                self.model.embed_tokens.as_linear(hidden)
-                if self.args.tie_word_embeddings
-                else self.lm_head(hidden)
-            )
-        return LanguageModelOutput(
-            logits=mx.concatenate(logits, axis=1),
-            hidden_states=[raw_hidden],
-            gdn_states=None,
-            shared_kv_states=None,
-        )
 
     def mtp_forward(
         self,
