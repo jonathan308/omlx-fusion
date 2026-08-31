@@ -2,7 +2,6 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/variant.h>
-#include <nanobind/stl/vector.h>
 
 #include "dsa_indexer.h"
 #include "ds4_attention_finalizer.h"
@@ -16,7 +15,6 @@
 #include "dspark_qmv.h"
 #include "exact_block_attention.h"
 #include "fused_moe.h"
-#include "qwen4_qsa_compact_stage.h"
 #include "qwen4_qsa_sparse_gqa.h"
 #include "sparse_mla.h"
 
@@ -93,31 +91,6 @@ NB_MODULE(_ext, m) {
       "q_offset"_a,
       "key_tile"_a = 128,
       "dimension_tile"_a = 32,
-      "stream"_a = nb::none());
-  m.def(
-      "qwen4_qsa_sparse_gqa_attention_tokens",
-      &omlx::glm_kernels::qwen4_qsa_sparse_gqa_attention_tokens,
-      "queries"_a,
-      "keys"_a,
-      "values"_a,
-      "selected_tokens"_a,
-      "scale"_a,
-      "key_tile"_a = 64,
-      "dimension_tile"_a = 64,
-      "stream"_a = nb::none());
-  m.def(
-      "qwen4_qsa_compact_stage_plan",
-      &omlx::glm_kernels::qwen4_qsa_compact_stage_plan,
-      "selected_blocks"_a,
-      "q_offset"_a,
-      "key_tokens"_a,
-      "stream"_a = nb::none());
-  m.def(
-      "qwen4_qsa_compact_stage_gather",
-      &omlx::glm_kernels::qwen4_qsa_compact_stage_gather,
-      "keys"_a,
-      "values"_a,
-      "source_tokens"_a,
       "stream"_a = nb::none());
   m.def(
       "qwen4_qsa_indexer_scores",

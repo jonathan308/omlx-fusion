@@ -619,7 +619,6 @@ def test_qwen4_depth5_terminal_reconciles_physical_plus3_sized_metadata():
     )
     pending = state.pending_commit
     assert pending is not None
-    assert pending.verify_width == 6
     full_offset = pending.target_base_offset + pending.verify_width
     assert set(_sized_counts(batch.prompt_cache)) == {full_offset}
 

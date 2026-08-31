@@ -2,8 +2,6 @@
 
 #include "qwen4_qsa_sparse_gqa.h"
 
-#include "qwen4_qsa_compact_stage.h"
-
 #include <dlfcn.h>
 #include <filesystem>
 #include <sstream>
@@ -55,16 +53,13 @@ struct Qwen4QSASparseGQAParams {
 class Qwen4QSASparseGQAPrimitive : public Primitive {
 public:
   Qwen4QSASparseGQAPrimitive(Stream stream, float scale, int q_offset,
-                             int key_tile, int dimension_tile,
-                             bool explicit_tokens = false)
+                             int key_tile, int dimension_tile)
       : Primitive(stream), scale_(scale), q_offset_(q_offset),
-        key_tile_(key_tile), dimension_tile_(dimension_tile),
-        explicit_tokens_(explicit_tokens) {}
+        key_tile_(key_tile), dimension_tile_(dimension_tile) {}
 
   static bool unsupported(const array &q, const array &k, const array &v,
                           const array &selected, int q_offset, int key_tile,
-                          int dimension_tile, bool explicit_tokens,
-                          Stream stream) {
+                          int dimension_tile, Stream stream) {
     if (stream.device == Device::cpu || q.dtype() != k.dtype() ||
         q.dtype() != v.dtype()) {
       return true;
@@ -85,11 +80,7 @@ public:
         v.shape(1) != 2 || q.shape(3) != 256 || k.shape(3) != 256 ||
         v.shape(3) != 256 || k.shape(2) != v.shape(2) || q.shape(2) <= 0 ||
         selected.shape(1) != 1 || selected.shape(2) != q.shape(2) ||
-        (!explicit_tokens && selected.shape(3) != 512) ||
-        (explicit_tokens &&
-         (q.shape(2) != kQwen4StageRows ||
-          k.shape(2) != kQwen4StageTokenCapacity ||
-          selected.shape(3) != kQwen4StageTokensPerRow))) {
+        selected.shape(3) != 512) {
       return true;
     }
     if (q_offset < 0 || q_offset + q.shape(2) > k.shape(2) ||
@@ -140,11 +131,9 @@ public:
         {out.strides(0), out.strides(1), out.strides(2)}};
 
     std::string kernel_name;
-    concatenate(kernel_name,
-                explicit_tokens_ ? "qwen4_qsa_sparse_gqa_tokens_"
-                                 : "qwen4_qsa_sparse_gqa_",
-                type_to_name(q), "_bk", key_tile_, "_dc", dimension_tile_,
-                "_gqa", gqa, "_hp", hpad, "_d", dim, "_wm", wm);
+    concatenate(kernel_name, "qwen4_qsa_sparse_gqa_", type_to_name(q), "_bk",
+                key_tile_, "_dc", dimension_tile_, "_gqa", gqa, "_hp", hpad,
+                "_d", dim, "_wm", wm);
 
     auto library = device.get_library("omlx_glm_kernels", current_binary_dir());
     auto kernel = device.get_kernel(kernel_name, library);
@@ -165,13 +154,11 @@ public:
   bool is_equivalent(const Primitive &other) const override {
     const auto &rhs = static_cast<const Qwen4QSASparseGQAPrimitive &>(other);
     return scale_ == rhs.scale_ && q_offset_ == rhs.q_offset_ &&
-           key_tile_ == rhs.key_tile_ &&
-           dimension_tile_ == rhs.dimension_tile_ &&
-           explicit_tokens_ == rhs.explicit_tokens_;
+           key_tile_ == rhs.key_tile_ && dimension_tile_ == rhs.dimension_tile_;
   }
   auto state() const {
     return std::make_tuple(nullptr, scale_, q_offset_, key_tile_,
-                           dimension_tile_, explicit_tokens_);
+                           dimension_tile_);
   }
 
 private:
@@ -179,7 +166,6 @@ private:
   int q_offset_;
   int key_tile_;
   int dimension_tile_;
-  bool explicit_tokens_;
 };
 
 } // namespace
@@ -192,7 +178,7 @@ array qwen4_qsa_sparse_gqa_attention(const array &queries, const array &keys,
   auto stream = to_stream(s);
   if (Qwen4QSASparseGQAPrimitive::unsupported(
           queries, keys, values, selected_blocks, q_offset, key_tile,
-          dimension_tile, false, stream)) {
+          dimension_tile, stream)) {
     std::ostringstream msg;
     msg << "[omlx_glm_kernels.qwen4_qsa_sparse_gqa_attention] expected "
         << "q=[1,24,M,256], k/v=[1,2,K,256], uint32 selected blocks="
@@ -207,34 +193,8 @@ array qwen4_qsa_sparse_gqa_attention(const array &queries, const array &keys,
                   queries.shape(3)};
   return array(std::move(out_shape), queries.dtype(),
                std::make_shared<Qwen4QSASparseGQAPrimitive>(
-                   stream, scale, q_offset, key_tile, dimension_tile, false),
+                   stream, scale, q_offset, key_tile, dimension_tile),
                std::vector<array>{queries, keys, values, selected_blocks});
-}
-
-array qwen4_qsa_sparse_gqa_attention_tokens(
-    const array &queries, const array &keys, const array &values,
-    const array &selected_tokens, float scale, int key_tile,
-    int dimension_tile, StreamOrDevice s) {
-  auto stream = to_stream(s);
-  if (Qwen4QSASparseGQAPrimitive::unsupported(
-          queries, keys, values, selected_tokens, 0, key_tile,
-          dimension_tile, true, stream)) {
-    std::ostringstream msg;
-    msg << "[omlx_glm_kernels.qwen4_qsa_sparse_gqa_attention_tokens] expected "
-        << "q=[1,24,6,256], staged k/v=[1,2,12306,256], uint32 selected tokens="
-        << "[1,1,6,2051], and (BK,DC) in "
-        << "{(128,32),(256,32),(64,64),(128,64)}; got " << queries.shape()
-        << ", " << keys.shape() << ", " << values.shape() << ", "
-        << selected_tokens.shape() << ".";
-    throw std::invalid_argument(msg.str());
-  }
-
-  Shape out_shape{queries.shape(0), queries.shape(1), queries.shape(2),
-                  queries.shape(3)};
-  return array(std::move(out_shape), queries.dtype(),
-               std::make_shared<Qwen4QSASparseGQAPrimitive>(
-                   stream, scale, 0, key_tile, dimension_tile, true),
-               std::vector<array>{queries, keys, values, selected_tokens});
 }
 
 } // namespace omlx::glm_kernels
