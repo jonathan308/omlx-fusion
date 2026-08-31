@@ -54,10 +54,16 @@ _SCALAR_MTP_HIDDEN_SINK: ContextVar[list | None] = ContextVar(
     "qwen4_scalar_mtp_hidden_sink",
     default=None,
 )
+_TOKENWISE_LM_HEAD_HIDDEN_SINK: ContextVar[list | None] = ContextVar(
+    "qwen4_tokenwise_lm_head_hidden_sink",
+    default=None,
+)
 _EXACT_HC_VERIFY_ENV = "OMLX_QWEN4_EXACT_HC_VERIFY"
 _EXACT_HC_VERIFY_LOGGED = False
 _TOKENWISE_GDN_VERIFY_ENV = "OMLX_QWEN4_TOKENWISE_GDN_VERIFY"
 _TOKENWISE_GDN_VERIFY_LOGGED = False
+_TOKENWISE_LM_HEAD_VERIFY_ENV = "OMLX_QWEN4_TOKENWISE_LM_HEAD_VERIFY"
+_TOKENWISE_LM_HEAD_VERIFY_LOGGED = False
 
 logger = logging.getLogger(__name__)
 _TOKENWISE_PLE_VERIFY_LOGGED = False
@@ -191,6 +197,78 @@ def _tokenwise_gdn_verify_enabled() -> bool:
         "yes",
         "on",
     }
+
+
+def _tokenwise_lm_head_verify_enabled() -> bool:
+    """Diagnostic gate for canonical scalar-row output projection."""
+
+    return os.environ.get(_TOKENWISE_LM_HEAD_VERIFY_ENV, "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _capture_tokenwise_lm_head_hidden(
+    hidden: mx.array,
+    target_verify: bool,
+) -> mx.array:
+    """Publish one Qwen4 final hidden tensor to the scoped output-head sink."""
+
+    sink = _TOKENWISE_LM_HEAD_HIDDEN_SINK.get()
+    if sink is not None and target_verify:
+        sink.append(hidden)
+    return hidden
+
+
+def _tokenwise_lm_head_projection(
+    model,
+    hidden: mx.array,
+) -> mx.array | None:
+    """Project each B1 M=2..9 row through the exact scalar decode head.
+
+    The ordinary target-verification projection is already available as the
+    fail-closed result.  Any scalar capability/runtime failure therefore
+    returns ``None`` and leaves those logits untouched.
+    """
+
+    if not (
+        hidden.ndim == 3
+        and hidden.shape[0] == 1
+        and hidden.shape[1] in _HC_FUSED_VERIFY_WIDTHS
+    ):
+        return None
+    projection = (
+        model.model.embed_tokens.as_linear
+        if model.args.tie_word_embeddings
+        else model.lm_head
+    )
+    try:
+        rows = [
+            projection(hidden[:, row : row + 1])
+            for row in range(hidden.shape[1])
+        ]
+        logits = mx.concatenate(rows, axis=1)
+        # Resolve the diagnostic graph here so a capability/runtime failure
+        # can retain the already-computed ordinary target-verify logits.
+        mx.eval(logits)
+    except Exception as exc:
+        logger.debug(
+            "Qwen4 tokenwise LM-head target-verify diagnostic failed closed: %s",
+            exc,
+        )
+        return None
+
+    global _TOKENWISE_LM_HEAD_VERIFY_LOGGED
+    if not _TOKENWISE_LM_HEAD_VERIFY_LOGGED:
+        _TOKENWISE_LM_HEAD_VERIFY_LOGGED = True
+        logger.info(
+            "Qwen4 tokenwise LM-head target-verify diagnostic active (M=%d, %s)",
+            hidden.shape[1],
+            "tied" if model.args.tie_word_embeddings else "untied",
+        )
+    return logits
 
 
 def _exact_hc_verify_projection(
@@ -3557,9 +3635,13 @@ class Qwen4ExpModel(nn.Module):
             hidden_sink.append(hidden_states)
 
         if profile is None:
-            return self.hyper_connection_mixer(
+            output = self.hyper_connection_mixer(
                 hidden_states,
                 target_verify=gdn_sink is not None,
+            )
+            return _capture_tokenwise_lm_head_hidden(
+                output,
+                gdn_sink is not None,
             )
 
         def apply_final_hyper_connection():
@@ -3570,7 +3652,10 @@ class Qwen4ExpModel(nn.Module):
 
         output = _profile_stage(profile, "final_hc", apply_final_hyper_connection)
         profile.model_ns = time.perf_counter_ns() - model_started
-        return output
+        return _capture_tokenwise_lm_head_hidden(
+            output,
+            gdn_sink is not None,
+        )
 
 
 class Qwen4ExpMTPModule(nn.Module):
@@ -3728,6 +3813,14 @@ class LanguageModel(Qwen3_5LanguageModel):
         mtp_capture = automatic_mtp_capture and not scalar_mtp_capture
         if mtp_capture:
             kwargs["capture_layer_ids"] = []
+        tokenwise_lm_head_capture = bool(
+            _tokenwise_lm_head_verify_enabled()
+            and kwargs.get("capture_layer_ids") is not None
+            and not kwargs.get("skip_logits", False)
+            and inputs.ndim == 2
+            and inputs.shape[0] == 1
+            and inputs.shape[1] in _HC_FUSED_VERIFY_WIDTHS
+        )
         profile = _new_decode_profile_sample(
             self.model,
             inputs,
@@ -3758,6 +3851,12 @@ class LanguageModel(Qwen3_5LanguageModel):
             if scalar_hidden_sink is not None
             else None
         )
+        lm_head_hidden_sink = [] if tokenwise_lm_head_capture else None
+        lm_head_capture_token = (
+            _TOKENWISE_LM_HEAD_HIDDEN_SINK.set(lm_head_hidden_sink)
+            if lm_head_hidden_sink is not None
+            else None
+        )
         try:
             output = super().__call__(inputs, inputs_embeds, mask, cache, **kwargs)
             if profile is not None:
@@ -3777,6 +3876,29 @@ class LanguageModel(Qwen3_5LanguageModel):
                     _DECODE_PROFILE_LOCAL.sample = previous_profile
             if scalar_capture_token is not None:
                 _SCALAR_MTP_HIDDEN_SINK.reset(scalar_capture_token)
+            if lm_head_capture_token is not None:
+                _TOKENWISE_LM_HEAD_HIDDEN_SINK.reset(lm_head_capture_token)
+        if lm_head_hidden_sink is not None:
+            if len(lm_head_hidden_sink) == 1:
+                try:
+                    scalar_logits = _tokenwise_lm_head_projection(
+                        self,
+                        lm_head_hidden_sink[0],
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Qwen4 tokenwise LM-head replacement failed closed: %s",
+                        exc,
+                    )
+                    scalar_logits = None
+                if scalar_logits is not None:
+                    output.logits = scalar_logits
+            else:
+                logger.debug(
+                    "Qwen4 tokenwise LM-head target-verify capture failed closed: "
+                    "expected one hidden tensor, got %d",
+                    len(lm_head_hidden_sink),
+                )
         if scalar_hidden_sink is not None:
             if len(scalar_hidden_sink) != 1:
                 raise RuntimeError(
