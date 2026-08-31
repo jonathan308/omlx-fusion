@@ -43,6 +43,8 @@ class ActiveVerifyParityProbe:
     fresh_verify_logits: Any
     scalar_cache_leaves: list[tuple[str, Any]]
     fresh_verify_cache_leaves: list[tuple[str, Any]]
+    active_base_scalar_logits: Any | None = None
+    active_base_scalar_cache_leaves: list[tuple[str, Any]] | None = None
 
 
 def _resolve_language_model(model: Any) -> Any:
@@ -173,28 +175,36 @@ def _array_comparison(left: Any, right: Any) -> dict[str, Any]:
 
 
 def _top_two_rows(logits: Any) -> list[dict[str, Any]]:
-    """Materialize exact top-two IDs/values without sorting the full vocab."""
+    """Materialize top-two IDs using production argmax tie semantics."""
 
     import mlx.core as mx
 
     flat = logits.reshape(-1, logits.shape[-1]).astype(mx.float32)
-    candidate_ids = mx.argpartition(flat, kth=-2, axis=-1)[:, -2:]
-    candidate_values = mx.take_along_axis(flat, candidate_ids, axis=-1)
-    order = mx.argsort(candidate_values, axis=-1)[:, ::-1]
-    ids = mx.take_along_axis(candidate_ids, order, axis=-1)
-    values = mx.take_along_axis(candidate_values, order, axis=-1)
-    mx.eval(ids, values)
-    id_rows = ids.tolist()
-    value_rows = values.tolist()
+    top1_ids = mx.argmax(flat, axis=-1).astype(mx.int32)
+    top1_values = mx.take_along_axis(flat, top1_ids[:, None], axis=-1).squeeze(-1)
+    vocab = mx.arange(flat.shape[-1], dtype=mx.int32)[None]
+    without_top1 = mx.where(vocab == top1_ids[:, None], -mx.inf, flat)
+    top2_ids = mx.argmax(without_top1, axis=-1).astype(mx.int32)
+    top2_values = mx.take_along_axis(
+        flat,
+        top2_ids[:, None],
+        axis=-1,
+    ).squeeze(-1)
+    mx.eval(top1_ids, top2_ids, top1_values, top2_values)
+    id_rows = zip(top1_ids.tolist(), top2_ids.tolist())
+    value_rows = zip(top1_values.tolist(), top2_values.tolist())
     return [
         {
-            "top1_id": int(id_row[0]),
-            "top2_id": int(id_row[1]),
-            "top1_logit": _finite_float(value_row[0]),
-            "top2_logit": _finite_float(value_row[1]),
-            "margin": _finite_float(value_row[0] - value_row[1]),
+            "top1_id": int(top1_id),
+            "top2_id": int(top2_id),
+            "top1_logit": _finite_float(top1_value),
+            "top2_logit": _finite_float(top2_value),
+            "margin": _finite_float(top1_value - top2_value),
         }
-        for id_row, value_row in zip(id_rows, value_rows)
+        for (top1_id, top2_id), (top1_value, top2_value) in zip(
+            id_rows,
+            value_rows,
+        )
     ]
 
 
@@ -293,6 +303,38 @@ def _prefill(
         mx.eval(hidden, *[array for _name, array in _cache_leaves(cache)])
 
 
+def _scalar_window_from_active_cache(
+    language_model: Any,
+    verify_tokens: Sequence[int],
+    cache: Sequence[Any],
+) -> tuple[Any, list[tuple[str, Any]]]:
+    """Run canonical L=1 target calls from an extracted live cache clone."""
+
+    import mlx.core as mx
+
+    from omlx.patches.mlx_lm_mtp import prompt_priming
+
+    position_ids = getattr(language_model, "_position_ids", None)
+    rope_deltas = getattr(language_model, "_rope_deltas", None)
+    rows = []
+    try:
+        with prompt_priming.suppress_capture():
+            for token in verify_tokens:
+                output = language_model(
+                    mx.array([[int(token)]], dtype=mx.int32),
+                    cache=cache,
+                )
+                rows.append(output.logits)
+        logits = mx.concatenate(rows, axis=1)
+        mx.eval(logits, *[array for _name, array in _cache_leaves(cache)])
+    finally:
+        # Diagnostic replay must not alter the position state used by the live
+        # verifier that immediately follows on the same model instance.
+        language_model._position_ids = position_ids
+        language_model._rope_deltas = rope_deltas
+    return logits, snapshot_cache_leaves(cache)
+
+
 def prepare_qwen4_active_verify_probe(
     model: Any,
     *,
@@ -344,6 +386,17 @@ def prepare_qwen4_active_verify_probe(
         if active_prefix_cache is not None
         else None
     )
+    active_base_scalar_logits = None
+    active_base_scalar_cache_leaves = None
+    if active_prefix_cache is not None:
+        (
+            active_base_scalar_logits,
+            active_base_scalar_cache_leaves,
+        ) = _scalar_window_from_active_cache(
+            language_model,
+            window,
+            active_prefix_cache,
+        )
 
     verify_array = mx.array([window], dtype=mx.int32)
     from omlx.patches import qwen35_verify_qmm
@@ -449,12 +502,26 @@ def prepare_qwen4_active_verify_probe(
             active_prefix_leaves,
             fresh_prefix_leaves,
         )
+    if active_base_scalar_logits is not None:
+        report["active_base_scalar"] = {
+            "rows": _top_two_rows(active_base_scalar_logits),
+            "logits_vs_fresh_scalar": _array_comparison(
+                active_base_scalar_logits,
+                scalar_logits,
+            ),
+            "post_cache_vs_fresh_scalar": _leaf_comparisons(
+                active_base_scalar_cache_leaves or [],
+                scalar_cache_leaves,
+            ),
+        }
     return ActiveVerifyParityProbe(
         report=report,
         scalar_logits=scalar_logits,
         fresh_verify_logits=batched_logits,
         scalar_cache_leaves=scalar_cache_leaves,
         fresh_verify_cache_leaves=fresh_verify_cache_leaves,
+        active_base_scalar_logits=active_base_scalar_logits,
+        active_base_scalar_cache_leaves=active_base_scalar_cache_leaves,
     )
 
 
@@ -474,20 +541,27 @@ def capture_qwen4_active_verify_result(
     active_top = _top_two_rows(active_logits)
     scalar_top = _top_two_rows(probe.scalar_logits)
     fresh_top = _top_two_rows(probe.fresh_verify_logits)
+    active_base_top = (
+        _top_two_rows(probe.active_base_scalar_logits)
+        if probe.active_base_scalar_logits is not None
+        else None
+    )
     rows = []
-    for row, (active, scalar, fresh) in enumerate(
-        zip(active_top, scalar_top, fresh_top)
-    ):
-        rows.append(
-            {
-                "row": row,
-                "active": active,
-                "scalar": scalar,
-                "fresh_verify": fresh,
-                "active_vs_scalar_argmax": active["top1_id"] == scalar["top1_id"],
-                "active_vs_fresh_argmax": active["top1_id"] == fresh["top1_id"],
-            }
-        )
+    for row, (active, scalar, fresh) in enumerate(zip(active_top, scalar_top, fresh_top)):
+        item = {
+            "row": row,
+            "active": active,
+            "scalar": scalar,
+            "fresh_verify": fresh,
+            "active_vs_scalar_argmax": active["top1_id"] == scalar["top1_id"],
+            "active_vs_fresh_argmax": active["top1_id"] == fresh["top1_id"],
+        }
+        if active_base_top is not None:
+            item["active_base_scalar"] = active_base_top[row]
+            item["active_vs_active_base_scalar_argmax"] = (
+                active["top1_id"] == active_base_top[row]["top1_id"]
+            )
+        rows.append(item)
     active_leaves = snapshot_cache_leaves(active_cache)
     probe.report["active"] = {
         "rows": rows,
@@ -505,6 +579,17 @@ def capture_qwen4_active_verify_result(
             probe.fresh_verify_cache_leaves,
         ),
     }
+    if probe.active_base_scalar_logits is not None:
+        probe.report["active"]["logits_vs_active_base_scalar"] = _array_comparison(
+            active_logits,
+            probe.active_base_scalar_logits,
+        )
+        probe.report["active"]["post_cache_vs_active_base_scalar"] = (
+            _leaf_comparisons(
+                active_leaves,
+                probe.active_base_scalar_cache_leaves or [],
+            )
+        )
     return probe.report
 
 
