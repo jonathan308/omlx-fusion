@@ -137,6 +137,7 @@ def _real_cycle(
     expected_pending_kind: str = "verify",
     alignment_distance: int | None = None,
     clamp_to: int | None = None,
+    before_cycle=None,
 ):
     from omlx.patches.mlx_lm_mtp import batch_generator as bg
 
@@ -192,6 +193,8 @@ def _real_cycle(
         _matcher_states=[],
     )
     batch._omlx_mtp_state = state
+    if before_cycle is not None:
+        before_cycle(batch, state)
     bg._run_verify_cycle_chain(batch, state)
     effective_accepted = state.pending_commit.accepted
     expected = target_tokens[: effective_accepted + 1]
