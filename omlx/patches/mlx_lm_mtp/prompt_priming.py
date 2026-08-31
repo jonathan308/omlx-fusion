@@ -1213,18 +1213,29 @@ def maybe_capture(
         # exact scheduler-owned text suffix: the target keeps the absolute
         # durable history and verifies every draft.
         plan = _find_plan(host)
-        suffix_local = offset_after != seq_len
-        if suffix_local and not (
-            _text_only_suffix_plan(host, plan)
-            and seq_start == plan.cached_tokens
-            and _inputs_match_plan(
-                inputs,
-                plan,
-                start=seq_start,
-                stop=offset_after,
-            )
-        ):
-            return
+        qwen4_suffix_capable = bool(
+            getattr(host, "_omlx_mtp_suffix_local_capability", None)
+            == _QWEN4_SUFFIX_LOCAL_CAPABILITY
+        )
+        restored_suffix = offset_after != seq_len
+        suffix_local = qwen4_suffix_capable and restored_suffix
+        if restored_suffix:
+            # Fusion intentionally keeps generic/DS4 partial-history capture
+            # fail-closed.  Only the explicitly tagged Qwen4 target can prove
+            # that its absolute target history and local verified-drafter
+            # history are safe to advance on separate timelines.
+            if not (
+                suffix_local
+                and _text_only_suffix_plan(host, plan)
+                and seq_start == plan.cached_tokens
+                and _inputs_match_plan(
+                    inputs,
+                    plan,
+                    start=seq_start,
+                    stop=offset_after,
+                )
+            ):
+                return
         if not suffix_local and seq_len <= 1:
             # A lone decode step cannot start a prompt timeline.
             return

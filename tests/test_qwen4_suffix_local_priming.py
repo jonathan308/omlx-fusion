@@ -402,6 +402,29 @@ def test_qwen4_suffix_local_priming_preserves_target_output_and_cache():
     _assert_target_cache_equal(control_cache, primed_cache)
 
 
+def test_qwen4_suffix_local_priming_requires_explicit_model_capability():
+    """A restored target prefix never implies a safe local drafter history."""
+
+    model = _model()
+    delattr(model, "_omlx_mtp_suffix_local_capability")
+    cache = model.make_cache()
+    prefix = mx.array([2, 3, 4, 5], dtype=mx.int32)
+    suffix = mx.array([6, 7], dtype=mx.int32)
+    prompt = mx.concatenate([prefix, suffix])
+    _restore_target_prefix(model, cache, prefix)
+    prompt_priming.prepare_prefix_context(
+        model,
+        request_id="qwen4-capability-missing",
+        prompt_tokens=prompt.tolist(),
+        cached_tokens=len(prefix),
+        prefix_cache=_NoSidecarPrefixCache(),
+    )
+
+    output = model(suffix[None], cache=cache)
+    mx.eval(output.logits)
+    assert prompt_priming._find_ctx(model) is None
+
+
 @pytest.mark.parametrize(
     ("extra_keys", "extra_start", "extra_ranges"),
     [
