@@ -8694,6 +8694,22 @@ class Scheduler:
             or not isinstance(cache_tokens, (list, tuple))
             or not cache_tokens
         ):
+            if (
+                getattr(self, "_exact_resident_cache", None) is not None
+                and self._exact_resident_cache.max_entries > 0
+                and self._exact_resident_cache.max_bytes > 0
+            ):
+                logger.info(
+                    "Skipping exact resident cache for %s: precondition "
+                    "cache_type=%s tokens_type=%s token_count=%s mtp=%s "
+                    "text_only=%s",
+                    request.request_id,
+                    type(cache_list).__name__,
+                    type(cache_tokens).__name__,
+                    len(cache_tokens) if isinstance(cache_tokens, (list, tuple)) else None,
+                    self._resident_cache_spec_decode_active(),
+                    self._request_is_text_only_for_resident_cache(request),
+                )
             return
         # In non-speculative mlx-lm GenerationBatch.next(), ``_step`` appends
         # the forwarded token to both the physical cache and ``all_tokens``
