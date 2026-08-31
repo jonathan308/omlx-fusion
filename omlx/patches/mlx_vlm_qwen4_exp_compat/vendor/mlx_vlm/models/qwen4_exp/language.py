@@ -57,6 +57,9 @@ _EXACT_HC_VERIFY_LOGGED = False
 
 logger = logging.getLogger(__name__)
 _TOKENWISE_PLE_VERIFY_LOGGED = False
+_TOKENWISE_MOE_VERIFY_ENV = "OMLX_QWEN4_TOKENWISE_MOE_VERIFY"
+_TOKENWISE_MOE_VERIFY_WIDTHS = frozenset(range(2, 10))
+_TOKENWISE_MOE_VERIFY_LOGGED = False
 
 
 def _tokenwise_ple_verify_enabled() -> bool:
@@ -68,6 +71,63 @@ def _tokenwise_ple_verify_enabled() -> bool:
         "yes",
         "on",
     )
+
+
+def _tokenwise_moe_verify_enabled() -> bool:
+    """Diagnostic gate for scalar router/expert target verification."""
+
+    return os.environ.get(_TOKENWISE_MOE_VERIFY_ENV, "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _tokenwise_moe_verify(
+    module,
+    mixed: mx.array,
+    target_verify: bool,
+) -> mx.array | None:
+    """Replay each B1 M=2..9 MoE row through the scalar module path."""
+
+    if not (
+        target_verify
+        and _tokenwise_moe_verify_enabled()
+        and mixed.ndim == 3
+        and mixed.shape[0] == 1
+        and mixed.shape[1] in _TOKENWISE_MOE_VERIFY_WIDTHS
+    ):
+        return None
+
+    try:
+        rows = [
+            module(mixed[:, row : row + 1], target_verify=False)
+            for row in range(mixed.shape[1])
+        ]
+        output = mx.concatenate(rows, axis=1)
+    except Exception as exc:
+        logger.debug(
+            "Qwen4 tokenwise MoE target-verify diagnostic failed closed: %s",
+            exc,
+        )
+        return None
+
+    global _TOKENWISE_MOE_VERIFY_LOGGED
+    if not _TOKENWISE_MOE_VERIFY_LOGGED:
+        _TOKENWISE_MOE_VERIFY_LOGGED = True
+        logger.info(
+            "Qwen4 tokenwise MoE target-verify diagnostic active (M=%d)",
+            mixed.shape[1],
+        )
+    return output
+
+
+def _qwen4_moe_forward(module, mixed: mx.array, target_verify: bool) -> mx.array:
+    tokenwise = _tokenwise_moe_verify(module, mixed, target_verify)
+    if tokenwise is not None:
+        return tokenwise
+    return module(mixed, target_verify=target_verify)
 
 
 def _exact_hc_verify_enabled() -> bool:
@@ -3106,7 +3166,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             hidden_states,
             target_verify=target_verify,
         )
-        branch = self.mlp(mixed, target_verify=target_verify)
+        branch = _qwen4_moe_forward(self.mlp, mixed, target_verify)
         injection = branch[..., None, :] * injection_weights[..., None]
         return hyper_input + injection.reshape(*hyper_input.shape)
 
@@ -3185,7 +3245,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         )
 
         def apply_moe():
-            return self.mlp(mixed, target_verify=target_verify)
+            return _qwen4_moe_forward(self.mlp, mixed, target_verify)
 
         branch = _profile_stage(profile, "moe", apply_moe)
 
