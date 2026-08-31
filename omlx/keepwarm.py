@@ -11,6 +11,7 @@ adds oMLX-specific admission, cache-clear, shutdown, and live-settings gates.
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
@@ -361,43 +362,26 @@ class KeepwarmController:
             }
 
 
-@dataclass
-class _CompiledMetalTouchPlan:
-    """Tiny synthetic operands and one shape-specialized callable."""
-
-    lhs: Any
-    rhs: Any
-    eager: Callable[[Any, Any], Any]
-    run: Callable[[Any, Any], Any]
-    compiled: bool
-    expected: int
-    validated: bool = False
-
-
 class CompiledMetalKeepwarmTouch:
-    """Per-engine, lazy Metal touch plans for the serialized MLX lane.
+    """Per-engine, lazy one-thread Metal pulse for the serialized MLX lane.
 
-    The controller decides *when* a keepwarm is safe. This object only makes
-    the local synthetic touch cheap after its first use: operands and the
-    shape-specialized ``mx.compile`` callable are built once per matrix size
-    on the engine worker/stream that calls :meth:`touch`. It never receives or
-    retains a model, KV cache, request, tokenizer, or SSD-cache object.
-
-    Compilation is an optimization, not a correctness dependency. Missing or
-    failing compile support permanently downgrades that shape to the eager
-    synthetic kernel, and EngineCore's existing outer safety gate keeps any
-    remaining MLX failure non-fatal to inference.
+    Idle/post-response work creates and JITs one safe ``mx.fast.metal_kernel``
+    on the engine worker/stream. Request admission can only consume an already
+    prepared pulse; a miss skips instead of compiling or allocating. The only
+    retained operand is one four-byte fp32 array. This object never receives or
+    retains model, KV-cache, request, tokenizer, or SSD-cache state.
     """
 
     MIN_MATRIX_SIZE = 1
     MAX_MATRIX_SIZE = 1024
     MIN_REPEATS = 1
     MAX_REPEATS = 16
-    # The shipped policy uses exactly these two shapes. Custom bounded action
-    # sizes still execute eagerly, but are never retained; this makes retained
-    # synthetic Metal memory a code-level constant rather than an env-driven
-    # collection of as many as 1,024 plans.
-    CACHEABLE_MATRIX_SIZES = frozenset({1, 128})
+    EXPECTED_OUTPUT = 1.0 + 1e-7
+    OUTPUT_ABS_TOLERANCE = 2e-7
+    KERNEL_SOURCE = """
+        uint elem = thread_position_in_grid.x;
+        out[elem] = inp[elem] + (T)1e-7;
+    """
 
     def __init__(
         self,
@@ -409,7 +393,9 @@ class CompiledMetalKeepwarmTouch:
         self._mx = mx_module
         self._stream = stream
         self._clock = clock
-        self._plans: dict[int, _CompiledMetalTouchPlan] = {}
+        self._input: Any | None = None
+        self._kernel: Callable[..., Any] | None = None
+        self._prepared = False
         self._closed = False
 
     @classmethod
@@ -426,123 +412,119 @@ class CompiledMetalKeepwarmTouch:
                 "keepwarm repeats must be between "
                 f"{cls.MIN_REPEATS} and {cls.MAX_REPEATS}"
             )
+        if action.kind not in {"idle", "post_response", "request_start"}:
+            raise ValueError(f"unsupported keepwarm action: {action.kind}")
         return matrix_size, repeats
 
-    def _build_plan(
+    def _invoke(
         self,
-        matrix_size: int,
-        *,
-        allow_compile: bool,
-    ) -> _CompiledMetalTouchPlan:
-        mx_module = self._mx
-        if mx_module is None or self._closed:
-            raise RuntimeError("compiled Metal keepwarm is closed")
-
-        # Identity x ones still exercises an NxN Metal matmul, while its scalar
-        # reduction is exactly N**2 for every admitted shape (<= 2**20). Cast
-        # the reduction input to fp32 so the 128x128 request-start plan cannot
-        # overflow fp16. Only these tiny synthetic arrays are retained.
-        lhs = mx_module.eye(matrix_size, dtype=mx_module.float16)
-        rhs = mx_module.ones(
-            (matrix_size, matrix_size),
-            dtype=mx_module.float16,
-        )
-
-        def eager(left: Any, right: Any) -> Any:
-            product = mx_module.matmul(left, right)
-            return mx_module.sum(product.astype(mx_module.float32))
-
-        run = eager
-        compiled = False
-        compile_fn = getattr(mx_module, "compile", None)
-        if allow_compile and callable(compile_fn):
-            try:
-                run = compile_fn(eager)
-                compiled = True
-            except Exception:
-                # A given MLX build may omit or reject compile. Eager execution
-                # preserves the experimental feature's no-regression contract.
-                run = eager
-
-        return _CompiledMetalTouchPlan(
-            lhs=lhs,
-            rhs=rhs,
-            eager=eager,
-            run=run,
-            compiled=compiled,
-            expected=matrix_size * matrix_size,
-        )
-
-    def _run_once(
-        self,
-        plan: _CompiledMetalTouchPlan,
+        kernel: Callable[..., Any],
+        input_value: Any,
         *,
         validate: bool,
     ) -> None:
         mx_module = self._mx
         if mx_module is None or self._closed:
-            raise RuntimeError("compiled Metal keepwarm is closed")
-        try:
-            value = plan.run(plan.lhs, plan.rhs)
-        except Exception:
-            if not plan.compiled:
-                raise
-            # Some MLX versions accept mx.compile() but fail during the first
-            # specialization. Do not retry compilation on every idle tick.
-            plan.run = plan.eager
-            plan.compiled = False
-            value = plan.run(plan.lhs, plan.rhs)
-        mx_module.eval(value)
-        if validate and not plan.validated:
-            actual = value.item()
-            if actual != plan.expected:
+            raise RuntimeError("Metal keepwarm pulse is closed")
+        outputs = kernel(
+            inputs=[input_value],
+            template=[("T", mx_module.float32)],
+            grid=(1, 1, 1),
+            threadgroup=(1, 1, 1),
+            output_shapes=[input_value.shape],
+            output_dtypes=[input_value.dtype],
+        )
+        if not outputs:
+            raise RuntimeError("Metal keepwarm pulse returned no output")
+        output = outputs[0]
+        # eval(output) is the completion fence for this exact command. Avoid a
+        # second mx.synchronize() and avoid host copies after first validation.
+        mx_module.eval(output)
+        if validate:
+            actual = float(output.item())
+            if not math.isclose(
+                actual,
+                self.EXPECTED_OUTPUT,
+                rel_tol=0.0,
+                abs_tol=self.OUTPUT_ABS_TOLERANCE,
+            ):
                 raise RuntimeError(
-                    "compiled Metal keepwarm produced an unexpected result: "
-                    f"expected {plan.expected}, got {actual}"
+                    "Metal keepwarm pulse produced an unexpected result: "
+                    f"expected approximately {self.EXPECTED_OUTPUT}, got {actual}"
                 )
-            plan.validated = True
 
-    def touch(self, action: KeepwarmAction) -> float:
-        """Evaluate one bounded synthetic action and return wall time."""
+    def _prepare(self) -> None:
+        mx_module = self._mx
+        if mx_module is None or self._closed:
+            raise RuntimeError("Metal keepwarm pulse is closed")
+        fast_module = getattr(mx_module, "fast", None)
+        metal_kernel = getattr(fast_module, "metal_kernel", None)
+        if not callable(metal_kernel):
+            raise RuntimeError("mx.fast.metal_kernel is unavailable")
 
-        matrix_size, repeats = self._validate_action(action)
+        input_value = mx_module.array([1.0], dtype=mx_module.float32)
+        mx_module.eval(input_value)
+        kernel = metal_kernel(
+            name="omlx_keepwarm_pulse",
+            input_names=["inp"],
+            output_names=["out"],
+            source=self.KERNEL_SOURCE,
+            header="",
+            ensure_row_contiguous=True,
+            atomic_outputs=False,
+            compile_options={"math_mode": "safe"},
+        )
+        # The first invocation performs JIT. Validate it before publication so
+        # request_start can never observe a partial or incorrect kernel.
+        self._invoke(kernel, input_value, validate=True)
+        self._input = input_value
+        self._kernel = kernel
+        self._prepared = True
+
+    def touch(self, action: KeepwarmAction) -> float | None:
+        """Run a pulse, or return None for an unprepared request-start."""
+
+        _matrix_size, repeats = self._validate_action(action)
         if self._closed:
-            raise RuntimeError("compiled Metal keepwarm is closed")
+            raise RuntimeError("Metal keepwarm pulse is closed")
+        if action.kind == "request_start" and not self._prepared:
+            return None
         started = self._clock()
         mx_module = self._mx
         if mx_module is None:
-            raise RuntimeError("compiled Metal keepwarm is closed")
+            raise RuntimeError("Metal keepwarm pulse is closed")
         stream_context = (
             nullcontext() if self._stream is None else mx_module.stream(self._stream)
         )
-        with stream_context:
-            plan = self._plans.get(matrix_size)
-            retained = plan is not None
-            if plan is None:
-                # Never put compilation/specialization or result validation on
-                # a cache-hit request's admission path. Request-start may use
-                # a plan prepared by an earlier idle/post-response action; on
-                # a miss it gets the old eager transient behavior instead.
-                prepare_for_later = (
-                    action.kind != "request_start"
-                    and matrix_size in self.CACHEABLE_MATRIX_SIZES
-                )
-                plan = self._build_plan(
-                    matrix_size,
-                    allow_compile=prepare_for_later,
-                )
-                if prepare_for_later:
-                    self._plans[matrix_size] = plan
-                    retained = True
-            for _ in range(repeats):
-                self._run_once(plan, validate=retained)
+        try:
+            with stream_context:
+                prepared_now = not self._prepared
+                if prepared_now:
+                    self._prepare()
+                kernel = self._kernel
+                input_value = self._input
+                if kernel is None or input_value is None:
+                    raise RuntimeError("Metal keepwarm pulse was not prepared")
+                # _prepare() already emitted and evaluated the first pulse.
+                remaining = repeats - 1 if prepared_now else repeats
+                for _ in range(remaining):
+                    self._invoke(kernel, input_value, validate=False)
+        except Exception:
+            # Do not retain or repeatedly call a partial/broken JIT. The outer
+            # controller records failure and applies bounded retry backoff.
+            self._prepared = False
+            self._kernel = None
+            self._input = None
+            raise
         return max(0.0, float(self._clock()) - started)
 
     def close(self) -> None:
         """Drop every synthetic array/function reference before teardown."""
 
         self._closed = True
-        self._plans.clear()
+        self._prepared = False
+        self._kernel = None
+        self._input = None
         self._stream = None
         self._mx = None
 

@@ -46,7 +46,6 @@ from .keepwarm import (
     KeepwarmAction,
     KeepwarmConfig,
     KeepwarmController,
-    metal_warmup_touch,
 )
 from .model_registry import get_registry
 from .output_collector import RequestOutputCollector, RequestStreamState
@@ -280,9 +279,9 @@ class EngineCore:
         self._start_time: Optional[float] = None
         self._steps_executed = 0
         self._keepwarm = KeepwarmController(self.config.keepwarm_config)
-        # Plans allocate/compile only when first touched on _mlx_executor. The
-        # object itself retains no model/cache state and is closed before model
-        # teardown so its tiny synthetic arrays cannot outlive this engine.
+        # The one-thread Metal pulse allocates/JITs only from idle/post-response
+        # work on _mlx_executor. It retains one four-byte input and no model or
+        # cache state, and closes before model teardown.
         self._compiled_metal_keepwarm = CompiledMetalKeepwarmTouch(
             mx,
             stream=self._mlx_stream,
@@ -453,13 +452,13 @@ class EngineCore:
             compiled_touch = getattr(self, "_compiled_metal_keepwarm", None)
             if compiled_touch is None:
                 # Focused embedders/tests may construct EngineCore via __new__.
-                elapsed = metal_warmup_touch(
-                    mx,
-                    action,
-                    stream=getattr(self, "_mlx_stream", None),
-                )
-            else:
-                elapsed = compiled_touch.touch(action)
+                # Never reintroduce the allocation-heavy local matmul fallback.
+                self._keepwarm.skip("local Metal pulse is unavailable")
+                return False
+            elapsed = compiled_touch.touch(action)
+            if elapsed is None:
+                self._keepwarm.skip("request-start Metal pulse is not prepared")
+                return False
         except Exception as exc:  # keep a model usable if experimental warming fails
             elapsed = max(0.0, time.monotonic() - started)
             self._keepwarm.record(
