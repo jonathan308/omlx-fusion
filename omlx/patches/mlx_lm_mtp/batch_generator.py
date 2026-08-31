@@ -1871,6 +1871,17 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         # re-prefill is still an armed MTP-managed backbone call, so discard
         # its speculative snapshots before exposing or merging the cache.
         _clear_rollback(new_cache)
+        if _model_qwen4_terminal_commit_enabled(gen_batch.model):
+            expected = len(tokens)
+            if (
+                _qwen4_target_offset(new_cache) != expected
+                or not _qwen4_reconcile_sized_recurrent_timeline(
+                    new_cache,
+                    expected=expected,
+                    allowed_current={expected},
+                )
+            ):
+                return False
         gen_batch.prompt_cache = new_cache
         gen_batch._next_tokens = next_tok
         gen_batch._next_logprobs = [next_lp]
@@ -2310,6 +2321,54 @@ def _iter_mtp_cache_leaves(cache_list: List[Any]):
             yield cache
 
 
+def _qwen4_reconcile_sized_recurrent_timeline(
+    prompt_cache: List[Any],
+    *,
+    expected: int,
+    allowed_current: set[int],
+) -> bool:
+    """Commit only proven Qwen4 SizedArraysCache timeline metadata.
+
+    ``SizedArraysCache._token_count`` is bookkeeping around positionless
+    recurrent state.  Qwen4's rollback restores GDN/PLE tensors exactly, but
+    the wrapper is advanced by the full verify width and cannot infer the
+    shorter accepted prefix.  Reconcile it only after the independent QSA
+    epoch and GDN/PLE transaction succeeded, and only when every wrapper still
+    reports either that exact full-window epoch or the already-correct target.
+    Unknown wrappers, missing recurrent tensors, mixed epochs, and B>1 state
+    fail closed before any metadata is changed.
+    """
+
+    if expected < 0 or not allowed_current:
+        return False
+    pending: List[Any] = []
+    for cache in _iter_mtp_cache_leaves(prompt_cache):
+        if type(cache).__name__ != "SizedArraysCache":
+            continue
+        token_count = getattr(cache, "_token_count", None)
+        inner = vars(cache).get("_inner")
+        state = getattr(inner, "state", None) if inner is not None else None
+        if (
+            type(token_count) is not int
+            or token_count not in allowed_current
+            or type(inner).__name__ != "ArraysCache"
+            or not isinstance(state, (list, tuple))
+            or len(state) < 2
+            or state[0] is None
+            or state[1] is None
+        ):
+            return False
+        for recurrent in state[:2]:
+            if getattr(recurrent, "ndim", 0) < 1 or recurrent.shape[0] != 1:
+                return False
+        pending.append(cache)
+
+    # Raw/cold ArraysCache has no wrapper metadata to reconcile.
+    for cache in pending:
+        cache._token_count = int(expected)
+    return True
+
+
 def _qwen4_target_offset(prompt_cache: List[Any]) -> Optional[int]:
     """Return a uniform absolute Qwen4 target offset or fail closed."""
 
@@ -2490,6 +2549,12 @@ def _qwen4_rollback_full_verify_to(
     full_offset = pending.target_base_offset + pending.verify_width
     if not _validate_qwen4_qsa_epoch(pending, expected_offset=full_offset):
         return False
+    if not _qwen4_reconcile_sized_recurrent_timeline(
+        gen_batch.prompt_cache,
+        expected=full_offset,
+        allowed_current={full_offset},
+    ):
+        return False
 
     if accepted == drafts:
         _clear_rollback(gen_batch.prompt_cache)
@@ -2514,6 +2579,12 @@ def _qwen4_rollback_full_verify_to(
 
     expected = pending.target_base_offset + accepted + 1
     if not _validate_qwen4_qsa_epoch(pending, expected_offset=expected):
+        return False
+    if not _qwen4_reconcile_sized_recurrent_timeline(
+        gen_batch.prompt_cache,
+        expected=expected,
+        allowed_current={full_offset, expected},
+    ):
         return False
     if not _set_qwen4_target_expected_offset(
         state, gen_batch.prompt_cache, expected
@@ -2547,8 +2618,13 @@ def _qwen4_materialize_target_tail(
     except Exception as exc:
         logger.warning("Qwen4 terminal one-token target commit failed: %s", exc)
         return False
-    return _set_qwen4_target_expected_offset(
-        state, gen_batch.prompt_cache, before + 1
+    expected = before + 1
+    return _qwen4_reconcile_sized_recurrent_timeline(
+        gen_batch.prompt_cache,
+        expected=expected,
+        allowed_current={expected},
+    ) and _set_qwen4_target_expected_offset(
+        state, gen_batch.prompt_cache, expected
     )
 
 
@@ -3673,9 +3749,13 @@ def _post_init_mtp(gen_batch: Any) -> None:
             and not getattr(gen_batch, "_omlx_rowwise_mtp", False)
         ):
             target_offset = _qwen4_target_offset(gen_batch.prompt_cache)
-            if target_offset is None:
+            if target_offset is None or not _qwen4_reconcile_sized_recurrent_timeline(
+                gen_batch.prompt_cache,
+                expected=target_offset or 0,
+                allowed_current={target_offset} if target_offset is not None else set(),
+            ):
                 raise _MtpStepFallback(
-                    "Qwen4 activation target cache has no uniform offset"
+                    "Qwen4 activation target cache timeline is not exact"
                 )
             align = int(getattr(gen_batch.model, "_omlx_mtp_commit_align", 0) or 0)
             final_count = len(gen_batch.tokens[0]) + 2
@@ -3875,6 +3955,12 @@ def _feed_next_main_to_standard(gen_batch: Any, state: _MtpState) -> bool:
 
     if state.next_main is None:
         return False
+    qwen4_terminal = _model_qwen4_terminal_commit_enabled(gen_batch.model)
+    target_before = (
+        _qwen4_target_offset(gen_batch.prompt_cache) if qwen4_terminal else None
+    )
+    if qwen4_terminal and target_before is None:
+        return False
     try:
         procs = _proc_list(gen_batch)
         _set_singleton_mrope_delta(gen_batch)
@@ -3897,6 +3983,17 @@ def _feed_next_main_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         logger.debug("MTP feed-to-standard handoff failed: %s", exc)
         return False
     _clear_rollback(gen_batch.prompt_cache)
+    if qwen4_terminal:
+        expected = int(target_before) + 1
+        if (
+            _qwen4_target_offset(gen_batch.prompt_cache) != expected
+            or not _qwen4_reconcile_sized_recurrent_timeline(
+                gen_batch.prompt_cache,
+                expected=expected,
+                allowed_current={expected},
+            )
+        ):
+            return False
     gen_batch._omlx_standard_target_exact_v1 = True
     return True
 
@@ -3952,6 +4049,14 @@ def _handoff_mtp_for_late_join(gen_batch: Any, state: _MtpState) -> bool:
     if len(state.queue) > 1:
         return False
     if len(state.queue) == 1:
+        if _model_qwen4_terminal_commit_enabled(gen_batch.model):
+            current = _qwen4_target_offset(gen_batch.prompt_cache)
+            if current is None or not _qwen4_reconcile_sized_recurrent_timeline(
+                gen_batch.prompt_cache,
+                expected=current,
+                allowed_current={current},
+            ):
+                return False
         token_id, logprobs_1d, _src = state.queue[0]
         gen_batch._next_tokens = mx.array([int(token_id)], dtype=mx.uint32)
         gen_batch._next_logprobs = [logprobs_1d]
@@ -4049,8 +4154,14 @@ def _qwen4_post_emit_transaction(
                 exact = False
         elif pending.kind == "init":
             if position == 0:
-                exact = _qwen4_target_offset(gen_batch.prompt_cache) == (
-                    pending.target_base_offset
+                exact = (
+                    _qwen4_target_offset(gen_batch.prompt_cache)
+                    == pending.target_base_offset
+                    and _qwen4_reconcile_sized_recurrent_timeline(
+                        gen_batch.prompt_cache,
+                        expected=pending.target_base_offset,
+                        allowed_current={pending.target_base_offset},
+                    )
                 )
             elif position == 1:
                 exact = _qwen4_materialize_target_tail(
@@ -4078,7 +4189,14 @@ def _qwen4_post_emit_transaction(
 
         all_tokens = list(gen_batch.tokens[0])
         if exact:
-            exact = _qwen4_target_offset(gen_batch.prompt_cache) == len(all_tokens)
+            exact = (
+                _qwen4_target_offset(gen_batch.prompt_cache) == len(all_tokens)
+                and _qwen4_reconcile_sized_recurrent_timeline(
+                    gen_batch.prompt_cache,
+                    expected=len(all_tokens),
+                    allowed_current={len(all_tokens)},
+                )
+            )
         if not exact:
             _clear_rollback(gen_batch.prompt_cache)
             return _MtpPostEmitResult(
@@ -4128,6 +4246,13 @@ def _qwen4_post_emit_transaction(
                 gen_batch,
                 state,
                 token_id,
+            )
+        else:
+            current = _qwen4_target_offset(gen_batch.prompt_cache)
+            exact = current is not None and _qwen4_reconcile_sized_recurrent_timeline(
+                gen_batch.prompt_cache,
+                expected=current,
+                allowed_current={current},
             )
     if not exact:
         raise _MtpStepFallback("Qwen4 scheduler target commit failed")
@@ -4612,8 +4737,14 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
             # state exists, but terminal emission of that tail still needs an
             # L=1 target-only commit.
             expected = target_base_offset + 1
-            if not _set_qwen4_target_expected_offset(
-                state, gen_batch.prompt_cache, expected
+            if not _qwen4_reconcile_sized_recurrent_timeline(
+                gen_batch.prompt_cache,
+                expected=expected,
+                allowed_current={expected},
+            ) or not _set_qwen4_target_expected_offset(
+                state,
+                gen_batch.prompt_cache,
+                expected,
             ):
                 raise _MtpStepFallback(
                     "Qwen4 depth-zero target commit offset mismatch"
@@ -4794,8 +4925,15 @@ def _materialize_qwen4_deferred_boundary(
             gen_batch.prompt_cache,
         )
         _clear_rollback(gen_batch.prompt_cache)
-        if not _set_qwen4_target_expected_offset(
-            state, gen_batch.prompt_cache, target_before + 1
+        expected = target_before + 1
+        if not _qwen4_reconcile_sized_recurrent_timeline(
+            gen_batch.prompt_cache,
+            expected=expected,
+            allowed_current={expected},
+        ) or not _set_qwen4_target_expected_offset(
+            state,
+            gen_batch.prompt_cache,
+            expected,
         ):
             return False
         next_logits = _mtp_prepare_logits(gen_batch, logits[:, -1, :])
@@ -5187,7 +5325,7 @@ def _emit_response(
         # and filters the row. Other MTP families keep the historical eager
         # finish behavior below.
         defer_terminal = bool(
-            state := getattr(gen_batch, "_omlx_mtp_state", None)
+            getattr(gen_batch, "_omlx_mtp_state", None)
         ) and _model_qwen4_terminal_commit_enabled(gen_batch.model)
         if defer_terminal:
             return [
