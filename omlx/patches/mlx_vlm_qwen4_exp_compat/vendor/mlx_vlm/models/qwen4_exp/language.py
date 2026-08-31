@@ -1670,6 +1670,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             index_key_norm=self.indexer.k_layernorm,
             apply_index_rope=self.indexer._apply_rope,
             pooled_index_keys=pooled_index_keys,
+            mtp_m6_target_verify=bool(target_verify and length == 6),
         )
         output = output.reshape(batch, length, -1)
         return _target_verify_linear(

@@ -62,7 +62,8 @@ template <
     int D,
     int WM,
     typename IndexT,
-    typename AccumType = float>
+    typename AccumType = float,
+    bool EXPLICIT_TOKENS = false>
 [[kernel, max_total_threads_per_threadgroup(WM * 32)]] void
 qwen4_qsa_sparse_gqa_attention(
     const device T* Q [[buffer(0)]],
@@ -147,7 +148,9 @@ qwen4_qsa_sparse_gqa_attention(
   const int q_abs = params->q_offset + q_pos;
   constexpr int kCompressRatio = 4;
   constexpr int kTail = kCompressRatio - 1;
-  const int selected_tokens = params->topk * kCompressRatio + kTail;
+  const int selected_tokens = EXPLICIT_TOKENS
+                                  ? params->topk
+                                  : params->topk * kCompressRatio + kTail;
   const int complete_blocks = (q_abs + 1) / kCompressRatio;
   const int valid_blocks = metal::min(params->topk, complete_blocks);
   const int n_tiles = (selected_tokens + BK - 1) / BK;
@@ -157,7 +160,14 @@ qwen4_qsa_sparse_gqa_attention(
     for (int k = lane; k < BK; k += tgp_size) {
       const int slot = topk_off + k;
       int k_pos = -1;
-      if (slot < params->topk * kCompressRatio) {
+      if constexpr (EXPLICIT_TOKENS) {
+        if (slot < params->topk) {
+          const IndexT raw_token = topk_base[slot];
+          if (ulong(raw_token) < ulong(params->kL)) {
+            k_pos = int(raw_token);
+          }
+        }
+      } else if (slot < params->topk * kCompressRatio) {
         const int block_slot = slot / kCompressRatio;
         if (block_slot < valid_blocks) {
           const IndexT raw_block = topk_base[block_slot];

@@ -12,6 +12,12 @@
                      qwen4_qsa_sparse_gqa_attention, dtype, bk, dc, 12, 16,    \
                      256, 2, uint, float)
 
+#define instantiate_qwen4_sparse_gqa_explicit(tname, dtype, bk, dc)            \
+  instantiate_kernel("qwen4_qsa_sparse_gqa_tokens_" #tname "_bk" #bk "_dc" #dc \
+                     "_gqa12_hp16_d256_wm2",                                  \
+                     qwen4_qsa_sparse_gqa_attention, dtype, bk, dc, 12, 16,    \
+                     256, 2, uint, float, true)
+
 instantiate_qwen4_sparse_gqa(float16, half, 128, 32);
 instantiate_qwen4_sparse_gqa(float16, half, 256, 32);
 instantiate_qwen4_sparse_gqa(float16, half, 64, 64);
@@ -20,4 +26,6 @@ instantiate_qwen4_sparse_gqa(bfloat16, bfloat16_t, 128, 32);
 instantiate_qwen4_sparse_gqa(bfloat16, bfloat16_t, 256, 32);
 instantiate_qwen4_sparse_gqa(bfloat16, bfloat16_t, 64, 64);
 instantiate_qwen4_sparse_gqa(bfloat16, bfloat16_t, 128, 64);
+instantiate_qwen4_sparse_gqa_explicit(float16, half, 64, 64);
+instantiate_qwen4_sparse_gqa_explicit(bfloat16, bfloat16_t, 64, 64);
 // SPDX-License-Identifier: Apache-2.0

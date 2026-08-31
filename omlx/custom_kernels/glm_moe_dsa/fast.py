@@ -148,6 +148,9 @@ NATIVE_SYMBOLS = (
     "qwen4_qsa_indexer_scores",
     "qwen4_qsa_topk_indices",
     "qwen4_qsa_sparse_gqa_attention",
+    "qwen4_qsa_sparse_gqa_attention_tokens",
+    "qwen4_qsa_compact_stage_plan",
+    "qwen4_qsa_compact_stage_gather",
     "dsa_topk_indices",
     "dspark_fp32_topk_indices",
     "ds4_router_topk_indices",
@@ -437,6 +440,87 @@ def qwen4_qsa_sparse_gqa_attention(
         q_offset,
         key_tile,
         dimension_tile,
+        **_native_stream_kwargs(stream),
+    )
+
+
+def qwen4_qsa_sparse_gqa_attention_tokens(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    selected_tokens: mx.array,
+    scale: float,
+    *,
+    key_tile: int = 64,
+    dimension_tile: int = 64,
+    stream=None,
+) -> mx.array:
+    """Exact M=6 attention over a compact explicit-token K/V bank.
+
+    ``selected_tokens`` is ``[1, 1, 6, 2051]`` uint32 and keeps each row's
+    chronological 2,048 selected block tokens followed by its causal tail.
+    ``UINT32_MAX`` pads absent tail positions.  Production callers must pair
+    this narrow ABI with the compact mapper's validation-status gate.
+    """
+
+    if _ext is None or not hasattr(
+        _ext, "qwen4_qsa_sparse_gqa_attention_tokens"
+    ):
+        raise RuntimeError("Qwen4 explicit-token sparse GQA kernel is unavailable")
+    return _ext.qwen4_qsa_sparse_gqa_attention_tokens(
+        queries,
+        keys,
+        values,
+        selected_tokens,
+        scale,
+        key_tile,
+        dimension_tile,
+        **_native_stream_kwargs(stream),
+    )
+
+
+def qwen4_qsa_compact_stage_plan(
+    selected_blocks: mx.array,
+    q_offset: int,
+    key_tokens: int,
+    *,
+    stream=None,
+):
+    """Fixed-capacity GPU six-way merge for exact M=6 staging.
+
+    The fifth result is a validation status.  Callers must require zero before
+    consuming any returned map; invalid rows leave the maps sentinel-filled.
+    """
+
+    if _ext is None or not hasattr(_ext, "qwen4_qsa_compact_stage_plan"):
+        raise RuntimeError("Qwen4 compact-stage mapper is unavailable")
+    return _ext.qwen4_qsa_compact_stage_plan(
+        selected_blocks,
+        q_offset,
+        key_tokens,
+        **_native_stream_kwargs(stream),
+    )
+
+
+def qwen4_qsa_compact_stage_gather(
+    keys: mx.array,
+    values: mx.array,
+    source_tokens: mx.array,
+    *,
+    stream=None,
+):
+    """Parallel fixed-capacity K/V copy for the exact M=6 mapper.
+
+    K/V may be visible prefixes of larger capacity-backed caches; the native
+    primitive preserves their independent head and token strides.
+    """
+
+    if _ext is None or not hasattr(_ext, "qwen4_qsa_compact_stage_gather"):
+        raise RuntimeError("Qwen4 compact-stage K/V gather is unavailable")
+    return _ext.qwen4_qsa_compact_stage_gather(
+        keys,
+        values,
+        source_tokens,
         **_native_stream_kwargs(stream),
     )
 

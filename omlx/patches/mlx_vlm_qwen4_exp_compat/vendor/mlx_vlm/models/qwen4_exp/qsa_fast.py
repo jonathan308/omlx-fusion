@@ -31,6 +31,18 @@ _NATIVE_QSA_TOPK_DISABLED = False
 _NATIVE_QSA_TOPK_PROVEN = False
 _NATIVE_QSA_MAIN_DISABLED = False
 _NATIVE_QSA_MAIN_PROVEN = False
+_NATIVE_QSA_COMPACT_STAGE_DISABLED = False
+
+
+# The direct sparse-QSA kernel is physically faster through 38K tokens and
+# crosses over sharply at 39K.  Use the conservative 40-Ki-token boundary so
+# production never pays the mapper/gather cost on the fast side of that cliff.
+_QSA_COMPACT_STAGE_MTP_M6_MIN_KEY_TOKENS = 40_960
+_QSA_COMPACT_STAGE_SYMBOLS = (
+    "qwen4_qsa_compact_stage_plan",
+    "qwen4_qsa_compact_stage_gather",
+    "qwen4_qsa_sparse_gqa_attention_tokens",
+)
 
 
 def contiguous_causal_query_chunk(key_tokens: int) -> int:
@@ -286,6 +298,155 @@ def _native_sparse_gqa_attention(
         return None
 
 
+def _compact_stage_mtp_m6_geometry(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    selected_blocks: mx.array,
+    *,
+    q_offset: int,
+    mtp_m6_target_verify: bool,
+) -> bool:
+    """Recognize only the physically qualified Qwen4 MTP M=6 stage."""
+
+    return bool(
+        mtp_m6_target_verify
+        and queries.ndim == 4
+        and queries.shape == (1, 24, 6, 256)
+        and keys.ndim == 4
+        and keys.shape[0] == 1
+        and keys.shape[1] == 2
+        and keys.shape[-1] == 256
+        and keys.shape[2] >= _QSA_COMPACT_STAGE_MTP_M6_MIN_KEY_TOKENS
+        and keys.shape[2] <= 0x7FFFFFFF
+        and values.shape == keys.shape
+        and queries.dtype == keys.dtype
+        and values.dtype == keys.dtype
+        and queries.dtype in {mx.float16, mx.bfloat16}
+        and selected_blocks.ndim == 3
+        and selected_blocks.shape == (1, 6, 512)
+        and selected_blocks.dtype in {mx.int32, mx.uint32}
+        and q_offset >= 0
+        and q_offset == keys.shape[2] - 6
+    )
+
+
+def _native_compact_stage_mtp_m6_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    selected_blocks: mx.array,
+    *,
+    q_offset: int,
+    mtp_m6_target_verify: bool,
+) -> mx.array | None:
+    """Stage the exact M=6 union once, or fail closed to direct sparse QSA.
+
+    Mapper, gather, and explicit-token attention stay function-local.  The
+    staged output and validation word are evaluated together so the temporary
+    24.1 MiB bank is released before the next QSA layer can create another
+    one.  A nonzero validation word means the already-computed staged output
+    is discarded; callers must use the existing direct path instead.
+    """
+
+    global _NATIVE_QSA_COMPACT_STAGE_DISABLED
+    if _NATIVE_QSA_COMPACT_STAGE_DISABLED or not _compact_stage_mtp_m6_geometry(
+        queries,
+        keys,
+        values,
+        selected_blocks,
+        q_offset=q_offset,
+        mtp_m6_target_verify=mtp_m6_target_verify,
+    ):
+        return None
+
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        if not fast.is_native_available() or any(
+            not fast.has_symbol(symbol) for symbol in _QSA_COMPACT_STAGE_SYMBOLS
+        ):
+            _NATIVE_QSA_COMPACT_STAGE_DISABLED = True
+            return None
+
+        native_blocks = selected_blocks
+        if native_blocks.dtype != mx.uint32:
+            native_blocks = native_blocks.astype(mx.uint32)
+        native_blocks = mx.contiguous(native_blocks[:, None])
+        (
+            _union_blocks,
+            _union_count,
+            row_token_slots,
+            source_tokens,
+            validation_status,
+        ) = fast.qwen4_qsa_compact_stage_plan(
+            native_blocks,
+            q_offset,
+            keys.shape[2],
+        )
+        staged_keys, staged_values = fast.qwen4_qsa_compact_stage_gather(
+            keys,
+            values,
+            source_tokens,
+        )
+        staged_output = fast.qwen4_qsa_sparse_gqa_attention_tokens(
+            queries,
+            staged_keys,
+            staged_values,
+            row_token_slots,
+            queries.shape[-1] ** -0.5,
+            key_tile=64,
+            dimension_tile=64,
+        )
+
+        # This synchronization is intentional for the first production
+        # candidate: it proves both the mapper status and a single-bank
+        # allocation lifetime.  Invalid maps are sentinel-filled, so the
+        # staged kernel cannot read out of bounds; its output is never returned.
+        mx.eval(staged_output, validation_status)
+        if int(validation_status.item()) != 0:
+            _NATIVE_QSA_COMPACT_STAGE_DISABLED = True
+            return None
+        return staged_output.transpose(0, 2, 1, 3)
+    except Exception:
+        # Geometry misses were excluded above.  A stale ABI, rejected capacity
+        # stride, or missing Metal pipeline demotes the process permanently to
+        # the already-qualified direct/portable paths.
+        _NATIVE_QSA_COMPACT_STAGE_DISABLED = True
+        return None
+
+
+def _native_routed_sparse_gqa_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    selected_blocks: mx.array,
+    *,
+    q_offset: int,
+    mtp_m6_target_verify: bool,
+) -> mx.array | None:
+    """Try the long-context M=6 stage, then preserve the direct fallback."""
+
+    if mtp_m6_target_verify:
+        staged = _native_compact_stage_mtp_m6_attention(
+            queries,
+            keys,
+            values,
+            selected_blocks,
+            q_offset=q_offset,
+            mtp_m6_target_verify=True,
+        )
+        if staged is not None:
+            return staged
+    return _native_sparse_gqa_attention(
+        queries,
+        keys,
+        values,
+        selected_blocks,
+        q_offset=q_offset,
+    )
+
+
 def _decode_qsa_sdpa(
     queries: mx.array,
     keys: mx.array,
@@ -462,6 +623,7 @@ def contiguous_causal_gathered_qsa(
     apply_index_rope: IndexRoPE,
     pooled_index_keys: mx.array | None = None,
     query_chunk: int | None = None,
+    mtp_m6_target_verify: bool = False,
 ) -> mx.array:
     """Run exact QSA over gathered K/V for one contiguous causal prompt.
 
@@ -629,12 +791,18 @@ def contiguous_causal_gathered_qsa(
 
             selected_count = mx.minimum(complete_counts, block_budget)
 
-            native_output = _native_sparse_gqa_attention(
+            native_output = _native_routed_sparse_gqa_attention(
                 queries[:, :, start:stop],
                 keys,
                 values,
                 selected_block_rows,
                 q_offset=query_start + start,
+                mtp_m6_target_verify=bool(
+                    mtp_m6_target_verify
+                    and query_tokens == 6
+                    and start == 0
+                    and stop == 6
+                ),
             )
             if native_output is not None:
                 outputs.append(native_output)

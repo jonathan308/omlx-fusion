@@ -110,7 +110,7 @@ def test_qwen4_decode_gathers_budget_and_tail_and_matches_official(monkeypatch):
         assert mx.array_equal(fast_value, reference_value).item()
 
 
-@pytest.mark.parametrize("verify_width", [4, 8, 9])
+@pytest.mark.parametrize("verify_width", [4, 6, 8, 9])
 def test_qwen4_verify_window_uses_direct_qsa_and_matches_official(
     monkeypatch,
     verify_width,
@@ -136,7 +136,13 @@ def test_qwen4_verify_window_uses_direct_qsa_and_matches_official(
     original = language.contiguous_causal_gathered_qsa
 
     def tracked(*args, **kwargs):
-        calls.append((args[0].shape[2], args[1].shape[2]))
+        calls.append(
+            (
+                args[0].shape[2],
+                args[1].shape[2],
+                kwargs["mtp_m6_target_verify"],
+            )
+        )
         return original(*args, **kwargs)
 
     monkeypatch.setattr(language, "contiguous_causal_gathered_qsa", tracked)
@@ -160,7 +166,7 @@ def test_qwen4_verify_window_uses_direct_qsa_and_matches_official(
     )
     mx.eval(actual, expected)
 
-    assert calls == [(verify_width, 10 + verify_width)]
+    assert calls == [(verify_width, 10 + verify_width, verify_width == 6)]
     assert mx.allclose(actual, expected, rtol=2e-5, atol=2e-5).item()
     assert mx.array_equal(
         mx.argmax(actual, axis=-1),
