@@ -52,8 +52,70 @@ _SCALAR_MTP_HIDDEN_SINK: ContextVar[list | None] = ContextVar(
     "qwen4_scalar_mtp_hidden_sink",
     default=None,
 )
+_EXACT_HC_VERIFY_ENV = "OMLX_QWEN4_EXACT_HC_VERIFY"
+_EXACT_HC_VERIFY_LOGGED = False
 
 logger = logging.getLogger(__name__)
+
+
+def _exact_hc_verify_enabled() -> bool:
+    """Diagnostic gate for scalar-reduction HC target verification."""
+
+    return os.environ.get(_EXACT_HC_VERIFY_ENV, "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _exact_hc_verify_projection(
+    module,
+    normed: mx.array,
+    target_verify: bool,
+) -> mx.array | None:
+    """Replay each M=2..9 HC row through the scalar hybrid projection.
+
+    This diagnostic isolates the first multi-row target-verification branch.
+    It deliberately reuses the already-qualified scalar ``hybrid_projection``
+    for every row, preserving row order when the results are concatenated.  A
+    capability miss or native failure returns ``None`` so the existing exact
+    fused-verify/canonical fallback remains authoritative.
+    """
+
+    if not (
+        target_verify
+        and _exact_hc_verify_enabled()
+        and getattr(module, "_omlx_exact_hybrid_projection", False)
+        and normed.ndim == 3
+        and normed.shape[0] == 1
+        and normed.shape[1] in _HC_FUSED_VERIFY_WIDTHS
+        and normed.shape[-1] == 10240
+        and normed.dtype == mx.bfloat16
+    ):
+        return None
+
+    from .hc_projection import hybrid_projection
+
+    rows = []
+    for row in range(normed.shape[1]):
+        projected = hybrid_projection(
+            normed[:, row : row + 1],
+            module.input_mix_weight_down,
+            module.block_inject_weight,
+        )
+        if projected is None:
+            return None
+        rows.append(projected)
+
+    global _EXACT_HC_VERIFY_LOGGED
+    if not _EXACT_HC_VERIFY_LOGGED:
+        _EXACT_HC_VERIFY_LOGGED = True
+        logger.info(
+            "Qwen4 exact HC target-verify diagnostic active (M=%d)",
+            normed.shape[1],
+        )
+    return mx.concatenate(rows, axis=1)
 
 
 class _Qwen4DecodeProfileSample:
@@ -1888,14 +1950,19 @@ class Qwen4ExpGatedResidual(nn.Module):
 
     def _forward(self, hyper_input: mx.array, target_verify: bool = False):
         normed = self.hc_norm(hyper_input)
-        verified_fused = None
+        verified_fused = _exact_hc_verify_projection(
+            self,
+            normed,
+            target_verify,
+        )
         fused_projection = getattr(
             self,
             "_omlx_exact_verify_fused_projection",
             None,
         )
         if (
-            fused_projection is not None
+            verified_fused is None
+            and fused_projection is not None
             and hyper_input.ndim == 3
             and hyper_input.shape[0] == 1
             and hyper_input.shape[-1] == 10240
