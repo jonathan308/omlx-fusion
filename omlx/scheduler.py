@@ -8708,11 +8708,29 @@ class Scheduler:
         ):
             return
         if not self._resident_cache_matches_token_count(cache_list, len(tokens)):
-            logger.debug(
+            leaf_summary = []
+            for leaf in self._resident_cache_leaf_objects(cache_list):
+                def _shape(name):
+                    value = getattr(leaf, name, None)
+                    return tuple(value.shape) if isinstance(value, mx.array) else None
+                leaf_summary.append({
+                    "type": type(leaf).__name__,
+                    "offset": getattr(leaf, "offset", None),
+                    "index_offset": getattr(leaf, "_index_offset", None),
+                    "token_count": getattr(leaf, "_token_count", None),
+                    "keys": _shape("keys"),
+                    "values": _shape("values"),
+                    "raw_index": _shape("_index_keys"),
+                    "raw_pos": _shape("_index_position_ids"),
+                    "logical_index": _shape("index_keys"),
+                    "logical_pos": _shape("index_position_ids"),
+                })
+            logger.info(
                 "Skipping exact resident cache for %s: cache offsets do not "
-                "prove the %d-token terminal state",
+                "prove the %d-token terminal state leaves=%r",
                 request.request_id,
                 len(tokens),
+                leaf_summary,
             )
             return
         cache_nbytes = self._resident_cache_nbytes(cache_list)
