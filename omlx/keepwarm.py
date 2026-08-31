@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Callable
 
@@ -358,6 +359,192 @@ class KeepwarmController:
                 "slow_count": self._slow_count,
                 "last_event": dict(self._last_event) if self._last_event else None,
             }
+
+
+@dataclass
+class _CompiledMetalTouchPlan:
+    """Tiny synthetic operands and one shape-specialized callable."""
+
+    lhs: Any
+    rhs: Any
+    eager: Callable[[Any, Any], Any]
+    run: Callable[[Any, Any], Any]
+    compiled: bool
+    expected: int
+    validated: bool = False
+
+
+class CompiledMetalKeepwarmTouch:
+    """Per-engine, lazy Metal touch plans for the serialized MLX lane.
+
+    The controller decides *when* a keepwarm is safe. This object only makes
+    the local synthetic touch cheap after its first use: operands and the
+    shape-specialized ``mx.compile`` callable are built once per matrix size
+    on the engine worker/stream that calls :meth:`touch`. It never receives or
+    retains a model, KV cache, request, tokenizer, or SSD-cache object.
+
+    Compilation is an optimization, not a correctness dependency. Missing or
+    failing compile support permanently downgrades that shape to the eager
+    synthetic kernel, and EngineCore's existing outer safety gate keeps any
+    remaining MLX failure non-fatal to inference.
+    """
+
+    MIN_MATRIX_SIZE = 1
+    MAX_MATRIX_SIZE = 1024
+    MIN_REPEATS = 1
+    MAX_REPEATS = 16
+    # The shipped policy uses exactly these two shapes. Custom bounded action
+    # sizes still execute eagerly, but are never retained; this makes retained
+    # synthetic Metal memory a code-level constant rather than an env-driven
+    # collection of as many as 1,024 plans.
+    CACHEABLE_MATRIX_SIZES = frozenset({1, 128})
+
+    def __init__(
+        self,
+        mx_module: Any,
+        *,
+        stream: Any | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._mx = mx_module
+        self._stream = stream
+        self._clock = clock
+        self._plans: dict[int, _CompiledMetalTouchPlan] = {}
+        self._closed = False
+
+    @classmethod
+    def _validate_action(cls, action: KeepwarmAction) -> tuple[int, int]:
+        matrix_size = int(action.matrix_size)
+        repeats = int(action.repeats)
+        if not cls.MIN_MATRIX_SIZE <= matrix_size <= cls.MAX_MATRIX_SIZE:
+            raise ValueError(
+                "keepwarm matrix size must be between "
+                f"{cls.MIN_MATRIX_SIZE} and {cls.MAX_MATRIX_SIZE}"
+            )
+        if not cls.MIN_REPEATS <= repeats <= cls.MAX_REPEATS:
+            raise ValueError(
+                "keepwarm repeats must be between "
+                f"{cls.MIN_REPEATS} and {cls.MAX_REPEATS}"
+            )
+        return matrix_size, repeats
+
+    def _build_plan(
+        self,
+        matrix_size: int,
+        *,
+        allow_compile: bool,
+    ) -> _CompiledMetalTouchPlan:
+        mx_module = self._mx
+        if mx_module is None or self._closed:
+            raise RuntimeError("compiled Metal keepwarm is closed")
+
+        # Identity x ones still exercises an NxN Metal matmul, while its scalar
+        # reduction is exactly N**2 for every admitted shape (<= 2**20). Cast
+        # the reduction input to fp32 so the 128x128 request-start plan cannot
+        # overflow fp16. Only these tiny synthetic arrays are retained.
+        lhs = mx_module.eye(matrix_size, dtype=mx_module.float16)
+        rhs = mx_module.ones(
+            (matrix_size, matrix_size),
+            dtype=mx_module.float16,
+        )
+
+        def eager(left: Any, right: Any) -> Any:
+            product = mx_module.matmul(left, right)
+            return mx_module.sum(product.astype(mx_module.float32))
+
+        run = eager
+        compiled = False
+        compile_fn = getattr(mx_module, "compile", None)
+        if allow_compile and callable(compile_fn):
+            try:
+                run = compile_fn(eager)
+                compiled = True
+            except Exception:
+                # A given MLX build may omit or reject compile. Eager execution
+                # preserves the experimental feature's no-regression contract.
+                run = eager
+
+        return _CompiledMetalTouchPlan(
+            lhs=lhs,
+            rhs=rhs,
+            eager=eager,
+            run=run,
+            compiled=compiled,
+            expected=matrix_size * matrix_size,
+        )
+
+    def _run_once(
+        self,
+        plan: _CompiledMetalTouchPlan,
+        *,
+        validate: bool,
+    ) -> None:
+        mx_module = self._mx
+        if mx_module is None or self._closed:
+            raise RuntimeError("compiled Metal keepwarm is closed")
+        try:
+            value = plan.run(plan.lhs, plan.rhs)
+        except Exception:
+            if not plan.compiled:
+                raise
+            # Some MLX versions accept mx.compile() but fail during the first
+            # specialization. Do not retry compilation on every idle tick.
+            plan.run = plan.eager
+            plan.compiled = False
+            value = plan.run(plan.lhs, plan.rhs)
+        mx_module.eval(value)
+        if validate and not plan.validated:
+            actual = value.item()
+            if actual != plan.expected:
+                raise RuntimeError(
+                    "compiled Metal keepwarm produced an unexpected result: "
+                    f"expected {plan.expected}, got {actual}"
+                )
+            plan.validated = True
+
+    def touch(self, action: KeepwarmAction) -> float:
+        """Evaluate one bounded synthetic action and return wall time."""
+
+        matrix_size, repeats = self._validate_action(action)
+        if self._closed:
+            raise RuntimeError("compiled Metal keepwarm is closed")
+        started = self._clock()
+        mx_module = self._mx
+        if mx_module is None:
+            raise RuntimeError("compiled Metal keepwarm is closed")
+        stream_context = (
+            nullcontext() if self._stream is None else mx_module.stream(self._stream)
+        )
+        with stream_context:
+            plan = self._plans.get(matrix_size)
+            retained = plan is not None
+            if plan is None:
+                # Never put compilation/specialization or result validation on
+                # a cache-hit request's admission path. Request-start may use
+                # a plan prepared by an earlier idle/post-response action; on
+                # a miss it gets the old eager transient behavior instead.
+                prepare_for_later = (
+                    action.kind != "request_start"
+                    and matrix_size in self.CACHEABLE_MATRIX_SIZES
+                )
+                plan = self._build_plan(
+                    matrix_size,
+                    allow_compile=prepare_for_later,
+                )
+                if prepare_for_later:
+                    self._plans[matrix_size] = plan
+                    retained = True
+            for _ in range(repeats):
+                self._run_once(plan, validate=retained)
+        return max(0.0, float(self._clock()) - started)
+
+    def close(self) -> None:
+        """Drop every synthetic array/function reference before teardown."""
+
+        self._closed = True
+        self._plans.clear()
+        self._stream = None
+        self._mx = None
 
 
 def metal_warmup_touch(

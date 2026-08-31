@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import threading
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from types import SimpleNamespace
 
 from omlx.engine_core import EngineCore
 from omlx.keepwarm import (
+    CompiledMetalKeepwarmTouch,
     KeepwarmAction,
     KeepwarmConfig,
     KeepwarmController,
@@ -410,3 +411,223 @@ def test_action_shape_is_bounded_by_configuration_parser(monkeypatch):
 def test_action_is_an_immutable_transport_value():
     action = KeepwarmAction("idle", 1, 1, 2.0)
     assert action.kind == "idle"
+
+
+class SyntheticArray:
+    def __init__(self, *, matrix_size: int, kind: str, value: int = 0) -> None:
+        self.matrix_size = matrix_size
+        self.kind = kind
+        self.value = value
+
+    def astype(self, _dtype):
+        return self
+
+    def item(self):
+        return self.value
+
+
+class SyntheticMX:
+    float16 = "float16"
+    float32 = "float32"
+
+    def __init__(
+        self,
+        *,
+        compile_creation_fails: bool = False,
+        compiled_call_fails: bool = False,
+    ) -> None:
+        self.compile_creation_fails = compile_creation_fails
+        self.compiled_call_fails = compiled_call_fails
+        self.allocations: list[tuple[str, int]] = []
+        self.compile_calls = 0
+        self.compiled_runs = 0
+        self.evaluated: list[int] = []
+        self.stream_entries: list[object] = []
+
+    def eye(self, matrix_size, *, dtype):
+        assert dtype == self.float16
+        self.allocations.append(("eye", matrix_size))
+        return SyntheticArray(matrix_size=matrix_size, kind="eye")
+
+    def ones(self, shape, *, dtype):
+        assert dtype == self.float16
+        assert shape[0] == shape[1]
+        self.allocations.append(("ones", shape[0]))
+        return SyntheticArray(matrix_size=shape[0], kind="ones")
+
+    def matmul(self, lhs, rhs):
+        assert lhs.matrix_size == rhs.matrix_size
+        return SyntheticArray(
+            matrix_size=lhs.matrix_size,
+            kind="product",
+            value=lhs.matrix_size * lhs.matrix_size,
+        )
+
+    @staticmethod
+    def sum(value):
+        return value
+
+    def compile(self, fn):
+        self.compile_calls += 1
+        if self.compile_creation_fails:
+            raise RuntimeError("compile unavailable")
+
+        def compiled(*args):
+            self.compiled_runs += 1
+            if self.compiled_call_fails:
+                raise RuntimeError("specialization failed")
+            return fn(*args)
+
+        return compiled
+
+    def eval(self, value):
+        self.evaluated.append(value.item())
+
+    @contextmanager
+    def stream(self, stream):
+        self.stream_entries.append(stream)
+        yield
+
+
+def test_compiled_touch_allocates_and_compiles_once_per_shape_then_reuses():
+    fake_mx = SyntheticMX()
+    touch = CompiledMetalKeepwarmTouch(fake_mx, stream="engine-stream")
+    small = KeepwarmAction("idle", 1, 1, 2.0)
+    post_response = KeepwarmAction("post_response", 128, 2, 2.0)
+    request_start = KeepwarmAction("request_start", 128, 2, 2.0)
+
+    touch.touch(small)
+    touch.touch(small)
+    touch.touch(post_response)
+    touch.touch(request_start)
+
+    assert fake_mx.allocations == [
+        ("eye", 1),
+        ("ones", 1),
+        ("eye", 128),
+        ("ones", 128),
+    ]
+    assert fake_mx.compile_calls == 2
+    assert fake_mx.compiled_runs == 6
+    assert fake_mx.evaluated == [1, 1, 16_384, 16_384, 16_384, 16_384]
+    assert fake_mx.stream_entries == ["engine-stream"] * 4
+
+
+def test_compiled_touch_compile_failure_falls_back_once_and_remains_usable():
+    fake_mx = SyntheticMX(compiled_call_fails=True)
+    touch = CompiledMetalKeepwarmTouch(fake_mx)
+    action = KeepwarmAction("idle", 1, 1, 2.0)
+
+    touch.touch(action)
+    touch.touch(action)
+
+    assert fake_mx.compile_calls == 1
+    assert fake_mx.compiled_runs == 1
+    assert fake_mx.evaluated == [1, 1]
+
+
+def test_compiled_touch_missing_compile_support_uses_eager_path():
+    fake_mx = SyntheticMX()
+    fake_mx.compile = None
+    touch = CompiledMetalKeepwarmTouch(fake_mx)
+
+    touch.touch(KeepwarmAction("idle", 1, 1, 2.0))
+
+    assert fake_mx.compile_calls == 0
+    assert fake_mx.compiled_runs == 0
+    assert fake_mx.evaluated == [1]
+
+
+def test_request_start_plan_miss_never_compiles_or_retains_transient_operands():
+    fake_mx = SyntheticMX()
+    touch = CompiledMetalKeepwarmTouch(fake_mx)
+
+    touch.touch(KeepwarmAction("request_start", 128, 1, 2.0))
+
+    assert fake_mx.compile_calls == 0
+    assert fake_mx.compiled_runs == 0
+    assert fake_mx.evaluated == [16_384]
+    assert touch._plans == {}
+
+
+def test_compiled_touch_cache_is_code_bounded_to_shipped_shapes():
+    fake_mx = SyntheticMX()
+    touch = CompiledMetalKeepwarmTouch(fake_mx)
+
+    for matrix_size in (1, 128, 2, 64, 256, 1024):
+        touch.touch(KeepwarmAction("idle", matrix_size, 1, 2.0))
+
+    assert set(touch._plans) == {1, 128}
+    assert fake_mx.compile_calls == 2
+
+
+def test_compiled_touch_rejects_an_inexact_synthetic_result():
+    class WrongResultMX(SyntheticMX):
+        def matmul(self, lhs, rhs):
+            value = super().matmul(lhs, rhs)
+            value.value += 1
+            return value
+
+    touch = CompiledMetalKeepwarmTouch(WrongResultMX())
+
+    try:
+        touch.touch(KeepwarmAction("idle", 1, 1, 2.0))
+    except RuntimeError as exc:
+        assert "unexpected result" in str(exc)
+    else:
+        raise AssertionError("inexact synthetic output must fail closed")
+
+
+def test_compiled_touch_enforces_existing_shape_and_repeat_bounds_before_allocating():
+    fake_mx = SyntheticMX()
+    touch = CompiledMetalKeepwarmTouch(fake_mx)
+
+    for action in (
+        KeepwarmAction("idle", 0, 1, 2.0),
+        KeepwarmAction("idle", 1025, 1, 2.0),
+        KeepwarmAction("idle", 1, 0, 2.0),
+        KeepwarmAction("idle", 1, 17, 2.0),
+    ):
+        try:
+            touch.touch(action)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("out-of-bounds synthetic touch must fail closed")
+
+    assert fake_mx.allocations == []
+    assert fake_mx.compile_calls == 0
+
+
+def test_compiled_touch_close_drops_every_retained_reference():
+    fake_mx = SyntheticMX()
+    touch = CompiledMetalKeepwarmTouch(fake_mx, stream="engine-stream")
+    touch.touch(KeepwarmAction("idle", 1, 1, 2.0))
+
+    touch.close()
+
+    assert touch._plans == {}
+    assert touch._mx is None
+    assert touch._stream is None
+    try:
+        touch.touch(KeepwarmAction("idle", 1, 1, 2.0))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("closed synthetic touch must not allocate again")
+
+
+def test_engine_compiled_touch_failure_is_nonfatal_to_inference():
+    class FailingTouch:
+        @staticmethod
+        def touch(_action):
+            raise RuntimeError("synthetic failure")
+
+    core = core_with_scheduler(Scheduler())
+    core._compiled_metal_keepwarm = FailingTouch()
+    core._keepwarm.observe_request_state(True)
+    core._keepwarm.observe_request_state(False, cache_tokens=4096)
+    action = KeepwarmAction("idle", 1, 1, 2.0, cache_tokens=4096)
+
+    assert core._run_keepwarm_action(action) is False
+    assert core._keepwarm.snapshot()["failures"] == 1

@@ -42,6 +42,7 @@ from .exceptions import (
     describe_ceiling_binding,
 )
 from .keepwarm import (
+    CompiledMetalKeepwarmTouch,
     KeepwarmAction,
     KeepwarmConfig,
     KeepwarmController,
@@ -279,6 +280,13 @@ class EngineCore:
         self._start_time: Optional[float] = None
         self._steps_executed = 0
         self._keepwarm = KeepwarmController(self.config.keepwarm_config)
+        # Plans allocate/compile only when first touched on _mlx_executor. The
+        # object itself retains no model/cache state and is closed before model
+        # teardown so its tiny synthetic arrays cannot outlive this engine.
+        self._compiled_metal_keepwarm = CompiledMetalKeepwarmTouch(
+            mx,
+            stream=self._mlx_stream,
+        )
         self._pending_admissions = 0
         self._pending_admissions_lock = threading.Lock()
         self._next_keepwarm_check_at = 0.0
@@ -442,7 +450,16 @@ class EngineCore:
             return False
         started = time.monotonic()
         try:
-            elapsed = metal_warmup_touch(mx, action, stream=self._mlx_stream)
+            compiled_touch = getattr(self, "_compiled_metal_keepwarm", None)
+            if compiled_touch is None:
+                # Focused embedders/tests may construct EngineCore via __new__.
+                elapsed = metal_warmup_touch(
+                    mx,
+                    action,
+                    stream=getattr(self, "_mlx_stream", None),
+                )
+            else:
+                elapsed = compiled_touch.touch(action)
         except Exception as exc:  # keep a model usable if experimental warming fails
             elapsed = max(0.0, time.monotonic() - started)
             self._keepwarm.record(
@@ -1289,6 +1306,16 @@ class EngineCore:
         if keepwarm is not None:
             keepwarm.shutdown()
 
+        compiled_touch = getattr(self, "_compiled_metal_keepwarm", None)
+
+        def shutdown_after_keepwarm_close() -> None:
+            # asyncio task cancellation cannot interrupt an executor call that
+            # already started. FIFO this close behind any in-flight touch, then
+            # release its stream-owned arrays before scheduler/model teardown.
+            if compiled_touch is not None:
+                compiled_touch.close()
+            self.scheduler.shutdown()
+
         # Release model ownership BEFORE setting _closed
         # (_release_model checks not self._closed)
         if self._owns_model:
@@ -1304,7 +1331,7 @@ class EngineCore:
         # stream is bound to the engine's executor thread, so dispatch both
         # through the executor; fall back to a direct call if the executor
         # is already shut down.
-        for fn in (self.scheduler.shutdown, self.scheduler.deep_reset):
+        for fn in (shutdown_after_keepwarm_close, self.scheduler.deep_reset):
             fn_name = getattr(fn, "__name__", repr(fn))
             try:
                 self._mlx_executor.submit(fn).result(timeout=FATAL_TEARDOWN_TIMEOUT_S)
@@ -1340,6 +1367,9 @@ class EngineCore:
         # Drop the last bound-method reference from the teardown loop before
         # the final GC/reclaim pass below.
         fn = None
+        shutdown_after_keepwarm_close = None
+        compiled_touch = None
+        self._compiled_metal_keepwarm = None
 
         # Guarantee the SSD cache manager is released even if shutdown() did not
         # reach its own close() above. The manager's writer thread holds a strong

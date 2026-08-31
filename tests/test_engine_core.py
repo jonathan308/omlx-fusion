@@ -14,6 +14,7 @@ Note: Uses pytest-asyncio for async tests.
 
 import asyncio
 import concurrent.futures
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -648,6 +649,33 @@ class TestEngineCoreClose:
             engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
             engine.close()
             engine.close()  # Should not raise
+
+    def test_close_serializes_keepwarm_release_before_scheduler_teardown(
+        self, mock_model, mock_tokenizer
+    ):
+        """Stream-owned synthetic plans drain on their executor before reset."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            events = []
+            original_shutdown = engine.scheduler.shutdown
+
+            class ObservedTouch:
+                @staticmethod
+                def close():
+                    events.append(("keepwarm", threading.current_thread().name))
+
+            def observed_shutdown():
+                events.append(("scheduler", threading.current_thread().name))
+                return original_shutdown()
+
+            engine._compiled_metal_keepwarm = ObservedTouch()
+            engine.scheduler.shutdown = observed_shutdown
+            engine.close()
+
+            assert [event[0] for event in events[:2]] == ["keepwarm", "scheduler"]
+            assert events[0][1].startswith("mlx-engine-")
+            assert events[1][1] == events[0][1]
 
     def test_close_fatal_exits_when_teardown_future_times_out(
         self, mock_model, mock_tokenizer
