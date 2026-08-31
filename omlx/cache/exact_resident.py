@@ -28,6 +28,7 @@ class ExactResidentHit:
     cache: list[Any]
     cached_tokens: int
     cache_nbytes: int
+    durable_tokens: int
 
 
 @dataclass
@@ -35,6 +36,7 @@ class _ExactResidentEntry:
     tokens: array
     cache: list[Any]
     cache_nbytes: int
+    durable_tokens: int
 
 
 class ExactResidentPrefixCache:
@@ -42,9 +44,9 @@ class ExactResidentPrefixCache:
 
     The scheduler never hands a retained entry to the asynchronous durable
     writer.  It is therefore claimable immediately after the response, with
-    no shared-array reader race.  Older paged/SSD blocks remain the crash and
-    concurrent-claim fallback; persisting this newest terminal state is a
-    separate future idle-store feature.
+    no shared-array reader race. ``durable_tokens`` records the independently
+    published paged/SSD prompt boundary that remains the crash, eviction, and
+    concurrent-claim fallback for that mutable terminal state.
     """
 
     def __init__(
@@ -78,6 +80,7 @@ class ExactResidentPrefixCache:
         cache: list[Any],
         *,
         cache_nbytes: int = 0,
+        durable_tokens: int = 0,
     ) -> bool:
         """Retain one detached cache, evicting oldest entries as needed."""
 
@@ -94,6 +97,9 @@ class ExactResidentPrefixCache:
         if not token_array:
             return False
         cache_nbytes = max(0, int(cache_nbytes))
+        durable_tokens = int(durable_tokens)
+        if durable_tokens < 0 or durable_tokens > len(token_array):
+            return False
         if self.max_bytes <= 0 or cache_nbytes > self.max_bytes:
             with self._lock:
                 self.oversize_rejections += 1
@@ -102,6 +108,7 @@ class ExactResidentPrefixCache:
             tokens=token_array,
             cache=cache,
             cache_nbytes=cache_nbytes,
+            durable_tokens=durable_tokens,
         )
         with self._lock:
             self._next_id += 1
@@ -143,6 +150,7 @@ class ExactResidentPrefixCache:
                 cache=entry.cache,
                 cached_tokens=len(entry.tokens),
                 cache_nbytes=entry.cache_nbytes,
+                durable_tokens=entry.durable_tokens,
             )
 
     def clear(self) -> int:
@@ -161,6 +169,10 @@ class ExactResidentPrefixCache:
                 "size_bytes": self._size_bytes,
                 "max_token_count": max(
                     (len(entry.tokens) for entry in self._entries.values()),
+                    default=0,
+                ),
+                "max_durable_token_count": max(
+                    (entry.durable_tokens for entry in self._entries.values()),
                     default=0,
                 ),
                 "max_entries": self.max_entries,

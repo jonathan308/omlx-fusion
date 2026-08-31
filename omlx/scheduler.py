@@ -2707,7 +2707,7 @@ class Scheduler:
         extra_key_token_start: int | None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
         hot_cache_write_back: bool = True,
-    ) -> None:
+    ) -> int:
         """Run store_cache + paged_cache cleanup off the inference thread.
 
         Pre-conditions enforced by the caller (_cleanup_finished):
@@ -2740,6 +2740,9 @@ class Scheduler:
 
         paged_cache_manager and block_aware_cache rely on
         threading.RLock so concurrent access from main and worker is safe.
+
+        Returns the number of cache tokens registered in the paged tier. A
+        zero result means the caller must not publish a deferred resident L0.
         """
         try:
             # Hold _mx_buffer_access_lock across the worker's mx-buffer
@@ -2776,12 +2779,17 @@ class Scheduler:
                     )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
+            durable_tokens = getattr(block_table, "num_tokens", 0)
+            if type(durable_tokens) is not int:
+                durable_tokens = 0
             if block_table and self.paged_cache_manager is not None:
                 self.paged_cache_manager.release_for_eviction(block_table.block_ids)
             if self.block_aware_cache is not None:
                 self.block_aware_cache.clear_request_entry(request_id)
+            return max(0, durable_tokens)
         except Exception as e:
             logger.warning("Async store_cache failed for %s: %s", request_id, e)
+            return 0
 
     def _drain_pending_async_removes(self) -> bool:
         """Process deferred batch_generator.remove() calls from prior steps.
@@ -2804,17 +2812,26 @@ class Scheduler:
                 pending.append((uid, request_id, future))
                 continue
             # Surface worker exceptions for visibility (don't crash step loop).
+            stored_durable_tokens = 0
             if future is not None:
                 try:
-                    exc = future.exception()
+                    result = future.result()
                 except concurrent.futures.CancelledError:
                     logger.warning("Async store_cache for %s was cancelled", request_id)
+                except Exception as exc:
+                    logger.warning(
+                        "Async store_cache for %s raised: %s", request_id, exc
+                    )
                 else:
-                    if exc is not None:
-                        logger.warning(
-                            "Async store_cache for %s raised: %s", request_id, exc
-                        )
+                    if type(result) is int:
+                        stored_durable_tokens = max(0, result)
             try:
+                request = self.requests.get(request_id)
+                if request is not None:
+                    self._publish_deferred_exact_resident_cache(
+                        request,
+                        stored_durable_tokens,
+                    )
                 # Run batch_generator.remove on the inference thread.
                 try:
                     _safe_sync_stream(self._stream)
@@ -8843,20 +8860,82 @@ class Scheduler:
         tokens, cache_list, cache_nbytes = candidate
         if not self._resident_cache_matches_token_count(cache_list, len(tokens)):
             return False
+        durable_tokens = getattr(
+            request,
+            "_exact_resident_durable_fallback_tokens",
+            0,
+        )
+        if type(durable_tokens) is not int:
+            durable_tokens = 0
+        durable_tokens = max(0, min(durable_tokens, len(tokens)))
         if self._exact_resident_cache.put(
             tokens,
             cache_list,
             cache_nbytes=cache_nbytes,
+            durable_tokens=durable_tokens,
         ):
             logger.info(
                 "Exact resident cache staged for %s: tokens=%d size=%.2fGiB "
-                "durability=prior-paged-tier",
+                "durability=paged-boundary durable_tokens=%d",
                 request.request_id,
                 len(tokens),
                 cache_nbytes / 1024**3,
+                durable_tokens,
             )
             return True
         return False
+
+    def _exact_resident_required_durable_tokens(self, request: Request) -> int:
+        """Largest full-block prompt boundary safe for generation kickoff."""
+
+        block_size = int(self.config.paged_cache_block_size or 0)
+        prompt_tokens = request.prompt_token_ids or []
+        if block_size <= 0 or len(prompt_tokens) <= 1:
+            return 0
+        # Stateful caches cannot generically trim an exact N-token hit to N-1.
+        # The last reusable durable boundary must therefore be strictly before
+        # the prompt end, matching _prepare_prefix_cache_for_request.
+        return ((len(prompt_tokens) - 1) // block_size) * block_size
+
+    def _publish_deferred_exact_resident_cache(
+        self,
+        request: Request,
+        stored_durable_tokens: int,
+    ) -> bool:
+        """Publish a terminal L0 only after its independent store is durable."""
+
+        required = getattr(request, "_exact_resident_publish_after_store", None)
+        request._exact_resident_publish_after_store = None
+        if type(required) is not int or required <= 0:
+            return False
+        if (
+            type(stored_durable_tokens) is not int
+            or stored_durable_tokens < required
+        ):
+            request._exact_resident_candidate = None
+            logger.warning(
+                "Exact resident cache not published for %s: durable prompt "
+                "boundary reached %d/%d tokens",
+                request.request_id,
+                (
+                    stored_durable_tokens
+                    if type(stored_durable_tokens) is int
+                    else 0
+                ),
+                required,
+            )
+            return False
+
+        request._exact_resident_durable_fallback_tokens = stored_durable_tokens
+        published = self._publish_exact_resident_cache(request)
+        if published:
+            logger.info(
+                "Published deferred exact resident handoff for %s after "
+                "durable prompt boundary reached %d tokens",
+                request.request_id,
+                stored_durable_tokens,
+            )
+        return published
 
     def _restore_exact_resident_cache(self, request: Request) -> bool:
         """Transfer one exact terminal cache directly into ``request``."""
@@ -8903,6 +8982,7 @@ class Scheduler:
         request.shared_prefix_blocks = 0
         request.block_table = None
         request._exact_resident_hit = True
+        request._exact_resident_durable_fallback_tokens = hit.durable_tokens
         leases = getattr(self, "_exact_resident_leases", None)
         if leases is None:
             leases = set()
@@ -8942,6 +9022,8 @@ class Scheduler:
     def _prepare_prefix_cache_for_request(self, request: Request) -> None:
         if request.request_id in self._prefix_cache_prepared:
             return
+
+        request._exact_resident_durable_fallback_tokens = 0
 
         # Fastest exact path: the preceding turn's already-detached live
         # cache.  Ownership is exclusive and token identity is proven before
@@ -9134,6 +9216,10 @@ class Scheduler:
                         fetch_ms,
                         reconstruct_ms,
                         not bypass_hot_cache,
+                    )
+                    request._exact_resident_durable_fallback_tokens = max(
+                        0,
+                        int(request.cached_tokens or 0),
                     )
                 else:
                     # Reconstruction failed, treat as cache miss
@@ -12152,7 +12238,39 @@ class Scheduler:
             )
             resident_handoff = False
             if singleton_resident_eligible:
-                resident_handoff = self._publish_exact_resident_cache(request)
+                required_durable_tokens = (
+                    self._exact_resident_required_durable_tokens(request)
+                )
+                durable_fallback_tokens = getattr(
+                    request,
+                    "_exact_resident_durable_fallback_tokens",
+                    0,
+                )
+                if type(durable_fallback_tokens) is not int:
+                    durable_fallback_tokens = 0
+                candidate = getattr(request, "_exact_resident_candidate", None)
+                if (
+                    candidate is not None
+                    and self.block_aware_cache is not None
+                    and required_durable_tokens > durable_fallback_tokens
+                ):
+                    # The terminal cache includes generated tokens and cannot
+                    # serve an identical shorter prompt. Keep it private until
+                    # this request's independent block-aligned prompt boundary
+                    # has finished storing; otherwise a one-slot replacement
+                    # can evict the only undurable copy and leave B2 at zero.
+                    request._exact_resident_publish_after_store = (
+                        required_durable_tokens
+                    )
+                    logger.info(
+                        "Deferring exact resident publication for %s until "
+                        "durable prompt boundary reaches %d tokens (current=%d)",
+                        request_id,
+                        required_durable_tokens,
+                        durable_fallback_tokens,
+                    )
+                else:
+                    resident_handoff = self._publish_exact_resident_cache(request)
             elif request is not None and getattr(
                 request, "_exact_resident_candidate", None
             ) is not None:
@@ -12169,6 +12287,7 @@ class Scheduler:
             # handles _extract_tensor_bytes (CPU memcpy) + index/queue
             # registration. batch_generator.remove(uid) is deferred and
             # picked up at the next step's _drain_pending_async_removes.
+            synchronous_store_tokens = 0
             store_future = None
             if request is not None and request.prompt_token_ids:
                 if self.block_aware_cache is not None:
@@ -12409,16 +12528,18 @@ class Scheduler:
                                 )
                             else:
                                 # Executor unavailable — synchronous fallback.
-                                self._async_store_cache_worker(
-                                    request_id,
-                                    token_sequence_to_store,
-                                    cache_to_store,
-                                    model_cache_config,
-                                    intermediate_snapshots,
-                                    request.vlm_extra_keys_for_cache,
-                                    request.vlm_extra_key_token_start_for_cache,
-                                    request.vlm_extra_key_ranges_for_cache,
-                                    hot_cache_write_back,
+                                synchronous_store_tokens = (
+                                    self._async_store_cache_worker(
+                                        request_id,
+                                        token_sequence_to_store,
+                                        cache_to_store,
+                                        model_cache_config,
+                                        intermediate_snapshots,
+                                        request.vlm_extra_keys_for_cache,
+                                        request.vlm_extra_key_token_start_for_cache,
+                                        request.vlm_extra_key_ranges_for_cache,
+                                        hot_cache_write_back,
+                                    )
                                 )
                             logger.debug(
                                 f"Submitted async store_cache for {request_id} "
@@ -12464,6 +12585,12 @@ class Scheduler:
                                 block_table.block_ids
                             )
                         self.block_aware_cache.clear_request_entry(request_id)
+
+            if request is not None and store_future is None:
+                self._publish_deferred_exact_resident_cache(
+                    request,
+                    synchronous_store_tokens,
+                )
 
             # Remove from running
             if request_id in self.running:

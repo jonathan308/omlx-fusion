@@ -2722,6 +2722,204 @@ class TestSchedulerBoundarySnapshots:
         assert hit is not None
         assert hit.cache is cache
 
+    def test_cleanup_finished_long_resident_publishes_only_after_durable_boundary(
+        self, mock_model, mock_tokenizer
+    ):
+        """A first long turn cannot make its terminal state the only prefix copy."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(
+                paged_cache_block_size=4,
+                exact_resident_cache_slots=1,
+            ),
+        )
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+        scheduler._boundary_snapshot_required = False
+
+        request = Request(
+            request_id="req-resident-needs-durable-boundary",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = list(range(10))
+        request.num_prompt_tokens = 10
+        request.output_token_ids = [10]
+        buffer = mx.zeros((8,), dtype=mx.uint8)
+        terminal_cache = [
+            SimpleNamespace(
+                offset=11,
+                rollback_state=None,
+                buffer=buffer,
+            )
+        ]
+        request._extracted_cache = [
+            {
+                "state": (buffer,),
+                "class_name": "KVCache",
+                "cache_type": "KVCache",
+            }
+        ]
+        request._model_cache_config = None
+        request._exact_resident_candidate = (
+            list(range(11)),
+            terminal_cache,
+            8,
+        )
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+
+        def store_with_boundary(*_args, **_kwargs):
+            # The terminal cache is still private while its independent prompt
+            # boundary is serialized, so a claimant cannot race this reader.
+            assert scheduler._exact_resident_cache.stats()["entries"] == 0
+            return SimpleNamespace(num_tokens=8, block_ids=[])
+
+        scheduler.block_aware_cache.store_cache.side_effect = store_with_boundary
+
+        scheduler._cleanup_finished({request.request_id})
+
+        scheduler.block_aware_cache.store_cache.assert_called_once()
+        # The terminal ledger includes the generated token and therefore cannot
+        # serve the byte-identical, shorter ten-token prompt.
+        assert scheduler._exact_resident_cache.acquire_prefix(list(range(10))) is None
+
+        # The next serial one-token prime restores the durable eight-token
+        # boundary. It can replace the one-slot terminal immediately without
+        # repeating the store or losing the fallback needed by an identical B2.
+        second = Request(
+            request_id="req-resident-second-prime",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        second.prompt_token_ids = list(range(10))
+        second.num_prompt_tokens = 10
+        second.output_token_ids = [10]
+        second_buffer = mx.zeros((8,), dtype=mx.uint8)
+        second_terminal_cache = [
+            SimpleNamespace(
+                offset=11,
+                rollback_state=None,
+                buffer=second_buffer,
+            )
+        ]
+        second._extracted_cache = [
+            {
+                "state": (second_buffer,),
+                "class_name": "KVCache",
+                "cache_type": "KVCache",
+            }
+        ]
+        second._model_cache_config = None
+        second._exact_resident_candidate = (
+            list(range(11)),
+            second_terminal_cache,
+            8,
+        )
+        second._exact_resident_durable_fallback_tokens = 8
+        scheduler.running[second.request_id] = second
+        scheduler.requests[second.request_id] = second
+
+        scheduler._cleanup_finished({second.request_id})
+
+        scheduler.block_aware_cache.store_cache.assert_called_once()
+        assert scheduler._exact_resident_cache.stats()["evictions"] == 1
+        assert scheduler._exact_resident_cache.acquire_prefix(list(range(10))) is None
+        hit = scheduler._exact_resident_cache.acquire_prefix(list(range(12)))
+        assert hit is not None
+        assert hit.cache is second_terminal_cache
+        assert hit.cached_tokens == 11
+        assert hit.durable_tokens == 8
+
+    def test_cleanup_finished_async_store_gates_resident_publication(
+        self, mock_model, mock_tokenizer
+    ):
+        """An async terminal handoff becomes claimable only after store success."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(
+                paged_cache_block_size=4,
+                exact_resident_cache_slots=1,
+            ),
+        )
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+        scheduler._boundary_snapshot_required = False
+        scheduler.batch_generator = MagicMock()
+        scheduler._store_cache_executor = MagicMock()
+
+        request = Request(
+            request_id="req-resident-async-boundary",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = list(range(10))
+        request.num_prompt_tokens = 10
+        request.output_token_ids = [10]
+        buffer = mx.zeros((8,), dtype=mx.uint8)
+        terminal_cache = [
+            SimpleNamespace(
+                offset=11,
+                rollback_state=None,
+                buffer=buffer,
+            )
+        ]
+        request._extracted_cache = [
+            {
+                "state": (buffer,),
+                "class_name": "KVCache",
+                "cache_type": "KVCache",
+            }
+        ]
+        request._model_cache_config = None
+        request._exact_resident_candidate = (
+            list(range(11)),
+            terminal_cache,
+            8,
+        )
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+        scheduler.request_id_to_uid[request.request_id] = 7
+        scheduler.uid_to_request_id[7] = request.request_id
+
+        store_future = concurrent.futures.Future()
+        scheduler._store_cache_executor.submit.return_value = store_future
+
+        scheduler._cleanup_finished({request.request_id})
+
+        assert scheduler._exact_resident_cache.stats()["entries"] == 0
+        assert request._exact_resident_publish_after_store == 8
+        store_future.set_result(8)
+        with patch("omlx.scheduler._safe_sync_stream"):
+            assert scheduler._drain_pending_async_removes()
+
+        hit = scheduler._exact_resident_cache.acquire_prefix(list(range(12)))
+        assert hit is not None
+        assert hit.cache is terminal_cache
+        assert hit.durable_tokens == 8
+
+    def test_deferred_resident_fails_closed_when_boundary_store_is_short(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(exact_resident_cache_slots=1),
+        )
+        request = Request(
+            request_id="req-resident-short-store",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request._exact_resident_candidate = ([1, 2, 3], [object()], 1)
+        request._exact_resident_publish_after_store = 8
+
+        assert not scheduler._publish_deferred_exact_resident_cache(request, 4)
+        assert request._exact_resident_candidate is None
+        assert scheduler._exact_resident_cache.stats()["entries"] == 0
+
     @pytest.mark.parametrize(
         ("slots", "max_bytes"),
         [(0, 8), (1, 4)],

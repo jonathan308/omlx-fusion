@@ -78,7 +78,12 @@ def _request(tokens):
 def test_exact_resident_transfers_ownership_for_true_suffix():
     tier = ExactResidentPrefixCache(max_entries=1)
     cache = [object()]
-    assert tier.put([1, 2, 3], cache, cache_nbytes=123)
+    assert tier.put(
+        [1, 2, 3],
+        cache,
+        cache_nbytes=123,
+        durable_tokens=2,
+    )
 
     hit = tier.acquire_prefix([1, 2, 3, 4, 5])
 
@@ -86,6 +91,7 @@ def test_exact_resident_transfers_ownership_for_true_suffix():
     assert hit.cache is cache
     assert hit.cached_tokens == 3
     assert hit.cache_nbytes == 123
+    assert hit.durable_tokens == 2
     assert tier.stats()["entries"] == 0
 
 
@@ -133,6 +139,7 @@ def test_exact_resident_enforces_byte_budget_and_uint32_tokens():
     assert not tier.put([1], [object()], cache_nbytes=101)
     assert not tier.put([-1], [object()], cache_nbytes=1)
     assert not tier.put([0x1_0000_0000], [object()], cache_nbytes=1)
+    assert not tier.put([1], [object()], cache_nbytes=1, durable_tokens=2)
     assert tier.put([0xFFFFFFFF], [object()], cache_nbytes=100)
     assert tier.stats()["size_bytes"] == 100
     assert tier.stats()["max_bytes"] == 100
@@ -142,11 +149,18 @@ def test_exact_resident_enforces_byte_budget_and_uint32_tokens():
 def test_exact_resident_stats_report_largest_resident_token_count():
     tier = ExactResidentPrefixCache(max_entries=3, max_bytes=1_000)
     assert tier.put([1, 2], [object()], cache_nbytes=10)
-    assert tier.put([3, 4, 5, 6], [object()], cache_nbytes=10)
+    assert tier.put(
+        [3, 4, 5, 6],
+        [object()],
+        cache_nbytes=10,
+        durable_tokens=3,
+    )
 
     assert tier.stats()["max_token_count"] == 4
+    assert tier.stats()["max_durable_token_count"] == 3
     assert tier.acquire_prefix([3, 4, 5, 6, 7]) is not None
     assert tier.stats()["max_token_count"] == 2
+    assert tier.stats()["max_durable_token_count"] == 0
     tier.clear()
     assert tier.stats()["max_token_count"] == 0
 
@@ -220,6 +234,7 @@ def test_clear_releases_only_resident_entries():
 def test_scheduler_stages_and_restores_exact_terminal_cache():
     scheduler = _scheduler()
     completed = _request([1, 2, 3])
+    completed._exact_resident_durable_fallback_tokens = 2
     cache = [_OffsetCache(3, nbytes=99)]
 
     scheduler._stage_exact_resident_cache(completed, cache, [1, 2, 3])
@@ -230,6 +245,7 @@ def test_scheduler_stages_and_restores_exact_terminal_cache():
     assert next_turn.prompt_cache is cache
     assert next_turn.cached_tokens == 3
     assert next_turn.remaining_tokens == [4, 5]
+    assert next_turn._exact_resident_durable_fallback_tokens == 2
 
 
 def test_scheduler_validates_every_positioned_and_recurrent_leaf():
