@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import threading
 from contextlib import contextmanager, suppress
 from types import SimpleNamespace
@@ -427,12 +428,14 @@ class SyntheticFast:
         self.owner = owner
 
     def metal_kernel(self, **kwargs):
+        self.owner.execution_threads.append(threading.current_thread().name)
         self.owner.kernel_creations += 1
         self.owner.kernel_options.append(kwargs)
         if self.owner.creation_fails:
             raise RuntimeError("JIT creation failed")
 
         def kernel(**call_kwargs):
+            self.owner.execution_threads.append(threading.current_thread().name)
             self.owner.kernel_runs += 1
             self.owner.kernel_calls.append(call_kwargs)
             if self.owner.invocation_fails:
@@ -463,6 +466,8 @@ class SyntheticMX:
         self.kernel_calls: list[dict] = []
         self.evaluated: list[SyntheticArray] = []
         self.stream_entries: list[object] = []
+        self.stream_creations: list[tuple[object, str]] = []
+        self.execution_threads: list[str] = []
 
     def array(self, values, *, dtype):
         assert values == [1.0]
@@ -471,7 +476,17 @@ class SyntheticMX:
         return SyntheticArray(values[0])
 
     def eval(self, value):
+        self.execution_threads.append(threading.current_thread().name)
         self.evaluated.append(value)
+
+    @staticmethod
+    def default_device():
+        return "gpu"
+
+    def new_stream(self, device):
+        stream = f"dedicated-stream-{len(self.stream_creations) + 1}"
+        self.stream_creations.append((device, threading.current_thread().name))
+        return stream
 
     @contextmanager
     def stream(self, stream):
@@ -515,6 +530,51 @@ def test_request_start_miss_skips_without_allocation_or_jit():
     assert fake_mx.kernel_creations == 0
     assert fake_mx.kernel_runs == 0
     assert fake_mx.evaluated == []
+    assert fake_mx.stream_creations == []
+
+
+def test_metal_pulse_lazily_creates_and_reuses_one_dedicated_stream():
+    fake_mx = SyntheticMX()
+    touch = CompiledMetalKeepwarmTouch(fake_mx)
+
+    assert touch._stream is None
+    touch.touch(KeepwarmAction("idle", 1, 1, 2.0))
+    touch.touch(KeepwarmAction("request_start", 128, 1, 2.0))
+
+    assert fake_mx.stream_creations == [("gpu", threading.current_thread().name)]
+    assert fake_mx.stream_entries == ["dedicated-stream-1"] * 2
+    assert touch._stream == "dedicated-stream-1"
+
+
+def test_metal_pulse_create_use_and_close_share_one_executor_thread():
+    fake_mx = SyntheticMX()
+    touch = CompiledMetalKeepwarmTouch(fake_mx)
+    close_threads = []
+    original_close = touch.close
+
+    def observed_close():
+        close_threads.append(threading.current_thread().name)
+        original_close()
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="keepwarm-owner",
+    ) as executor:
+        executor.submit(
+            touch.touch,
+            KeepwarmAction("idle", 1, 1, 2.0),
+        ).result()
+        executor.submit(
+            touch.touch,
+            KeepwarmAction("request_start", 128, 1, 2.0),
+        ).result()
+        executor.submit(observed_close).result()
+
+    owner_thread = fake_mx.stream_creations[0][1]
+    assert owner_thread.startswith("keepwarm-owner")
+    assert set(fake_mx.execution_threads) == {owner_thread}
+    assert close_threads == [owner_thread]
+    assert touch._stream is None
 
 
 def test_missing_metal_kernel_and_jit_failure_never_fall_back_to_matmul():

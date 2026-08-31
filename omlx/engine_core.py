@@ -279,13 +279,11 @@ class EngineCore:
         self._start_time: Optional[float] = None
         self._steps_executed = 0
         self._keepwarm = KeepwarmController(self.config.keepwarm_config)
-        # The one-thread Metal pulse allocates/JITs only from idle/post-response
-        # work on _mlx_executor. It retains one four-byte input and no model or
-        # cache state, and closes before model teardown.
-        self._compiled_metal_keepwarm = CompiledMetalKeepwarmTouch(
-            mx,
-            stream=self._mlx_stream,
-        )
+        # The pulse lazily creates its own stream from idle/post-response work
+        # on _mlx_executor, so its fence never drains the model stream. It
+        # retains one four-byte input and no model/cache state, and closes on
+        # the executor before model teardown.
+        self._compiled_metal_keepwarm = CompiledMetalKeepwarmTouch(mx)
         self._pending_admissions = 0
         self._pending_admissions_lock = threading.Lock()
         self._next_keepwarm_check_at = 0.0

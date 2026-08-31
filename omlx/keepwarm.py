@@ -15,7 +15,6 @@ import math
 import os
 import threading
 import time
-from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Callable
 
@@ -365,11 +364,14 @@ class KeepwarmController:
 class CompiledMetalKeepwarmTouch:
     """Per-engine, lazy one-thread Metal pulse for the serialized MLX lane.
 
-    Idle/post-response work creates and JITs one safe ``mx.fast.metal_kernel``
-    on the engine worker/stream. Request admission can only consume an already
-    prepared pulse; a miss skips instead of compiling or allocating. The only
-    retained operand is one four-byte fp32 array. This object never receives or
-    retains model, KV-cache, request, tokenizer, or SSD-cache state.
+    Idle/post-response work lazily creates a dedicated MLX stream and JITs one
+    safe ``mx.fast.metal_kernel`` on the engine worker thread. Request admission
+    can only consume an already prepared pulse; a miss skips instead of creating
+    a stream, compiling, or allocating. The isolated stream prevents the pulse
+    fence from draining unrelated model/cache work queued on the inference
+    stream. The only retained operand is one four-byte fp32 array. This object
+    never receives or retains model, KV-cache, request, tokenizer, or SSD-cache
+    state.
     """
 
     MIN_MATRIX_SIZE = 1
@@ -481,6 +483,20 @@ class CompiledMetalKeepwarmTouch:
         self._kernel = kernel
         self._prepared = True
 
+    def _ensure_stream(self) -> Any:
+        mx_module = self._mx
+        if mx_module is None or self._closed:
+            raise RuntimeError("Metal keepwarm pulse is closed")
+        if self._stream is None:
+            new_stream = getattr(mx_module, "new_stream", None)
+            if not callable(new_stream):
+                raise RuntimeError("mx.new_stream is unavailable")
+            # Called only from touch(), which EngineCore dispatches on its
+            # existing one-worker MLX executor. Creation, use, and close thus
+            # share thread ownership without sharing the model's command queue.
+            self._stream = new_stream(mx_module.default_device())
+        return self._stream
+
     def touch(self, action: KeepwarmAction) -> float | None:
         """Run a pulse, or return None for an unprepared request-start."""
 
@@ -493,9 +509,8 @@ class CompiledMetalKeepwarmTouch:
         mx_module = self._mx
         if mx_module is None:
             raise RuntimeError("Metal keepwarm pulse is closed")
-        stream_context = (
-            nullcontext() if self._stream is None else mx_module.stream(self._stream)
-        )
+        pulse_stream = self._ensure_stream()
+        stream_context = mx_module.stream(pulse_stream)
         try:
             with stream_context:
                 prepared_now = not self._prepared
