@@ -134,6 +134,9 @@ def _real_cycle(
     batched_cache: bool = False,
     sized_cache: bool = False,
     draft_depth: int = 2,
+    expected_pending_kind: str = "verify",
+    alignment_distance: int | None = None,
+    clamp_to: int | None = None,
 ):
     from omlx.patches.mlx_lm_mtp import batch_generator as bg
 
@@ -170,6 +173,10 @@ def _real_cycle(
         model._omlx_mtp_commit_align = len(tokens) + accepted + 1
     else:
         model._omlx_mtp_commit_align = 0
+    if alignment_distance is not None:
+        model._omlx_mtp_commit_align = len(tokens) + alignment_distance
+    if clamp_to is not None:
+        model.mtp_clamp_accept = lambda _cache, _accepted, _drafts: clamp_to
     batch = _CycleBatch(
         model=model,
         prompt_cache=target_cache,
@@ -186,11 +193,13 @@ def _real_cycle(
     )
     batch._omlx_mtp_state = state
     bg._run_verify_cycle_chain(batch, state)
-    expected = target_tokens[: accepted + 1]
+    effective_accepted = state.pending_commit.accepted
+    expected = target_tokens[: effective_accepted + 1]
     assert [entry[0] for entry in state.queue] == expected
     assert state.pending_commit is not None
-    assert state.pending_commit.kind == "verify"
-    assert state.pending_commit.accepted == accepted
+    assert state.pending_commit.kind == expected_pending_kind
+    if alignment_distance is None and clamp_to is None:
+        assert state.pending_commit.accepted == accepted
     return bg, model, batch, state, expected
 
 

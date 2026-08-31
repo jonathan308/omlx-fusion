@@ -181,6 +181,9 @@ def _greedy(logprobs):
     return mx.argmax(logprobs, axis=-1).astype(mx.uint32)
 
 
+_greedy.temp = 0.0
+
+
 def _target_continuation(model, history, count):
     """Unprimed target oracle: next token and subsequent greedy tokens."""
 

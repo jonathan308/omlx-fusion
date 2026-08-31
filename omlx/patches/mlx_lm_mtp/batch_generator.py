@@ -278,7 +278,11 @@ def apply() -> bool:
                         )
                         active = getattr(self, "_omlx_mtp_state", None)
                         if active is not None:
-                            _reconcile_mtp_to_standard(self, active)
+                            if not _reconcile_mtp_to_standard(self, active):
+                                raise RuntimeError(
+                                    "MTP step fallback could not reconstruct "
+                                    "an exact standard target cache"
+                                ) from exc
                             if active.reentry_probe:
                                 try:
                                     delattr(self, "_omlx_mtp_park_state")
@@ -717,6 +721,19 @@ _QWEN4_EVIDENCE_DEPTH_ENV = "OMLX_QWEN4_EVIDENCE_DEPTH"
 _QWEN4_VERIFY_PARITY_PATH_ENV = "OMLX_QWEN4_VERIFY_PARITY_PATH"
 _QWEN4_VERIFY_PARITY_CYCLES_ENV = "OMLX_QWEN4_VERIFY_PARITY_CYCLES"
 _QWEN4_VERIFY_PARITY_PREFILL_STEP_ENV = "OMLX_QWEN4_VERIFY_PARITY_PREFILL_STEP"
+_QWEN4_SEQUENTIAL_VERIFY_ENV = "OMLX_QWEN4_SEQUENTIAL_VERIFY"
+_QWEN4_SEQUENTIAL_POOLED_REQUIRED_TOKENS = 32
+
+
+def _qwen4_sequential_verify_enabled() -> bool:
+    """Opt in to the B1 greedy full-model scalar verification oracle."""
+
+    return os.environ.get(_QWEN4_SEQUENTIAL_VERIFY_ENV, "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _fixed_depth_override(max_depth: int) -> Optional[int]:
@@ -1106,6 +1123,14 @@ class _MtpStepFallback(RuntimeError):
     """Raised inside the MTP path to signal a clean fallback to the standard step."""
 
 
+class _Qwen4SequentialRecoveredFallback(_MtpStepFallback):
+    """The scalar oracle restored its base and may use the wide verifier."""
+
+
+class _Qwen4SequentialHardFailure(RuntimeError):
+    """The oracle detected an invalid contract that wide verify also shares."""
+
+
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
@@ -1256,6 +1281,69 @@ class _Qwen4QSARollbackSnapshot:
     full_index_offset: int
 
 
+@dataclass(frozen=True)
+class _Qwen4SequentialRecurrentSnapshot:
+    """Detached pre-cycle state for one Qwen4 GDN/PLE cache leaf."""
+
+    cache: Any
+    state: Tuple[Any, ...]
+    token_count: Optional[int]
+    metadata: Tuple[Tuple[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class _Qwen4SequentialQSASnapshot:
+    """Logical pre-cycle QSA suffix boundary without a context-sized clone."""
+
+    cache: Any
+    offset: int
+    index_offset: int
+    keys_backing: Any
+    values_backing: Any
+    index_keys_backing: Any
+    index_positions_backing: Any
+    private_index_backing: bool
+    text_positions_qualified: bool
+    pooled_keys: Any
+    pooled_offset: int
+    pooled_ratio: Any
+    pooled_tag: Any
+    has_pooled_state: bool
+    index_capacity_managed: Any
+    geometric_capacity_managed: Any
+
+
+@dataclass(frozen=True)
+class _Qwen4SequentialBaseSnapshot:
+    """Exact live-target base retained until one scheduler transaction ends."""
+
+    base_offset: int
+    owner_uid: Any
+    recurrent: Tuple[_Qwen4SequentialRecurrentSnapshot, ...]
+    qsa: Tuple[_Qwen4SequentialQSASnapshot, ...]
+    language_model: Any
+    position_ids: Any
+    rope_deltas: Any
+
+
+@dataclass(frozen=True)
+class _Qwen4SequentialVerifyResult:
+    """Canonical scalar target rows and greedy decision for one cycle."""
+
+    snapshot: _Qwen4SequentialBaseSnapshot
+    target_input_ids: Tuple[int, ...]
+    draft_ids: Tuple[int, ...]
+    accepted: int
+    emitted_id: int
+    emitted_logprobs: Any
+    combined_logprobs: Any
+    hidden: Any
+    processor_base_snapshot: Any
+    token_buffer_base_size: Optional[int]
+    processor_snapshots: Tuple[Any, ...]
+    target_ids: Tuple[int, ...]
+
+
 @dataclass
 class _MtpPendingCommit:
     """One scheduler-visible Lightning-MTP target transaction.
@@ -1287,6 +1375,8 @@ class _MtpPendingCommit:
     deferred_boundary: bool = False
     final_source: str = ""
     committed: bool = False
+    sequential_base: Optional[_Qwen4SequentialBaseSnapshot] = None
+    target_input_ids: Tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2129,6 +2219,49 @@ def _restore_snapshotable(procs, snaps) -> None:
                 return
 
 
+def _snapshot_qwen4_sequential_processors(procs) -> Tuple[Any, ...]:
+    """Capture stateful processors with stable identity/index alignment."""
+
+    if not procs:
+        return ()
+    snapshots = []
+    for index, proc in enumerate(procs):
+        has_snapshot = callable(getattr(proc, "snapshot_state", None))
+        has_restore = callable(getattr(proc, "restore_state", None))
+        if has_snapshot != has_restore:
+            raise _MtpStepFallback(
+                "Qwen4 sequential processor cannot round-trip state"
+            )
+        if has_snapshot:
+            snapshots.append((index, proc, proc.snapshot_state()))
+        elif getattr(proc, "__dict__", None):
+            # Unknown mutable processors are not safe to replay speculatively.
+            raise _MtpStepFallback(
+                "Qwen4 sequential processor has untracked mutable state"
+            )
+    return tuple(snapshots)
+
+
+def _restore_qwen4_sequential_processors(procs, snapshots) -> bool:
+    """Restore only the exact processor objects captured above."""
+
+    if not snapshots:
+        return True
+    if not procs:
+        return False
+    try:
+        for index, proc, snapshot in snapshots:
+            if index >= len(procs) or procs[index] is not proc:
+                return False
+            restore = getattr(proc, "restore_state", None)
+            if not callable(restore):
+                return False
+            restore(snapshot)
+        return True
+    except Exception:
+        return False
+
+
 def _logprobs(logits_2d):
     import mlx.core as mx
 
@@ -2615,6 +2748,678 @@ def _qwen4_qsa_offsets(cache: Any) -> Optional[Tuple[int, int]]:
     return offset, index_offset
 
 
+def _qwen4_language_model(model: Any) -> Any:
+    """Resolve the stateful Qwen4 LanguageModel through serving wrappers."""
+
+    pending = [model]
+    seen = set()
+    while pending:
+        candidate = pending.pop()
+        if candidate is None or id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        inner = getattr(candidate, "model", None)
+        if (
+            hasattr(candidate, "_position_ids")
+            and hasattr(candidate, "_rope_deltas")
+            and inner is not None
+            and type(inner).__name__ == "Qwen4ExpModel"
+        ):
+            return candidate
+        for name in ("language_model", "_language_model", "model"):
+            child = getattr(candidate, name, None)
+            if child is not None and child is not candidate:
+                pending.append(child)
+    return None
+
+
+def _qwen4_detach_snapshot_value(value: Any, arrays: List[Any]) -> Any:
+    """Detach MLX arrays recursively and collect them for one eager barrier."""
+
+    import mlx.core as mx
+
+    if isinstance(value, mx.array):
+        try:
+            detached = mx.copy(value)
+        except AttributeError:
+            detached = value + mx.zeros((), dtype=value.dtype)
+        arrays.append(detached)
+        return detached
+    if isinstance(value, list):
+        return [_qwen4_detach_snapshot_value(item, arrays) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_qwen4_detach_snapshot_value(item, arrays) for item in value)
+    if isinstance(value, dict):
+        return {
+            key: _qwen4_detach_snapshot_value(item, arrays)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _capture_qwen4_sequential_base(
+    gen_batch: Any,
+    *,
+    base_offset: int,
+) -> _Qwen4SequentialBaseSnapshot:
+    """Capture recurrent tensors plus logical QSA/model-position state.
+
+    QSA K/V and raw-index buffers are intentionally not copied: scalar target
+    calls only append a suffix, and every supported QSA cache owns an exact
+    trim operation over both logical timelines.  Recurrent GDN/PLE tensors are
+    positionless and cannot be trimmed, so those relatively small states are
+    detached eagerly.
+    """
+
+    import mlx.core as mx
+
+    if _qwen4_target_offset(gen_batch.prompt_cache) != base_offset:
+        raise _MtpStepFallback("Qwen4 sequential base offset changed")
+    uids = tuple(getattr(gen_batch, "uids", ()) or ())
+    if len(uids) != 1:
+        raise _MtpStepFallback("Qwen4 sequential base has no exclusive B1 owner")
+    language_model = _qwen4_language_model(gen_batch.model)
+    if language_model is None:
+        raise _MtpStepFallback("Qwen4 sequential LanguageModel is unavailable")
+
+    arrays: List[Any] = []
+    recurrent: List[_Qwen4SequentialRecurrentSnapshot] = []
+    qsa: List[_Qwen4SequentialQSASnapshot] = []
+    for cache in _iter_mtp_cache_leaves(gen_batch.prompt_cache):
+        class_name = type(cache).__name__
+        if any(
+            getattr(cache, name, None) is not None
+            for name in (
+                "rollback_state",
+                "_qwen4_exp_ple_speculative_state",
+                "_mtp_draft_stash",
+                "_mtp_undo",
+                "_undo",
+            )
+        ):
+            raise _MtpStepFallback(
+                "Qwen4 sequential base has stale rollback state"
+            )
+        if class_name in _QWEN4_QSA_CACHE_TYPES:
+            if class_name == "BatchQSAKVCache":
+                raise _MtpStepFallback(
+                    "Qwen4 sequential oracle requires compact singleton QSA"
+                )
+            offsets = _qwen4_qsa_offsets(cache)
+            if offsets != (base_offset, base_offset):
+                raise _MtpStepFallback(
+                    "Qwen4 sequential QSA base offsets are not exact"
+                )
+            logical_keys = getattr(cache, "index_keys", None)
+            logical_positions = getattr(cache, "index_position_ids", None)
+            if (
+                logical_keys is None
+                or logical_positions is None
+                or int(logical_keys.shape[1]) != base_offset
+                or int(logical_positions.shape[-1]) != base_offset
+            ):
+                raise _MtpStepFallback(
+                    "Qwen4 sequential QSA index state is incomplete"
+                )
+            qualified = getattr(
+                cache,
+                "_omlx_text_position_ids_qualified",
+                False,
+            )
+            if type(qualified) is not bool:
+                raise _MtpStepFallback(
+                    "Qwen4 sequential QSA text qualification is malformed"
+                )
+            has_pooled = hasattr(cache, "_pooled_index_offset")
+            private_index = hasattr(cache, "_index_keys") and hasattr(
+                cache,
+                "_index_position_ids",
+            )
+            keys_backing = getattr(cache, "keys", None)
+            values_backing = getattr(cache, "values", None)
+            key_array = (
+                keys_backing[0]
+                if isinstance(keys_backing, (list, tuple)) and keys_backing
+                else keys_backing
+            )
+            value_array = (
+                values_backing[0]
+                if isinstance(values_backing, (list, tuple)) and values_backing
+                else values_backing
+            )
+            index_keys_backing = (
+                getattr(cache, "_index_keys", None)
+                if private_index
+                else logical_keys
+            )
+            index_positions_backing = (
+                getattr(cache, "_index_position_ids", None)
+                if private_index
+                else logical_positions
+            )
+            if (
+                key_array is None
+                or value_array is None
+                or int(key_array.shape[2]) < base_offset
+                or int(value_array.shape[2]) < base_offset
+                or index_keys_backing is None
+                or index_positions_backing is None
+                or int(index_keys_backing.shape[1]) < base_offset
+                or int(index_positions_backing.shape[-1]) < base_offset
+            ):
+                raise _MtpStepFallback(
+                    "Qwen4 sequential QSA backing capacity is incomplete"
+                )
+            pooled_keys = getattr(cache, "_pooled_index_keys", None)
+            pooled_offset = int(getattr(cache, "_pooled_index_offset", 0) or 0)
+            pooled_ratio = getattr(cache, "_pooled_index_ratio", None)
+            pooled_tag = getattr(cache, "_pooled_index_tag", None)
+            if has_pooled:
+                if pooled_keys is None:
+                    if (
+                        pooled_offset != 0
+                        or pooled_ratio is not None
+                        or pooled_tag is not None
+                        or base_offset
+                        >= _QWEN4_SEQUENTIAL_POOLED_REQUIRED_TOKENS
+                    ):
+                        raise _MtpStepFallback(
+                            "Qwen4 sequential pooled QSA base is malformed"
+                        )
+                elif (
+                    type(pooled_ratio) is not int
+                    or pooled_ratio <= 0
+                    or pooled_tag is None
+                    or pooled_offset != base_offset // pooled_ratio
+                    or pooled_offset > int(pooled_keys.shape[1])
+                ):
+                    raise _MtpStepFallback(
+                        "Qwen4 sequential pooled QSA epoch is malformed"
+                    )
+            qsa.append(
+                _Qwen4SequentialQSASnapshot(
+                    cache=cache,
+                    offset=base_offset,
+                    index_offset=base_offset,
+                    keys_backing=keys_backing,
+                    values_backing=values_backing,
+                    index_keys_backing=(
+                        index_keys_backing
+                    ),
+                    index_positions_backing=(
+                        index_positions_backing
+                    ),
+                    private_index_backing=private_index,
+                    text_positions_qualified=qualified,
+                    pooled_keys=pooled_keys,
+                    pooled_offset=pooled_offset,
+                    pooled_ratio=pooled_ratio,
+                    pooled_tag=pooled_tag,
+                    has_pooled_state=has_pooled,
+                    index_capacity_managed=getattr(
+                        cache,
+                        "_index_capacity_managed",
+                        None,
+                    ),
+                    geometric_capacity_managed=getattr(
+                        cache,
+                        "_geometric_capacity_managed",
+                        None,
+                    ),
+                )
+            )
+            continue
+
+        inner = vars(cache).get("_inner") if class_name == "SizedArraysCache" else cache
+        if type(inner).__name__ != "ArraysCache":
+            raise _MtpStepFallback(
+                f"Qwen4 sequential cache leaf is unsupported: {class_name}"
+            )
+        state = getattr(inner, "state", None)
+        if not isinstance(state, (list, tuple)) or len(state) not in (2, 4):
+            raise _MtpStepFallback("Qwen4 sequential recurrent state is incomplete")
+        expected_ndims = (3, 4) if len(state) == 2 else (3, 4, 3, 2)
+        total_bytes = 0
+        for value, expected_ndim in zip(state, expected_ndims):
+            if (
+                value is None
+                or getattr(value, "ndim", 0) != expected_ndim
+                or not hasattr(value, "nbytes")
+                or int(value.nbytes) > 16 * 1024 * 1024
+            ):
+                raise _MtpStepFallback(
+                    "Qwen4 sequential recurrent schema is not bounded"
+                )
+            total_bytes += int(value.nbytes)
+        if total_bytes > 32 * 1024 * 1024:
+            raise _MtpStepFallback(
+                "Qwen4 sequential recurrent snapshot exceeds its per-leaf cap"
+            )
+        detached_state = tuple(
+            _qwen4_detach_snapshot_value(value, arrays) for value in state
+        )
+        for index, value in enumerate(detached_state):
+            if index < 2 and value is None:
+                raise _MtpStepFallback(
+                    "Qwen4 sequential recurrent state is not B1"
+                )
+            if value is not None and (
+                getattr(value, "ndim", 0) < 1 or value.shape[0] != 1
+            ):
+                raise _MtpStepFallback(
+                    "Qwen4 sequential recurrent/PLE state is not B1"
+                )
+        token_count = (
+            getattr(cache, "_token_count", None)
+            if class_name == "SizedArraysCache"
+            else None
+        )
+        if token_count is not None and token_count != base_offset:
+            raise _MtpStepFallback(
+                "Qwen4 sequential recurrent timeline is not at the base"
+            )
+        metadata = tuple(
+            (
+                name,
+                _qwen4_detach_snapshot_value(getattr(inner, name, None), arrays),
+            )
+            for name in (
+                "_left_padding",
+                "_left_padding_advance",
+                "_lengths",
+                "_lengths_advance",
+                "_qwen3_5_left_padding_info",
+                "_qwen3_5_lengths_info",
+            )
+        )
+        recurrent.append(
+            _Qwen4SequentialRecurrentSnapshot(
+                cache=cache,
+                state=detached_state,
+                token_count=token_count,
+                metadata=metadata,
+            )
+        )
+
+    if not recurrent or not qsa:
+        raise _MtpStepFallback(
+            "Qwen4 sequential base requires recurrent and QSA cache leaves"
+        )
+    # Qwen4 replaces these arrays rather than mutating them. Retaining the
+    # references avoids copying a context-long MRoPE position tensor per cycle.
+    position_ids = getattr(language_model, "_position_ids", None)
+    rope_deltas = getattr(language_model, "_rope_deltas", None)
+    if arrays:
+        mx.eval(*arrays)
+    return _Qwen4SequentialBaseSnapshot(
+        base_offset=base_offset,
+        owner_uid=uids[0],
+        recurrent=tuple(recurrent),
+        qsa=tuple(qsa),
+        language_model=language_model,
+        position_ids=position_ids,
+        rope_deltas=rope_deltas,
+    )
+
+
+def _qwen4_sequential_prefix_is_exact(
+    gen_batch: Any,
+    snapshot: _Qwen4SequentialBaseSnapshot,
+    *,
+    accepted: int,
+) -> bool:
+    """Prove the live target owns base + next_main + accepted drafts."""
+
+    expected = snapshot.base_offset + int(accepted) + 1
+    uids = tuple(getattr(gen_batch, "uids", ()) or ())
+    if (
+        uids != (snapshot.owner_uid,)
+        or _qwen4_language_model(gen_batch.model) is not snapshot.language_model
+    ):
+        return False
+    live_cache_ids = {
+        id(cache) for cache in _iter_mtp_cache_leaves(gen_batch.prompt_cache)
+    }
+    if any(
+        id(entry.cache) not in live_cache_ids
+        for entry in (*snapshot.recurrent, *snapshot.qsa)
+    ):
+        return False
+    if _qwen4_target_offset(gen_batch.prompt_cache) != expected:
+        return False
+    for qsa in snapshot.qsa:
+        if _qwen4_qsa_offsets(qsa.cache) != (expected, expected):
+            return False
+        keys = getattr(qsa.cache, "index_keys", None)
+        positions = getattr(qsa.cache, "index_position_ids", None)
+        if (
+            keys is None
+            or positions is None
+            or int(keys.shape[1]) != expected
+            or int(positions.shape[-1]) != expected
+        ):
+            return False
+        if qsa.has_pooled_state:
+            pooled_keys = getattr(qsa.cache, "_pooled_index_keys", None)
+            pooled_offset = int(
+                getattr(qsa.cache, "_pooled_index_offset", 0) or 0
+            )
+            pooled_ratio = getattr(qsa.cache, "_pooled_index_ratio", None)
+            pooled_tag = getattr(qsa.cache, "_pooled_index_tag", None)
+            if pooled_keys is None:
+                if (
+                    expected >= _QWEN4_SEQUENTIAL_POOLED_REQUIRED_TOKENS
+                    or pooled_offset != 0
+                    or pooled_ratio is not None
+                    or pooled_tag is not None
+                ):
+                    return False
+            elif (
+                type(pooled_ratio) is not int
+                or pooled_ratio <= 0
+                or pooled_tag is None
+                or pooled_offset != expected // pooled_ratio
+                or pooled_offset > int(pooled_keys.shape[1])
+            ):
+                return False
+    for recurrent in snapshot.recurrent:
+        if recurrent.token_count is not None and getattr(
+            recurrent.cache,
+            "_token_count",
+            None,
+        ) != expected:
+            return False
+        state = getattr(recurrent.cache, "state", None)
+        if not isinstance(state, (list, tuple)) or len(state) < 2:
+            return False
+        for index, value in enumerate(state):
+            if index < 2 and value is None:
+                return False
+            if value is not None and (
+                getattr(value, "ndim", 0) < 1 or value.shape[0] != 1
+            ):
+                return False
+    return True
+
+
+def _restore_qwen4_sequential_base(
+    gen_batch: Any,
+    state: _MtpState,
+    snapshot: _Qwen4SequentialBaseSnapshot,
+    *,
+    accepted_current: int,
+) -> bool:
+    """Restore one live scalar-verifier prefix to its detached base."""
+
+    current = snapshot.base_offset + int(accepted_current) + 1
+    if not _qwen4_sequential_prefix_is_exact(
+        gen_batch,
+        snapshot,
+        accepted=accepted_current,
+    ):
+        return False
+    try:
+        # Preflight every suffix before mutating any cache object.
+        for qsa in snapshot.qsa:
+            if _qwen4_qsa_offsets(qsa.cache) != (current, current):
+                return False
+        for qsa in snapshot.qsa:
+            qsa.cache.keys = qsa.keys_backing
+            qsa.cache.values = qsa.values_backing
+            qsa.cache.offset = qsa.offset
+            if qsa.private_index_backing:
+                qsa.cache._index_keys = qsa.index_keys_backing
+                qsa.cache._index_position_ids = qsa.index_positions_backing
+                qsa.cache._index_offset = qsa.index_offset
+            else:
+                qsa.cache.index_keys = qsa.index_keys_backing
+                qsa.cache.index_position_ids = qsa.index_positions_backing
+                qsa.cache.index_offset = qsa.index_offset
+            if qsa.has_pooled_state:
+                qsa.cache._pooled_index_keys = qsa.pooled_keys
+                qsa.cache._pooled_index_offset = qsa.pooled_offset
+                qsa.cache._pooled_index_ratio = qsa.pooled_ratio
+                qsa.cache._pooled_index_tag = qsa.pooled_tag
+            if qsa.index_capacity_managed is not None:
+                qsa.cache._index_capacity_managed = qsa.index_capacity_managed
+            if qsa.geometric_capacity_managed is not None:
+                qsa.cache._geometric_capacity_managed = (
+                    qsa.geometric_capacity_managed
+                )
+            qsa.cache._omlx_text_position_ids_qualified = (
+                qsa.text_positions_qualified
+            )
+
+        for recurrent in snapshot.recurrent:
+            inner = (
+                vars(recurrent.cache).get("_inner")
+                if type(recurrent.cache).__name__ == "SizedArraysCache"
+                else recurrent.cache
+            )
+            inner.state = list(recurrent.state)
+            for name, value in recurrent.metadata:
+                setattr(inner, name, value)
+            if recurrent.token_count is not None:
+                recurrent.cache._token_count = recurrent.token_count
+
+        snapshot.language_model._position_ids = snapshot.position_ids
+        snapshot.language_model._rope_deltas = snapshot.rope_deltas
+        _clear_rollback(gen_batch.prompt_cache)
+    except Exception as exc:
+        logger.warning("Qwen4 sequential base restore failed: %s", exc)
+        return False
+
+    if any(
+        _qwen4_qsa_offsets(qsa.cache)
+        != (snapshot.base_offset, snapshot.base_offset)
+        for qsa in snapshot.qsa
+    ):
+        return False
+    if not _qwen4_reconcile_sized_recurrent_timeline(
+        gen_batch.prompt_cache,
+        expected=snapshot.base_offset,
+        allowed_current={snapshot.base_offset},
+    ):
+        return False
+    return _set_qwen4_target_expected_offset(
+        state,
+        gen_batch.prompt_cache,
+        snapshot.base_offset,
+    )
+
+
+def _restore_qwen4_sequential_partial_forward(
+    gen_batch: Any,
+    state: _MtpState,
+    snapshot: _Qwen4SequentialBaseSnapshot,
+    *,
+    max_width: int,
+) -> bool:
+    """Restore a base even when a failed scalar row left mixed layer epochs."""
+
+    if max_width <= 0:
+        return False
+    uids = tuple(getattr(gen_batch, "uids", ()) or ())
+    live_cache_ids = {
+        id(cache) for cache in _iter_mtp_cache_leaves(gen_batch.prompt_cache)
+    }
+    if (
+        uids != (snapshot.owner_uid,)
+        or _qwen4_language_model(gen_batch.model) is not snapshot.language_model
+        or any(
+            id(entry.cache) not in live_cache_ids
+            for entry in (*snapshot.recurrent, *snapshot.qsa)
+        )
+    ):
+        return False
+    upper = snapshot.base_offset + int(max_width)
+    try:
+        # Per-leaf preflight is deliberately independent: a model exception can
+        # leave early QSA layers one row ahead of later layers, making the
+        # uniform target-offset helper unreadable even though every suffix is
+        # still bounded and restorable.
+        for qsa in snapshot.qsa:
+            offsets = _qwen4_qsa_offsets(qsa.cache)
+            if offsets is None:
+                return False
+            kv_offset, index_offset = offsets
+            if not (
+                snapshot.base_offset <= kv_offset <= upper
+                and snapshot.base_offset <= index_offset <= upper
+            ):
+                return False
+
+        for qsa in snapshot.qsa:
+            qsa.cache.keys = qsa.keys_backing
+            qsa.cache.values = qsa.values_backing
+            qsa.cache.offset = qsa.offset
+            if qsa.private_index_backing:
+                qsa.cache._index_keys = qsa.index_keys_backing
+                qsa.cache._index_position_ids = qsa.index_positions_backing
+                qsa.cache._index_offset = qsa.index_offset
+            else:
+                qsa.cache.index_keys = qsa.index_keys_backing
+                qsa.cache.index_position_ids = qsa.index_positions_backing
+                qsa.cache.index_offset = qsa.index_offset
+            if qsa.has_pooled_state:
+                qsa.cache._pooled_index_keys = qsa.pooled_keys
+                qsa.cache._pooled_index_offset = qsa.pooled_offset
+                qsa.cache._pooled_index_ratio = qsa.pooled_ratio
+                qsa.cache._pooled_index_tag = qsa.pooled_tag
+            if qsa.index_capacity_managed is not None:
+                qsa.cache._index_capacity_managed = qsa.index_capacity_managed
+            if qsa.geometric_capacity_managed is not None:
+                qsa.cache._geometric_capacity_managed = (
+                    qsa.geometric_capacity_managed
+                )
+            qsa.cache._omlx_text_position_ids_qualified = (
+                qsa.text_positions_qualified
+            )
+
+        for recurrent in snapshot.recurrent:
+            inner = (
+                vars(recurrent.cache).get("_inner")
+                if type(recurrent.cache).__name__ == "SizedArraysCache"
+                else recurrent.cache
+            )
+            inner.state = list(recurrent.state)
+            for name, value in recurrent.metadata:
+                setattr(inner, name, value)
+            if recurrent.token_count is not None:
+                recurrent.cache._token_count = recurrent.token_count
+        snapshot.language_model._position_ids = snapshot.position_ids
+        snapshot.language_model._rope_deltas = snapshot.rope_deltas
+        _clear_rollback(gen_batch.prompt_cache)
+    except Exception as exc:
+        logger.error("Qwen4 partial sequential restore failed: %s", exc)
+        return False
+
+    if any(
+        _qwen4_qsa_offsets(qsa.cache)
+        != (snapshot.base_offset, snapshot.base_offset)
+        for qsa in snapshot.qsa
+    ):
+        return False
+    if not _qwen4_reconcile_sized_recurrent_timeline(
+        gen_batch.prompt_cache,
+        expected=snapshot.base_offset,
+        allowed_current={snapshot.base_offset},
+    ):
+        return False
+    return _set_qwen4_target_expected_offset(
+        state,
+        gen_batch.prompt_cache,
+        snapshot.base_offset,
+    )
+
+
+def _replay_qwen4_sequential_prefix(
+    gen_batch: Any,
+    state: _MtpState,
+    snapshot: _Qwen4SequentialBaseSnapshot,
+    token_ids: Tuple[int, ...],
+) -> Any:
+    """Commit an exact width-one target prefix from a restored base."""
+
+    import mlx.core as mx
+
+    if not token_ids:
+        raise _MtpStepFallback("Qwen4 sequential replay prefix is empty")
+    hidden_rows = []
+    _set_singleton_mrope_delta(gen_batch)
+    for token_id in token_ids:
+        token = mx.array([[int(token_id)]], dtype=mx.uint32)
+        logits, hidden, _ = _call_backbone(
+            gen_batch.model,
+            token,
+            gen_batch.prompt_cache,
+            n_confirmed=0,
+        )
+        if hidden is None or hidden.ndim < 3 or hidden.shape[1] != 1:
+            raise _MtpStepFallback(
+                "Qwen4 sequential replay did not return one raw hidden row"
+            )
+        mx.eval(
+            logits,
+            hidden,
+            *[cache.state for cache in gen_batch.prompt_cache],
+        )
+        _clear_rollback(gen_batch.prompt_cache)
+        hidden_rows.append(hidden)
+
+    accepted = len(token_ids) - 1
+    expected = snapshot.base_offset + len(token_ids)
+    if not _qwen4_reconcile_sized_recurrent_timeline(
+        gen_batch.prompt_cache,
+        expected=expected,
+        allowed_current={expected},
+    ) or not _set_qwen4_target_expected_offset(
+        state,
+        gen_batch.prompt_cache,
+        expected,
+    ):
+        raise _MtpStepFallback(
+            "Qwen4 sequential replay target timeline is not exact"
+        )
+    if not _qwen4_sequential_prefix_is_exact(
+        gen_batch,
+        snapshot,
+        accepted=accepted,
+    ):
+        raise _MtpStepFallback(
+            "Qwen4 sequential replay cache proof failed"
+        )
+    return mx.concatenate(hidden_rows, axis=1)
+
+
+def _select_qwen4_sequential_prefix(
+    gen_batch: Any,
+    state: _MtpState,
+    snapshot: _Qwen4SequentialBaseSnapshot,
+    *,
+    current_accepted: int,
+    target_input_ids: Tuple[int, ...],
+    accepted: int,
+) -> Any:
+    """Restore the base and replay next_main plus ``accepted`` drafts."""
+
+    if accepted < 0 or accepted >= len(target_input_ids):
+        raise _MtpStepFallback("Qwen4 sequential accepted prefix is invalid")
+    if not _restore_qwen4_sequential_base(
+        gen_batch,
+        state,
+        snapshot,
+        accepted_current=current_accepted,
+    ):
+        raise _MtpStepFallback("Qwen4 sequential base restore was not exact")
+    return _replay_qwen4_sequential_prefix(
+        gen_batch,
+        state,
+        snapshot,
+        target_input_ids[: accepted + 1],
+    )
+
+
 def _capture_qwen4_verify_snapshots(
     prompt_cache: List[Any],
     *,
@@ -2784,6 +3589,62 @@ def _qwen4_rollback_full_verify_to(
         return False
     pending.committed = True
     return True
+
+
+def _qwen4_commit_sequential_verify_to(
+    gen_batch: Any,
+    state: _MtpState,
+    pending: _MtpPendingCommit,
+    *,
+    accepted: int,
+) -> bool:
+    """Select one prefix from a canonical live scalar-verifier transaction."""
+
+    snapshot = pending.sequential_base
+    if (
+        snapshot is None
+        or snapshot.base_offset != pending.target_base_offset
+        or len(pending.target_input_ids) != pending.verify_width
+        or pending.verify_width < 2
+        or not 0 <= pending.accepted <= pending.verify_width - 1
+        or accepted < 0
+        or accepted > pending.accepted
+        or len(pending.target_input_ids) < accepted + 1
+    ):
+        return False
+    try:
+        if accepted < pending.accepted:
+            _select_qwen4_sequential_prefix(
+                gen_batch,
+                state,
+                snapshot,
+                current_accepted=pending.accepted,
+                target_input_ids=pending.target_input_ids,
+                accepted=accepted,
+            )
+        elif not _qwen4_sequential_prefix_is_exact(
+            gen_batch,
+            snapshot,
+            accepted=accepted,
+        ):
+            return False
+        expected = pending.target_base_offset + accepted + 1
+        if not _qwen4_reconcile_sized_recurrent_timeline(
+            gen_batch.prompt_cache,
+            expected=expected,
+            allowed_current={expected},
+        ) or not _set_qwen4_target_expected_offset(
+            state,
+            gen_batch.prompt_cache,
+            expected,
+        ):
+            return False
+        _clear_rollback(gen_batch.prompt_cache)
+        pending.committed = True
+        return True
+    except Exception as exc:
+        logger.warning("Qwen4 sequential target commit failed: %s", exc)
+        return False
 
 
 def _qwen4_materialize_target_tail(
@@ -5234,7 +6095,32 @@ def _qwen4_post_emit_transaction(
 
     exact = True
     if terminal:
-        if pending.kind == "verify":
+        if pending.kind == "verify-sequential":
+            if position < pending.accepted:
+                # The live cache currently owns the complete accepted prefix.
+                # An earlier parser/text stop selects a shorter prefix by
+                # restoring the detached recurrent/QSA base and replaying only
+                # next_main plus the terminal accepted drafts.
+                exact = _qwen4_commit_sequential_verify_to(
+                    gen_batch,
+                    state,
+                    pending,
+                    accepted=position + 1,
+                )
+            elif position == pending.accepted:
+                exact = _qwen4_commit_sequential_verify_to(
+                    gen_batch,
+                    state,
+                    pending,
+                    accepted=pending.accepted,
+                ) and _qwen4_materialize_target_tail(
+                    gen_batch,
+                    state,
+                    token_id,
+                )
+            else:
+                exact = False
+        elif pending.kind == "verify":
             if position < pending.accepted:
                 # Terminal on accepted draft j: retain confirmed next_main and
                 # exactly drafts d1..d(j+1), discarding every later verified
@@ -5330,7 +6216,21 @@ def _qwen4_post_emit_transaction(
     if state.queue:
         return _MtpPostEmitResult(handled=True, reason="queue-not-empty")
 
-    if pending.kind == "verify":
+    if pending.kind == "verify-sequential":
+        exact = _qwen4_commit_sequential_verify_to(
+            gen_batch,
+            state,
+            pending,
+            accepted=pending.accepted,
+        )
+        state.pending_commit = None
+        if exact and pending.deferred_boundary:
+            exact = _materialize_qwen4_deferred_boundary(
+                gen_batch,
+                state,
+                token_id,
+            )
+    elif pending.kind == "verify":
         exact = _qwen4_rollback_full_verify_to(
             gen_batch,
             state,
@@ -5567,6 +6467,456 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
     return _run_verify_cycle_legacy(gen_batch, state)
 
 
+def _qwen4_sequential_cycle_eligible(
+    gen_batch: Any,
+    *,
+    k: int,
+    is_greedy: bool,
+    two_phase_qwen4: bool,
+) -> bool:
+    """Admit only the initial lossless-oracle contract."""
+
+    sampler = _resolve_sampler(gen_batch)
+    try:
+        explicit_greedy = bool(
+            sampler is not None
+            and (
+                getattr(sampler, "_omlx_greedy", False) is True
+                or (
+                    hasattr(sampler, "temp")
+                    and float(getattr(sampler, "temp")) == 0.0
+                )
+            )
+        )
+    except (TypeError, ValueError):
+        explicit_greedy = False
+    compact_qsa = all(
+        type(cache).__name__ != "BatchQSAKVCache"
+        for cache in _iter_mtp_cache_leaves(
+            getattr(gen_batch, "prompt_cache", None) or []
+        )
+    )
+    try:
+        import mlx.core as mx
+
+        single_device = int(mx.distributed.init().size()) == 1
+    except Exception:
+        single_device = False
+    return bool(
+        _qwen4_sequential_verify_enabled()
+        and two_phase_qwen4
+        and is_greedy
+        and explicit_greedy
+        and single_device
+        and compact_qsa
+        and 1 <= k <= 8
+        and _is_qwen4_exp_model(getattr(gen_batch, "model", None))
+        and _mtp_vocab_coordinator(gen_batch) is None
+    )
+
+
+def _run_qwen4_sequential_target(
+    gen_batch: Any,
+    state: _MtpState,
+    *,
+    k: int,
+    target_base_offset: int,
+    sampler: Any,
+    procs: Any,
+) -> _Qwen4SequentialVerifyResult:
+    """Run canonical width-one target calls until reject or full accept."""
+
+    import mlx.core as mx
+
+    packed = mx.concatenate([state.next_main, state.drafts]).tolist()
+    target_input_ids = tuple(int(value) for value in packed)
+    draft_ids = tuple(target_input_ids[1:])
+    if len(target_input_ids) != k + 1 or len(draft_ids) != k:
+        raise _MtpStepFallback("Qwen4 sequential target window is malformed")
+
+    try:
+        snapshot = _capture_qwen4_sequential_base(
+            gen_batch,
+            base_offset=target_base_offset,
+        )
+    except _MtpStepFallback as exc:
+        raise _Qwen4SequentialRecoveredFallback(str(exc)) from exc
+    row_logprobs = []
+    hidden_rows = []
+    processor_snapshots = []
+    target_ids = []
+    accepted = -1
+    emitted_id = -1
+    processor_base_snapshot = _snapshot_qwen4_sequential_processors(procs)
+    token_buffer = gen_batch._token_context[0] if procs is not None else None
+    token_buffer_base_size = (
+        int(getattr(token_buffer, "_size", 0)) if token_buffer is not None else None
+    )
+    try:
+        _set_singleton_mrope_delta(gen_batch)
+        for row, token_id in enumerate(target_input_ids):
+            token = mx.array([[token_id]], dtype=mx.uint32)
+            prev_buf = None
+            if procs is not None:
+                prev_buf = gen_batch._token_context[0].update_and_fetch(
+                    token.reshape(1)
+                )
+            logits, hidden, _ = _call_backbone(
+                gen_batch.model,
+                token,
+                gen_batch.prompt_cache,
+                n_confirmed=0,
+            )
+            if hidden is None or hidden.ndim < 3 or hidden.shape[1] != 1:
+                raise _MtpStepFallback(
+                    "Qwen4 sequential target did not return one raw hidden row"
+                )
+            row_logits = _mtp_prepare_logits(gen_batch, logits[:, -1, :])
+            row_logits = _apply_processors(procs, prev_buf, row_logits)
+            lp_2d = _mtp_logprobs(gen_batch, row_logits)
+            target = _ensure_uint32(
+                _mtp_sample(gen_batch, sampler, lp_2d).reshape(1)
+            )
+            mx.eval(
+                target,
+                hidden,
+                *[cache.state for cache in gen_batch.prompt_cache],
+            )
+            _clear_rollback(gen_batch.prompt_cache)
+            target_id = int(target.tolist()[0])
+            target_ids.append(target_id)
+            row_logprobs.append(lp_2d.squeeze(0))
+            hidden_rows.append(hidden)
+            processor_snapshots.append(
+                _snapshot_qwen4_sequential_processors(procs)
+            )
+
+            if row == k:
+                accepted = k
+                emitted_id = target_id
+                break
+            if target_id != draft_ids[row]:
+                accepted = row
+                emitted_id = target_id
+                break
+
+        if accepted < 0 or emitted_id < 0:
+            raise _MtpStepFallback("Qwen4 sequential target made no decision")
+        expected = target_base_offset + accepted + 1
+        if not _qwen4_reconcile_sized_recurrent_timeline(
+            gen_batch.prompt_cache,
+            expected=expected,
+            allowed_current={expected},
+        ) or not _set_qwen4_target_expected_offset(
+            state,
+            gen_batch.prompt_cache,
+            expected,
+        ):
+            raise _MtpStepFallback(
+                "Qwen4 sequential target timeline is not exact"
+            )
+        if not _qwen4_sequential_prefix_is_exact(
+            gen_batch,
+            snapshot,
+            accepted=accepted,
+        ):
+            raise _MtpStepFallback(
+                "Qwen4 sequential target cache proof failed"
+            )
+    except Exception as exc:
+        processors_restored = _restore_qwen4_sequential_processors(
+            procs,
+            processor_base_snapshot,
+        )
+        if token_buffer is not None and token_buffer_base_size is not None:
+            token_buffer._size = token_buffer_base_size
+        restored = _restore_qwen4_sequential_partial_forward(
+            gen_batch,
+            state,
+            snapshot,
+            max_width=k + 1,
+        )
+        if not processors_restored or not restored:
+            raise RuntimeError(
+                "Qwen4 sequential target failed with an unprovable live cache"
+            ) from exc
+        raise _Qwen4SequentialRecoveredFallback(
+            f"Qwen4 sequential target failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    return _Qwen4SequentialVerifyResult(
+        snapshot=snapshot,
+        target_input_ids=target_input_ids,
+        draft_ids=draft_ids,
+        accepted=accepted,
+        emitted_id=emitted_id,
+        emitted_logprobs=row_logprobs[accepted],
+        combined_logprobs=mx.stack(row_logprobs),
+        hidden=mx.concatenate(hidden_rows, axis=1),
+        processor_base_snapshot=processor_base_snapshot,
+        token_buffer_base_size=token_buffer_base_size,
+        processor_snapshots=tuple(processor_snapshots),
+        target_ids=tuple(target_ids),
+    )
+
+
+def _abort_qwen4_sequential_cycle(
+    gen_batch: Any,
+    state: _MtpState,
+    result: _Qwen4SequentialVerifyResult,
+    *,
+    k: int,
+    procs: Any,
+) -> None:
+    """Restore the cycle base before handing a post-target failure outward."""
+
+    processors_restored = _restore_qwen4_sequential_processors(
+        procs,
+        result.processor_base_snapshot,
+    )
+    if procs is not None and result.token_buffer_base_size is not None:
+        gen_batch._token_context[0]._size = result.token_buffer_base_size
+    state.queue.clear()
+    state.pending_commit = None
+    state.pending_emit = None
+    cache_restored = _restore_qwen4_sequential_partial_forward(
+        gen_batch,
+        state,
+        result.snapshot,
+        max_width=k + 1,
+    )
+    if not processors_restored or not cache_restored:
+        raise RuntimeError(
+            "Qwen4 sequential post-target failure left an unprovable cache"
+        )
+
+
+def _run_qwen4_sequential_verify_cycle(
+    gen_batch: Any,
+    state: _MtpState,
+    *,
+    k: int,
+    target_base_offset: int,
+    head_base_offset: int,
+    cycle_t0: float,
+    sampler: Any,
+    procs: Any,
+) -> None:
+    """Complete one Qwen4 cycle using the canonical scalar target oracle."""
+
+    import time
+
+    import mlx.core as mx
+
+    t0 = time.perf_counter()
+    result = _run_qwen4_sequential_target(
+        gen_batch,
+        state,
+        k=k,
+        target_base_offset=target_base_offset,
+        sampler=sampler,
+        procs=procs,
+    )
+    state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
+    t0 = time.perf_counter()
+
+    raw_accepted = result.accepted
+    m = raw_accepted
+    draft_ids = list(result.draft_ids)
+    emit_last_id = result.emitted_id
+    emit_last_lp = result.emitted_logprobs
+    token_buffer = gen_batch._token_context[0] if procs is not None else None
+    try:
+        clamp = getattr(gen_batch.model, "mtp_clamp_accept", None)
+        if m < k and callable(clamp):
+            clamped = int(clamp(gen_batch.prompt_cache, m, k))
+            if not 0 <= clamped <= m:
+                raise _Qwen4SequentialHardFailure(
+                    "Qwen4 sequential clamp returned an invalid prefix"
+                )
+            if clamped < m:
+                m = clamped
+                emit_last_id = draft_ids[m]
+                emit_last_lp = result.combined_logprobs[m]
+
+        align = int(getattr(gen_batch.model, "_omlx_mtp_commit_align", 0) or 0)
+        emitted = len(gen_batch.tokens[0])
+        to_boundary = (
+            ((emitted // align) + 1) * align - emitted if align > 0 else 0
+        )
+        if 0 < to_boundary < m:
+            m = to_boundary
+            if callable(clamp):
+                clamped = int(clamp(gen_batch.prompt_cache, m, k))
+                if not 0 <= clamped <= m:
+                    raise _Qwen4SequentialHardFailure(
+                        "Qwen4 sequential boundary clamp is invalid"
+                    )
+                if clamped < m:
+                    m = clamped
+            emit_last_id = draft_ids[m]
+            emit_last_lp = result.combined_logprobs[m]
+
+        hidden = result.hidden
+        if m < raw_accepted:
+            hidden = _select_qwen4_sequential_prefix(
+                gen_batch,
+                state,
+                result.snapshot,
+                current_accepted=raw_accepted,
+                target_input_ids=result.target_input_ids,
+                accepted=m,
+            )
+            if procs is not None:
+                if not _restore_qwen4_sequential_processors(
+                    procs,
+                    result.processor_snapshots[m],
+                ):
+                    raise _MtpStepFallback(
+                        "Qwen4 sequential clamped processor restore failed"
+                    )
+                _trim_token_buffer(gen_batch, raw_accepted - m)
+
+        materialize_boundary_emit = (
+            align > 0 and to_boundary > 0 and to_boundary == m + 1
+        )
+    except Exception as exc:
+        processors_restored = _restore_qwen4_sequential_processors(
+            procs,
+            result.processor_base_snapshot,
+        )
+        if token_buffer is not None and result.token_buffer_base_size is not None:
+            token_buffer._size = result.token_buffer_base_size
+        restored = _restore_qwen4_sequential_partial_forward(
+            gen_batch,
+            state,
+            result.snapshot,
+            max_width=k + 1,
+        )
+        if not processors_restored or not restored:
+            raise RuntimeError(
+                "Qwen4 sequential prefix selection failed with an unprovable cache"
+            ) from exc
+        if isinstance(exc, _Qwen4SequentialHardFailure):
+            raise
+        raise _Qwen4SequentialRecoveredFallback(
+            f"Qwen4 sequential prefix selection failed: {exc}"
+        ) from exc
+
+    if not _qwen4_sequential_prefix_is_exact(
+        gen_batch,
+        result.snapshot,
+        accepted=m,
+    ):
+        _abort_qwen4_sequential_cycle(
+            gen_batch,
+            state,
+            result,
+            k=k,
+            procs=procs,
+        )
+        raise _Qwen4SequentialRecoveredFallback(
+            "Qwen4 sequential accepted-prefix proof failed before staging"
+        )
+
+    state.stats.cycles += 1
+    state.stats.physical_drafts += k
+    if len(state.stats.depth_drafted) < state.depth:
+        pad = state.depth - len(state.stats.depth_drafted)
+        state.stats.depth_drafted.extend([0] * pad)
+        state.stats.depth_accepted.extend([0] * pad)
+    for row in range(k):
+        state.stats.depth_drafted[row] += 1
+        if row < m:
+            state.stats.depth_accepted[row] += 1
+        else:
+            break
+    state.stats.accepts += m
+    if m < k:
+        state.stats.rejects += 1
+    state.stats.sample_ms += (time.perf_counter() - t0) * 1000
+
+    try:
+        t0 = time.perf_counter()
+        for row in range(m):
+            state.queue.append(
+                (
+                    draft_ids[row],
+                    result.combined_logprobs[row],
+                    "draft",
+                )
+            )
+        final_source = "bonus" if m == k else "verify"
+        state.queue.append((emit_last_id, emit_last_lp, final_source))
+
+        sources = tuple(["draft"] * m + [final_source])
+        tokens = tuple(draft_ids[:m] + [emit_last_id])
+        state.pending_commit = _MtpPendingCommit(
+            kind="verify-sequential",
+            target_base_offset=target_base_offset,
+            head_base_offset=head_base_offset,
+            verify_width=k + 1,
+            accepted=m,
+            source_map=sources,
+            token_map=tokens,
+            deferred_boundary=materialize_boundary_emit,
+            final_source=final_source,
+            sequential_base=result.snapshot,
+            target_input_ids=result.target_input_ids,
+        )
+        state.stats.cache_ops_ms += (time.perf_counter() - t0) * 1000
+
+        t0 = time.perf_counter()
+        if not state.head_clone:
+            _trim_committed_mtp_head(state)
+        committed = mx.array(
+            draft_ids[:m] + [emit_last_id],
+            dtype=mx.uint32,
+        )
+        next_main = committed[-1:]
+        prev_buf = None
+        if procs is not None:
+            prev_buf = gen_batch._token_context[0].tokens
+        _chain_next_drafts(
+            gen_batch,
+            state,
+            hidden[:, : m + 1],
+            committed,
+            prev_buf,
+        )
+        state.next_main = next_main
+        state.pending_commit.head_committed_offset = int(state.hist_offset)
+        state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
+
+        if state.controller is not None:
+            was_warmup = bool(state.controller._warmup)
+            keepalive = bool(getattr(state.mtp_cache, "fold_keepalive", False))
+            if keepalive:
+                state.mtp_cache.fold_keepalive = False
+            state.controller.observe(
+                k,
+                m,
+                (time.perf_counter() - cycle_t0) * 1000,
+                time_sample=not keepalive,
+            )
+            _maybe_finish_mtp_reentry_probe(
+                gen_batch,
+                state,
+                was_warmup=was_warmup,
+            )
+    except Exception as exc:
+        _abort_qwen4_sequential_cycle(
+            gen_batch,
+            state,
+            result,
+            k=k,
+            procs=procs,
+        )
+        raise _MtpStepFallback(
+            f"Qwen4 sequential post-target staging failed: {exc}"
+        ) from exc
+
+
 def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
     """One depth-k verify cycle.
 
@@ -5607,6 +6957,34 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         if target_base_offset is None:
             raise _MtpStepFallback(
                 "Qwen4 verifier target cache has no uniform base offset"
+            )
+
+    if _qwen4_sequential_cycle_eligible(
+        gen_batch,
+        k=k,
+        is_greedy=is_greedy,
+        two_phase_qwen4=two_phase_qwen4,
+    ):
+        assert target_base_offset is not None
+        try:
+            return _run_qwen4_sequential_verify_cycle(
+                gen_batch,
+                state,
+                k=k,
+                target_base_offset=target_base_offset,
+                head_base_offset=head_base_offset,
+                cycle_t0=cycle_t0,
+                sampler=sampler,
+                procs=procs,
+            )
+        except _Qwen4SequentialRecoveredFallback as exc:
+            # The scalar attempt restores target/model/processor state before
+            # raising this recoverable signal. Continue with the established
+            # wide verifier in the same cycle; an unprovable restore raises a
+            # hard RuntimeError instead and must never reuse the live cache.
+            logger.debug(
+                "Qwen4 sequential oracle fell back to wide verification: %s",
+                exc,
             )
 
     inputs = mx.concatenate([state.next_main, state.drafts])  # (k+1,)
