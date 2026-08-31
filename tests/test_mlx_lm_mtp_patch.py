@@ -1097,6 +1097,33 @@ class TestBatchGeneratorDispatch:
         finally:
             set_mtp_active(prior_active)
 
+    def test_force_standard_env_disables_mtp_without_mutating_model(
+        self, monkeypatch
+    ):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        model = SimpleNamespace(
+            mtp=object(),
+            mtp_forward=lambda *args, **kwargs: None,
+            _omlx_mtp_decode_enabled=True,
+        )
+        gen_batch = SimpleNamespace(
+            model=model,
+            uids=[0],
+            logits_processors=None,
+        )
+        mtp_module = model.mtp
+        mtp_forward = model.mtp_forward
+
+        monkeypatch.delenv("OMLX_MTP_FORCE_STANDARD", raising=False)
+        assert batch_generator._mtp_common_eligible(gen_batch) is True
+
+        monkeypatch.setenv("OMLX_MTP_FORCE_STANDARD", "1")
+        assert batch_generator._mtp_common_eligible(gen_batch) is False
+        assert model.mtp is mtp_module
+        assert model.mtp_forward is mtp_forward
+        assert model._omlx_mtp_decode_enabled is True
+
     def test_decode_marker_is_found_on_wrapped_language_model(self):
         from omlx.patches.mlx_lm_mtp import batch_generator
 

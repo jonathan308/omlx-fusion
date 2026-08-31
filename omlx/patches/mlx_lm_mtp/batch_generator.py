@@ -668,7 +668,15 @@ def _singleton_mtp_handoff_ready(gen_batch: Any) -> bool:
     return len(state.queue) <= 1
 
 
+_MTP_FORCE_STANDARD_ENV = "OMLX_MTP_FORCE_STANDARD"
+
+
 def _mtp_common_eligible(gen_batch: Any) -> bool:
+    # Diagnostic only: preserve the loaded MTP module and model marker while
+    # routing decode through the standard target path.  This isolates
+    # load-time model changes from MTP execution changes in physical A/Bs.
+    if os.environ.get(_MTP_FORCE_STANDARD_ENV, "").strip() == "1":
+        return False
     park_state = _mtp_park_state_for_batch(gen_batch)
     if park_state is not None:
         uids = getattr(gen_batch, "uids", None) or ()
