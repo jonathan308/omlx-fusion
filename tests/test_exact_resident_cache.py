@@ -139,6 +139,18 @@ def test_exact_resident_enforces_byte_budget_and_uint32_tokens():
     assert tier.stats()["oversize_rejections"] == 1
 
 
+def test_exact_resident_stats_report_largest_resident_token_count():
+    tier = ExactResidentPrefixCache(max_entries=3, max_bytes=1_000)
+    assert tier.put([1, 2], [object()], cache_nbytes=10)
+    assert tier.put([3, 4, 5, 6], [object()], cache_nbytes=10)
+
+    assert tier.stats()["max_token_count"] == 4
+    assert tier.acquire_prefix([3, 4, 5, 6, 7]) is not None
+    assert tier.stats()["max_token_count"] == 2
+    tier.clear()
+    assert tier.stats()["max_token_count"] == 0
+
+
 def test_disabled_exact_resident_reports_zero_effective_memory_cap():
     tier = ExactResidentPrefixCache(max_entries=0, max_bytes=8 * 1024**3)
 

@@ -399,14 +399,30 @@ class EngineCore:
     def _resident_cache_tokens(self) -> int:
         """Best-effort current prefix-cache size, read on the MLX lane."""
 
+        cache_tokens = 0
         prefix_cache = getattr(self.scheduler, "block_aware_cache", None)
         paged_cache = getattr(prefix_cache, "paged_cache", None)
         try:
             stats = getattr(paged_cache, "stats", None)
-            return max(0, int(getattr(stats, "total_tokens_cached", 0) or 0))
+            cache_tokens = max(
+                cache_tokens,
+                int(getattr(stats, "total_tokens_cached", 0) or 0),
+            )
         except Exception:
             logger.debug("Unable to read cache size for keepwarm", exc_info=True)
-            return 0
+        exact_stats = getattr(self.scheduler, "_exact_resident_stats", None)
+        if callable(exact_stats):
+            try:
+                cache_tokens = max(
+                    cache_tokens,
+                    int(exact_stats().get("max_token_count", 0) or 0),
+                )
+            except Exception:
+                logger.debug(
+                    "Unable to read exact-resident size for keepwarm",
+                    exc_info=True,
+                )
+        return max(0, cache_tokens)
 
     def _run_keepwarm_action(self, action: KeepwarmAction) -> bool:
         """Run one touch on this engine's existing serialized MLX lane."""

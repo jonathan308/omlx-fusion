@@ -159,6 +159,10 @@ class ExactResidentPrefixCache:
             return {
                 "entries": len(self._entries),
                 "size_bytes": self._size_bytes,
+                "max_token_count": max(
+                    (len(entry.tokens) for entry in self._entries.values()),
+                    default=0,
+                ),
                 "max_entries": self.max_entries,
                 "max_bytes": self.max_bytes if self.max_entries > 0 else 0,
                 "hits": self.hits,
