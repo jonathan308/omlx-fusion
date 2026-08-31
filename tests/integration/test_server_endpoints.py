@@ -386,6 +386,8 @@ class TestHealthEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "healthy"
+        assert isinstance(data["process_id"], int)
+        assert data["process_id"] > 0
 
     def test_health_contains_required_fields(self, client):
         """Test that health response contains required fields."""

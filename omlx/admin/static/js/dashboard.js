@@ -8887,6 +8887,22 @@
                     message: window.t('settings.server.restart_status_sending'),
                 };
 
+                // Capture the serving process before POST. launchd can bounce
+                // a small unloaded server entirely between 1s health polls;
+                // a changed PID proves the restart even if no failed probe was
+                // observed. A missing PID simply retains the down→up gate.
+                let previousProcessId = null;
+                try {
+                    const health = await fetch('/health', { cache: 'no-store' });
+                    if (health.ok) {
+                        const healthData = await health.json();
+                        const parsed = Number(healthData?.process_id);
+                        if (Number.isInteger(parsed) && parsed > 0) {
+                            previousProcessId = parsed;
+                        }
+                    }
+                } catch (e) { /* down→up polling remains available */ }
+
                 let response;
                 try {
                     response = await fetch('/admin/api/server/restart', { method: 'POST' });
@@ -8899,7 +8915,7 @@
                         status: 'waiting',
                         message: window.t('settings.server.restart_status_waiting'),
                     };
-                    this._restartServerPoll();
+                    this._restartServerPoll(previousProcessId);
                     return;
                 }
 
@@ -8931,10 +8947,10 @@
                     status: 'waiting',
                     message: window.t('settings.server.restart_status_waiting'),
                 };
-                this._restartServerPoll();
+                this._restartServerPoll(previousProcessId);
             },
 
-            _restartServerPoll() {
+            _restartServerPoll(previousProcessId = null) {
                 const deadline = Date.now() + 60000;  // 60s max wait
                 let sawDownAt = 0;
                 const tick = async () => {
@@ -8946,9 +8962,17 @@
                         return;
                     }
                     let alive = false;
+                    let processId = null;
                     try {
                         const r = await fetch('/health', { cache: 'no-store' });
                         alive = r.ok;
+                        if (alive) {
+                            const data = await r.json();
+                            const parsed = Number(data?.process_id);
+                            if (Number.isInteger(parsed) && parsed > 0) {
+                                processId = parsed;
+                            }
+                        }
                     } catch (e) {
                         alive = false;
                     }
@@ -8961,9 +8985,13 @@
                         setTimeout(tick, 1000);
                         return;
                     }
-                    // Alive again. If we never observed the down state, the
-                    // restart hasn't actually fired yet — keep polling.
-                    if (!sawDownAt) {
+                    const processChanged = previousProcessId !== null
+                        && processId !== null
+                        && processId !== previousProcessId;
+                    // Alive again. Either an observed down→up transition or a
+                    // changed process ID proves a real restart. Without either,
+                    // the old process may simply still be serving.
+                    if (!sawDownAt && !processChanged) {
                         setTimeout(tick, 1000);
                         return;
                     }

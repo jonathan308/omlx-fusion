@@ -2898,6 +2898,11 @@ async def health(response: Response):
         response.status_code = 503
     return {
         "status": "loading" if loading else "healthy",
+        # A successful supervised restart can be faster than the dashboard's
+        # polling cadence, so clients need a process-generation witness in
+        # addition to a transient connection failure. Extra health fields are
+        # backwards compatible with existing watchdogs.
+        "process_id": os.getpid(),
         "default_model": _server_state.default_model,
         "engine_pool": pool_status,
         "mcp": mcp_info,

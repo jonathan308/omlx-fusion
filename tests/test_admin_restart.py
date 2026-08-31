@@ -65,6 +65,7 @@ class TestRestartServerRoute:
         body = r.json()
         assert body["status"] == "restarting"
         assert body["supervisor"] == "menubar"
+        assert body["process_id"] > 0
         assert body["expected_downtime_seconds"] > 0
         # The handler must schedule the SIGTERM (not invoke it synchronously)
         # and pass a positive delay so FastAPI can flush the 202 first.
@@ -156,7 +157,7 @@ def test_web_restart_persists_form_before_post_and_stops_on_save_failure():
     """Unsaved restart-scoped settings cannot be lost by the Restart button."""
     script = DASHBOARD_JS.read_text(encoding="utf-8")
     restart = script.split("async restartServerStart() {", 1)[1].split(
-        "_restartServerPoll() {", 1
+        "_restartServerPoll(previousProcessId = null) {", 1
     )[0]
 
     save_index = restart.index("const saved = await this.saveGlobalSettings();")
@@ -174,23 +175,24 @@ def test_web_restart_persists_form_before_post_and_stops_on_save_failure():
     assert "return saved;" in save
 
 
-def test_restart_transport_fallback_requires_down_then_up_or_times_out():
-    """An ambiguous dropped 202 polls safely instead of claiming success."""
+def test_restart_poll_accepts_down_up_or_changed_process_and_times_out_otherwise():
+    """Fast launchd bounces cannot be missed between health probes."""
     script = DASHBOARD_JS.read_text(encoding="utf-8")
     restart = script.split("async restartServerStart() {", 1)[1].split(
-        "_restartServerPoll() {", 1
+        "_restartServerPoll(previousProcessId = null) {", 1
     )[0]
     transport_error = restart.split("} catch (err) {", 1)[1].split(
         "if (response.status === 503)", 1
     )[0]
     assert "status: 'waiting'" in transport_error
-    assert "this._restartServerPoll();" in transport_error
+    assert "this._restartServerPoll(previousProcessId);" in transport_error
 
-    poll = script.split("_restartServerPoll() {", 1)[1].split(
+    poll = script.split("_restartServerPoll(previousProcessId = null) {", 1)[1].split(
         "get llmModels()", 1
     )[0]
     assert "const deadline = Date.now() + 60000" in poll
     assert "let sawDownAt = 0" in poll
     assert "if (!alive)" in poll
-    assert "if (!sawDownAt)" in poll
+    assert "processId !== previousProcessId" in poll
+    assert "if (!sawDownAt && !processChanged)" in poll
     assert "settings.server.restart_status_timeout" in poll

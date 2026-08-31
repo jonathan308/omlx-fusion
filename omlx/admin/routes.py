@@ -3731,6 +3731,7 @@ async def restart_server(is_admin: bool = Depends(require_admin)):
     content: dict[str, Any] = {
         "status": "restarting",
         "supervisor": supervisor,
+        "process_id": os.getpid(),
         "expected_downtime_seconds": 7,
     }
     if supervisor_id:
