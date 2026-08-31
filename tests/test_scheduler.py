@@ -6108,9 +6108,26 @@ class TestOutputParserSmoke:
         scheduler.batch_generator.extract_cache.return_value = {
             99: (detached_cache, [1, 2, 3, 11])
         }
+        raw_batch_cache = [
+            SimpleNamespace(
+                offset=mx.array([4]),
+                rollback_state=None,
+                buffer=mx.zeros((8,), dtype=mx.uint8),
+            )
+        ]
 
         responses = [
-            type("Resp", (), {"uid": 99, "token": 11, "finish_reason": None})(),
+            type(
+                "Resp",
+                (),
+                {
+                    "uid": 99,
+                    "token": 11,
+                    "finish_reason": None,
+                    "prompt_cache": raw_batch_cache,
+                    "all_tokens": [1, 2, 3, 11],
+                },
+            )(),
         ]
 
         outputs, finished_ids = scheduler._process_batch_responses(responses)
@@ -6122,6 +6139,7 @@ class TestOutputParserSmoke:
         # token timeline, not the parser-filtered API output.
         assert request._exact_resident_candidate[0] == [1, 2, 3, 11]
         assert request._exact_resident_candidate[1] is detached_cache
+        assert request._exact_resident_candidate[1] is not raw_batch_cache
 
     def test_deepseek_v4_tool_block_end_stops_batch_row(self, mock_model):
         mock_model.config.model_type = "deepseek_v4"

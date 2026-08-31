@@ -11778,23 +11778,28 @@ class Scheduler:
                 # future prompt must match it exactly before reuse.
                 raw_cache = getattr(response, "prompt_cache", None)
                 resident_tokens = getattr(response, "all_tokens", None)
-                resident_cache = raw_cache
-                if (
-                    resident_cache is None
-                    and parser_session is not None
-                    and self.batch_generator is not None
-                ):
+                resident_cache = None
+                if self.batch_generator is not None:
                     try:
+                        # A request admitted from a reconstructed prefix may
+                        # leave ``Response.prompt_cache`` in its one-row
+                        # Batch* representation.  The executable resident tier
+                        # owns a singleton cache tree; normalize through the
+                        # same extraction seam used for parser stops even when
+                        # the response already carries a raw cache.  Keep
+                        # ``raw_cache`` unchanged for the durable block writer.
                         detached = self.batch_generator.extract_cache([response.uid])
                         resident_cache, resident_tokens = detached.get(
                             response.uid, (None, None)
                         )
                     except Exception as exc:
                         logger.debug(
-                            "Could not detach parser-stop resident cache for %s: %s",
+                            "Could not detach singleton resident cache for %s: %s",
                             request_id,
                             exc,
                         )
+                if resident_cache is None:
+                    resident_cache = raw_cache
                 self._stage_exact_resident_cache(
                     request,
                     resident_cache,
