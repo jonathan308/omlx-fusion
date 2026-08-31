@@ -3931,6 +3931,12 @@ class _LockstepAcceptanceDepthController:
         self.max_depth = max(1, int(max_depth))
         self.cur = self.max_depth
         self.cycles = 0
+        # The verify loop shares a small lifecycle interface with the local
+        # adaptive controllers. Lockstep has no calibration sweep and never
+        # parks for performance, but explicit empty/zero state keeps that
+        # common path total rather than relying on controller-specific attrs.
+        self._warmup: List[int] = []
+        self.exit_streak = 0
 
     def observe(
         self,
@@ -3950,6 +3956,12 @@ class _LockstepAcceptanceDepthController:
 
     def should_exit(self) -> bool:
         return False
+
+    def reentry_win_proven(self) -> bool:
+        # Lockstep never performs a cost-based handoff. If an existing parked
+        # row is resumed after switching policies, it can leave cooldown
+        # immediately without a fictitious timing calibration.
+        return True
 
 
 def _new_depth_controller(model: Any, max_depth: int) -> Any:

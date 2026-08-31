@@ -23,6 +23,9 @@ from omlx.patches.mlx_lm_mtp.batch_generator import (
 def test_lockstep_acceptance_controller_has_no_warmup_or_clock_input():
     controller = _LockstepAcceptanceDepthController(5)
     assert controller.cur == 5
+    assert controller._warmup == []
+    assert controller.exit_streak == 0
+    assert controller.reentry_win_proven()
     controller.observe(5, 2, 999999.0)
     assert controller.cur == 3
     controller.observe(3, 3, 0.001)
