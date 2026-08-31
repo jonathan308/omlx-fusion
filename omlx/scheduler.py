@@ -11860,6 +11860,16 @@ class Scheduler:
                         )
                 if resident_cache is None:
                     resident_cache = raw_cache
+                if resident_cache is not None and resident_tokens is None:
+                    # Some GenerationBatch response wrappers expose the exact
+                    # cache list but omit ``all_tokens`` after filtering the
+                    # finished row. The scheduler owns the same cumulative
+                    # token ledger; use it only as a paired fallback and let
+                    # the physical cache-offset validator fail closed if the
+                    # wrapper's timeline is not exact.
+                    resident_tokens = list(request.prompt_token_ids or []) + list(
+                        request.output_token_ids or []
+                    )
                 self._stage_exact_resident_cache(
                     request,
                     resident_cache,
