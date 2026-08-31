@@ -43,6 +43,8 @@ _PLE_RUNTIME_MODE = "resident"
 _HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
 _HC_FUSED_VERIFY_WIDTHS = frozenset({2, 3, 4, 5, 6, 7, 8, 9})
 _QSA_DIRECT_VERIFY_MIN_TOKENS = 32_768
+_QSA_VERIFY_MATCH_DECODE_ENV = "OMLX_QWEN4_VERIFY_MATCH_DECODE_QSA"
+_QSA_VERIFY_MATCH_DECODE_LOGGED = False
 _DECODE_PROFILE_LOCAL = threading.local()
 _DECODE_PROFILE_LOCK = threading.Lock()
 _DECODE_PROFILE_CALLS = 0
@@ -73,6 +75,43 @@ def _tokenwise_ple_verify_enabled() -> bool:
         "yes",
         "on",
     )
+
+
+def _qsa_verify_match_decode_enabled() -> bool:
+    """Whether target verification may use scalar decode's QSA crossover."""
+
+    return os.environ.get(_QSA_VERIFY_MATCH_DECODE_ENV, "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _qsa_verify_sparse_threshold_met(
+    prospective_tokens: int,
+    prospective_blocks: int,
+    block_topk: int,
+) -> bool:
+    """Preserve the sparse-block proof and optionally remove only the 32K floor."""
+
+    if prospective_blocks <= block_topk:
+        return False
+    if prospective_tokens >= _QSA_DIRECT_VERIFY_MIN_TOKENS:
+        return True
+    if not _qsa_verify_match_decode_enabled():
+        return False
+
+    global _QSA_VERIFY_MATCH_DECODE_LOGGED
+    if not _QSA_VERIFY_MATCH_DECODE_LOGGED:
+        _QSA_VERIFY_MATCH_DECODE_LOGGED = True
+        logger.info(
+            "Qwen4 target verify matching scalar decode QSA crossover "
+            "(tokens=%d blocks=%d)",
+            prospective_tokens,
+            prospective_blocks,
+        )
+    return True
 
 
 def _tokenwise_moe_verify_enabled() -> bool:
@@ -1838,9 +1877,10 @@ class Qwen4ExpAttention(Qwen3_5Attention):
 
         prospective_tokens = cache.offset + x.shape[1]
         prospective_blocks = prospective_tokens // self.indexer.compress_ratio
-        return bool(
-            prospective_tokens >= _QSA_DIRECT_VERIFY_MIN_TOKENS
-            and prospective_blocks > self.indexer.block_topk
+        return _qsa_verify_sparse_threshold_met(
+            prospective_tokens,
+            prospective_blocks,
+            self.indexer.block_topk,
         )
 
     def _gathered_text_prefill(
