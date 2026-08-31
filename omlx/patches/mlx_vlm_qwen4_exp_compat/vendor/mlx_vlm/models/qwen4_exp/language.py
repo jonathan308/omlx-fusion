@@ -54,6 +54,18 @@ _SCALAR_MTP_HIDDEN_SINK: ContextVar[list | None] = ContextVar(
 )
 
 logger = logging.getLogger(__name__)
+_TOKENWISE_PLE_VERIFY_LOGGED = False
+
+
+def _tokenwise_ple_verify_enabled() -> bool:
+    """Diagnostic: preserve scalar PLE math inside a target verify window."""
+
+    return os.environ.get("OMLX_QWEN4_TOKENWISE_PLE_VERIFY", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 class _Qwen4DecodeProfileSample:
@@ -2808,6 +2820,95 @@ class Qwen4ExpPLELayer(nn.Module):
             cache[2] = mx.contiguous(conv_input[:, -self.short_conv_state_len :])
         return nn.silu(self.conv1d(conv_input))
 
+    def _tokenwise_verify(
+        self,
+        hidden_states: mx.array,
+        input_ids: mx.array,
+        cache: Optional[ArraysCache],
+        mask: Optional[mx.array],
+    ) -> mx.array:
+        """Evaluate PLE exactly as consecutive scalar target calls.
+
+        This is a diagnostic route for locating Qwen4's first M-width versus
+        scalar divergence.  It preserves the existing full-window rollback
+        ABI by installing one equivalent snapshot after all scalar rows have
+        advanced the live PLE slots.
+        """
+
+        batch = input_ids.shape[0]
+        input_ids_i64 = input_ids.astype(mx.int64)
+        if cache is not None and cache[3] is not None:
+            previous_history = cache[3]
+        else:
+            previous_history = mx.full(
+                (batch, self.ple_embedding.context_len),
+                self.ple_embedding.eos_token_id,
+                dtype=mx.int64,
+            )
+        if cache is not None and cache[2] is not None:
+            previous_conv = cache[2]
+        else:
+            previous_conv = mx.zeros(
+                (batch, self.short_conv_state_len, hidden_states.shape[-1]),
+                dtype=hidden_states.dtype,
+            )
+
+        outputs = []
+        conv_inputs = []
+        for row in range(input_ids.shape[1]):
+            row_hidden = hidden_states[:, row : row + 1]
+            row_ids = input_ids[:, row : row + 1]
+            embeddings = self.ple_embedding(
+                row_ids,
+                cache,
+                capture_speculative_state=False,
+            )
+            keys = self.norm_key(
+                _target_verify_linear(self.key_proj, embeddings, False)
+            ).reshape(*row_hidden.shape[:-1], self.hc_count, self.hidden_size)
+            values = _target_verify_linear(self.value_proj, embeddings, False)
+            queries = self.norm_query(row_hidden).reshape(
+                *row_hidden.shape[:-1], self.hc_count, self.hidden_size
+            )
+            gate = mx.sum(keys * queries, axis=-1, keepdims=True) / math.sqrt(
+                self.hidden_size
+            )
+            gate = mx.sign(gate) * mx.sqrt(mx.maximum(mx.abs(gate), 1e-6))
+            gated_values = mx.sigmoid(gate) * values[..., None, :]
+            gated_values = gated_values.reshape(*row_hidden.shape)
+            normed = self.norm_conv(gated_values)
+            row_mask = (
+                mask[:, row : row + 1]
+                if isinstance(mask, mx.array) and mask.ndim == 2
+                else mask
+            )
+            if (
+                row_mask is not None
+                and isinstance(row_mask, mx.array)
+                and row_mask.ndim == 2
+            ):
+                gated_values = mx.where(row_mask[..., None], gated_values, 0)
+                normed = mx.where(row_mask[..., None], normed, 0)
+            conv_inputs.append(normed)
+            outputs.append(
+                gated_values
+                + self._short_conv(
+                    normed,
+                    cache,
+                    capture_speculative_state=False,
+                )
+            )
+
+        if cache is not None:
+            cache._qwen4_exp_ple_speculative_state = _PLESpeculativeState(
+                history=previous_history,
+                input_ids=input_ids_i64,
+                conv_state=previous_conv,
+                conv_inputs=mx.concatenate(conv_inputs, axis=1),
+                complete=True,
+            )
+        return mx.concatenate(outputs, axis=1)
+
     def __call__(
         self,
         hidden_states: mx.array,
@@ -2816,6 +2917,19 @@ class Qwen4ExpPLELayer(nn.Module):
         mask: Optional[mx.array],
         target_verify: bool = False,
     ):
+        if (
+            target_verify
+            and input_ids.shape[1] > 1
+            and _tokenwise_ple_verify_enabled()
+        ):
+            global _TOKENWISE_PLE_VERIFY_LOGGED
+            if not _TOKENWISE_PLE_VERIFY_LOGGED:
+                _TOKENWISE_PLE_VERIFY_LOGGED = True
+                logger.info(
+                    "Qwen4 tokenwise PLE target-verify diagnostic active (S=%d)",
+                    input_ids.shape[1],
+                )
+            return self._tokenwise_verify(hidden_states, input_ids, cache, mask)
         capture_speculative_state = target_verify and input_ids.shape[1] > 1
         embeddings = self.ple_embedding(
             input_ids,
