@@ -54,6 +54,8 @@ _SCALAR_MTP_HIDDEN_SINK: ContextVar[list | None] = ContextVar(
 )
 _EXACT_HC_VERIFY_ENV = "OMLX_QWEN4_EXACT_HC_VERIFY"
 _EXACT_HC_VERIFY_LOGGED = False
+_TOKENWISE_GDN_VERIFY_ENV = "OMLX_QWEN4_TOKENWISE_GDN_VERIFY"
+_TOKENWISE_GDN_VERIFY_LOGGED = False
 
 logger = logging.getLogger(__name__)
 _TOKENWISE_PLE_VERIFY_LOGGED = False
@@ -134,6 +136,17 @@ def _exact_hc_verify_enabled() -> bool:
     """Diagnostic gate for scalar-reduction HC target verification."""
 
     return os.environ.get(_EXACT_HC_VERIFY_ENV, "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _tokenwise_gdn_verify_enabled() -> bool:
+    """Diagnostic gate for canonical scalar-row GDN verification."""
+
+    return os.environ.get(_TOKENWISE_GDN_VERIFY_ENV, "0").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -1340,6 +1353,127 @@ class Qwen4ExpGatedDeltaNet(Qwen3_5GatedDeltaNet):
         q = q * mx.rsqrt(mx.sum(mx.square(q), axis=-1, keepdims=True) + 1e-6)
         k = k * mx.rsqrt(mx.sum(mx.square(k), axis=-1, keepdims=True) + 1e-6)
         return q * scale, k
+
+    @staticmethod
+    def _row_mask(mask: Optional[mx.array], row: int) -> Optional[mx.array]:
+        if isinstance(mask, mx.array) and mask.ndim == 2:
+            return mask[:, row : row + 1]
+        return mask
+
+    def _tokenwise_verify(
+        self,
+        inputs: mx.array,
+        mask: Optional[mx.array],
+        cache: Any,
+        gdn_sink: list,
+    ) -> mx.array:
+        """Run one full target window through the canonical scalar GDN path.
+
+        Each row calls the official Qwen3.5 scalar implementation with
+        ``target_verify=False`` and advances the live cache chronologically.
+        The synthetic sink record keeps the existing 12-field rollback ABI:
+        post-row SSM states form ``intermediate_states`` and the chronological
+        convolution input is reconstructed from the pre-window state plus the
+        newest scalar cache slot after every row.  The inherited Qwen3.5/Qwen4
+        rollback therefore selects an accepted prefix without a second or
+        approximate recurrent replay.
+        """
+
+        batch, width, _ = inputs.shape
+        existing_conv = cache[0]
+        if existing_conv is not None and existing_conv.shape[0] == batch:
+            initial_conv = existing_conv + mx.zeros((), dtype=existing_conv.dtype)
+        else:
+            initial_conv = mx.zeros(
+                (batch, self.conv_kernel_size - 1, self.conv_dim),
+                dtype=inputs.dtype,
+            )
+
+        existing_state = cache[1]
+        if existing_state is not None and existing_state.shape[0] == batch:
+            initial_state = existing_state + mx.zeros((), dtype=existing_state.dtype)
+        else:
+            initial_state = None
+
+        outputs = []
+        conv_tokens = []
+        intermediate_states = []
+        for row in range(width):
+            output = super().__call__(
+                inputs[:, row : row + 1],
+                mask=self._row_mask(mask, row),
+                cache=cache,
+                gdn_sink=None,
+                target_verify=False,
+            )
+            if cache[0] is None or cache[1] is None:
+                raise RuntimeError(
+                    "Qwen4 scalar GDN verification did not publish both cache states"
+                )
+            outputs.append(output)
+            conv_tokens.append(
+                cache[0][:, -1:, :] + mx.zeros((), dtype=cache[0].dtype)
+            )
+            intermediate_states.append(
+                cache[1] + mx.zeros((), dtype=cache[1].dtype)
+            )
+
+        conv_input = mx.concatenate([initial_conv, *conv_tokens], axis=1)
+        states = mx.stack(intermediate_states, axis=1)
+        # The inherited rollback fast path consumes fields 7, 9, 10 and 11.
+        # Keep every legacy slot in place so no caller or model ABI changes.
+        gdn_sink.append(
+            (
+                None,  # q: unused when intermediate states are present
+                None,  # k
+                None,  # v
+                None,  # a
+                None,  # b
+                self.A_log,
+                self.dt_bias,
+                initial_state,
+                mask,
+                conv_input,
+                self.conv_kernel_size,
+                states,
+            )
+        )
+        return mx.concatenate(outputs, axis=1)
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+        gdn_sink: Optional[list] = None,
+        target_verify: bool = False,
+    ) -> mx.array:
+        verify = target_verify or gdn_sink is not None
+        if (
+            verify
+            and _tokenwise_gdn_verify_enabled()
+            and inputs.ndim == 3
+            and inputs.shape[0] == 1
+            and inputs.shape[1] in _HC_FUSED_VERIFY_WIDTHS
+            and cache is not None
+            and gdn_sink is not None
+        ):
+            output = self._tokenwise_verify(inputs, mask, cache, gdn_sink)
+            global _TOKENWISE_GDN_VERIFY_LOGGED
+            if not _TOKENWISE_GDN_VERIFY_LOGGED:
+                _TOKENWISE_GDN_VERIFY_LOGGED = True
+                logger.info(
+                    "Qwen4 tokenwise GDN target-verify diagnostic active (M=%d)",
+                    inputs.shape[1],
+                )
+            return output
+        return super().__call__(
+            inputs,
+            mask=mask,
+            cache=cache,
+            gdn_sink=gdn_sink,
+            target_verify=target_verify,
+        )
 
 
 class Qwen4ExpQSAIndexer(nn.Module):
