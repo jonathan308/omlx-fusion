@@ -347,10 +347,23 @@ def apply() -> bool:
             had_rowwise_state = (
                 getattr(self, "_omlx_mtp_batch_state", None) is not None
             )
+            compact_survivor = None
+            if had_rowwise_state and len(old_uids) > 1 and len(keep) == 1:
+                # Prove and detach the survivor before stock filter mutates any
+                # batch-owned field. A failed Qwen4 timeline proof therefore
+                # leaves the original B2 entirely intact for the request-error
+                # path instead of exposing a half-filtered cache/state pair.
+                compact_survivor = _prepare_compact_rowwise_mtp_survivor(
+                    self,
+                    int(keep[0]),
+                )
             result = original_filter(self, keep, *args, **kwargs)
             _drop_invalid_mtp_state(self, "filter", log_empty=True)
-            if had_rowwise_state and len(old_uids) > 1 and len(keep) == 1:
-                _compact_rowwise_mtp_survivor(self)
+            if compact_survivor is not None:
+                _compact_rowwise_mtp_survivor(
+                    self,
+                    compact=compact_survivor,
+                )
             _drop_invalid_mtp_batch_state(
                 self,
                 "filter",
@@ -1637,7 +1650,28 @@ def _qsa_singleton_alignment_error(prompt_cache: List[Any]) -> Optional[str]:
     return None
 
 
-def _compact_rowwise_mtp_survivor(gen_batch: Any) -> None:
+def _prepare_compact_rowwise_mtp_survivor(
+    gen_batch: Any,
+    idx: int,
+) -> List[Any]:
+    """Detach and fully prove one prospective survivor before B2 mutation."""
+
+    compact = gen_batch.extract_cache(idx)
+    error = _qsa_singleton_alignment_error(compact)
+    if error is None and _model_qwen4_terminal_commit_enabled(
+        getattr(gen_batch, "model", None)
+    ):
+        error = _rebase_qwen4_extracted_recurrent_timeline(compact)
+    if error is not None:
+        raise ValueError(f"Qwen4 row-wise survivor cache is not exact: {error}")
+    return compact
+
+
+def _compact_rowwise_mtp_survivor(
+    gen_batch: Any,
+    *,
+    compact: Optional[List[Any]] = None,
+) -> None:
     """Move a B2->B1 row-wise survivor back to exact singleton caches.
 
     ``GenerationBatch.filter`` keeps the cache container batched even when a
@@ -1656,11 +1690,77 @@ def _compact_rowwise_mtp_survivor(gen_batch: Any) -> None:
     batch_state = getattr(gen_batch, "_omlx_mtp_batch_state", None)
     if batch_state is None or uids[0] not in batch_state.states:
         return
-    compact = gen_batch.extract_cache(0)
-    error = _qsa_singleton_alignment_error(compact)
-    if error is not None:
-        raise ValueError(f"Qwen4 row-wise survivor cache is not exact: {error}")
+    if compact is None:
+        compact = _prepare_compact_rowwise_mtp_survivor(gen_batch, 0)
     gen_batch.prompt_cache = compact
+
+
+def _rebase_qwen4_extracted_recurrent_timeline(
+    prompt_cache: List[Any],
+) -> Optional[str]:
+    """Repair only metadata lost by a proven ragged B2 -> B1 extraction.
+
+    ``SizedArraysCache`` carries one scalar ``_token_count``. Its current
+    ``merge`` therefore copies the first row's count even when independently
+    advanced row-wise Qwen4 requests have different target epochs. Extracting
+    the other row preserves that foreign scalar although the positionless GDN
+    and PLE tensors themselves are correctly row-isolated.
+
+    This seam is deliberately narrower than the ordinary timeline reconciler:
+    it runs only after ``GenerationBatch.filter`` selected one row and QSA's KV,
+    raw-index, and position histories proved a compact singleton. The uniform
+    QSA offset is an independent absolute target epoch. Rebase only wrapper
+    bookkeeping after proving every recurrent tensor is B1; never alter tensor
+    state or accept a cache without a readable QSA timeline.
+    """
+
+    qsa_offsets: List[int] = []
+    sized: List[Any] = []
+    pending = list(prompt_cache)
+    while pending:
+        cache = pending.pop()
+        pending.extend(getattr(cache, "caches", ()) or ())
+        cache_name = type(cache).__name__
+        if cache_name in _QWEN4_QSA_CACHE_TYPES:
+            if cache_name not in {"QSAKVCache", "QSAQuantizedKVCache"}:
+                return "Qwen4 extracted survivor retained a batched QSA cache"
+            offsets = _qwen4_qsa_offsets(cache)
+            if offsets is None or offsets[0] != offsets[1]:
+                return "Qwen4 extracted survivor has invalid QSA offsets"
+            qsa_offsets.append(offsets[0])
+            continue
+        if cache_name != "SizedArraysCache":
+            continue
+        token_count = getattr(cache, "_token_count", None)
+        inner = vars(cache).get("_inner")
+        state = getattr(inner, "state", None) if inner is not None else None
+        if (
+            type(token_count) is not int
+            or type(inner).__name__ != "ArraysCache"
+            or not isinstance(state, (list, tuple))
+            or len(state) < 2
+            or state[0] is None
+            or state[1] is None
+        ):
+            return "Qwen4 extracted survivor has invalid recurrent metadata"
+        for recurrent in state:
+            if recurrent is None:
+                continue
+            if getattr(recurrent, "ndim", 0) < 1 or recurrent.shape[0] != 1:
+                return "Qwen4 extracted survivor retained batched recurrent state"
+        sized.append(cache)
+
+    if not qsa_offsets:
+        return "Qwen4 extracted survivor has no compact singleton QSA witness"
+    expected = qsa_offsets[0]
+    if any(offset != expected for offset in qsa_offsets[1:]):
+        return "Qwen4 extracted survivor has mixed QSA target epochs"
+    if _qwen4_target_offset(prompt_cache) != expected:
+        return "Qwen4 extracted survivor target leaves disagree with QSA"
+
+    for cache in sized:
+        cache._token_count = int(expected)
+    return None
 
 
 def _merge_row_caches(row_caches: List[List[Any]]) -> List[Any]:
@@ -1859,6 +1959,35 @@ def _rebuild_singleton_cache(model: Any) -> Optional[List[Any]]:
         make_cache = sys.modules["mlx_lm.generate"]._make_cache
         return make_cache(model, [0], None)
     except Exception as exc:
+        # Qwen4's vendored ArraysCache is intentionally not a subclass of
+        # mlx-lm's class with the same name, so mlx-lm's isinstance dispatch
+        # rejects it. Its own cache classes expose the exact singleton merge
+        # contract used everywhere else in this row-wise path; use that narrow
+        # route rather than making a failed emergency reconcile fatal.
+        if _is_qwen4_exp_model(model):
+            try:
+                fresh = model.make_cache()
+                from omlx.cache.type_handlers import SizedArraysCache
+
+                fresh = [
+                    (
+                        SizedArraysCache(cache, token_count=0)
+                        if type(cache).__name__ == "ArraysCache"
+                        else cache
+                    )
+                    for cache in fresh
+                ]
+                rebuilt = _merge_row_caches([fresh])
+                if rebuilt:
+                    return rebuilt
+            except Exception as vendor_exc:
+                logger.warning(
+                    "MTP reconcile: Qwen4 cache rebuild unavailable: %s "
+                    "(mlx-lm path: %s)",
+                    vendor_exc,
+                    exc,
+                )
+                return None
         logger.warning("MTP reconcile: cache rebuild unavailable: %s", exc)
         return None
 

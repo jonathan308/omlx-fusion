@@ -292,6 +292,248 @@ def test_real_qwen4_nonterminal_queue_drain_commits_once_then_continues():
     _assert_no_speculative_markers(batch.prompt_cache)
 
 
+def test_qwen4_ragged_rowwise_survivor_real_verify_and_post_emit_is_exact():
+    """A non-first B2 survivor must retain its own recurrent target epoch."""
+
+    from mlx_lm.generate import GenerationBatch, SequenceStateMachine
+    from mlx_lm.models.cache import TokenBuffer
+
+    from omlx.patches.mlx_lm_mtp import (
+        apply_mlx_lm_mtp_patch,
+    )
+    from omlx.patches.mlx_lm_mtp import (
+        batch_generator as bg,
+    )
+
+    apply_mlx_lm_mtp_patch()
+    model = _model()
+    survivor_cache, survivor_state, history, next_main = _suffix_cycle_fixture(model)
+    survivor_state.uid = 2
+    survivor_cache = _wrap_sized_recurrent(
+        survivor_cache,
+        token_count=len(history),
+    )
+
+    # Put the departing row first so SizedArraysCache.merge reproduces the
+    # physical bug: its scalar count becomes the shared B2 metadata even though
+    # the second row owns a shorter, independent target timeline.
+    old_history = mx.array([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], dtype=mx.int32)
+    old_cache = model.make_cache()
+    model._position_ids = None
+    model._rope_deltas = None
+    with prompt_priming.suppress_capture():
+        old_output = model(old_history[None], cache=old_cache)
+        mx.eval(old_output.logits)
+    old_cache = _wrap_sized_recurrent(old_cache, token_count=len(old_history))
+    merged = bg._merge_row_caches([old_cache, survivor_cache])
+    assert set(_sized_counts(merged)) == {len(old_history)}
+
+    matcher_a = SequenceStateMachine()
+    matcher_b = SequenceStateMachine()
+    zeros = mx.zeros((model.args.vocab_size,), dtype=mx.float32)
+    survivor_tokens = [*history.tolist(), next_main]
+    batch = GenerationBatch.__new__(GenerationBatch)
+    batch.model = model
+    batch.uids = [1, 2]
+    batch.prompt_cache = merged
+    batch.tokens = [old_history.tolist(), survivor_tokens]
+    batch.samplers = [None, None]
+    batch.fallback_sampler = _greedy
+    batch.logits_processors = [[], []]
+    batch.state_machines = [matcher_a, matcher_b]
+    batch.max_tokens = [512, 512]
+    batch._current_tokens = None
+    batch._current_logprobs = []
+    batch._next_tokens = mx.array([3, next_main], dtype=mx.uint32)
+    batch._next_logprobs = [zeros, zeros]
+    batch._token_context = [
+        TokenBuffer(batch.tokens[0]),
+        TokenBuffer(batch.tokens[1]),
+    ]
+    batch._num_tokens = [0, 0]
+    batch._matcher_states = [matcher_a.make_state(), matcher_b.make_state()]
+    batch._omlx_mtp_batch_state = bg._MtpBatchState(
+        states={1: bg._MtpState(uid=1), 2: survivor_state}
+    )
+
+    # Real patched filter -> compaction -> row-wise-state promotion.
+    batch.filter([1])
+    assert batch.uids == [2]
+    assert batch._omlx_mtp_state is survivor_state
+    assert not hasattr(batch, "_omlx_mtp_batch_state")
+    assert set(_sized_counts(batch.prompt_cache)) == {len(history)}
+    assert bg._qwen4_target_offset(batch.prompt_cache) == len(history)
+
+    # Run the real two-phase verifier and acknowledge every queue position
+    # through the production post-emit transaction hook.
+    model._position_ids = None
+    model._rope_deltas = None
+    oracle_next_main, target_tokens = _target_continuation(model, history, 4)
+    assert oracle_next_main == next_main
+    survivor_state.depth = 2
+    survivor_state.drafts = mx.array(target_tokens[:2], dtype=mx.uint32)
+    survivor_state.draft_lps = [zeros, zeros]
+    survivor_state.draft_accept_lps = [zeros, zeros]
+    model._omlx_mtp_commit_align = 0
+    bg._run_verify_cycle_chain(batch, survivor_state)
+    assert survivor_state.pending_commit is not None
+
+    holder = _BatchGenerator()
+    holder._generation_batch = batch
+    while survivor_state.queue:
+        token, _logprobs, source = survivor_state.queue.popleft()
+        batch.tokens[0].append(token)
+        bg._mark_qwen4_pending_emit(survivor_state, token, source)
+        result = bg._batch_generator_mtp_post_emit(
+            holder,
+            2,
+            terminal=False,
+        )
+        assert result.handled
+
+    assert survivor_state.pending_commit is None
+    committed = batch.tokens[0][:-1]
+    assert bg._qwen4_target_offset(batch.prompt_cache) == len(committed)
+    assert set(_sized_counts(batch.prompt_cache)) == {len(committed)}
+
+    reference = model.make_cache()
+    model._position_ids = None
+    model._rope_deltas = None
+    with prompt_priming.suppress_capture():
+        reference_output = model(
+            mx.array(committed, dtype=mx.int32)[None],
+            cache=reference,
+        )
+        mx.eval(reference_output.logits)
+    reference = _wrap_sized_recurrent(reference, token_count=len(committed))
+    _assert_full_cache_parity(batch.extract_cache(0), reference)
+
+
+def test_qwen4_extracted_recurrent_rebase_is_atomic_and_generic_is_unchanged():
+    from mlx_lm.generate import GenerationBatch
+    from mlx_vlm.models.qwen4_exp.cache import ArraysCache
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache, QSAKVCache
+
+    from omlx.cache.type_handlers import SizedArraysCache
+    from omlx.patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch
+    from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+    def qsa(length):
+        cache = QSAKVCache()
+        cache.state = (
+            mx.zeros((1, 2, length, 8)),
+            mx.zeros((1, 2, length, 8)),
+            mx.zeros((1, length, 8)),
+            mx.zeros((3, 1, length), dtype=mx.int32),
+        )
+        return cache
+
+    model = _model()
+    recurrent = model.make_cache()[0]
+    recurrent.state = [mx.zeros((1, 2, 4)), mx.zeros((1, 2, 4)), None, None]
+    valid = SizedArraysCache(recurrent, token_count=99)
+    compact = [valid, qsa(7)]
+    assert bg._rebase_qwen4_extracted_recurrent_timeline(compact) is None
+    assert valid._token_count == 7
+
+    bad_inner = model.make_cache()[0]
+    bad_inner.state = [mx.zeros((2, 2, 4)), mx.zeros((2, 2, 4)), None, None]
+    bad = SizedArraysCache(bad_inner, token_count=101)
+    mixed = [valid, bad, qsa(7)]
+    error = bg._rebase_qwen4_extracted_recurrent_timeline(mixed)
+    assert "batched recurrent state" in error
+    # Atomic preflight: neither wrapper is rewritten on failure.
+    assert valid._token_count == 7
+    assert bad._token_count == 101
+
+    # Mixed QSA epochs fail before recurrent metadata can be touched.
+    valid._token_count = 88
+    assert (
+        bg._rebase_qwen4_extracted_recurrent_timeline(
+            [valid, qsa(7), qsa(8)]
+        )
+        == "Qwen4 extracted survivor has mixed QSA target epochs"
+    )
+    assert valid._token_count == 88
+
+    assert (
+        bg._rebase_qwen4_extracted_recurrent_timeline(
+            [valid, BatchQSAKVCache.merge([qsa(7)])]
+        )
+        == "Qwen4 extracted survivor retained a batched QSA cache"
+    )
+    assert valid._token_count == 88
+    assert (
+        bg._rebase_qwen4_extracted_recurrent_timeline([valid])
+        == "Qwen4 extracted survivor has no compact singleton QSA witness"
+    )
+    assert valid._token_count == 88
+
+    # The production patched-filter seam must fail before stock filter mutates
+    # any batch-owned field. A malformed detached survivor cannot leave B1 UIDs
+    # beside B2 cache/state.
+    apply_mlx_lm_mtp_patch()
+    batched_inner = ArraysCache(2)
+    batched_inner.state = [mx.zeros((2, 2, 4)), mx.zeros((2, 2, 4))]
+    invalid_sized = SizedArraysCache(batched_inner, token_count="mixed")
+    batched_qsa = BatchQSAKVCache.merge([qsa(7), qsa(7)])
+    batch = GenerationBatch.__new__(GenerationBatch)
+    batch.model = model
+    batch.uids = [10, 11]
+    batch.tokens = [[1, 2], [3, 4]]
+    batch.prompt_cache = [invalid_sized, batched_qsa]
+    batch._omlx_mtp_batch_state = bg._MtpBatchState(
+        states={10: bg._MtpState(uid=10), 11: bg._MtpState(uid=11)}
+    )
+    with pytest.raises(ValueError, match="invalid recurrent metadata"):
+        batch.filter([1])
+    assert batch.uids == [10, 11]
+    assert batch.tokens == [[1, 2], [3, 4]]
+    assert batch.prompt_cache == [invalid_sized, batched_qsa]
+    assert invalid_sized._inner.state[0].shape[0] == 2
+    assert batched_qsa.offset.tolist() == [7, 7]
+    assert set(batch._omlx_mtp_batch_state.states) == {10, 11}
+
+    # Generic models never enter the Qwen-only rebase seam.
+    generic = SimpleNamespace(model=SimpleNamespace(), uids=[1])
+    generic.prompt_cache = [valid]
+    generic._omlx_mtp_batch_state = bg._MtpBatchState(
+        states={1: bg._MtpState(uid=1)}
+    )
+    generic.extract_cache = lambda _idx: list(generic.prompt_cache)
+    bg._compact_rowwise_mtp_survivor(generic)
+    assert valid._token_count == 88
+
+
+def test_qwen4_reconcile_fallback_uses_model_owned_sized_b1_cache(monkeypatch):
+    import sys
+
+    from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+    model = _model()
+
+    def reject_vendor_arrays(*_args, **_kwargs):
+        raise ValueError("vendor ArraysCache does not yet support batching")
+
+    monkeypatch.setattr(sys.modules["mlx_lm.generate"], "_make_cache", reject_vendor_arrays)
+    rebuilt = bg._rebuild_singleton_cache(model)
+    assert rebuilt is not None
+    assert _sized_counts(rebuilt) and set(_sized_counts(rebuilt)) == {0}
+    assert all(
+        getattr(cache, "batch_size", 1) == 1
+        for cache in rebuilt
+    )
+
+    tokens = mx.array([[2, 3, 4, 5]], dtype=mx.int32)
+    model._position_ids = None
+    model._rope_deltas = None
+    with prompt_priming.suppress_capture():
+        output = model(tokens, cache=rebuilt)
+        mx.eval(output.logits)
+    assert set(_sized_counts(rebuilt)) == {tokens.shape[1]}
+    assert bg._qwen4_target_offset(rebuilt) == tokens.shape[1]
+
+
 @pytest.mark.parametrize("accepted", [0, 1, 2])
 @pytest.mark.parametrize("sized_cache", [False, True])
 def test_real_qwen4_batched_nonterminal_drain_matches_target_oracle(
