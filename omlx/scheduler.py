@@ -8696,6 +8696,44 @@ class Scheduler:
             or request.vlm_extra_key_ranges_for_cache
         )
 
+    @classmethod
+    def _resident_cache_timeline_observation(cls, cache_list: Any) -> str:
+        """Return bounded reason telemetry without dumping long-context shapes."""
+
+        if not isinstance(cache_list, list):
+            return f"cache_type={type(cache_list).__name__}"
+        offsets: set[int] = set()
+        recurrent_counts: set[int] = set()
+        rollback: set[str] = set()
+        leaves = 0
+        for cache_obj in cls._resident_cache_leaf_objects(cache_list):
+            leaves += 1
+            offset = getattr(cache_obj, "offset", None)
+            if type(offset) is int:
+                offsets.add(offset)
+            elif offset is not None and getattr(offset, "size", 0) == 1:
+                try:
+                    offsets.add(int(offset.reshape(()).item()))
+                except Exception:
+                    pass
+            token_count = getattr(cache_obj, "_token_count", None)
+            if type(token_count) is int:
+                recurrent_counts.add(token_count)
+            for attr in (
+                "rollback_state",
+                "_qwen4_exp_ple_speculative_state",
+                "_mtp_undo",
+                "_mtp_draft_stash",
+                "_undo",
+            ):
+                if getattr(cache_obj, attr, None) is not None:
+                    rollback.add(attr)
+        return (
+            f"leaves={leaves} offsets={sorted(offsets)[:8]} "
+            f"recurrent_counts={sorted(recurrent_counts)[:8]} "
+            f"rollback={sorted(rollback)}"
+        )
+
     def _stage_exact_resident_cache(
         self,
         request: Request,
@@ -8711,26 +8749,38 @@ class Scheduler:
         arrays are never handed to the asynchronous writer.
         """
 
-        if (
-            getattr(self, "_exact_resident_cache", None) is None
-            or self._exact_resident_cache.max_entries <= 0
-            or self._exact_resident_cache.max_bytes <= 0
-            or request.specprefill_indices is not None
-            or getattr(request, "skip_cache_store", False)
-            or (
-                self._resident_cache_spec_decode_active()
-                and not (
-                    getattr(request, "_mtp_exact_terminal_proved", None)
-                    == "qwen4-target-only-v1"
-                    and self._resident_cache_qwen4_target_only_enabled()
-                )
-            )
-            or not self._request_is_text_only_for_resident_cache(request)
-            or not isinstance(cache_list, list)
-            or not cache_list
-            or not isinstance(cache_tokens, (list, tuple))
-            or not cache_tokens
+        attempted_qwen4 = (
+            getattr(request, "_mtp_exact_terminal_proved", None)
+            == "qwen4-target-only-v1"
+        )
+        resident_tier = getattr(self, "_exact_resident_cache", None)
+        reject_reason = None
+        if resident_tier is None:
+            reject_reason = "tier-unavailable"
+        elif resident_tier.max_entries <= 0 or resident_tier.max_bytes <= 0:
+            reject_reason = "tier-disabled"
+        elif request.specprefill_indices is not None:
+            reject_reason = "specprefill"
+        elif getattr(request, "skip_cache_store", False):
+            reject_reason = "request-skip-cache"
+        elif self._resident_cache_spec_decode_active() and not (
+            attempted_qwen4 and self._resident_cache_qwen4_target_only_enabled()
         ):
+            reject_reason = "speculative-terminal-unproved"
+        elif not self._request_is_text_only_for_resident_cache(request):
+            reject_reason = "non-text-request"
+        elif not isinstance(cache_list, list) or not cache_list:
+            reject_reason = "cache-missing-or-not-list"
+        elif not isinstance(cache_tokens, (list, tuple)) or not cache_tokens:
+            reject_reason = "token-ledger-missing"
+        if reject_reason is not None:
+            if attempted_qwen4:
+                logger.info(
+                    "Qwen4 exact resident candidate rejected for %s: reason=%s %s",
+                    request.request_id,
+                    reject_reason,
+                    self._resident_cache_timeline_observation(cache_list),
+                )
             return
         # In non-speculative mlx-lm GenerationBatch.next(), ``_step`` appends
         # the forwarded token to both the physical cache and ``all_tokens``
@@ -8745,11 +8795,13 @@ class Scheduler:
         ):
             return
         if not self._resident_cache_matches_token_count(cache_list, len(tokens)):
-            logger.debug(
-                "Skipping exact resident cache for %s: cache offsets do not "
-                "prove the %d-token terminal state",
+            log = logger.info if attempted_qwen4 else logger.debug
+            log(
+                "Skipping exact resident cache for %s: reason=timeline-mismatch "
+                "tokens=%d %s",
                 request.request_id,
                 len(tokens),
+                self._resident_cache_timeline_observation(cache_list),
             )
             return
         cache_nbytes = self._resident_cache_nbytes(cache_list)
@@ -11723,6 +11775,24 @@ class Scheduler:
                         if qwen4_terminal_cache_proved
                         else None
                     )
+                    logger.info(
+                        "Qwen4 terminal resident proof for %s: exact=%s "
+                        "reason=%s tokens=%s cache_layers=%s finish=%s",
+                        request_id,
+                        qwen4_terminal_cache_proved,
+                        getattr(mtp_commit, "reason", "unspecified"),
+                        (
+                            len(response.all_tokens)
+                            if isinstance(response.all_tokens, list)
+                            else None
+                        ),
+                        (
+                            len(response.prompt_cache)
+                            if isinstance(response.prompt_cache, list)
+                            else None
+                        ),
+                        response.finish_reason,
+                    )
                 elif (
                     is_finished
                     and getattr(
@@ -11880,9 +11950,21 @@ class Scheduler:
                         # ``raw_cache`` unchanged for the durable block writer.
                         detached = self.batch_generator.extract_cache([response.uid])
                         if isinstance(detached, dict):
-                            resident_cache, resident_tokens = detached.get(
-                                response.uid, (None, None)
-                            )
+                            # A Qwen4 terminal transaction detaches and filters
+                            # its row inside the post-emit hook.  A subsequent
+                            # BatchGenerator lookup therefore returns an empty
+                            # mapping.  Preserve the authoritative cache/token
+                            # pair already carried by the response; replacing
+                            # its raw token ledger with None makes the fallback
+                            # omit a hidden EOS/tool delimiter and produces the
+                            # observed exact +1 cache skew at 100K context.
+                            detached_pair = detached.get(response.uid)
+                            if detached_pair is not None:
+                                detached_cache, detached_tokens = detached_pair
+                                if detached_cache is not None:
+                                    resident_cache = detached_cache
+                                if detached_tokens is not None:
+                                    resident_tokens = detached_tokens
                         elif isinstance(detached, (list, tuple)):
                             resident_cache = detached
                             if resident_tokens is None:

@@ -1231,6 +1231,7 @@ class _MtpPostEmitResult:
     exact_terminal: bool = False
     prompt_cache: Optional[List[Any]] = None
     all_tokens: Optional[List[int]] = None
+    reason: str = "not-applicable"
 
 
 @dataclass
@@ -4002,7 +4003,7 @@ def _qwen4_post_emit_transaction(
     pending = state.pending_commit
     receipt = state.pending_emit
     if pending is None or receipt is None:
-        return _MtpPostEmitResult()
+        return _MtpPostEmitResult(reason="no-pending-transaction")
     if (
         pending.head_committed_offset is not None
         and int(state.hist_offset) != pending.head_committed_offset
@@ -4012,7 +4013,10 @@ def _qwen4_post_emit_transaction(
         )
     position, token_id, _source = receipt
     if position != pending.emitted or position >= len(pending.token_map):
-        return _MtpPostEmitResult(handled=True)
+        return _MtpPostEmitResult(
+            handled=True,
+            reason="queue-position-mismatch",
+        )
 
     exact = True
     if terminal:
@@ -4077,12 +4081,16 @@ def _qwen4_post_emit_transaction(
             exact = _qwen4_target_offset(gen_batch.prompt_cache) == len(all_tokens)
         if not exact:
             _clear_rollback(gen_batch.prompt_cache)
-            return _MtpPostEmitResult(handled=True)
+            return _MtpPostEmitResult(
+                handled=True,
+                reason="terminal-target-reconcile-failed",
+            )
         return _MtpPostEmitResult(
             handled=True,
             exact_terminal=True,
             prompt_cache=gen_batch.extract_cache(0),
             all_tokens=all_tokens,
+            reason="terminal-target-exact",
         )
 
     # Nonterminal acknowledgement. Only the last queue position is allowed to
@@ -4091,9 +4099,9 @@ def _qwen4_post_emit_transaction(
     pending.emitted += 1
     state.pending_emit = None
     if pending.emitted < len(pending.token_map):
-        return _MtpPostEmitResult(handled=True)
+        return _MtpPostEmitResult(handled=True, reason="queue-draining")
     if state.queue:
-        return _MtpPostEmitResult(handled=True)
+        return _MtpPostEmitResult(handled=True, reason="queue-not-empty")
 
     if pending.kind == "verify":
         exact = _qwen4_rollback_full_verify_to(
@@ -4127,7 +4135,7 @@ def _qwen4_post_emit_transaction(
         state.park_after_commit = False
         if not _park_mtp_to_standard(gen_batch, state):
             raise _MtpStepFallback("Qwen4 deferred adaptive park failed")
-    return _MtpPostEmitResult(handled=True)
+    return _MtpPostEmitResult(handled=True, reason="window-committed")
 
 
 def _batch_generator_mtp_post_emit(
@@ -4141,15 +4149,15 @@ def _batch_generator_mtp_post_emit(
 
     gen_batch = getattr(batch_generator, "_generation_batch", None)
     if gen_batch is None:
-        return _MtpPostEmitResult()
+        return _MtpPostEmitResult(reason="no-generation-batch")
     uids = list(getattr(gen_batch, "uids", ()) or ())
     if len(uids) != 1 or not uids or uids[0] != uid:
         # Target-only ExactResident is intentionally B1. Row-wise MTP keeps
         # the existing path and remains behind the resident-cache gate.
-        return _MtpPostEmitResult()
+        return _MtpPostEmitResult(reason="not-b1-owner")
     state = getattr(gen_batch, "_omlx_mtp_state", None)
     if state is None or not _model_qwen4_terminal_commit_enabled(gen_batch.model):
-        return _MtpPostEmitResult()
+        return _MtpPostEmitResult(reason="no-qwen4-transaction")
 
     try:
         result = _qwen4_post_emit_transaction(
@@ -4168,7 +4176,10 @@ def _batch_generator_mtp_post_emit(
                     "Qwen4 target commit and exact standard reconcile both failed"
                 ) from exc
             _drop_mtp_state(gen_batch, "post-emit-reconciled")
-        result = _MtpPostEmitResult(handled=True)
+        result = _MtpPostEmitResult(
+            handled=True,
+            reason=f"post-emit-{type(exc).__name__}",
+        )
 
     if terminal:
         state._finish_reason = finish_reason or "terminal"

@@ -6176,6 +6176,103 @@ class TestOutputParserSmoke:
         # has promoted this otherwise nonterminal response to a stop.
         assert scheduler.batch_generator.post_emit_calls == [(99, True, "stop")]
 
+    def test_qwen4_tool_eos_keeps_terminal_response_ledger_after_row_filter(
+        self,
+        mock_model,
+        caplog,
+    ):
+        """Regression: an empty post-filter UID lookup must not drop hidden EOS."""
+
+        from omlx.patches import mlx_vlm_qwen4_exp_compat as qwen4_compat
+
+        qwen4_compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+        from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+
+        tokenizer = self._GemmaTokenizer({11: "<|return|>"})
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=tokenizer,
+            config=SchedulerConfig(
+                model_name="test-model",
+                exact_resident_cache_slots=1,
+            ),
+        )
+        scheduler._output_parser_factory = _ParserStopFactory()
+        scheduler.model = SimpleNamespace(
+            _omlx_mtp_decode_enabled=True,
+            _omlx_mtp_terminal_commit_v1=True,
+            _omlx_mtp_suffix_local_capability="qwen4-verified-text-v1",
+        )
+
+        request = Request(
+            request_id="qwen4-tool-eos",
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=5),
+            prompt_token_ids=[1, 2, 3],
+            num_prompt_tokens=3,
+            status=RequestStatus.RUNNING,
+            batch_uid=99,
+        )
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+        scheduler.uid_to_request_id[99] = request.request_id
+        scheduler.request_id_to_uid[request.request_id] = 99
+
+        terminal_cache = QSAKVCache()
+        terminal_cache.state = (
+            mx.zeros((1, 2, 4, 8)),
+            mx.ones((1, 2, 4, 8)),
+            mx.zeros((1, 4, 8)),
+            mx.arange(4)[None],
+        )
+
+        class _FilteredTerminalBatchGenerator:
+            def __init__(self):
+                self.calls = []
+
+            def omlx_mtp_post_emit(
+                self, uid, *, terminal, finish_reason=None
+            ):
+                self.calls.append((uid, terminal, finish_reason))
+                return SimpleNamespace(
+                    handled=True,
+                    exact_terminal=True,
+                    prompt_cache=[terminal_cache],
+                    all_tokens=[1, 2, 3, 11],
+                    reason="terminal-target-exact",
+                )
+
+            def extract_cache(self, _uids):
+                # The terminal hook has already filtered this uid.
+                return {}
+
+        scheduler.batch_generator = _FilteredTerminalBatchGenerator()
+        response = type(
+            "Resp",
+            (),
+            {
+                "uid": 99,
+                "token": 11,
+                "finish_reason": None,
+                "prompt_cache": None,
+                "all_tokens": None,
+            },
+        )()
+
+        caplog.set_level("INFO", logger="omlx.scheduler")
+        outputs, finished_ids = scheduler._process_batch_responses([response])
+
+        assert finished_ids == {request.request_id}
+        assert outputs[-1].finish_reason == "stop"
+        assert request.output_token_ids == []
+        assert request._mtp_exact_terminal_proved == "qwen4-target-only-v1"
+        assert request._exact_resident_candidate[0] == [1, 2, 3, 11]
+        assert request._exact_resident_candidate[1] == [terminal_cache]
+        assert getattr(request, "_extracted_cache", None) is None
+        assert scheduler.batch_generator.calls == [(99, True, "stop")]
+        assert "reason=terminal-target-exact" in caplog.text
+        assert "tokens=4" in caplog.text
+
     def test_deepseek_v4_tool_block_end_stops_batch_row(self, mock_model):
         mock_model.config.model_type = "deepseek_v4"
         tokenizer = self._DeepSeekV4Tokenizer(
