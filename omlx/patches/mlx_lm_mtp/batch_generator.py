@@ -92,6 +92,7 @@ _MTP_RUNTIME_TOTALS: Dict[str, Any] = {
     "tokens": 0,
     "cycles": 0,
     "accepted_draft_tokens": 0,
+    "physical_drafted_tokens": 0,
     "drafted_tokens": 0,
     "zero_depth_cycles": 0,
     "depth_drafted": [],
@@ -115,6 +116,8 @@ def mtp_runtime_stats_snapshot() -> Dict[str, Any] | None:
             return None
         cycles = int(_MTP_RUNTIME_TOTALS["cycles"])
         drafted = int(_MTP_RUNTIME_TOTALS["drafted_tokens"])
+        physical_drafted = int(_MTP_RUNTIME_TOTALS["physical_drafted_tokens"])
+        accepted = int(_MTP_RUNTIME_TOTALS["accepted_draft_tokens"])
         tokens = int(_MTP_RUNTIME_TOTALS["tokens"])
         return {
             **{
@@ -123,9 +126,10 @@ def mtp_runtime_stats_snapshot() -> Dict[str, Any] | None:
                 if key not in {"depth_drafted", "depth_accepted", "timing_ms"}
             },
             "acceptance_ratio": (
-                int(_MTP_RUNTIME_TOTALS["accepted_draft_tokens"]) / drafted
-                if drafted
-                else 0.0
+                accepted / drafted if drafted else 0.0
+            ),
+            "physical_acceptance_ratio": (
+                accepted / physical_drafted if physical_drafted else 0.0
             ),
             "tokens_per_cycle": tokens / cycles if cycles else 0.0,
             "depth_drafted": list(_MTP_RUNTIME_TOTALS["depth_drafted"]),
@@ -139,12 +143,14 @@ def _record_mtp_runtime_stats(stats: "_MtpStats", finish_reason: str) -> None:
         stats.init_emits + stats.draft_emits + stats.bonus_emits + stats.verify_emits
     )
     total_drafted = sum(stats.depth_drafted) or stats.cycles
+    physical_drafted = stats.physical_drafts or total_drafted
     with _MTP_RUNTIME_LOCK:
         _MTP_RUNTIME_TOTALS["sequences"] += 1
         _MTP_RUNTIME_TOTALS["tokens"] += total_emits
         _MTP_RUNTIME_TOTALS["cycles"] += stats.cycles
         _MTP_RUNTIME_TOTALS["accepted_draft_tokens"] += stats.accepts
         _MTP_RUNTIME_TOTALS["drafted_tokens"] += total_drafted
+        _MTP_RUNTIME_TOTALS["physical_drafted_tokens"] += physical_drafted
         _MTP_RUNTIME_TOTALS["zero_depth_cycles"] += stats.zero_cycles
         for key, values in (
             ("depth_drafted", stats.depth_drafted),
@@ -684,6 +690,7 @@ _ROWWISE_BATCH_MTP_ENV = "OMLX_MTP_ROWWISE_BATCH"
 
 _FIXED_DEPTH_ENV = "OMLX_MTP_FIXED_DEPTH"
 _LOCKSTEP_DEPTH_ENV = "OMLX_MTP_DISTRIBUTED_LOCKSTEP_DEPTH"
+_QWEN4_EVIDENCE_DEPTH_ENV = "OMLX_QWEN4_EVIDENCE_DEPTH"
 
 
 def _fixed_depth_override(max_depth: int) -> Optional[int]:
@@ -710,6 +717,18 @@ def _lockstep_depth_enabled() -> bool:
         "yes",
         "on",
     )
+
+
+def _qwen4_evidence_depth_enabled(model: Any) -> bool:
+    """Opt in to the experimental evidence policy for Qwen4 only."""
+
+    enabled = os.environ.get(_QWEN4_EVIDENCE_DEPTH_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    return enabled and _is_qwen4_exp_model(model)
 
 
 def _rowwise_batch_mtp_override() -> Optional[bool]:
@@ -1059,6 +1078,7 @@ class _MtpStats:
 
     cycles: int = 0  # number of verify cycles run
     accepts: int = 0  # accepted draft tokens (depth-k: sum over positions)
+    physical_drafts: int = 0  # all drafts built, including post-rejection tail
     rejects: int = 0  # cycles that ended in a rejection
     init_emits: int = 0  # tokens emitted from the post-init queue (always 2)
     draft_emits: int = 0  # tokens emitted as accepted drafts
@@ -1308,12 +1328,17 @@ def _maybe_finish_mtp_reentry_probe(
 ) -> bool:
     """Clear the cooldown once the existing controller measures a win."""
     controller = state.controller
+    reentry_win_proven = getattr(controller, "reentry_win_proven", None)
     if (
         not state.reentry_probe
         or controller is None
         or was_warmup
         or controller._warmup
         or controller.exit_streak != 0
+        or (
+            callable(reentry_win_proven)
+            and not reentry_win_proven()
+        )
     ):
         return False
     try:
@@ -1759,6 +1784,13 @@ def _prepare_mtp_state_for_next(gen_batch: Any) -> Optional[_MtpState]:
     # cannot strand the cooldown marker beside a normal MTP state.
     if park_state is not None:
         state.reentry_probe = True
+        prepare_reentry_probe = getattr(
+            state.controller,
+            "prepare_reentry_probe",
+            None,
+        )
+        if callable(prepare_reentry_probe):
+            prepare_reentry_probe()
         logger.info(
             "MTP[%s] re-entry probe started after %d standard tokens",
             state.uid,
@@ -3288,6 +3320,600 @@ class _DepthController:
         return best_d
 
 
+class _EvidenceDepthController:
+    """Experimental evidence-directed draft-depth selection.
+
+    The factory selects this policy only for Qwen4 when
+    ``OMLX_QWEN4_EVIDENCE_DEPTH=1``. Every other local model keeps the legacy
+    controller above, and distributed lockstep remains authoritative.
+
+    Pure host-side bookkeeping — no extra GPU syncs. Tracks an EMA of
+    conditional acceptance per depth position and a wall-time EMA of cycle
+    cost per depth used, then picks the depth with the best expected tokens
+    per unit time:
+
+        score(d) = (1 + p1 + p1*p2 + ... ) / t_est(d)
+
+    Everything the decision uses is measured on this machine, on this model,
+    under the current load — no hand-tuned per-chip or per-model value:
+
+    - Cost: a warmup sweep runs each speculative depth once so every ``t[d]``
+      starts from a real cycle; the marginal cost of an extra verify row is the
+      measured slope between depths (``_marginal_est``), so a fine-grained MoE
+      on a bandwidth-limited chip learns its true (large) marginal within the
+      first few cycles. ``MARGINAL_MS`` is only the pre-measurement fallback.
+    - Drift: the cost EMA horizon is wall-clock (``TAU_MS``), not a cycle
+      count, so context growth, thermal throttling and external GPU contention
+      are tracked at constant real-time responsiveness however long a cycle
+      is; a one-off slow cycle is damped (``SPIKE_RATIO``).
+    - Staleness: only the depth currently run gets fresh measurements, and a
+      fresh-vs-stale cost comparison is systematically biased — e.g. a depth
+      whose t was measured during the slow post-prefill cycles looks expensive
+      forever, so the controller locks into its rival (measured as a depth-2
+      lock costing prose ~2-4%). Probes are therefore bidirectional and
+      evidence-directed: an under-observed conditional-acceptance tail gets a
+      Jeffreys-posterior upper bound for exploration, while mature rivals are
+      re-run only while empirical cost intervals can overlap the current
+      winner. Periodic most-stale probes remain the drift backstop. On heavy
+      models a fixed wall-clock cadence would spend a large share of cycles
+      probing, so probing is duty-bounded to ~``PROBE_DUTY`` of cycles.
+
+    Depth 0 — the escape hatch: speculation is only profitable while the
+    multi-token verify forward is cheap relative to a plain decode step.
+    On models with a large L=1 -> L=2 forward-cost jump (gemma4 head_dim
+    256/512 leaves the single-token attention kernel; MoE expert loads
+    scale with verify tokens) the whole depth menu can be worse than
+    standard decoding — measured 0.67x on gemma4 26B story/16k with the
+    best depth choice. Depth 0 runs the cycle as a plain 1-token step
+    ([next_main] only, no drafts, no rollback) whose cost is tracked as
+    ``t[0]`` through the same EMA/probe machinery, so the controller
+    parks at 0 when every speculative depth loses and re-enters through
+    the existing bidirectional probes. ``t[0]`` is measured lazily when
+    optimistic speculation cannot clear the estimated baseline, or from the
+    bounded-staleness explorer. This keeps high-accept sequences from paying
+    three unconditional plain cycles.
+    Parking alone is not enough on fast backbones — a parked cycle still
+    pays the MTP loop's synchronous host round-trip that the standard
+    decoder pipelines away — so a sustained park hands the sequence back
+    to the standard step entirely (``_park_mtp_to_standard``).
+
+    Content-adaptive by construction: prose/chat settles at depth 1,
+    code/predictable text climbs. Rejected alternatives (interleaved
+    in-process A/B, rotated order, paired per rep, on Qwen3.6-35B-A3B +
+    GLM-5.2, M3 Ultra): a fixed shallow-bias constant (won earlier separate-
+    process comparisons only by masking the staleness lock; this design beats
+    it on 3 of 4 model x content cells and ties the 4th), a pure realized
+    tok/s bandit (exploration tax), a live per-cycle learned correction
+    (decision churn), a frozen cross-generation correction (content
+    oscillation), and a base x shape cost decomposition (unidentifiable while
+    one depth runs for long stretches).
+    """
+
+    ALPHA = 0.08  # acceptance evidence discount (token domain, content-driven)
+    # Conditional acceptance is a censored Bernoulli stream: position j is
+    # observed only after positions <j were accepted.  A fixed EMA seed acts
+    # like a strong prior and can therefore strand an unobserved deep tail.
+    # Keep weak Jeffreys evidence instead, and use its one-sided normal
+    # approximation only while a position has fewer than this many effective
+    # observations. Mature exploitation uses the discounted empirical ratio;
+    # the prior exists only to make an unobserved censored tail explorable.
+    ACCEPT_PRIOR = 0.5
+    CONFIDENCE_Z = 1.645
+    ACCEPT_EXPLORE_TRIALS = 4.0
+    TAU_MS = 400.0  # cost EMA horizon in wall-clock ms (load/thermal/context)
+    PROBE_PERIOD_MS = 1000.0  # min wall-time between probes (light models)
+    PROBE_PERIOD_MAX_MS = 5000.0  # staleness-exploration cadence floor
+    PROBE_LEN = 4
+    PROBE_PIPELINE_TAIL = 1  # target chain already built when a probe finishes
+    PROBE_DUTY = 0.15  # probes never consume more than ~this share of cycles
+    SPIKE_RATIO = 2.0  # a cycle above this * the EMA is treated as an outlier
+    SPIKE_DAMP = 0.25  # ...and folded in at this fraction of the normal weight
+    # Fallback prior for one extra verify token's cost, used only until two
+    # depths have actually been measured; after that the marginal is the
+    # measured slope between depths. 7 ms matches dense backbones (6-10 ms).
+    MARGINAL_MS = 7.0
+    HYSTERESIS = 1.03  # switch depth only for a >3% score gain
+    COST_MIN_SAMPLES = 4
+    BASELINE_MIN_SAMPLES = 3
+    # Hand-off gate: ``t[0]`` is measured INSIDE the MTP loop, so it carries
+    # the loop's synchronous host round-trip that the standard decoder
+    # pipelines away. Speculation that cannot beat this taxed baseline by
+    # EXIT_MARGIN is losing to the real standard step; after EXIT_STREAK
+    # consecutive losing decisions the sequence leaves the MTP path
+    # entirely (_park_mtp_to_standard). EXIT_MARGIN is only the
+    # pre-measurement fallback (like MARGINAL_MS): each hand-off measures
+    # the actual standard-step rate right after it and stores the real
+    # loop tax on the model instance, which seeds later controllers via
+    # the ``exit_margin`` constructor arg — machine/model-measured, not
+    # a hardcoded ratio.
+    EXIT_MARGIN = 1.15
+    EXIT_STREAK = 16
+
+    def __init__(
+        self,
+        max_depth: int,
+        marginal_ms: Optional[float] = None,
+        exit_margin: Optional[float] = None,
+    ):
+        if marginal_ms:
+            self.MARGINAL_MS = float(marginal_ms)
+        if exit_margin:
+            self.EXIT_MARGIN = min(
+                _STD_TAX_MAX, max(1.0, float(exit_margin))
+            )
+        self.max_depth = max(1, int(max_depth))
+        self.cur = self.max_depth  # first cycle drafts deep; warmup sweeps down
+        self.p = [0.5] * self.max_depth
+        self._accept_hits = [0.0] * self.max_depth
+        self._accept_trials = [0.0] * self.max_depth
+        self.t: Dict[int, float] = {}
+        self.t_age: Dict[int, float] = {}  # ms since each depth was measured
+        self.t_samples: Dict[int, int] = {}
+        # Exponentially weighted cost variance uses the same spike-damped
+        # alpha as ``t``. ``_t_weight_sq`` tracks the squared normalized
+        # weights, so 1/q is the effective (not lifetime) sample count.
+        self._t_variance: Dict[int, float] = {}
+        self._t_weight_sq: Dict[int, float] = {}
+        self.cycles = 0
+        self.probe_left = 0
+        self._probe_target: Optional[int] = None
+        self._probe_forced = False
+        self.exit_streak = 0
+        self._ms_probe = 0.0  # wall-time since any probe burst
+        self._ms_explore = 0.0  # wall-time since a staleness-exploration burst
+        self._ms_baseline = 0.0  # wall-time while depth 0 remains unmeasured
+        # Measure each speculative depth once (max..1).  Depth 0 is calibrated
+        # lazily only when even optimistic speculative acceptance makes the
+        # plain baseline competitive; the five-second staleness explorer is a
+        # backstop for an unexpectedly cheap baseline.  This avoids spending
+        # three plain cycles on every high-accept sequence.
+        self._warmup: List[int] = list(range(self.max_depth, 0, -1))
+
+    def observe(
+        self,
+        used: int,
+        accepted: int,
+        cycle_ms: float,
+        time_sample: bool = True,
+    ) -> None:
+        self.cycles += 1
+        used = max(0, min(int(used), self.max_depth))
+        accepted = max(0, min(int(accepted), used))
+        # Acceptance: discounted conditional Bernoulli evidence. Decay every
+        # position on every cycle so a tail that is no longer reached gradually
+        # regains uncertainty and can be explored when content changes.
+        keep = 1.0 - self.ALPHA
+        self._accept_hits = [keep * value for value in self._accept_hits]
+        self._accept_trials = [keep * value for value in self._accept_trials]
+        self.p = [
+            self._accept_posterior_mean(j) for j in range(self.max_depth)
+        ]
+        for j in range(used):
+            hit = 1.0 if j < accepted else 0.0
+            self._accept_hits[j] += hit
+            self._accept_trials[j] += 1.0
+            self.p[j] = self._accept_posterior_mean(j)
+            if j >= accepted:
+                break
+        # Cost: wall-time-domain EMA with a one-off-spike guard, plus per-depth
+        # ages so probes can target the estimate that is most stale.
+        # ``time_sample=False`` marks cycles carrying a one-off maintenance
+        # cost (a multi-block head keepalive refold) whose spike would bias
+        # this depth's estimate; the acceptance update above still applies.
+        cycle_ms = max(0.0, float(cycle_ms))
+        if time_sample:
+            self._update_time(used, cycle_ms)
+        for d in list(self.t_age):
+            self.t_age[d] += cycle_ms
+        if time_sample:
+            self.t_age[used] = 0.0
+        self._ms_probe += cycle_ms
+        self._ms_explore += cycle_ms
+        if 0 not in self.t:
+            self._ms_baseline += cycle_ms
+
+        if self._speculation_losing():
+            self.exit_streak += 1
+        else:
+            self.exit_streak = 0
+
+        # Warmup/probe decisions are consumed by _chain_next_drafts after the
+        # current chain has already been built. Advance their bookkeeping only
+        # when the requested depth was actually observed, not on the one-cycle
+        # pipeline lag.
+        if self._warmup:
+            expected = self._warmup[0]
+            if used != expected or not time_sample:
+                self.cur = expected
+                return
+            self._warmup.pop(0)
+            if self._warmup:
+                self.cur = self._warmup[0]
+                return
+            self.cur = self._best()
+            self._ms_probe = 0.0
+            target = self._best_rival()
+            if target is not None and self._acceptance_underexplored(target):
+                self._start_probe(target)
+            return
+
+        # Finishing a probe burst.
+        if self.probe_left > 0:
+            target = self._probe_target
+            if (target is not None and used != target) or not time_sample:
+                self.cur = target if target is not None else used
+                return
+            self.probe_left -= 1
+            point_best = self._best_candidate()
+            baseline_incomplete = bool(
+                target == 0
+                and self._cost_sample_count(0) < self.BASELINE_MIN_SAMPLES
+            )
+            separated = bool(
+                target is not None
+                and not baseline_incomplete
+                and not self._probe_forced
+                and not self._rival_needs_probe(target, point_best)
+            )
+            if self.probe_left == 0 or (
+                not self._probe_forced and (point_best == target or separated)
+            ):
+                self._finish_probe()
+                self._ms_probe = 0.0
+            return
+
+        # Re-decide every cycle (cheap); HYSTERESIS in _best prevents thrash.
+        self.cur = self._best()
+
+        # Probe scheduling: bounded-staleness re-measurement in either
+        # direction, at a duty-bounded wall-clock cadence.
+        if self.max_depth > 1:
+            period = max(
+                self.PROBE_PERIOD_MS,
+                (self.PROBE_LEN + self.PROBE_PIPELINE_TAIL)
+                * cycle_ms
+                / self.PROBE_DUTY,
+            )
+            if self._ms_probe >= period:
+                explore_due = self._ms_explore >= max(
+                    self.PROBE_PERIOD_MAX_MS, 2.0 * period
+                )
+                target = (
+                    self._most_stale() if explore_due else self._best_rival()
+                )
+                if target is not None:
+                    self._start_probe(target, forced=explore_due)
+                    if explore_due:
+                        self._ms_explore = 0.0
+
+    def _accept_posterior_mean(self, j: int) -> float:
+        prior = self.ACCEPT_PRIOR
+        successes = self._accept_hits[j]
+        trials = self._accept_trials[j]
+        # Jeffreys mass is an exploration prior, not permanent exploitation
+        # evidence. Once the discounted stream is mature, use its empirical
+        # ratio so a truly perfect tail converges to 1.0 instead of 0.963.
+        if trials >= self.ACCEPT_EXPLORE_TRIALS:
+            return successes / max(1e-12, trials)
+        return (successes + prior) / (trials + 2.0 * prior)
+
+    def _accept_upper(self, j: int) -> float:
+        """Jeffreys-posterior upper bound for under-explored tails only."""
+
+        trials = self._accept_trials[j]
+        mean = self.p[j]
+        if trials >= self.ACCEPT_EXPLORE_TRIALS:
+            return mean
+        alpha = self._accept_hits[j] + self.ACCEPT_PRIOR
+        beta = max(0.0, trials - self._accept_hits[j]) + self.ACCEPT_PRIOR
+        total = alpha + beta
+        variance = alpha * beta / max(1e-12, total * total * (total + 1.0))
+        return min(1.0, mean + self.CONFIDENCE_Z * math.sqrt(variance))
+
+    def _acceptance_underexplored(self, depth: int) -> bool:
+        return any(
+            self._accept_trials[j] < self.ACCEPT_EXPLORE_TRIALS
+            for j in range(depth)
+        )
+
+    def _start_probe(self, target: int, *, forced: bool = False) -> None:
+        self.cur = int(target)
+        self._probe_target = int(target)
+        self._probe_forced = bool(forced)
+        self.probe_left = self.PROBE_LEN
+        self._ms_probe = 0.0
+
+    def _finish_probe(self) -> None:
+        self.probe_left = 0
+        self._probe_target = None
+        self._probe_forced = False
+        # A forced probe target is not an incumbent. Applying switch
+        # hysteresis relative to it can strand the controller at a measured
+        # loser whose score happens to be within 3% of the winner.
+        self.cur = self._best_candidate()
+
+    def _time_alpha(self, cycle_ms: float) -> float:
+        # EMA weight for a cycle of this wall-time: the memory horizon is
+        # ~TAU_MS regardless of cycle duration, so responsiveness is constant
+        # in real time whether a cycle is 8 ms (short) or 80 ms (128k context).
+        return 1.0 - math.exp(-max(0.0, float(cycle_ms)) / self.TAU_MS)
+
+    def _update_time(self, used: int, cycle_ms: float) -> None:
+        cycle_ms = max(0.0, float(cycle_ms))
+        count = self.t_samples.get(used, 0) + 1
+        self.t_samples[used] = count
+        prev = self.t.get(used)
+        if prev is None:
+            self.t[used] = cycle_ms
+            self._t_variance[used] = 0.0
+            self._t_weight_sq[used] = 1.0
+            return
+        # Deliberately a per-cycle EMA, NOT an irregular-sampling EMA weighted
+        # by staleness age. Age-weighting (nearly replacing a stale estimate at
+        # the first probe cycle) is the textbook form, but it was measured
+        # WORSE here: single-cycle noise is ~±10%, so replacing an estimate
+        # from a 4-cycle probe burst injects that noise straight into the depth
+        # decision every probe (~1s), and prose re-over-drafted (-1.6%). The
+        # slow EMA is a variance shield; stale errors are corrected by probe
+        # REPETITION instead (each ~1s rival probe moves the estimate ~10% of
+        # the gap, converging within a few seconds).
+        a = self._time_alpha(cycle_ms)
+        if cycle_ms > self.SPIKE_RATIO * prev:
+            a *= self.SPIKE_DAMP  # a one-off spike moves the estimate slowly
+        delta = cycle_ms - prev
+        variance = (1.0 - a) * (
+            self._t_variance.get(used, 0.0) + a * delta * delta
+        )
+        weight_sq = (
+            (1.0 - a) ** 2 * self._t_weight_sq.get(used, 1.0) + a * a
+        )
+        estimate = (1.0 - a) * prev + a * cycle_ms
+        if used == 0 and count <= self.BASELINE_MIN_SAMPLES:
+            # A lazy baseline probe still rejects first-run shape inflation.
+            # Keep the wider discounted variance, so this optimistic center
+            # fails toward more evidence rather than a premature park.
+            estimate = min(prev, cycle_ms)
+        self.t[used] = estimate
+        self._t_variance[used] = max(0.0, variance)
+        self._t_weight_sq[used] = min(1.0, max(1e-12, weight_sq))
+
+    def _marginal_est(self) -> float:
+        # Measured cost of one extra verify row: the slope between the cheapest
+        # and priciest measured depths. Falls back to the prior until two
+        # depths exist. This is what self-calibrates the controller to the real
+        # (model x chip x context) marginal instead of a hardcoded value.
+        if len(self.t) >= 2:
+            depths = sorted(self.t)
+            lo, hi = depths[0], depths[-1]
+            if hi > lo:
+                slope = (self.t[hi] - self.t[lo]) / (hi - lo)
+                if slope > 0.0:
+                    return slope
+        return self.MARGINAL_MS
+
+    def _t_est(self, d: int) -> float:
+        if d in self.t:
+            return self.t[d]
+        if not self.t:
+            return 30.0 + self.MARGINAL_MS * d
+        if d == 0:
+            # The plain step sits below the L=1 -> L=2 verify jump, so the
+            # per-row marginal says nothing about it. Estimate it at the
+            # cheapest measured cycle: conservative (true t[0] is lower),
+            # which keeps an unmeasured baseline from hijacking probes —
+            # yet still useful as a conservative trigger when optimistic
+            # speculative acceptance is poor enough to justify measuring it.
+            return min(self.t.values())
+        ref = min(self.t, key=lambda x: abs(x - d))
+        return max(1e-3, self.t[ref] + self._marginal_est() * (d - ref))
+
+    def _expected_tokens(self, d: int, *, optimistic: bool = False) -> float:
+        expected = 1.0
+        run = 1.0
+        for j in range(d):
+            probability = self._accept_upper(j) if optimistic else self.p[j]
+            run *= probability
+            expected += run
+        return expected
+
+    def _score(self, d: int, *, optimistic: bool = False) -> float:
+        return self._expected_tokens(d, optimistic=optimistic) / max(
+            1e-6,
+            self._t_est(d),
+        )
+
+    def _cost_sample_count(self, d: int) -> int:
+        # Unit tests and persisted seeds may inject t directly. Treat those as
+        # mature point estimates; live measurements always populate t_samples.
+        if d in self.t and d not in self.t_samples:
+            return self.COST_MIN_SAMPLES
+        return self.t_samples.get(d, 0)
+
+    def _cost_bounds(self, d: int) -> tuple[float, float]:
+        estimate = max(1e-6, self._t_est(d))
+        count = self._cost_sample_count(d)
+        if d not in self.t or count < self.COST_MIN_SAMPLES:
+            return 0.0, math.inf
+        variance = self._t_variance.get(d)
+        weight_sq = self._t_weight_sq.get(d)
+        if variance is None or weight_sq is None:
+            # Directly seeded test/persisted estimates have no uncertainty
+            # history. Live measurements always populate both maps.
+            return estimate, estimate
+        if variance <= 0.0:
+            return estimate, estimate
+        effective_samples = 1.0 / max(1e-12, weight_sq)
+        half_width = self.CONFIDENCE_Z * math.sqrt(
+            variance / max(1.0, effective_samples)
+        )
+        return max(1e-6, estimate - half_width), estimate + half_width
+
+    def _score_bounds(self, d: int) -> tuple[float, float]:
+        lower_time, upper_time = self._cost_bounds(d)
+        lower = self._expected_tokens(d) / max(1e-6, upper_time)
+        upper = self._expected_tokens(d, optimistic=True) / max(
+            1e-6,
+            lower_time,
+        )
+        return lower, upper
+
+    def _speculation_losing(self) -> bool:
+        # True when the best speculative depth cannot beat the (taxed)
+        # in-loop baseline by EXIT_MARGIN. Only meaningful once the warmup
+        # sweep has measured t[0].
+        if (
+            self._warmup
+            or 0 not in self.t
+            or self._cost_sample_count(0) < self.BASELINE_MIN_SAMPLES
+        ):
+            return False
+        base = self._score(0)
+        if base <= 0.0:
+            return False
+        best = max(self._score(d) for d in range(1, self.max_depth + 1))
+        return best < base * self.EXIT_MARGIN
+
+    def should_exit(self) -> bool:
+        """Sustained losing speculation: hand the sequence back to the
+        standard decoder."""
+        return self.exit_streak >= self.EXIT_STREAK
+
+    def reentry_win_proven(self) -> bool:
+        """Require a mature plain-step baseline before clearing a cooldown."""
+
+        return bool(
+            not self._warmup
+            and self._cost_sample_count(0) >= self.BASELINE_MIN_SAMPLES
+            and not self._speculation_losing()
+        )
+
+    def prepare_reentry_probe(self) -> None:
+        """Bound re-entry proof with three real depth-zero measurements."""
+
+        if 0 not in self.t and 0 not in self._warmup:
+            self._warmup.extend([0] * self.BASELINE_MIN_SAMPLES)
+
+    def _select_candidates(self) -> List[int]:
+        # Depth 0 is only selectable once its cost has actually been
+        # measured (or seeded) — an extrapolated baseline must never PARK
+        # the sequence, only motivate a probe.
+        ds = list(range(1, self.max_depth + 1))
+        if (
+            0 in self.t
+            and self._cost_sample_count(0) >= self.BASELINE_MIN_SAMPLES
+        ):
+            ds.insert(0, 0)
+        return ds
+
+    def _baseline_probe_worthwhile(self) -> bool:
+        if 0 in self.t:
+            return True
+        if not self.t or self._warmup:
+            return False
+        baseline = 1.0 / max(1e-6, self._t_est(0))
+        optimistic_speculation = max(
+            self._score(d, optimistic=True)
+            for d in range(1, self.max_depth + 1)
+        )
+        return optimistic_speculation < baseline * self.EXIT_MARGIN
+
+    def _probe_candidates(self, *, include_baseline: bool = False) -> List[int]:
+        candidates = list(range(1, self.max_depth + 1))
+        if include_baseline or self._baseline_probe_worthwhile():
+            candidates.append(0)
+        return candidates
+
+    def _baseline_stale_due(self) -> bool:
+        if 0 in self.t:
+            return True
+        # A controller already exploiting below max depth has evidence that
+        # speculative yield is limited, so the ordinary five-second explorer
+        # measures the unknown plain baseline. A mature max-depth winner gets
+        # one extra stale interval before paying that shape/calibration cost.
+        delay = self.PROBE_PERIOD_MAX_MS
+        if (
+            self._best_candidate() == self.max_depth
+            and not self._acceptance_underexplored(self.max_depth)
+            and not self._baseline_probe_worthwhile()
+        ):
+            delay *= 2.0
+        return self._ms_baseline >= delay
+
+    def _rival_needs_probe(self, rival: int, incumbent: int) -> bool:
+        if rival == incumbent:
+            return False
+        incumbent_score = self._score(incumbent)
+        # Acceptance optimism is only an exploration gate. A rival whose
+        # under-sampled tail still cannot approach the incumbent does not earn
+        # a cost probe.
+        if (
+            self._cost_sample_count(rival) < self.COST_MIN_SAMPLES
+            and self._score(rival, optimistic=True)
+            < incumbent_score / self.HYSTERESIS
+        ):
+            return False
+        incumbent_lower, _ = self._score_bounds(incumbent)
+        _, rival_upper = self._score_bounds(rival)
+        return rival_upper >= incumbent_lower / self.HYSTERESIS
+
+    def _best_rival(self) -> Optional[int]:
+        # Choose the rival with the highest acceptance-UCB score, then probe it
+        # only while its empirical score interval can overlap exploitation.
+        incumbent = (
+            self.cur
+            if self.cur in self._select_candidates()
+            else self._best_candidate()
+        )
+        if self._score(incumbent) <= 0.0:
+            return self._most_stale()
+        rival = None
+        rival_score = -1.0
+        for d in self._probe_candidates():
+            if d == incumbent:
+                continue
+            s = self._score(d, optimistic=True)
+            if s > rival_score:
+                rival, rival_score = d, s
+        if rival is not None and self._rival_needs_probe(rival, incumbent):
+            return rival
+        return None
+
+    def _most_stale(self) -> Optional[int]:
+        # The depth whose cost estimate has gone longest unmeasured (never
+        # measured counts as infinitely stale). Keeps every t[d] fresh enough
+        # that fresh-vs-stale comparison bias stays bounded.
+        cand = None
+        worst = -1.0
+        for d in self._probe_candidates(
+            include_baseline=self._baseline_stale_due()
+        ):
+            if d == self.cur:
+                continue
+            age = self.t_age.get(d)
+            age = float("inf") if age is None else age
+            if age > worst:
+                cand, worst = d, age
+        return cand
+
+    def _best_candidate(self) -> int:
+        # argmax of measured score with switch hysteresis; ascending scan
+        # with strict '>' keeps the shallower choice on an exact tie.
+        best_d = self._select_candidates()[0]
+        best_score = -1.0
+        for d in self._select_candidates():
+            s = self._score(d)
+            if s > best_score:
+                best_d, best_score = d, s
+        return best_d
+
+    def _best(self) -> int:
+        best_d = self._best_candidate()
+        best_score = self._score(best_d)
+        if best_d != self.cur and best_score < self._score(self.cur) * self.HYSTERESIS:
+            return self.cur
+        return best_d
+
+
 class _LockstepAcceptanceDepthController:
     """Zero-collective distributed depth adaptation from accepted prefixes.
 
@@ -3329,7 +3955,12 @@ class _LockstepAcceptanceDepthController:
 def _new_depth_controller(model: Any, max_depth: int) -> Any:
     if _lockstep_depth_enabled():
         return _LockstepAcceptanceDepthController(max_depth)
-    return _DepthController(
+    controller_type = (
+        _EvidenceDepthController
+        if _qwen4_evidence_depth_enabled(model)
+        else _DepthController
+    )
+    return controller_type(
         max_depth,
         marginal_ms=getattr(model, "_omlx_mtp_marginal_ms", None),
         exit_margin=_effective_loop_tax(model),
@@ -4365,7 +4996,8 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
 
     Format chosen to match PR 990's headline metrics, plus component timings
     that make wall-clock vs. accept-rate gaps debuggable:
-      MTP[<uid>] finish=<reason> tokens=<N> cycles=<C> accept=<A>/<C> (<rate>%)
+      MTP[<uid>] finish=<reason> tokens=<N> cycles=<C>
+        accept=<A>/<conditional> (<rate>%) physical=<A>/<built> (<rate>%)
         emits[init=<i>,draft=<d>,bonus=<b>,verify=<v>]
         timing[backbone=<X>ms mtp=<Y>ms sample=<S>ms cache=<C>ms]
     """
@@ -4377,6 +5009,12 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
         rate_str = f"{stats.accepts / total_drafted * 100:.1f}%"
     else:
         rate_str = "n/a"
+    physical_drafted = stats.physical_drafts or total_drafted
+    physical_rate_str = (
+        f"{stats.accepts / physical_drafted * 100:.1f}%"
+        if physical_drafted
+        else "n/a"
+    )
     if stats.depth_drafted:
         depth_str = " depth[" + ",".join(
             f"d{i + 1}={a}/{d}"
@@ -4391,7 +5029,8 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
     tpc = total_emits / stats.cycles if stats.cycles else 0.0
     _record_mtp_runtime_stats(stats, finish_reason)
     logger.info(
-        "MTP[%s] finish=%s tokens=%d cycles=%d tok/cycle=%.2f accept=%d/%d (%s)%s "
+        "MTP[%s] finish=%s tokens=%d cycles=%d tok/cycle=%.2f "
+        "accept=%d/%d (%s) physical=%d/%d (%s)%s "
         "emits[init=%d,draft=%d,bonus=%d,verify=%d] "
         "timing[backbone=%.1fms mtp=%.1fms sample=%.1fms cache=%.1fms]",
         uid,
@@ -4402,6 +5041,9 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
         stats.accepts,
         total_drafted,
         rate_str,
+        stats.accepts,
+        physical_drafted,
+        physical_rate_str,
         depth_str,
         stats.init_emits,
         stats.draft_emits,
@@ -4703,6 +5345,7 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
 
     # --- stats ---
     state.stats.cycles += 1
+    state.stats.physical_drafts += k
     if len(state.stats.depth_drafted) < state.depth:
         pad = state.depth - len(state.stats.depth_drafted)
         state.stats.depth_drafted.extend([0] * pad)
@@ -5121,6 +5764,7 @@ def _run_verify_cycle_legacy(gen_batch: Any, state: _MtpState) -> None:
     hidden_at_draft = hidden[:, 1:2, :]
 
     state.stats.cycles += 1
+    state.stats.physical_drafts += 1
     if accept:
         state.stats.accepts += 1
         # --- cache cleanup (timed) ---

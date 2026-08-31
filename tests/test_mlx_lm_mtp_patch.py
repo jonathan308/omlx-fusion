@@ -111,6 +111,7 @@ def test_mtp_runtime_stats_accumulate_structured_cycle_economics():
         "tokens": 0,
         "cycles": 0,
         "accepted_draft_tokens": 0,
+        "physical_drafted_tokens": 0,
         "drafted_tokens": 0,
         "zero_depth_cycles": 0,
         "depth_drafted": [],
@@ -125,6 +126,7 @@ def test_mtp_runtime_stats_accumulate_structured_cycle_economics():
     stats = bg._MtpStats(
         cycles=2,
         accepts=3,
+        physical_drafts=6,
         init_emits=2,
         draft_emits=3,
         bonus_emits=1,
@@ -147,10 +149,18 @@ def test_mtp_runtime_stats_accumulate_structured_cycle_economics():
     assert after["cycles"] - before["cycles"] == 2
     assert after["accepted_draft_tokens"] - before["accepted_draft_tokens"] == 3
     assert after["drafted_tokens"] - before["drafted_tokens"] == 4
+    assert (
+        after["physical_drafted_tokens"]
+        - before["physical_drafted_tokens"]
+        == 6
+    )
     assert after["zero_depth_cycles"] - before["zero_depth_cycles"] == 1
     assert after["last_finish_reason"] == "length"
     assert after["acceptance_ratio"] == (
         after["accepted_draft_tokens"] / after["drafted_tokens"]
+    )
+    assert after["physical_acceptance_ratio"] == (
+        after["accepted_draft_tokens"] / after["physical_drafted_tokens"]
     )
     assert after["tokens_per_cycle"] == after["tokens"] / after["cycles"]
 

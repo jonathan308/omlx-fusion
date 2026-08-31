@@ -500,8 +500,10 @@ def test_runtime_markers_validate_mtp_cycle_economics(tmp_path):
         "cycles": 120,
         "accepted_draft_tokens": 240,
         "drafted_tokens": 300,
+        "physical_drafted_tokens": 360,
         "zero_depth_cycles": 2,
         "acceptance_ratio": 0.8,
+        "physical_acceptance_ratio": 2 / 3,
         "tokens_per_cycle": 3.0,
         "depth_drafted": [120, 100, 80],
         "depth_accepted": [115, 85, 40],
@@ -550,6 +552,37 @@ def test_runtime_markers_reject_impossible_mtp_acceptance(tmp_path):
 
     assert result["jobs"] == []
     assert "accepted count exceeds drafted" in result["warnings"][0]
+
+
+def test_runtime_markers_reject_impossible_physical_mtp_drafts(tmp_path):
+    metrics = _metrics()
+    metrics["mtp"] = {
+        "sequences": 1,
+        "tokens": 20,
+        "cycles": 10,
+        "accepted_draft_tokens": 8,
+        "drafted_tokens": 10,
+        "physical_drafted_tokens": 9,
+        "zero_depth_cycles": 0,
+        "acceptance_ratio": 0.8,
+        "physical_acceptance_ratio": 8 / 9,
+        "tokens_per_cycle": 2.0,
+        "depth_drafted": [10],
+        "depth_accepted": [8],
+        "timing_ms": {
+            "backbone": 1.0,
+            "mtp_head": 1.0,
+            "sampling": 1.0,
+            "cache_ops": 1.0,
+        },
+        "last_finish_reason": "length",
+    }
+    (tmp_path / "job.json").write_text(json.dumps(_marker(metrics=metrics)))
+
+    result = read_runtime_markers(tmp_path)
+
+    assert result["jobs"] == []
+    assert "physical draft count is invalid" in result["warnings"][0]
 
 
 def test_runtime_markers_validate_performance_controls_and_live_pipeline_metrics(

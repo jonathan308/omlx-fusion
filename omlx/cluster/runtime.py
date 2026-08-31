@@ -572,6 +572,28 @@ def _validated_metrics(value: Any) -> dict[str, Any]:
             validated_mtp[key] = _nonnegative_float(mtp.get(key), f"MTP metrics {key}")
         if validated_mtp["acceptance_ratio"] > 1:
             raise ValueError("runtime MTP acceptance ratio is out of range")
+        physical_drafted = mtp.get("physical_drafted_tokens")
+        physical_ratio = mtp.get("physical_acceptance_ratio")
+        if physical_drafted is not None or physical_ratio is not None:
+            validated_mtp["physical_drafted_tokens"] = _nonnegative_int(
+                physical_drafted,
+                "MTP metrics physical_drafted_tokens",
+            )
+            validated_mtp["physical_acceptance_ratio"] = _nonnegative_float(
+                physical_ratio,
+                "MTP metrics physical_acceptance_ratio",
+            )
+            if (
+                validated_mtp["physical_drafted_tokens"]
+                < validated_mtp["drafted_tokens"]
+                or validated_mtp["accepted_draft_tokens"]
+                > validated_mtp["physical_drafted_tokens"]
+            ):
+                raise ValueError("runtime MTP physical draft count is invalid")
+            if validated_mtp["physical_acceptance_ratio"] > 1:
+                raise ValueError(
+                    "runtime MTP physical acceptance ratio is out of range"
+                )
         depth_drafted = mtp.get("depth_drafted")
         depth_accepted = mtp.get("depth_accepted")
         if (
