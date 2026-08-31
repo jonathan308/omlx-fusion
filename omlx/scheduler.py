@@ -8694,22 +8694,6 @@ class Scheduler:
             or not isinstance(cache_tokens, (list, tuple))
             or not cache_tokens
         ):
-            if (
-                getattr(self, "_exact_resident_cache", None) is not None
-                and self._exact_resident_cache.max_entries > 0
-                and self._exact_resident_cache.max_bytes > 0
-            ):
-                logger.info(
-                    "Skipping exact resident cache for %s: precondition "
-                    "cache_type=%s tokens_type=%s token_count=%s mtp=%s "
-                    "text_only=%s",
-                    request.request_id,
-                    type(cache_list).__name__,
-                    type(cache_tokens).__name__,
-                    len(cache_tokens) if isinstance(cache_tokens, (list, tuple)) else None,
-                    self._resident_cache_spec_decode_active(),
-                    self._request_is_text_only_for_resident_cache(request),
-                )
             return
         # In non-speculative mlx-lm GenerationBatch.next(), ``_step`` appends
         # the forwarded token to both the physical cache and ``all_tokens``
@@ -8724,29 +8708,11 @@ class Scheduler:
         ):
             return
         if not self._resident_cache_matches_token_count(cache_list, len(tokens)):
-            leaf_summary = []
-            for leaf in self._resident_cache_leaf_objects(cache_list):
-                def _shape(name):
-                    value = getattr(leaf, name, None)
-                    return tuple(value.shape) if isinstance(value, mx.array) else None
-                leaf_summary.append({
-                    "type": type(leaf).__name__,
-                    "offset": getattr(leaf, "offset", None),
-                    "index_offset": getattr(leaf, "_index_offset", None),
-                    "token_count": getattr(leaf, "_token_count", None),
-                    "keys": _shape("keys"),
-                    "values": _shape("values"),
-                    "raw_index": _shape("_index_keys"),
-                    "raw_pos": _shape("_index_position_ids"),
-                    "logical_index": _shape("index_keys"),
-                    "logical_pos": _shape("index_position_ids"),
-                })
-            logger.info(
+            logger.debug(
                 "Skipping exact resident cache for %s: cache offsets do not "
-                "prove the %d-token terminal state leaves=%r",
+                "prove the %d-token terminal state",
                 request.request_id,
                 len(tokens),
-                leaf_summary,
             )
             return
         cache_nbytes = self._resident_cache_nbytes(cache_list)
