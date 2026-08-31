@@ -207,7 +207,11 @@ def _native_topk_indices(scores: mx.array, topk: int) -> mx.array | None:
         ):
             _NATIVE_QSA_TOPK_DISABLED = True
             return None
-        indices = fast.qwen4_qsa_topk_indices(scores, topk=topk).astype(mx.int32)
+        # The native radix kernel already returns uint32. Preserve that dtype
+        # through the direct sparse-attention seam: converting to int32 here
+        # and back to uint32 at attention materializes a needless dependency
+        # and copy on every QSA layer.
+        indices = fast.qwen4_qsa_topk_indices(scores, topk=topk)
         if not _NATIVE_QSA_TOPK_PROVEN:
             mx.eval(indices)
             _NATIVE_QSA_TOPK_PROVEN = True
@@ -257,7 +261,10 @@ def _native_sparse_gqa_attention(
         ):
             _NATIVE_QSA_MAIN_DISABLED = True
             return None
-        native_blocks = mx.contiguous(selected_blocks.astype(mx.uint32)[:, None])
+        native_blocks = selected_blocks
+        if native_blocks.dtype != mx.uint32:
+            native_blocks = native_blocks.astype(mx.uint32)
+        native_blocks = mx.contiguous(native_blocks[:, None])
         output = fast.qwen4_qsa_sparse_gqa_attention(
             queries,
             keys,
@@ -406,6 +413,10 @@ def contiguous_causal_gathered_qsa_decode(
     # Argpartition/native radix order is not chronological.  Sorting the
     # selected set preserves the official key order for deterministic SDPA.
     selected_blocks = mx.sort(selected_blocks, axis=-1)
+    # Token-index arithmetic and the portable gather contract use signed
+    # indices. The direct native path above consumes uint32 without this
+    # round-trip; scalar gathered decode converts only after ordering.
+    selected_blocks = selected_blocks.astype(mx.int32)
     selected_tokens = (
         selected_blocks[..., None] * compress_ratio
         + mx.arange(compress_ratio, dtype=mx.int32)
@@ -602,6 +613,7 @@ def contiguous_causal_gathered_qsa(
                         kth=-block_budget,
                         axis=-1,
                     )[..., -block_budget:].astype(mx.int32)
+                canonical = canonical.astype(ranked.dtype)
                 selected_block_rows = mx.where(
                     (complete_counts <= block_budget)[..., None],
                     canonical,
@@ -628,6 +640,11 @@ def contiguous_causal_gathered_qsa(
                 outputs.append(native_output)
                 continue
 
+            # The portable gather path requires signed indices for flattened
+            # offset arithmetic. Cast only after the exact native seam has
+            # declined the request, keeping its uint32 selector dependency
+            # intact on the production path.
+            selected_block_rows = selected_block_rows.astype(mx.int32)
             selected_indices = (
                 selected_block_rows[..., None] * ratio
                 + mx.arange(ratio, dtype=mx.int32)

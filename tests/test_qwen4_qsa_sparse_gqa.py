@@ -117,7 +117,7 @@ def test_qwen4_prefill_restores_chronological_selected_order(monkeypatch):
     def reverse_topk(scores, topk):
         del scores
         return mx.broadcast_to(
-            mx.arange(topk - 1, -1, -1, dtype=mx.int32)[None, None],
+            mx.arange(topk - 1, -1, -1, dtype=mx.uint32)[None, None],
             (1, total, topk),
         )
 
@@ -149,6 +149,7 @@ def test_qwen4_prefill_restores_chronological_selected_order(monkeypatch):
     mx.eval(output, *captured)
     assert output.shape == (1, total, 24, 256)
     selected = captured[0]
+    assert selected.dtype == mx.uint32
     assert selected[0, -1].tolist() == [0, 1, 2, 3]
 
 
