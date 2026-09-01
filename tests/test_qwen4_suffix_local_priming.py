@@ -368,6 +368,9 @@ def test_qwen4_suffix_local_priming_preserves_target_output_and_cache():
         cached_tokens=len(prefix),
         prefix_cache=prefix_cache,
     )
+    plan = prompt_priming._find_plan(model)
+    assert plan is not None and plan.cached_tokens == len(prefix)
+    assert prompt_priming.capture_eligible(model, primed_cache)
     primed_suffix = model(suffix[None], cache=primed_cache)
     ctx = prompt_priming._find_ctx(model)
     assert ctx is not None and ctx.suffix_local
@@ -403,6 +406,43 @@ def test_qwen4_suffix_local_priming_preserves_target_output_and_cache():
     assert prefix_cache.store_calls == []
     # The seam fold touched only the drafter; target output/cache stay exact.
     _assert_target_cache_equal(control_cache, primed_cache)
+
+
+def test_qwen4_cold_plan_never_captures_or_changes_forward(monkeypatch):
+    """Cold Qwen4 stays on the exact priming-OFF model-forward path."""
+
+    model = _model()
+    prompt = mx.array([2, 3, 4, 5, 6, 7, 8], dtype=mx.int32)
+    control_cache = model.make_cache()
+    candidate_cache = model.make_cache()
+
+    with prompt_priming.suppress_capture():
+        control = model(prompt[None], cache=control_cache)
+
+    assert not prompt_priming.prepare_prefix_context(
+        model,
+        request_id="qwen4-cold-no-capture",
+        prompt_tokens=prompt.tolist(),
+        cached_tokens=0,
+        prefix_cache=_NoSidecarPrefixCache(),
+    )
+    assert prompt_priming._find_plan(model) is None
+    assert prompt_priming._find_ctx(model) is None
+    assert not prompt_priming.capture_eligible(model, candidate_cache)
+
+    def unexpected_capture(*_args, **_kwargs):
+        raise AssertionError("cold Qwen4 entered prompt capture")
+
+    monkeypatch.setattr(prompt_priming, "maybe_capture", unexpected_capture)
+    candidate = model(prompt[None], cache=candidate_cache)
+
+    mx.eval(control.logits, candidate.logits)
+    assert candidate.logits.shape == control.logits.shape
+    assert mx.array_equal(candidate.logits, control.logits).item()
+    assert not getattr(control, "hidden_states", None)
+    assert not getattr(candidate, "hidden_states", None)
+    _assert_target_cache_equal(control_cache, candidate_cache)
+    assert prompt_priming._find_ctx(model) is None
 
 
 def test_qwen4_suffix_local_priming_requires_explicit_model_capability():

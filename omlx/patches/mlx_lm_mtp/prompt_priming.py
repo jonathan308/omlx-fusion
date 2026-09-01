@@ -358,12 +358,20 @@ def _eligible_host(model: Any) -> Any | None:
     return None
 
 
-def _text_only_suffix_plan(host: Any, plan: Optional[_PrimePlan]) -> bool:
-    """Narrow capability gate for Qwen4 verified-drafter local history."""
+def _qwen4_suffix_local_host(host: Any) -> bool:
+    """Return whether ``host`` opts into verified suffix-only priming."""
 
     return bool(
         getattr(host, "_omlx_mtp_suffix_local_capability", None)
         == _QWEN4_SUFFIX_LOCAL_CAPABILITY
+    )
+
+
+def _text_only_suffix_plan(host: Any, plan: Optional[_PrimePlan]) -> bool:
+    """Narrow capability gate for Qwen4 verified-drafter local history."""
+
+    return bool(
+        _qwen4_suffix_local_host(host)
         and isinstance(plan, _PrimePlan)
         and plan.cached_tokens > 0
         and not plan.extra_keys
@@ -876,12 +884,23 @@ def capture_eligible(host: Any, cache: Optional[List[Any]]) -> bool:
     :func:`maybe_capture`; this exists purely to keep the ineligible path
     identical to stock.
     """
-    return (
+    eligible = (
         not _suppressed()
         and priming_enabled()
         and cache is not None
         and _host_eligible(host)
     )
+    if not eligible:
+        return False
+    # Qwen4's capability is deliberately suffix-local: a cold request has no
+    # missing-prefix seam to bridge, and folding its complete prompt adds one
+    # draft-head forward to every prefill chunk.  Require the immutable
+    # scheduler plan to prove a real text-only cache hit before the model even
+    # enters the capture hook.  Generic/DS4 families retain full-history cold
+    # priming and its existing sidecar publication behavior.
+    if _qwen4_suffix_local_host(host):
+        return _text_only_suffix_plan(host, _find_plan(host))
+    return True
 
 
 def prepare_prefix_context(
@@ -914,6 +933,12 @@ def prepare_prefix_context(
 
     tokens = tuple(int(token) for token in prompt_tokens)
     cached_tokens = max(0, int(cached_tokens))
+    if _qwen4_suffix_local_host(host) and cached_tokens <= 0:
+        # Do not retain even a plan marker for cold Qwen4.  This keeps its
+        # model-call shape and hidden-state lifetime identical to priming OFF;
+        # only a scheduler-proven cached suffix may opt into the feature.
+        drop_ctx(model)
+        return False
     existing = _find_ctx(model)
     plan = _find_plan(model)
     if (
@@ -1156,6 +1181,14 @@ def maybe_capture(
         return
     if cache is None or not _host_eligible(host):
         return
+    plan = _find_plan(host)
+    qwen4_suffix_capable = _qwen4_suffix_local_host(host)
+    if qwen4_suffix_capable and not _text_only_suffix_plan(host, plan):
+        # Re-check the scheduler-owned warm-prefix contract even when a caller
+        # bypasses capture_eligible().  A stale/missing/cold plan can never
+        # fall through into generic full-history Qwen4 priming.
+        drop_ctx(host)
+        return
     if inputs is None or getattr(inputs, "ndim", 0) != 2:
         return
     if inputs.shape[0] != 1:
@@ -1188,7 +1221,6 @@ def maybe_capture(
         ctx.target_expected_offset = offset_after
         return
     if ctx is not None and ctx.suffix_local:
-        plan = _find_plan(host)
         if not (
             _text_only_suffix_plan(host, plan)
             and _inputs_match_plan(
@@ -1222,21 +1254,11 @@ def maybe_capture(
         # Qwen4 alone may opt into a clearly tagged local head timeline for an
         # exact scheduler-owned text suffix: the target keeps the absolute
         # durable history and verifies every draft.
-        plan = _find_plan(host)
-        qwen4_suffix_capable = bool(
-            getattr(host, "_omlx_mtp_suffix_local_capability", None)
-            == _QWEN4_SUFFIX_LOCAL_CAPABILITY
-        )
         restored_suffix = offset_after != seq_len
-        suffix_local = qwen4_suffix_capable and restored_suffix
-        if restored_suffix:
-            # Fusion intentionally keeps generic/DS4 partial-history capture
-            # fail-closed.  Only the explicitly tagged Qwen4 target can prove
-            # that its absolute target history and local verified-drafter
-            # history are safe to advance on separate timelines.
+        suffix_local = qwen4_suffix_capable
+        if suffix_local:
             if not (
-                suffix_local
-                and _text_only_suffix_plan(host, plan)
+                _text_only_suffix_plan(host, plan)
                 and seq_start == plan.cached_tokens
                 and _inputs_match_plan(
                     inputs,
@@ -1246,6 +1268,12 @@ def maybe_capture(
                 )
             ):
                 return
+        elif restored_suffix:
+            # Fusion intentionally keeps generic/DS4 partial-history capture
+            # fail-closed.  Only the explicitly tagged Qwen4 target can prove
+            # that its absolute target history and local verified-drafter
+            # history are safe to advance on separate timelines.
+            return
         if not suffix_local and seq_len <= 1:
             # A lone decode step cannot start a prompt timeline.
             return
