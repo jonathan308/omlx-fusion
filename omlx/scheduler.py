@@ -6298,15 +6298,22 @@ class Scheduler:
         if suppress_processor is not None:
             logits_processors.append(suppress_processor)
 
-        # Add thinking budget processor for reasoning models
-        if (
+        # Keep prompt-opened reasoning structurally complete even when no
+        # explicit thinking budget is configured.  Previously a target-sampled
+        # EOS inside ``<think>`` produced a successful three-token ``stop`` and
+        # forced the streaming parser to surface internal reasoning as the
+        # answer body.  The processor masks terminal tokens only until the
+        # natural close marker; an explicit budget retains its existing forced
+        # close behavior.
+        needs_think_protocol = bool(
+            request is not None and getattr(request, "needs_think_prefix", False)
+        )
+        parser_budget_protocol = bool(
             sampling_params.thinking_budget is not None
             and request is not None
-            and (
-                getattr(request, "needs_think_prefix", False)
-                or self._get_output_parser_thinking_end_text() is not None
-            )
-        ):
+            and self._get_output_parser_thinking_end_text() is not None
+        )
+        if needs_think_protocol or parser_budget_protocol:
             think_end_ids = self._resolve_think_end_token_ids()
             if think_end_ids:
                 from .api.thinking import ThinkingBudgetProcessor
@@ -6327,6 +6334,11 @@ class Scheduler:
                     leading_token_ids=leading_ids,
                     trailing_token_ids=trailing_ids,
                     token_to_piece=self._thinking_budget_token_to_piece,
+                    stop_token_ids=(
+                        sorted(self._get_stop_tokens() - set(think_end_ids))
+                        if needs_think_protocol
+                        else None
+                    ),
                 )
                 logits_processors.append(processor)
 

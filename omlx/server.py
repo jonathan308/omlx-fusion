@@ -5768,6 +5768,20 @@ async def stream_chat_completion(
         if tool_calls
         else (last_output.finish_reason if last_output else "stop")
     )
+    if (
+        not tool_calls
+        and thinking_parser.unfinished_thinking
+        and finish_reason == "stop"
+    ):
+        # The target terminated inside a prompt-opened reasoning block. Treat
+        # this as an incomplete response rather than a successful answer; the
+        # private reasoning has already streamed on reasoning_content and must
+        # never be promoted into delta.content.
+        finish_reason = "length"
+        logger.warning(
+            "Chat stream ended before the thinking protocol closed; "
+            "reporting an incomplete response"
+        )
     final_chunk = ChatCompletionChunk(
         id=response_id,
         model=request.model,
@@ -6099,6 +6113,7 @@ async def stream_anthropic_messages(
 
     # Flush remaining buffered content from thinking parser
     thinking_delta, content_delta = thinking_parser.finish()
+    unfinished_thinking = thinking_parser.unfinished_thinking
     if thinking_delta:
         if thinking_filter:
             thinking_delta = thinking_filter.feed(thinking_delta)
@@ -6270,8 +6285,16 @@ async def stream_anthropic_messages(
             yield create_content_block_stop_event(index=i)
 
     # 6. Send message_delta with stop_reason and actual token counts
+    anthropic_finish_reason = output.finish_reason if output else "stop"
+    if not tool_calls and unfinished_thinking and anthropic_finish_reason == "stop":
+        anthropic_finish_reason = "length"
+        logger.warning(
+            "Anthropic stream ended before the thinking protocol closed; "
+            "reporting max_tokens"
+        )
     stop_reason = map_finish_reason_to_stop_reason(
-        output.finish_reason if output else "stop", bool(tool_calls)
+        anthropic_finish_reason,
+        bool(tool_calls),
     )
     # Use actual token counts from the last output
     actual_input_tokens = last_output.prompt_tokens if last_output else 0
@@ -7342,19 +7365,22 @@ async def stream_responses_api(
     has_tools = bool(kwargs.get("tools"))
     # Some templates open the thinking block in the prompt itself, so the
     # generated text starts with reasoning body and only later emits </think>.
-    start_in_thinking = native_reasoning
-    if not start_in_thinking:
-        try:
-            tokenizer = getattr(engine, "tokenizer", None)
-            if tokenizer is not None:
-                prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
-                    engine, messages, kwargs
-                )
-                start_in_thinking, _ = prompt_opens_thinking(
-                    tokenizer, prompt, prompt_token_ids=prompt_token_ids
-                )
-        except Exception as exc:
-            logger.debug("Could not detect Responses stream thinking state: %s", exc)
+    start_in_thinking = False
+    try:
+        tokenizer = getattr(engine, "tokenizer", None)
+        if tokenizer is not None:
+            prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
+                engine, messages, kwargs
+            )
+            start_in_thinking, _ = prompt_opens_thinking(
+                tokenizer, prompt, prompt_token_ids=prompt_token_ids
+            )
+    except Exception as exc:
+        # Capability is only a conservative fallback when rendering cannot be
+        # inspected. The actual prompt wins, because clients can explicitly
+        # disable thinking on a model that supports native reasoning.
+        start_in_thinking = native_reasoning
+        logger.debug("Could not detect Responses stream thinking state: %s", exc)
     thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
     seq = 0
 
@@ -7662,8 +7688,10 @@ async def stream_responses_api(
         await _aclose_async_iterator(engine_stream)
 
     # Flush remaining content from parsers
+    unfinished_thinking = False
     if stream_content:
         thinking_delta, content_delta = thinking_parser.finish()
+        unfinished_thinking = thinking_parser.unfinished_thinking
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
@@ -7715,10 +7743,16 @@ async def stream_responses_api(
                     },
                 )
 
-    # Parse tool calls from accumulated text
+    # Parse tool calls from accumulated text. An unfinished reasoning block is
+    # structurally incomplete and therefore cannot contain trusted public
+    # content or an executable tool call. Fail closed before reparsing the raw,
+    # tag-free text; otherwise Responses would correctly stream it as reasoning
+    # and then duplicate it into ``output_text.done`` at finalization.
     tool_calls = None
     cleaned_text = accumulated_text
-    if last_output and last_output.tool_calls:
+    if unfinished_thinking:
+        cleaned_text = ""
+    elif last_output and last_output.tool_calls:
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
         cleaned_text = ""
     elif has_tools and accumulated_text:
@@ -7762,6 +7796,10 @@ async def stream_responses_api(
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
+    if unfinished_thinking:
+        # Filter recovery is only for a complete output protocol. Never promote
+        # a buffered candidate from an unfinished reasoning region.
+        recovered_content = ""
     if not tool_calls:
         for ev in _emit_reasoning_delta(recovered_thinking):
             yield ev
@@ -8012,7 +8050,10 @@ async def stream_responses_api(
         }
 
     # 13. Emit the terminal event matching the final response status.
-    truncated = getattr(last_output, "finish_reason", None) == "length"
+    truncated = bool(
+        getattr(last_output, "finish_reason", None) == "length"
+        or (not tool_calls and unfinished_thinking)
+    )
     terminal_event = "response.incomplete" if truncated else "response.completed"
     final_response = {
         "id": response_id,
