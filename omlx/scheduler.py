@@ -8658,7 +8658,7 @@ class Scheduler:
         request: Request,
         cache_list: list[Any] | None,
     ) -> bool:
-        """Detach an already-computed, provider-proved prompt N-1 boundary.
+        """Detach an already-computed, provider-proved prompt boundary.
 
         This is staged on the request and published only after normal terminal
         cleanup proves the request stayed singleton.  It therefore adds no
@@ -8682,28 +8682,39 @@ class Scheduler:
             return False
 
         source_tokens = list(request.prompt_token_ids or [])
-        stable_tokens = source_tokens[:-1]
-        if len(stable_tokens) < 2:
+        source_cache_tokens = len(source_tokens) - 1
+        if source_cache_tokens < 2:
             return False
 
         from .cache.exact_boundary import plan_plain_kv_boundary
 
         qwen4_provider = self._resident_cache_qwen4_target_only_enabled()
         provider_name = "qwen4-qsa" if qwen4_provider else "plain-kv-v1"
+        block_size = int(self.config.paged_cache_block_size or 0)
+        stable_token_count = source_cache_tokens
         plain_kv_plan = None
         if not qwen4_provider:
             # Generic V1 is target-only plain KV. Any speculative drafter or
             # non-exact cache graph remains outside its proof.
-            if self._resident_cache_spec_decode_active():
+            if self._resident_cache_spec_decode_active() or block_size <= 0:
+                return False
+            # Plain chat templates may rewrite more than one generation-marker
+            # token between turns. The preceding already-durable block boundary
+            # is template-independent while bounding replay to one cache block.
+            stable_token_count = (
+                source_cache_tokens // block_size
+            ) * block_size
+            if stable_token_count < 2:
                 return False
             plain_kv_plan = plan_plain_kv_boundary(
                 cache_list,
                 source_tokens=len(source_tokens),
-                target_tokens=len(stable_tokens),
+                source_cache_tokens=source_cache_tokens,
+                target_tokens=stable_token_count,
             )
             if plain_kv_plan is None:
                 return False
-        block_size = int(self.config.paged_cache_block_size or 0)
+        stable_tokens = source_tokens[:stable_token_count]
         required_durable = (
             (len(stable_tokens) // block_size) * block_size
             if block_size > 0
@@ -9824,12 +9835,39 @@ class Scheduler:
         if max_tokens > 0 and len(prompt_tokens) > int(max_tokens):
             result.update(reason="prompt-too-large", prompt_tokens=len(prompt_tokens))
             return result
-        contains_exact = getattr(
+        qwen4_boundary = self._resident_cache_qwen4_target_only_enabled()
+        minimum_resident_tokens = len(prompt_tokens)
+        if not qwen4_boundary:
+            prewarm_block_size = int(
+                getattr(
+                    getattr(self, "config", None),
+                    "paged_cache_block_size",
+                    0,
+                )
+                or 0
+            )
+            durable_boundary = (
+                (len(prompt_tokens) // prewarm_block_size) * prewarm_block_size
+                if prewarm_block_size > 0
+                else 0
+            )
+            if durable_boundary >= 2:
+                minimum_resident_tokens = durable_boundary
+        contains_prefix = getattr(
             self._exact_resident_cache,
-            "contains_exact",
+            "contains_prefix",
             None,
         )
-        if callable(contains_exact) and contains_exact(prompt_tokens):
+        contains_exact = getattr(self._exact_resident_cache, "contains_exact", None)
+        already_resident = (
+            contains_prefix(
+                prompt_tokens,
+                minimum_tokens=minimum_resident_tokens,
+            )
+            if callable(contains_prefix)
+            else callable(contains_exact) and contains_exact(prompt_tokens)
+        )
+        if already_resident:
             result.update(
                 reason="stable-boundary-already-resident",
                 prompt_tokens=len(prompt_tokens),

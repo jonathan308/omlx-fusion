@@ -152,6 +152,21 @@ def test_prompt_tail_skips_hidden_recompute_when_stable_boundary_is_resident():
     scheduler._prepare_prefix_cache_for_request.assert_not_called()
 
 
+def test_prompt_tail_skips_for_generic_durable_resident_prefix():
+    scheduler, _cache, _state = _scheduler()
+    scheduler.config = SimpleNamespace(paged_cache_block_size=4)
+    scheduler._exact_resident_cache.contains_prefix = MagicMock(return_value=True)
+
+    result = scheduler.prewarm_prompt_tail(list(range(10)), min_tokens=2)
+
+    assert result["reason"] == "stable-boundary-already-resident"
+    scheduler._exact_resident_cache.contains_prefix.assert_called_once_with(
+        list(range(9)),
+        minimum_tokens=8,
+    )
+    scheduler._prepare_prefix_cache_for_request.assert_not_called()
+
+
 def test_prompt_tail_prefix_restore_does_not_change_user_cache_metrics(monkeypatch):
     scheduler, _cache, _state = _scheduler()
     tracker = MagicMock()

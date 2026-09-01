@@ -371,6 +371,15 @@ def test_lifecycle_generation_makes_deferred_publication_atomic():
     assert tier.generation() == resized_generation + 1
 
 
+def test_contains_prefix_requires_exact_ledger_and_minimum_boundary():
+    tier = ExactResidentPrefixCache(max_entries=2, max_bytes=1_000)
+    assert tier.put([1, 2, 3, 4], [object()], cache_nbytes=10)
+
+    assert tier.contains_prefix([1, 2, 3, 4, 9], minimum_tokens=4)
+    assert not tier.contains_prefix([1, 2, 3, 4, 9], minimum_tokens=5)
+    assert not tier.contains_prefix([1, 2, 8, 4, 9], minimum_tokens=4)
+
+
 def test_scheduler_stages_and_restores_exact_terminal_cache():
     scheduler = _scheduler()
     completed = _request([1, 2, 3])

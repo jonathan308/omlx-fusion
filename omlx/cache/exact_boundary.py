@@ -33,6 +33,7 @@ class PlainKVBoundaryPlan:
     """Allocation-free proof for one exact plain-KV prompt boundary."""
 
     source_tokens: int
+    source_cache_tokens: int
     target_tokens: int
     estimated_nbytes: int
     layers: tuple[_PlainKVLayerPlan, ...]
@@ -60,6 +61,7 @@ def plan_plain_kv_boundary(
     cache_list: Any,
     *,
     source_tokens: int,
+    source_cache_tokens: int,
     target_tokens: int,
 ) -> PlainKVBoundaryPlan | None:
     """Validate a whole plain-KV graph without allocating any MLX arrays."""
@@ -73,9 +75,12 @@ def plan_plain_kv_boundary(
         not isinstance(cache_list, list)
         or not cache_list
         or type(source_tokens) is not int
+        or type(source_cache_tokens) is not int
         or type(target_tokens) is not int
         or source_tokens < 2
-        or target_tokens != source_tokens - 1
+        or source_cache_tokens != source_tokens - 1
+        or target_tokens <= 0
+        or target_tokens > source_cache_tokens
     ):
         return None
 
@@ -94,7 +99,7 @@ def plan_plain_kv_boundary(
             not isinstance(keys, mx.array)
             or not isinstance(values, mx.array)
             or type(offset) is not int
-            or offset != target_tokens
+            or offset != source_cache_tokens
             or keys.ndim != 4
             or values.ndim != 4
         ):
@@ -105,9 +110,9 @@ def plan_plain_kv_boundary(
             key_shape[0] != 1
             or value_shape[0] != 1
             or key_shape[:3] != value_shape[:3]
-            or key_shape[2] < target_tokens
-            or value_shape[2] < target_tokens
-            or cache.size() != target_tokens
+            or key_shape[2] < source_cache_tokens
+            or value_shape[2] < source_cache_tokens
+            or cache.size() != source_cache_tokens
             or id(keys) in source_array_ids
             or id(values) in source_array_ids
             or keys is values
@@ -133,6 +138,7 @@ def plan_plain_kv_boundary(
         return None
     return PlainKVBoundaryPlan(
         source_tokens=source_tokens,
+        source_cache_tokens=source_cache_tokens,
         target_tokens=target_tokens,
         estimated_nbytes=estimated_nbytes,
         layers=tuple(layers),
@@ -183,7 +189,7 @@ def materialize_plain_kv_boundary(
             or tuple(int(dim) for dim in layer.values.shape) != layer.value_shape
             or layer.keys.dtype != layer.key_dtype
             or layer.values.dtype != layer.value_dtype
-            or cache.size() != plan.target_tokens
+            or cache.size() != plan.source_cache_tokens
         ):
             return None
 

@@ -240,6 +240,26 @@ class ExactResidentPrefixCache:
         with self._lock:
             return any(entry.tokens == token_array for entry in self._entries.values())
 
+    def contains_prefix(
+        self,
+        tokens: Iterable[int],
+        *,
+        minimum_tokens: int = 1,
+    ) -> bool:
+        """Whether a sufficiently long resident entry exactly prefixes tokens."""
+
+        try:
+            token_array = array("I", [int(token) for token in tokens])
+            minimum = max(1, int(minimum_tokens))
+        except (OverflowError, TypeError, ValueError):
+            return False
+        with self._lock:
+            return any(
+                minimum <= len(entry.tokens) <= len(token_array)
+                and entry.tokens == token_array[: len(entry.tokens)]
+                for entry in self._entries.values()
+            )
+
     def acquire_prefix(self, prompt_tokens: list[int]) -> ExactResidentHit | None:
         """Pop the longest ready entry that exactly prefixes ``prompt_tokens``."""
 
