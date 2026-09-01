@@ -17,8 +17,9 @@ from __future__ import annotations
 import threading
 from array import array
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -86,17 +87,35 @@ class ExactResidentPrefixCache:
             and all(saved == current for saved, current in zip(stored, candidate))
         )
 
+    def _newest_extending_entry(
+        self,
+        candidate: array,
+    ) -> tuple[int, _ExactResidentEntry] | None:
+        """Return the newest terminal extending a shared stable boundary.
+
+        A current turn can leave multiple terminal branches that all extend the
+        same coarse boundary. Only the newest is the active conversation; older
+        branches remain recoverable through the durable tier and are LRU
+        victims. OrderedDict insertion order makes recency unambiguous, so
+        terminal length is deliberately not used to override it.
+        """
+
+        for entry_id, entry in reversed(self._entries.items()):
+            if self._stored_extends_candidate(entry.tokens, candidate):
+                return entry_id, entry
+        return None
+
     def can_fit_protected_candidate(
         self,
         tokens: Iterable[int],
         *,
         estimated_cache_nbytes: int,
     ) -> bool:
-        """Preflight a fallback without sacrificing a longer terminal entry.
+        """Preflight a fallback without sacrificing the current terminal.
 
-        Unrelated LRU entries are evictable.  A longer entry that extends this
-        exact candidate is protected, and its measured bytes also calibrate a
-        conservative same-cache-family estimate for the shorter candidate.
+        Unrelated and older terminal entries are evictable. The newest entry
+        extending this exact candidate is protected, and its measured bytes
+        calibrate a conservative same-cache-family estimate for the fallback.
         """
 
         try:
@@ -107,28 +126,23 @@ class ExactResidentPrefixCache:
             return False
         estimate = max(0, int(estimated_cache_nbytes))
         with self._lock:
-            protected = [
-                entry
-                for entry in self._entries.values()
-                if self._stored_extends_candidate(entry.tokens, token_array)
-            ]
-            if not protected:
+            protected = self._newest_extending_entry(token_array)
+            if protected is None:
                 return True
-            for entry in protected:
-                if len(entry.tokens) > 0:
-                    estimate = max(
-                        estimate,
-                        (
-                            entry.cache_nbytes * len(token_array)
-                            + len(entry.tokens)
-                            - 1
-                        )
-                        // len(entry.tokens),
+            _, protected_entry = protected
+            if len(protected_entry.tokens) > 0:
+                estimate = max(
+                    estimate,
+                    (
+                        protected_entry.cache_nbytes * len(token_array)
+                        + len(protected_entry.tokens)
+                        - 1
                     )
+                    // len(protected_entry.tokens),
+                )
             return bool(
-                len(protected) + 1 <= self.max_entries
-                and sum(entry.cache_nbytes for entry in protected) + estimate
-                <= self.max_bytes
+                self.max_entries >= 2
+                and protected_entry.cache_nbytes + estimate <= self.max_bytes
             )
 
     def put(
@@ -176,14 +190,8 @@ class ExactResidentPrefixCache:
             ):
                 return False
             if protect_longer_prefix:
-                protected_ids = {
-                    entry_id
-                    for entry_id, existing in self._entries.items()
-                    if self._stored_extends_candidate(
-                        existing.tokens,
-                        token_array,
-                    )
-                }
+                protected = self._newest_extending_entry(token_array)
+                protected_ids = {protected[0]} if protected is not None else set()
                 if protected_ids:
                     prospective_count = len(self._entries) + 1
                     prospective_bytes = self._size_bytes + cache_nbytes
@@ -204,8 +212,8 @@ class ExactResidentPrefixCache:
                         or prospective_bytes > self.max_bytes
                     ):
                         # Prompt-tail prewarm is a fallback for transcript
-                        # divergence, never a reason to evict a longer terminal
-                        # state that may give the next turn a better exact hit.
+                        # divergence, never a reason to evict the newest
+                        # extending terminal state for the active conversation.
                         self.protected_rejections += 1
                         return False
                     for entry_id in victims:

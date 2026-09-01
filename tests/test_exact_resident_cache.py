@@ -223,6 +223,43 @@ def test_prompt_fallback_evicts_unrelated_lru_before_protected_terminal():
     assert tier.acquire_prefix([1, 2, 8]).cache is fallback
 
 
+def test_shared_boundary_keeps_newest_terminal_and_evicts_older_longer_branch():
+    tier = ExactResidentPrefixCache(max_entries=2, max_bytes=2_000)
+    old_longer = [object()]
+    new_shorter = [object()]
+    stable = [object()]
+    old_tokens = [1, 2, 3, 4, 5, 6]
+    new_tokens = [1, 2, 9, 10]
+    stable_tokens = [1, 2]
+
+    assert tier.put(old_tokens, old_longer, cache_nbytes=600, durable_tokens=2)
+    assert tier.put(new_tokens, new_shorter, cache_nbytes=400, durable_tokens=2)
+    assert tier.can_fit_protected_candidate(
+        stable_tokens,
+        estimated_cache_nbytes=200,
+    )
+    assert tier.put(
+        stable_tokens,
+        stable,
+        cache_nbytes=200,
+        durable_tokens=2,
+        protect_longer_prefix=True,
+    )
+
+    assert not tier.contains_exact(old_tokens)
+    assert tier.contains_exact(new_tokens)
+    assert tier.contains_exact(stable_tokens)
+    assert tier.stats()["entries"] == 2
+    assert tier.stats()["evictions"] == 1
+
+    rewritten = tier.acquire_prefix([1, 2, 42, 43])
+    assert rewritten is not None
+    assert rewritten.cache is stable
+    current_append = tier.acquire_prefix([1, 2, 9, 10, 11])
+    assert current_append is not None
+    assert current_append.cache is new_shorter
+
+
 def test_prompt_fallback_preflight_accounts_for_protected_terminal_bytes():
     tier = ExactResidentPrefixCache(max_entries=2, max_bytes=1_000)
     assert tier.put([1, 2, 3, 4], [object()], cache_nbytes=700)
