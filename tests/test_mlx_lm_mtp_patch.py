@@ -2069,6 +2069,40 @@ class TestBatchGeneratorDispatch:
         assert batch.uids == []
         assert batch.prompt_cache == []
 
+    def test_qwen4_verify_rebinds_singleton_mrope_after_rowwise_shrink(
+        self, monkeypatch
+    ):
+        """A B2 adapter delta vector must never leak into the next B1 verify."""
+
+        import mlx.core as mx
+
+        from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+        class Model:
+            _uses_mrope = True
+
+            def __init__(self):
+                self._uid_rope_deltas = {7: 0.0}
+                # Simulate adapter state left by the preceding row-wise B2.
+                self._batch_rope_deltas = mx.array([0.0, 0.0])
+
+            def set_batch_rope_deltas(self, deltas):
+                self._batch_rope_deltas = deltas
+
+        model = Model()
+        batch = SimpleNamespace(model=model, uids=[7])
+        state = bg._MtpState(uid=7, chain=True)
+
+        def verify_chain(observed_batch, observed_state):
+            assert observed_batch is batch
+            assert observed_state is state
+            assert model._batch_rope_deltas.shape == (1,)
+            assert model._batch_rope_deltas.tolist() == [0.0]
+
+        monkeypatch.setattr(bg, "_run_verify_cycle_chain", verify_chain)
+
+        bg._run_verify_cycle(batch, state)
+
     def test_qwen4_rowwise_survivor_alignment_gate_never_truncates_aux_state(self):
         """A malformed QSA survivor fails closed instead of guessing a trim."""
 

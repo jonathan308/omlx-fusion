@@ -6535,6 +6535,17 @@ def _bump_emit_stat(state: _MtpState, source: str) -> None:
 
 def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
     """Dispatch to the depth-k chain cycle or the PR-990 depth-1 legacy cycle."""
+    # A row-wise B2 batch promotes its surviving state directly back to
+    # ``_omlx_mtp_state`` when the other row finishes.  The adapter's previous
+    # two-row mRoPE vector is process-local model state, however, and is not
+    # owned by the compact cache extracted during that B2 -> B1 transition.
+    # If it remains length two, VLMModelAdapter deliberately declines to apply
+    # it to the singleton.  The next Qwen4 verify window then falls through to
+    # get_rope_index() and appends local positions ``0..k`` in the middle of an
+    # otherwise absolute QSA timeline.  Rebind the surviving UID immediately
+    # before every target verify; the helper is a no-op for non-mRoPE and
+    # non-singleton routes.
+    _set_singleton_mrope_delta(gen_batch)
     if state.chain:
         return _run_verify_cycle_chain(gen_batch, state)
     return _run_verify_cycle_legacy(gen_batch, state)
