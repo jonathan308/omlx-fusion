@@ -1,19 +1,24 @@
-# Latent Metal keepwarm (experimental)
+# Instant cached turns (experimental)
 
-Latent Metal keepwarm is an opt-in latency stack for cached follow-up turns.
-It combines two idle-only mechanisms:
+The Advanced **Instant cached turns** toggle controls oMLX's opt-in latency
+stack for exact cached text follow-ups. Internally the setting remains
+`latent_metal_keepwarm_enabled` for configuration compatibility. It combines:
 
 1. a tiny asynchronous Metal pulse that keeps the command path responsive;
-2. an exact prompt-tail materializer that reconstructs an existing durable
+2. a bounded exact-resident handoff that retains validated prompt state in RAM;
+3. an exact prompt-tail materializer that reconstructs an existing durable
    prefix, evaluates only a bounded uncached suffix through the target model,
-   and publishes the resulting all-token state into a bounded resident L0.
+   and atomically publishes a stable fallback.
 
 The second mechanism is useful when an API client re-renders an assistant or
 tool transcript differently from the raw terminal token stream. oMLX retains
-both the longer validated terminal cache and the guaranteed input-prompt
-prefix when they fit under the same byte ceiling. The next request acquires
-the longest exact token prefix that actually matches. If both cannot fit, the
-longer terminal wins and prompt-tail materialization skips.
+the newest validated terminal cache and a stable input-prompt prefix when they
+fit under the same byte ceiling. The next request acquires the longest exact
+token prefix that actually matches; older branches use the durable fallback.
+
+The toggle never changes logits, sampling, or accepted output. Unsupported,
+multimodal, concurrent, or mismatched cache state falls back to normal serving.
+Enabling it can use additional RAM and a small amount of idle power.
 
 The mechanism is adapted from the Apache-2.0
 [ThunderMLX](https://github.com/jonathan308/ThunderMLX) keepwarm design, with

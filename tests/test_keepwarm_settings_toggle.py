@@ -123,3 +123,10 @@ def test_keepwarm_ui_keys_exist_in_every_locale():
     for locale_path in sorted(I18N_DIR.glob("*.json")):
         locale = json.loads(locale_path.read_text(encoding="utf-8"))
         assert not (required - set(locale)), locale_path.name
+        assert (
+            locale["settings.advanced.latent_metal_keepwarm"]
+            == "Instant cached turns"
+        )
+        hint = locale["settings.advanced.latent_metal_keepwarm_hint"]
+        assert "lossless" in hint
+        assert "additional RAM" in hint
