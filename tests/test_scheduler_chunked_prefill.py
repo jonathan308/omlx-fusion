@@ -252,9 +252,12 @@ class TestChunkedPrefillMRoPE:
                 self.batch_deltas = None
                 self.delta_history = []
 
+            def set_text_prefill_rope_delta(self, delta):
+                self.batch_deltas = mx.array([delta])
+                self.delta_history.append([delta])
+
             def set_batch_rope_deltas(self, deltas):
-                self.batch_deltas = deltas
-                self.delta_history.append(deltas.tolist())
+                raise AssertionError("text prefill must use the bounded binder")
 
             def __call__(self, tokens, cache=None):
                 assert self.batch_deltas is not None
