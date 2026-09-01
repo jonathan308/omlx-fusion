@@ -7442,8 +7442,14 @@ class Scheduler:
         expected_tokens: list[int],
     ) -> tuple[list[dict[str, Any]], Optional["ModelCacheConfig"]] | None:
         """Extract live cache only when its token prefix matches exactly."""
+        def terminal_source_fallback():
+            return self._extract_terminal_prompt_source_for_store(
+                request_id,
+                expected_tokens,
+            )
+
         if self.batch_generator is None or uid is None or uid < 0:
-            return None
+            return terminal_source_fallback()
 
         try:
             _safe_sync_stream(self._stream)
@@ -7455,7 +7461,7 @@ class Scheduler:
                     request_id,
                     uid,
                 )
-                return None
+                return terminal_source_fallback()
 
             live_cache, live_tokens = result[uid]
             live_tokens_list = list(live_tokens) if live_tokens is not None else []
@@ -7469,7 +7475,7 @@ class Scheduler:
                     min(len(live_tokens_list), len(expected_tokens)),
                     len(expected_tokens),
                 )
-                return None
+                return terminal_source_fallback()
 
             extracted_cache, model_cache_config = self._extract_cache_states(live_cache)
             if not extracted_cache:
@@ -7481,7 +7487,85 @@ class Scheduler:
                 request_id,
                 e,
             )
+            return terminal_source_fallback()
+
+    def _extract_terminal_prompt_source_for_store(
+        self,
+        request_id: str,
+        expected_tokens: list[int],
+    ) -> tuple[list[dict[str, Any]], Optional["ModelCacheConfig"]] | None:
+        """Use a proved terminal cache after MTP has retired its live uid.
+
+        Qwen4's exact terminal transaction can retire the BatchGenerator uid
+        before ``_cleanup_finished`` prepares the prompt-boundary durable
+        store.  Boundary snapshots already own the non-sliceable recurrent
+        state, but their QSA/KV placeholders still need a sliceable source.
+        The request-local terminal source is independent of the optional L0
+        tier. It is admitted only when its raw token ledger contains the
+        requested boundary verbatim and every live cache offset matches the
+        complete raw ledger. The store path will slice these extracted QSA/KV
+        layers back to ``expected_tokens`` while keeping recurrent state from
+        the captured boundary snapshot.
+        """
+
+        requests = getattr(self, "requests", None)
+        request = requests.get(request_id) if isinstance(requests, dict) else None
+        candidate = getattr(request, "_terminal_prompt_boundary_source", None)
+        if not (
+            isinstance(candidate, tuple)
+            and len(candidate) == 2
+            and isinstance(candidate[0], list)
+            and isinstance(candidate[1], list)
+        ):
             return None
+
+        candidate_tokens, candidate_cache = candidate
+        if len(candidate_tokens) < len(expected_tokens) or (
+            candidate_tokens[: len(expected_tokens)] != expected_tokens
+        ):
+            logger.debug(
+                "Skipping terminal prompt source for %s: token prefix "
+                "does not match prompt boundary (%s/%s tokens)",
+                request_id,
+                min(len(candidate_tokens), len(expected_tokens)),
+                len(expected_tokens),
+            )
+            return None
+        if not self._resident_cache_matches_token_count(
+            candidate_cache,
+            len(candidate_tokens),
+        ):
+            logger.warning(
+                "Skipping terminal prompt source for %s: candidate "
+                "timeline does not match its %s-token ledger",
+                request_id,
+                len(candidate_tokens),
+            )
+            return None
+
+        try:
+            extracted_cache, model_cache_config = self._extract_cache_states(
+                candidate_cache
+            )
+        except Exception as exc:
+            logger.debug(
+                "Failed to extract terminal prompt source for boundary "
+                "store %s: %s",
+                request_id,
+                exc,
+            )
+            return None
+        if not extracted_cache:
+            return None
+        logger.info(
+            "Using exact terminal source as sliceable prompt-boundary "
+            "source for %s after uid retirement (%s-token boundary, "
+            "%s-token candidate)",
+            request_id,
+            len(expected_tokens),
+            len(candidate_tokens),
+        )
+        return extracted_cache, model_cache_config
 
     def _prepare_prompt_boundary_cache_store(
         self,
@@ -8750,6 +8834,55 @@ class Scheduler:
             f"recurrent_counts={sorted(recurrent_counts)[:8]} "
             f"rollback={sorted(rollback)}"
         )
+
+    def _stage_terminal_prompt_boundary_source(
+        self,
+        request: Request,
+        cache_list: Any,
+        cache_tokens: Any,
+    ) -> None:
+        """Retain an exact Qwen4 terminal cache solely for durable refill.
+
+        The terminal post-emit hook may retire its BatchGenerator row before
+        cleanup. Boundary snapshots already contain recurrent state at each
+        prompt boundary, but intentionally omit sliceable QSA/KV state. Keep
+        the proved terminal cache reachable on the request so cleanup can fill
+        only those sliceable placeholders. This ownership is independent of
+        the optional exact-resident L0 tier and is released with the request
+        after the durable store worker completes.
+        """
+
+        request._terminal_prompt_boundary_source = None
+        if (
+            getattr(request, "_mtp_exact_terminal_proved", None)
+            != "qwen4-target-only-v1"
+            or request.specprefill_indices is not None
+            or getattr(request, "skip_cache_store", False)
+            or not self._request_is_text_only_for_resident_cache(request)
+            or not isinstance(cache_list, list)
+            or not cache_list
+            or not isinstance(cache_tokens, (list, tuple))
+            or not cache_tokens
+        ):
+            return
+        try:
+            tokens = [int(token) for token in cache_tokens]
+        except (TypeError, ValueError):
+            return
+        if not self._invalidate_resident_pool_with_telemetry(
+            cache_list,
+            phase="durable-source",
+        ):
+            return
+        if not self._resident_cache_matches_token_count(cache_list, len(tokens)):
+            logger.warning(
+                "Skipping terminal prompt-boundary source for %s: cache "
+                "timeline does not match its %s-token ledger",
+                request.request_id,
+                len(tokens),
+            )
+            return
+        request._terminal_prompt_boundary_source = (tokens, cache_list)
 
     def _stage_exact_resident_cache(
         self,
@@ -12094,6 +12227,11 @@ class Scheduler:
                     resident_tokens = list(request.prompt_token_ids or []) + list(
                         request.output_token_ids or []
                     )
+                self._stage_terminal_prompt_boundary_source(
+                    request,
+                    resident_cache,
+                    resident_tokens,
+                )
                 self._stage_exact_resident_cache(
                     request,
                     resident_cache,

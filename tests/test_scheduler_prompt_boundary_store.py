@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for parser-stop prompt-boundary cache storage."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -193,6 +194,172 @@ def test_prompt_boundary_store_uses_live_cache_for_sliceable_models():
         7,
         boundary_tokens,
     )
+
+
+def test_live_store_uses_exact_terminal_source_after_uid_retirement():
+    scheduler = _scheduler()
+    request_id = "req-terminal-candidate"
+    expected_tokens = [1, 2, 3, 4]
+    candidate_tokens = expected_tokens + [5, 6]
+    candidate_cache = [object()]
+    request = _request(expected_tokens)
+    request._terminal_prompt_boundary_source = (
+        candidate_tokens,
+        candidate_cache,
+    )
+    scheduler.requests = {request_id: request}
+    scheduler.batch_generator = MagicMock()
+    scheduler.batch_generator.extract_cache.return_value = {}
+    scheduler._stream = object()
+    scheduler._resident_cache_matches_token_count = MagicMock(return_value=True)
+    extracted = [
+        {"state": ("qsa",), "class_name": "QSAKVCache", "cache_type": "QSAKVCache"}
+    ]
+    scheduler._extract_cache_states = MagicMock(
+        return_value=(extracted, "candidate-config")
+    )
+
+    with (
+        patch("omlx.scheduler._safe_sync_stream"),
+        patch("omlx.scheduler.mx.stream", return_value=nullcontext()),
+    ):
+        result = scheduler._extract_live_request_cache_for_store(
+            request_id,
+            uid=7,
+            expected_tokens=expected_tokens,
+        )
+
+    assert result == (extracted, "candidate-config")
+    scheduler._resident_cache_matches_token_count.assert_called_once_with(
+        candidate_cache,
+        len(candidate_tokens),
+    )
+    scheduler._extract_cache_states.assert_called_once_with(candidate_cache)
+
+
+def test_prompt_boundary_store_refills_qsa_from_retired_terminal_source():
+    scheduler = _scheduler()
+    request_id = "req-terminal-boundary"
+    prompt_tokens = list(range(10))
+    boundary_tokens = prompt_tokens[:8]
+    boundary_cache = [
+        {"state": (), "class_name": "QSAKVCache", "cache_type": "QSAKVCache"},
+        {
+            "state": ("arrays-at-boundary",),
+            "class_name": "ArraysCache",
+            "cache_type": "ArraysCache",
+        },
+    ]
+    terminal_cache = [object(), object()]
+    terminal_extracted = [
+        {
+            "state": ("qsa-terminal-tail",),
+            "class_name": "QSAKVCache",
+            "cache_type": "QSAKVCache",
+        },
+        {
+            "state": ("arrays-terminal-tail",),
+            "class_name": "ArraysCache",
+            "cache_type": "ArraysCache",
+        },
+    ]
+    request = _request(prompt_tokens)
+    request._terminal_prompt_boundary_source = (
+        prompt_tokens + [100, 101],
+        terminal_cache,
+    )
+    scheduler.requests = {request_id: request}
+    scheduler.batch_generator = MagicMock()
+    scheduler.batch_generator.extract_cache.return_value = {}
+    scheduler._stream = object()
+    scheduler._get_boundary_store_override = MagicMock(
+        return_value=(boundary_tokens, boundary_cache, None, {})
+    )
+    scheduler._resident_cache_matches_token_count = MagicMock(return_value=True)
+    scheduler._extract_cache_states = MagicMock(
+        return_value=(terminal_extracted, "terminal-config")
+    )
+
+    with (
+        patch("omlx.scheduler._safe_sync_stream"),
+        patch("omlx.scheduler.mx.stream", return_value=nullcontext()),
+    ):
+        result = scheduler._prepare_prompt_boundary_cache_store(
+            request_id,
+            request,
+            uid=7,
+        )
+
+    assert result is not None
+    token_sequence, cache_to_store, model_config, snapshots = result
+    assert token_sequence == boundary_tokens
+    assert cache_to_store == [terminal_extracted[0], boundary_cache[1]]
+    assert model_config == "terminal-config"
+    assert snapshots == {}
+
+
+def test_terminal_prompt_source_rejects_wrong_prefix_or_timeline():
+    scheduler = _scheduler()
+    request_id = "req-terminal-candidate"
+    candidate_cache = [object()]
+    request = _request([1, 2, 3, 4])
+    request._terminal_prompt_boundary_source = ([1, 9, 3, 4, 5], candidate_cache)
+    scheduler.requests = {request_id: request}
+    scheduler._resident_cache_matches_token_count = MagicMock(return_value=True)
+    scheduler._extract_cache_states = MagicMock()
+
+    assert (
+        scheduler._extract_terminal_prompt_source_for_store(
+            request_id,
+            [1, 2, 3, 4],
+        )
+        is None
+    )
+    scheduler._resident_cache_matches_token_count.assert_not_called()
+    scheduler._extract_cache_states.assert_not_called()
+
+    request._terminal_prompt_boundary_source = ([1, 2, 3, 4, 5], candidate_cache)
+    scheduler._resident_cache_matches_token_count.return_value = False
+    assert (
+        scheduler._extract_terminal_prompt_source_for_store(
+            request_id,
+            [1, 2, 3, 4],
+        )
+        is None
+    )
+    scheduler._extract_cache_states.assert_not_called()
+
+
+def test_terminal_prompt_source_stages_without_exact_resident_tier():
+    scheduler = _scheduler()
+    cache = [object()]
+    request = _request([1, 2, 3, 4])
+    request.request_id = "req-terminal-source"
+    request._mtp_exact_terminal_proved = "qwen4-target-only-v1"
+    request.skip_cache_store = False
+    request.images = None
+    request.videos = None
+    request.vlm_inputs_embeds = None
+    request.vlm_extra_keys_for_cache = None
+    scheduler._request_is_text_only_for_resident_cache = MagicMock(return_value=True)
+    scheduler._invalidate_resident_pool_with_telemetry = MagicMock(return_value=True)
+    scheduler._resident_cache_matches_token_count = MagicMock(return_value=True)
+
+    scheduler._stage_terminal_prompt_boundary_source(
+        request,
+        cache,
+        [1, 2, 3, 4, 5],
+    )
+
+    assert request._terminal_prompt_boundary_source == (
+        [1, 2, 3, 4, 5],
+        cache,
+    )
+    scheduler._invalidate_resident_pool_with_telemetry.assert_called_once_with(
+        cache,
+        phase="durable-source",
+    )
+    scheduler._resident_cache_matches_token_count.assert_called_once_with(cache, 5)
 
 
 def test_cleanup_finished_stores_prompt_boundary_without_extracted_cache(
