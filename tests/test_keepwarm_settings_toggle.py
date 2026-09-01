@@ -40,6 +40,7 @@ def test_admin_toggle_persists_and_hot_applies_loaded_and_future_engines(
     monkeypatch.setattr(routes, "_get_global_settings", lambda: settings)
     monkeypatch.setattr(omlx.server._server_state, "engine_pool", pool)
     monkeypatch.delenv("OMLX_KEEPWARM", raising=False)
+    monkeypatch.delenv("OMLX_KEEPWARM_PROMPT_TAIL", raising=False)
 
     result = asyncio.run(
         routes.update_global_settings(
@@ -54,6 +55,7 @@ def test_admin_toggle_persists_and_hot_applies_loaded_and_future_engines(
     configure_pool.assert_called_once_with(True)
     assert core.configure_keepwarm.call_args.args == (True,)
     assert os.environ["OMLX_KEEPWARM"] == "1"
+    assert os.environ["OMLX_KEEPWARM_PROMPT_TAIL"] == "1"
     persisted = json.loads((tmp_path / "settings.json").read_text())
     assert persisted["server"]["latent_metal_keepwarm_enabled"] is True
 

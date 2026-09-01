@@ -239,8 +239,14 @@ class TestBurstDecodeEnv:
 
 
 def test_latent_metal_keepwarm_env_maps_boolean_master_switch():
-    assert latent_metal_keepwarm_env(True) == {"OMLX_KEEPWARM": "1"}
-    assert latent_metal_keepwarm_env(False) == {"OMLX_KEEPWARM": "0"}
+    assert latent_metal_keepwarm_env(True) == {
+        "OMLX_KEEPWARM": "1",
+        "OMLX_KEEPWARM_PROMPT_TAIL": "1",
+    }
+    assert latent_metal_keepwarm_env(False) == {
+        "OMLX_KEEPWARM": "0",
+        "OMLX_KEEPWARM_PROMPT_TAIL": "0",
+    }
 
 
 class TestModelSettings:

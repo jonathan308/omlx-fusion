@@ -80,7 +80,7 @@ from .speculative.vlm_mtp import (
 )
 from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
 from .utils.generation_config import load_generation_config_token_ids
-from .utils.hardware import format_bytes
+from .utils.hardware import format_bytes, get_max_working_set_bytes
 from .utils.metal_sync import (
     _default_generation_stream,
     _mx_buffer_access_lock,
@@ -5435,6 +5435,8 @@ class Scheduler:
         request: "Request",
         tokens: list[int],
         existing_cache: "list[Any] | None",
+        *,
+        process_all_tokens: bool = False,
     ) -> _PrefillState:
         """Initialise a _PrefillState for a non-VLM request.
 
@@ -5475,8 +5477,8 @@ class Scheduler:
             )
             base_size = request.cached_tokens
 
-        prefill_tokens = tokens[:-1]
-        last_token = tokens[-1:]
+        prefill_tokens = tokens if process_all_tokens else tokens[:-1]
+        last_token = [] if process_all_tokens else tokens[-1:]
         # Build the input row on the engine stream so chunk eval graphs stay
         # single-stream (see _do_external_prefill, #2197/#2183).
         with mx.stream(self._stream):
@@ -5492,7 +5494,11 @@ class Scheduler:
             emitted_boundaries={},
             boundary_enabled=boundary_enabled,
             block_size=block_size,
-            total_length=len(tokens),
+            # Progress code reports ``total_length - 1`` because ordinary
+            # generation leaves one kickoff token. A prewarm-only pass
+            # processes every real token, so add one synthetic accounting
+            # slot while keeping the token row itself unchanged.
+            total_length=len(tokens) + (1 if process_all_tokens else 0),
         )
 
     def _step_prefill_chunk(self, state: _PrefillState) -> bool:
@@ -5518,8 +5524,16 @@ class Scheduler:
             state.tokens_processed, remaining
         )
         n = min(prefill_step_size, remaining)
+        prewarm_chunk_size = int(
+            getattr(state.request, "_prompt_tail_prewarm_chunk_size", 0) or 0
+        )
+        cache_prewarm_only = bool(
+            getattr(state.request, "_cache_prewarm_only", False)
+        )
+        if prewarm_chunk_size > 0:
+            n = min(n, prewarm_chunk_size)
 
-        if state.tokens_processed == 0:
+        if state.tokens_processed == 0 and not cache_prewarm_only:
             _sync_and_clear_cache(self._stream)
 
         # Clamp to the next block boundary so boundary snapshots fire exactly.
@@ -5571,16 +5585,17 @@ class Scheduler:
             mx.eval([c.state for c in state.cache])
         _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
         _throttle_post = get_phys_footprint()
-        self._record_chunk_transient(
-            n,
-            _throttle_pre,
-            _throttle_post,
-            request_id=state.request.request_id,
-            loop_label="chunked_step",
-            kv_len=state.base_size + state.tokens_processed,
-            requested_step=prefill_step_size,
-        )
-        self._maybe_record_fixed_state_bytes(state.cache)
+        if not cache_prewarm_only:
+            self._record_chunk_transient(
+                n,
+                _throttle_pre,
+                _throttle_post,
+                request_id=state.request.request_id,
+                loop_label="chunked_step",
+                kv_len=state.base_size + state.tokens_processed,
+                requested_step=prefill_step_size,
+            )
+            self._maybe_record_fixed_state_bytes(state.cache)
         state.tokens_processed += n
 
         # Boundary snapshot
@@ -5601,16 +5616,17 @@ class Scheduler:
         # chunked prefill. _do_external_prefill calls _on_prompt_progress
         # via the temp_uid mapping; the chunked path has no temp uid so we
         # talk to the tracker directly with the request_id.
-        get_prefill_tracker().update(
-            state.request.request_id,
-            state.tokens_processed,
-            state.total_length - 1,
-            (
-                self.config.model_name
-                if self.config.model_name
-                else ""
-            ),
-        )
+        if not cache_prewarm_only:
+            get_prefill_tracker().update(
+                state.request.request_id,
+                state.tokens_processed,
+                state.total_length - 1,
+                (
+                    self.config.model_name
+                    if self.config.model_name
+                    else ""
+                ),
+            )
 
         # Memory monitoring — use max(active, phys_footprint) so MLX cache
         # pool and IOAccelerator-backed allocations that don't show up in
@@ -5674,10 +5690,13 @@ class Scheduler:
                     f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
                 )
 
-        if self._should_clear_after_chunk():
+        if not cache_prewarm_only and self._should_clear_after_chunk():
             _sync_and_clear_cache(self._stream)
         chunk_dt = time.perf_counter() - _t_chunk_start
-        if _PREFILL_STEP_TRACE or getattr(state.request, "benchmark_trace", False):
+        if not cache_prewarm_only and (
+            _PREFILL_STEP_TRACE
+            or getattr(state.request, "benchmark_trace", False)
+        ):
             _ane_sequence = int(
                 getattr(state.request, "benchmark_ane_sequence_length", 0) or 0
             )
@@ -5707,11 +5726,16 @@ class Scheduler:
             )
         # Full-size chunks only: boundary/tail slivers under-measure, and
         # the running max must reflect sustained capability.
-        if chunk_dt > 0.0 and n >= _CONTENDED_CHUNK_FLOOR:
+        if (
+            not cache_prewarm_only
+            and chunk_dt > 0.0
+            and n >= _CONTENDED_CHUNK_FLOOR
+        ):
             rate = n / chunk_dt
             if self._prefill_tps_best is None or rate > self._prefill_tps_best:
                 self._prefill_tps_best = rate
-        self._accrue_decode_debt(chunk_dt)
+        if not cache_prewarm_only:
+            self._accrue_decode_debt(chunk_dt)
         return state.tokens_remaining.shape[1] == 0
 
     def _emit_final_boundary_if_needed(self, state: _PrefillState) -> None:
@@ -8625,7 +8649,17 @@ class Scheduler:
                 return False
             keys_len = axis_two_length(getattr(cache_obj, "keys", None))
             values_len = axis_two_length(getattr(cache_obj, "values", None))
-            if keys_len != token_count or values_len != token_count:
+            # QSA uses geometric backing buffers. ``offset`` is the exact
+            # logical KV boundary while keys/values may retain spare capacity
+            # for later appends; state access slices them to that offset. A
+            # backing shorter than the ledger is corrupt, but extra capacity
+            # is expected and does not represent additional committed tokens.
+            if (
+                keys_len is None
+                or values_len is None
+                or keys_len < token_count
+                or values_len < token_count
+            ):
                 return False
 
             raw_keys = getattr(cache_obj, "_index_keys", None)
@@ -8834,6 +8868,123 @@ class Scheduler:
             f"recurrent_counts={sorted(recurrent_counts)[:8]} "
             f"rollback={sorted(rollback)}"
         )
+
+    @classmethod
+    def _resident_qsa_timeline_observation(
+        cls,
+        cache_list: Any,
+        token_count: int,
+    ) -> list[dict[str, Any]]:
+        """Return bounded QSA invariant telemetry after a failed proof."""
+
+        rows: list[dict[str, Any]] = []
+        if not isinstance(cache_list, list):
+            return rows
+        expected = mx.arange(token_count, dtype=mx.int32)
+        for cache_obj in cls._resident_cache_leaf_objects(cache_list):
+            if type(cache_obj).__name__ not in {
+                "QSAKVCache",
+                "QSAQuantizedKVCache",
+            }:
+                continue
+            raw_positions = getattr(cache_obj, "_index_position_ids", None)
+            logical_positions = getattr(cache_obj, "index_position_ids", None)
+            position_exact = False
+            planes_equal = None
+            raw_logical_equal = False
+            try:
+                if isinstance(logical_positions, mx.array):
+                    if logical_positions.ndim == 2:
+                        position_exact = bool(
+                            mx.array_equal(
+                                logical_positions[0].astype(mx.int32),
+                                expected,
+                            ).item()
+                        )
+                    elif logical_positions.ndim == 3:
+                        planes_equal = bool(
+                            (
+                                mx.all(
+                                    logical_positions[0]
+                                    == logical_positions[1]
+                                )
+                                & mx.all(
+                                    logical_positions[0]
+                                    == logical_positions[2]
+                                )
+                            ).item()
+                        )
+                        position_exact = bool(
+                            mx.array_equal(
+                                logical_positions[0, 0].astype(mx.int32),
+                                expected,
+                            ).item()
+                        )
+                if (
+                    isinstance(raw_positions, mx.array)
+                    and isinstance(logical_positions, mx.array)
+                ):
+                    raw_logical_equal = bool(
+                        mx.array_equal(
+                            raw_positions[..., :token_count].astype(mx.int32),
+                            logical_positions.astype(mx.int32),
+                        ).item()
+                    )
+            except Exception:
+                pass
+            rows.append(
+                {
+                    "type": type(cache_obj).__name__,
+                    "offset": getattr(cache_obj, "offset", None),
+                    "kv": (
+                        getattr(getattr(cache_obj, "keys", None), "shape", None),
+                        getattr(getattr(cache_obj, "values", None), "shape", None),
+                    ),
+                    "raw_keys": getattr(
+                        getattr(cache_obj, "_index_keys", None),
+                        "shape",
+                        None,
+                    ),
+                    "raw_positions": getattr(raw_positions, "shape", None),
+                    "raw_offset": getattr(cache_obj, "_index_offset", None),
+                    "logical_keys": getattr(
+                        getattr(cache_obj, "index_keys", None),
+                        "shape",
+                        None,
+                    ),
+                    "logical_positions": getattr(
+                        logical_positions,
+                        "shape",
+                        None,
+                    ),
+                    "public_index_offset": getattr(
+                        cache_obj,
+                        "index_offset",
+                        None,
+                    ),
+                    "position_exact": position_exact,
+                    "planes_equal": planes_equal,
+                    "raw_logical_equal": raw_logical_equal,
+                    "qualified": getattr(
+                        cache_obj,
+                        "_omlx_text_position_ids_qualified",
+                        None,
+                    ),
+                    "pooled": (
+                        getattr(
+                            getattr(cache_obj, "_pooled_index_keys", None),
+                            "shape",
+                            None,
+                        ),
+                        getattr(cache_obj, "_pooled_index_offset", None),
+                        getattr(cache_obj, "_pooled_index_ratio", None),
+                        getattr(cache_obj, "_pooled_index_tag", None) is not None,
+                    ),
+                }
+            )
+            if len(rows) >= 2:
+                break
+        return rows
 
     def _stage_terminal_prompt_boundary_source(
         self,
@@ -9152,6 +9303,386 @@ class Scheduler:
         )
         return stats
 
+    @contextmanager
+    def _suppress_prompt_tail_cache_observability(self):
+        """Keep idle maintenance out of user cache/phase accounting.
+
+        Prompt-tail prewarm deliberately reads and promotes the ordinary
+        durable prefix, but it is not a user request and must not inflate hit
+        rate, tokens-saved, SSD-load, or endpoint phase metrics. The owning
+        scheduler's serialized MLX lane prevents a user cache operation from
+        racing while these snapshots are restored.
+        """
+
+        prefix_cache = getattr(self, "block_aware_cache", None)
+        prefix_counter_names = (
+            "_hits",
+            "_misses",
+            "_tokens_saved",
+            "_partial_block_skips",
+            "_partial_tokens_skipped",
+            "_tokens_matched_total",
+            "_tokens_requested_total",
+            "_last_partial_tokens_skipped",
+            "_last_tokens_to_next_block",
+            "_exact_prefix_hits",
+            "_exact_prefix_misses",
+            "_exact_prefix_tokens_restored",
+            "_exact_prefix_stores",
+            "_exact_prefix_store_failures",
+            "_gdn_checkpoint_loads",
+            "_gdn_checkpoint_walkbacks",
+        )
+        prefix_snapshot = {
+            name: getattr(prefix_cache, name)
+            for name in prefix_counter_names
+            if prefix_cache is not None and hasattr(prefix_cache, name)
+        }
+        ssd_manager = getattr(self, "paged_ssd_cache_manager", None)
+        ssd_stats = getattr(ssd_manager, "_stats", None)
+        ssd_snapshot = dict(ssd_stats) if isinstance(ssd_stats, dict) else None
+        phase_total = getattr(self, "_phase_total_ms", None)
+        phase_count = getattr(self, "_phase_count", None)
+        phase_total_snapshot = dict(phase_total) if phase_total is not None else None
+        phase_count_snapshot = dict(phase_count) if phase_count is not None else None
+        try:
+            yield
+        finally:
+            for name, value in prefix_snapshot.items():
+                setattr(prefix_cache, name, value)
+            if ssd_snapshot is not None and isinstance(ssd_stats, dict):
+                ssd_stats.clear()
+                ssd_stats.update(ssd_snapshot)
+            if phase_total_snapshot is not None and phase_total is not None:
+                phase_total.clear()
+                phase_total.update(phase_total_snapshot)
+            if phase_count_snapshot is not None and phase_count is not None:
+                phase_count.clear()
+                phase_count.update(phase_count_snapshot)
+
+    def prewarm_prompt_tail(
+        self,
+        prompt: str | list[int],
+        *,
+        min_tokens: int = 256,
+        max_tokens: int = 262144,
+        max_suffix_tokens: int = 4096,
+        chunk_size: int = 128,
+        abort_requested: Callable[[], bool] | None = None,
+        publish_if_current: (
+            Callable[[list[int], list[Any], int, int], bool] | None
+        ) = None,
+    ) -> dict[str, Any]:
+        """Publish an exact arbitrary prompt tail into resident L0.
+
+        This is the target-only counterpart to ThunderMLX visible transcript
+        prewarm. It reuses the ordinary durable prefix, evaluates only a
+        bounded suffix on the owning MLX lane, performs no sampling or MTP
+        work, and publishes cache state at all ``N`` prompt tokens. A future
+        request must add a non-empty suffix before ExactResidentPrefixCache
+        will transfer ownership, so generation kickoff never needs a generic
+        recurrent-cache trim.
+        """
+
+        result: dict[str, Any] = {"status": "skipped", "reason": "unknown"}
+        if self.has_requests() or self._others_decoding():
+            result["reason"] = "scheduler-busy"
+            return result
+        if self._exact_resident_cache.max_entries <= 0:
+            result["reason"] = "resident-disabled"
+            return result
+        if (
+            self._resident_cache_spec_decode_active()
+            and not self._resident_cache_qwen4_target_only_enabled()
+        ):
+            # A hidden target-only pass is reusable during speculative decode
+            # only when the model advertises the same verified Qwen4 terminal
+            # transaction used by normal exact-resident handoff.  Other
+            # speculative families may leave target state ahead of their
+            # public token ledger, so do not allocate an entry that restore
+            # must reject (or, worse, might later learn to accept broadly).
+            result["reason"] = "speculative-terminal-unproved"
+            return result
+
+        try:
+            prompt_tokens = (
+                self.tokenizer.encode(prompt)
+                if isinstance(prompt, str)
+                else [int(token) for token in prompt]
+            )
+        except Exception as exc:
+            result.update(reason="tokenize-failed", error=str(exc)[:200])
+            return result
+        if len(prompt_tokens) < max(2, int(min_tokens)):
+            result.update(reason="prompt-too-short", prompt_tokens=len(prompt_tokens))
+            return result
+        if max_tokens > 0 and len(prompt_tokens) > int(max_tokens):
+            result.update(reason="prompt-too-large", prompt_tokens=len(prompt_tokens))
+            return result
+        if (
+            (abort_requested is not None and abort_requested())
+            or self._others_decoding()
+        ):
+            result["reason"] = "admission-pending"
+            return result
+
+        # Idle optimization must never trigger model eviction or rely on the
+        # user's optional memory-guard switch. Price a full-N scratch cache
+        # against the stable physical/Metal ceilings before reconstructing a
+        # single prefix block. If this model cannot produce a trustworthy
+        # estimate, skip and preserve the current hot entry.
+        current_usage = self._current_usage_bytes()
+        estimate = self._admission_estimate(
+            num_prompt_tokens=len(prompt_tokens),
+            cached_tokens=0,
+            current=current_usage,
+        )
+        cap_candidates = [
+            int(getattr(self, name, 0) or 0)
+            for name in (
+                "_memory_abort_limit_bytes",
+                "_memory_metal_cap_bytes",
+                "_memory_static_ceiling_bytes",
+            )
+        ]
+        try:
+            cap_candidates.append(int(get_max_working_set_bytes() or 0))
+        except Exception:
+            pass
+        cap_candidates = [value for value in cap_candidates if value > 0]
+        physical_cap = min(cap_candidates) if cap_candidates else 0
+        if estimate is None or physical_cap <= 0:
+            result["reason"] = "memory-estimate-unavailable"
+            return result
+        if (
+            estimate.estimated > physical_cap
+            or estimate.kv_exact > self._exact_resident_cache.max_bytes
+        ):
+            result.update(
+                reason="memory-headroom-rejected",
+                estimated_bytes=int(estimate.estimated),
+                resident_bytes=int(estimate.kv_exact),
+                limit_bytes=int(physical_cap),
+            )
+            return result
+        can_fit_protected = getattr(
+            self._exact_resident_cache,
+            "can_fit_protected_candidate",
+            None,
+        )
+        if callable(can_fit_protected) and not can_fit_protected(
+            prompt_tokens,
+            estimated_cache_nbytes=int(estimate.kv_exact),
+        ):
+            result.update(
+                reason="protected-terminal-budget",
+                resident_bytes=int(estimate.kv_exact),
+                limit_bytes=int(self._exact_resident_cache.max_bytes),
+            )
+            return result
+
+        request_id = f"keepwarm-tail-{time.time_ns()}"
+        request = Request(
+            request_id=request_id,
+            prompt=prompt_tokens,
+            sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
+            skip_cache_store=True,
+        )
+        request.prompt_token_ids = prompt_tokens
+        request.num_prompt_tokens = len(prompt_tokens)
+        request._cache_prewarm_only = True
+        request._specprefill_enabled = False
+        request._prompt_tail_prewarm_chunk_size = max(64, int(chunk_size))
+
+        original_cache: list[Any] | None = None
+        prefilled_cache: list[Any] | None = None
+        state: _PrefillState | None = None
+        original_cached_tokens = 0
+        original_durable_tokens = 0
+        published = False
+        started = time.perf_counter()
+        # Hidden prompt-tail evaluation is target-only.  Qwen4 prompt
+        # priming normally observes target forwards and builds model-global
+        # MTP state for the next decode.  That state is useful for a user
+        # request but is both wasted and unsafe to leak out of an idle cache
+        # maintenance pass, so make the exclusion explicit rather than
+        # relying on the current runtime's priming setting.
+        from .patches.mlx_lm_mtp import prompt_priming
+
+        prompt_priming.drop_ctx(getattr(self, "model", None))
+        try:
+            with self._suppress_prompt_tail_cache_observability():
+                with mx.stream(self._stream):
+                    self._prepare_prefix_cache_for_request(request)
+            original_cache = request.prompt_cache
+            original_cached_tokens = max(0, int(request.cached_tokens or 0))
+            original_durable_tokens = max(
+                0,
+                int(
+                    getattr(
+                        request,
+                        "_exact_resident_durable_fallback_tokens",
+                        0,
+                    )
+                    or 0
+                ),
+            )
+            remaining = (
+                list(request.remaining_tokens)
+                if request.remaining_tokens is not None
+                else prompt_tokens
+            )
+            result.update(
+                prompt_tokens=len(prompt_tokens),
+                cached_tokens=original_cached_tokens,
+                suffix_tokens=len(remaining),
+            )
+            if original_cached_tokens <= 0 or original_cache is None:
+                result["reason"] = "no-reusable-prefix"
+                return result
+            if len(remaining) > max(1, int(max_suffix_tokens)):
+                result["reason"] = "suffix-too-large"
+                return result
+            if (
+                (abort_requested is not None and abort_requested())
+                or self._others_decoding()
+            ):
+                result["reason"] = "admission-pending"
+                return result
+            if not self._validate_cache(original_cache):
+                result["reason"] = "restored-cache-invalid"
+                return result
+            preflight_rejection = self._preflight_memory_check(request)
+            if preflight_rejection is not None:
+                result.update(
+                    reason="memory-headroom-rejected",
+                    estimated_bytes=preflight_rejection.estimated_bytes,
+                    limit_bytes=preflight_rejection.limit_bytes,
+                )
+                return result
+
+            with prompt_priming.suppress_capture():
+                state = self._begin_prefill(
+                    request,
+                    remaining,
+                    original_cache,
+                    process_all_tokens=True,
+                )
+                # Resident prewarm is memory-only. Durable 4K snapshots remain
+                # the restart fallback and must not be rewritten by this
+                # hidden pass.
+                state.boundary_enabled = False
+                while not self._step_prefill_chunk(state):
+                    if (
+                        (abort_requested is not None and abort_requested())
+                        or self._others_decoding()
+                    ):
+                        result["reason"] = "admission-arrived"
+                        return result
+                if (
+                    (abort_requested is not None and abort_requested())
+                    or self._others_decoding()
+                ):
+                    result["reason"] = "admission-arrived"
+                    return result
+
+                prefilled_cache = state.cache
+                self._finalize_chunked_prefill_cache_for_insert(
+                    request,
+                    prefilled_cache,
+                )
+            if not self._invalidate_resident_pool_with_telemetry(
+                prefilled_cache,
+                phase="prompt-tail-prewarm",
+            ):
+                result["reason"] = "derived-state-invalidation-failed"
+                return result
+            if not self._resident_cache_matches_token_count(
+                prefilled_cache,
+                len(prompt_tokens),
+            ):
+                logger.info(
+                    "Latent prompt-tail timeline mismatch: expected=%d %s qsa=%s",
+                    len(prompt_tokens),
+                    self._resident_cache_timeline_observation(prefilled_cache),
+                    self._resident_qsa_timeline_observation(
+                        prefilled_cache,
+                        len(prompt_tokens),
+                    ),
+                )
+                result["reason"] = "timeline-mismatch"
+                return result
+            cache_nbytes = self._resident_cache_nbytes(prefilled_cache)
+            if cache_nbytes is None or cache_nbytes <= 0:
+                result["reason"] = "cache-size-unavailable"
+                return result
+            durable_tokens = min(original_durable_tokens, len(prompt_tokens))
+            if (
+                (abort_requested is not None and abort_requested())
+                or self._others_decoding()
+            ):
+                result["reason"] = "admission-arrived"
+                return result
+            if publish_if_current is None:
+                published = self._exact_resident_cache.put(
+                    prompt_tokens,
+                    prefilled_cache,
+                    cache_nbytes=cache_nbytes,
+                    durable_tokens=durable_tokens,
+                    protect_longer_prefix=True,
+                )
+            else:
+                published = publish_if_current(
+                    prompt_tokens,
+                    prefilled_cache,
+                    cache_nbytes,
+                    durable_tokens,
+                )
+            if not published:
+                result["reason"] = "resident-budget-rejected"
+                return result
+            result.update(
+                status="published",
+                reason="ok",
+                cache_nbytes=cache_nbytes,
+                durable_tokens=durable_tokens,
+            )
+            logger.info(
+                "Latent prompt-tail prewarm published: prompt=%d cached=%d "
+                "suffix=%d size=%.2fGiB elapsed=%.1fms",
+                len(prompt_tokens),
+                original_cached_tokens,
+                len(remaining),
+                cache_nbytes / 1024**3,
+                (time.perf_counter() - started) * 1000.0,
+            )
+            return result
+        except Exception as exc:
+            logger.warning("Latent prompt-tail prewarm failed closed: %s", exc)
+            result.update(reason="exception", error=str(exc)[:200])
+            return result
+        finally:
+            self._release_paged_cache_for_request(request_id)
+            self._clear_request_admission_bookkeeping(request_id)
+            get_prefill_tracker().remove(request_id)
+            request.prompt_cache = None
+            request._terminal_prompt_boundary_source = None
+            original_cache = None
+            prefilled_cache = None
+            state = None
+            model = getattr(self, "model", None)
+            prompt_priming.drop_ctx(model)
+            if hasattr(model, "clear_vlm_position_state"):
+                model.clear_vlm_position_state()
+            if hasattr(model, "clear_pending_embeddings"):
+                model.clear_pending_embeddings()
+            # Use the same delayed IOKit-safe reclamation path as ordinary
+            # request completion. Immediate mx.clear_cache here can race
+            # completeMemory callbacks and can flush another engine's warm
+            # allocator pool.
+            self._schedule_deferred_metal_clear()
+            result["elapsed_ms"] = (time.perf_counter() - started) * 1000.0
+
     def _prepare_prefix_cache_for_request(self, request: Request) -> None:
         if request.request_id in self._prefix_cache_prepared:
             return
@@ -9161,30 +9692,35 @@ class Scheduler:
         # Fastest exact path: the preceding turn's already-detached live
         # cache.  Ownership is exclusive and token identity is proven before
         # use.  Any miss falls through to the durable block cache unchanged.
-        if self._restore_exact_resident_cache(request):
+        if (
+            not getattr(request, "_cache_prewarm_only", False)
+            and self._restore_exact_resident_cache(request)
+        ):
             try:
                 from .patches.mlx_lm_mtp import prompt_priming
 
-                prompt_priming.prepare_prefix_context(
-                    self.model,
-                    request_id=request.request_id,
-                    prompt_tokens=request.prompt_token_ids,
-                    cached_tokens=request.cached_tokens,
-                    prefix_cache=self.block_aware_cache,
-                    extra_keys=request.vlm_extra_keys_for_cache,
-                    extra_key_token_start=(
-                        request.vlm_extra_key_token_start_for_cache
-                    ),
-                    extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
-                )
+                if not getattr(request, "_cache_prewarm_only", False):
+                    prompt_priming.prepare_prefix_context(
+                        self.model,
+                        request_id=request.request_id,
+                        prompt_tokens=request.prompt_token_ids,
+                        cached_tokens=request.cached_tokens,
+                        prefix_cache=self.block_aware_cache,
+                        extra_keys=request.vlm_extra_keys_for_cache,
+                        extra_key_token_start=(
+                            request.vlm_extra_key_token_start_for_cache
+                        ),
+                        extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+                    )
             except Exception as exc:
                 logger.debug(
                     "MTP resident-prefix preparation failed closed for %s: %s",
                     request.request_id,
                     exc,
                 )
-            self._log_prefix_divergence(request)
-            self._try_specprefill_scoring(request)
+            if not getattr(request, "_cache_prewarm_only", False):
+                self._log_prefix_divergence(request)
+                self._try_specprefill_scoring(request)
             self._prefix_cache_prepared.add(request.request_id)
             return
 
@@ -9378,16 +9914,17 @@ class Scheduler:
         try:
             from .patches.mlx_lm_mtp import prompt_priming
 
-            prompt_priming.prepare_prefix_context(
-                self.model,
-                request_id=request.request_id,
-                prompt_tokens=request.prompt_token_ids,
-                cached_tokens=request.cached_tokens,
-                prefix_cache=self.block_aware_cache,
-                extra_keys=request.vlm_extra_keys_for_cache,
-                extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
-                extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
-            )
+            if not getattr(request, "_cache_prewarm_only", False):
+                prompt_priming.prepare_prefix_context(
+                    self.model,
+                    request_id=request.request_id,
+                    prompt_tokens=request.prompt_token_ids,
+                    cached_tokens=request.cached_tokens,
+                    prefix_cache=self.block_aware_cache,
+                    extra_keys=request.vlm_extra_keys_for_cache,
+                    extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+                    extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+                )
         except Exception as exc:
             logger.debug(
                 "MTP prefix-history preparation failed closed for %s: %s",
@@ -9398,11 +9935,13 @@ class Scheduler:
         # Trace where this prompt diverges from recently stored cache
         # sequences: one INFO line for large re-prefills (#2333/#2349
         # triage), decoded token context at DEBUG (issue #1003).
-        self._log_prefix_divergence(request)
+        if not getattr(request, "_cache_prewarm_only", False):
+            self._log_prefix_divergence(request)
 
         # SpecPrefill: score remaining tokens with draft model if applicable.
         # Must run AFTER prefix cache check (scoring applies only to uncached suffix).
-        self._try_specprefill_scoring(request)
+        if not getattr(request, "_cache_prewarm_only", False):
+            self._try_specprefill_scoring(request)
         self._prefix_cache_prepared.add(request.request_id)
 
     def add_request(self, request: Request) -> None:
@@ -10501,6 +11040,11 @@ class Scheduler:
             or self._pending_reclaim_request
             or self._pending_pressure_clear
         )
+
+    def has_active_user_requests(self) -> bool:
+        """Return real user work, excluding post-finish cache housekeeping."""
+
+        return bool(self.waiting or self.prefilling or self.running)
 
     def has_pending_route_preflight_cleanup(self) -> bool:
         """Return whether finished-request memory is still being reclaimed.

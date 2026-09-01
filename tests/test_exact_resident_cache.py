@@ -133,6 +133,78 @@ def test_exact_resident_is_bounded_lru():
     assert tier.acquire_prefix([2, 4]).cache is second
 
 
+def test_prompt_fallback_never_evicts_longer_terminal_when_budget_is_tight():
+    tier = ExactResidentPrefixCache(max_entries=1, max_bytes=1_000)
+    terminal = [object()]
+    fallback = [object()]
+    assert tier.put([1, 2, 3, 4], terminal, cache_nbytes=400)
+
+    assert not tier.put(
+        [1, 2],
+        fallback,
+        cache_nbytes=200,
+        protect_longer_prefix=True,
+    )
+    hit = tier.acquire_prefix([1, 2, 3, 4, 5])
+    assert hit is not None
+    assert hit.cache is terminal
+    assert tier.stats()["protected_rejections"] == 1
+
+
+def test_prompt_fallback_coexists_with_longer_terminal_under_shared_byte_cap():
+    tier = ExactResidentPrefixCache(max_entries=2, max_bytes=1_000)
+    terminal = [object()]
+    fallback = [object()]
+    assert tier.put([1, 2, 3, 4], terminal, cache_nbytes=400)
+    assert tier.put(
+        [1, 2],
+        fallback,
+        cache_nbytes=200,
+        protect_longer_prefix=True,
+    )
+
+    longest = tier.acquire_prefix([1, 2, 3, 4, 5])
+    assert longest is not None
+    assert longest.cache is terminal
+    divergent = tier.acquire_prefix([1, 2, 9])
+    assert divergent is not None
+    assert divergent.cache is fallback
+
+
+def test_prompt_fallback_evicts_unrelated_lru_before_protected_terminal():
+    tier = ExactResidentPrefixCache(max_entries=2, max_bytes=1_000)
+    unrelated = [object()]
+    terminal = [object()]
+    fallback = [object()]
+    assert tier.put([9, 9], unrelated, cache_nbytes=100)
+    assert tier.put([1, 2, 3, 4], terminal, cache_nbytes=400)
+
+    assert tier.put(
+        [1, 2],
+        fallback,
+        cache_nbytes=200,
+        protect_longer_prefix=True,
+    )
+
+    assert tier.acquire_prefix([9, 9, 10]) is None
+    assert tier.acquire_prefix([1, 2, 3, 4, 5]).cache is terminal
+    assert tier.acquire_prefix([1, 2, 8]).cache is fallback
+
+
+def test_prompt_fallback_preflight_accounts_for_protected_terminal_bytes():
+    tier = ExactResidentPrefixCache(max_entries=2, max_bytes=1_000)
+    assert tier.put([1, 2, 3, 4], [object()], cache_nbytes=700)
+
+    assert not tier.can_fit_protected_candidate(
+        [1],
+        estimated_cache_nbytes=400,
+    )
+    assert tier.can_fit_protected_candidate(
+        [1],
+        estimated_cache_nbytes=200,
+    )
+
+
 def test_exact_resident_enforces_byte_budget_and_uint32_tokens():
     tier = ExactResidentPrefixCache(max_entries=2, max_bytes=100)
 
@@ -231,6 +303,20 @@ def test_clear_releases_only_resident_entries():
     assert tier.stats()["size_bytes"] == 0
 
 
+def test_resize_restores_entry_limit_and_evicts_oldest():
+    tier = ExactResidentPrefixCache(max_entries=2, max_bytes=1_000)
+    first = [object()]
+    second = [object()]
+    assert tier.put([1], first, cache_nbytes=10)
+    assert tier.put([2], second, cache_nbytes=20)
+
+    assert tier.resize(1) == 1
+    assert tier.stats()["max_entries"] == 1
+    assert tier.stats()["entries"] == 1
+    assert tier.acquire_prefix([1, 3]) is None
+    assert tier.acquire_prefix([2, 3]).cache is second
+
+
 def test_scheduler_stages_and_restores_exact_terminal_cache():
     scheduler = _scheduler()
     completed = _request([1, 2, 3])
@@ -267,6 +353,8 @@ def test_scheduler_qsa_terminal_validation_covers_all_auxiliary_state():
     assert hasattr(request, "_exact_resident_candidate")
 
     for mutate in (
+        lambda cache: setattr(cache, "keys", mx.zeros((1, 2, 3, 4))),
+        lambda cache: setattr(cache, "values", mx.zeros((1, 2, 3, 4))),
         lambda cache: setattr(cache, "_index_offset", 3),
         lambda cache: setattr(cache, "_index_keys", mx.zeros((1, 3, 8))),
         lambda cache: setattr(
@@ -290,6 +378,22 @@ def test_scheduler_qsa_terminal_validation_covers_all_auxiliary_state():
             rejected, [probe, ArraysCache()], [1, 2, 3, 4]
         )
         assert not hasattr(rejected, "_exact_resident_candidate")
+
+
+def test_scheduler_qsa_accepts_geometric_kv_capacity_at_exact_logical_offset():
+    scheduler = _scheduler()
+    request = _request([1, 2, 3, 4])
+    qsa = QSAKVCache(4)
+    qsa.keys = mx.zeros((1, 2, 8, 4))
+    qsa.values = mx.ones((1, 2, 8, 4))
+
+    scheduler._stage_exact_resident_cache(
+        request,
+        [qsa, ArraysCache()],
+        [1, 2, 3, 4],
+    )
+
+    assert hasattr(request, "_exact_resident_candidate")
 
 
 def test_scheduler_qsa_pooled_and_text_qualification_must_be_coherent():

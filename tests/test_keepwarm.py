@@ -7,7 +7,9 @@ import concurrent.futures
 import threading
 from contextlib import contextmanager, suppress
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+import omlx.engine_core as engine_core_module
 from omlx.engine_core import EngineCore
 from omlx.keepwarm import (
     CompiledMetalKeepwarmTouch,
@@ -184,6 +186,7 @@ def test_live_toggle_preserves_cache_arming_and_disable_stops_actions():
     assert controller.idle_action() is None
 
     controller.configure(True)
+    assert controller.config.prompt_tail_prewarm_enabled is True
     queued = controller.idle_action()
     assert queued is not None
     assert controller.should_execute(queued) is True
@@ -221,10 +224,12 @@ class Scheduler:
         self,
         *,
         busy: bool = False,
+        housekeeping: bool = False,
         cache_tokens: int = 0,
         exact_resident_tokens: int = 0,
     ) -> None:
         self.busy = busy
+        self.housekeeping = housekeeping
         self.added = []
         self._exact_resident_tokens = exact_resident_tokens
         self.block_aware_cache = SimpleNamespace(
@@ -237,6 +242,9 @@ class Scheduler:
         return {"max_token_count": self._exact_resident_tokens}
 
     def has_requests(self) -> bool:
+        return self.busy or self.housekeeping
+
+    def has_active_user_requests(self) -> bool:
         return self.busy
 
     def add_request(self, request) -> None:
@@ -250,8 +258,195 @@ def core_with_scheduler(scheduler: Scheduler) -> EngineCore:
     core.config = SimpleNamespace(keepwarm_config=core._keepwarm.config)
     core._pending_admissions_lock = threading.Lock()
     core._pending_admissions = 0
+    core._closed = False
+    core._running = True
+    core._prompt_tail_lock = threading.Lock()
+    core._prompt_tail_plan = None
+    core._prompt_tail_epoch = 0
+    core._prompt_tail_inflight_epoch = None
+    core._prompt_tail_stats = {
+        "scheduled": 0,
+        "published": 0,
+        "skipped": 0,
+        "cancelled": 0,
+        "failures": 0,
+        "last_result": None,
+    }
     core._wake_engine_loop = lambda: None
     return core
+
+
+def test_prompt_tail_plan_is_latest_wins_due_and_cancelled_by_disable():
+    core = core_with_scheduler(Scheduler())
+    core._keepwarm.configure(True)
+    core.config.keepwarm_config = core._keepwarm.config
+
+    assert core.schedule_prompt_tail_prewarm("first") is True
+    assert core.schedule_prompt_tail_prewarm("second") is True
+    prompt, due, epoch = core._prompt_tail_plan
+    assert prompt == "second"
+    assert core._take_prompt_tail_prewarm(due - 0.001) is None
+    assert core._take_prompt_tail_prewarm(due) == ("second", epoch)
+    core._record_prompt_tail_result(epoch, {"status": "skipped"})
+
+    assert core.schedule_prompt_tail_prewarm("third") is True
+    core.configure_keepwarm(False)
+    assert core._prompt_tail_plan is None
+    assert core._prompt_tail_stats["cancelled"] == 1
+
+
+def test_prompt_tail_waits_for_source_cache_housekeeping():
+    scheduler = Scheduler(housekeeping=True)
+    core = core_with_scheduler(scheduler)
+    core._keepwarm.configure(True)
+    core.config.keepwarm_config = core._keepwarm.config
+    assert core.schedule_prompt_tail_prewarm("prompt") is True
+    _prompt, due, _epoch = core._prompt_tail_plan
+
+    assert core._take_prompt_tail_prewarm(due) is None
+    assert core._prompt_tail_plan is not None
+
+    scheduler.housekeeping = False
+    assert core._take_prompt_tail_prewarm(due) is not None
+
+
+def test_prompt_tail_run_forwards_bounded_policy_and_records_result():
+    scheduler = Scheduler()
+    scheduler.prewarm_prompt_tail = lambda prompt, **kwargs: {
+        "status": "published",
+        "prompt": prompt,
+        **kwargs,
+    }
+    core = core_with_scheduler(scheduler)
+    core._keepwarm.configure(True)
+    core.config.keepwarm_config = core._keepwarm.config
+
+    core.schedule_prompt_tail_prewarm([1, 2, 3])
+    _prompt, due, epoch = core._prompt_tail_plan
+    assert core._take_prompt_tail_prewarm(due) == ([1, 2, 3], epoch)
+    result = core._run_prompt_tail_prewarm([1, 2, 3], epoch)
+    assert result["status"] == "published"
+    assert result["prompt"] == [1, 2, 3]
+    assert result["max_suffix_tokens"] == 4096
+    assert result["chunk_size"] == 128
+
+    core._record_prompt_tail_result(epoch, result)
+    assert core._prompt_tail_stats["published"] == 1
+    assert core._prompt_tail_stats["last_result"]["status"] == "published"
+
+
+def test_prompt_tail_inflight_epoch_is_cancelled_by_clear_or_stop():
+    scheduler = Scheduler()
+    scheduler.prewarm_prompt_tail = MagicMock(return_value={"status": "published"})
+    core = core_with_scheduler(scheduler)
+    core._keepwarm.configure(True)
+    core.config.keepwarm_config = core._keepwarm.config
+    core.schedule_prompt_tail_prewarm("prompt")
+    prompt, due, epoch = core._prompt_tail_plan
+    assert core._take_prompt_tail_prewarm(due) == (prompt, epoch)
+
+    core.disarm_keepwarm_cache()
+
+    assert core._prompt_tail_abort_requested(epoch) is True
+    result = core._run_prompt_tail_prewarm(prompt, epoch)
+    assert result["status"] == "skipped"
+    scheduler.prewarm_prompt_tail.assert_not_called()
+
+
+def test_prompt_tail_publish_cannot_race_after_hot_clear():
+    scheduler = Scheduler()
+    scheduler._exact_resident_cache = SimpleNamespace(put=MagicMock(return_value=True))
+    core = core_with_scheduler(scheduler)
+    core._keepwarm.configure(True)
+    core.config.keepwarm_config = core._keepwarm.config
+    core.schedule_prompt_tail_prewarm("prompt")
+    prompt, due, epoch = core._prompt_tail_plan
+    assert core._take_prompt_tail_prewarm(due) == (prompt, epoch)
+
+    core.disarm_keepwarm_cache()
+    published = core._publish_prompt_tail_if_current(
+        epoch,
+        [1, 2],
+        [object()],
+        128,
+        0,
+    )
+
+    assert published is False
+    scheduler._exact_resident_cache.put.assert_not_called()
+
+
+def test_prompt_tail_never_arms_under_b2_b4_or_b6_admission_pressure():
+    for concurrency in (2, 4, 6):
+        scheduler = Scheduler()
+        core = core_with_scheduler(scheduler)
+        core._keepwarm.configure(True)
+        core.config.keepwarm_config = core._keepwarm.config
+        core._pending_admissions = concurrency
+
+        assert core.schedule_prompt_tail_prewarm("prompt") is False
+        assert core._prompt_tail_plan is None
+        assert core._prompt_tail_stats["last_result"] == {
+            "status": "skipped",
+            "reason": "request-already-active",
+        }
+
+
+def test_prompt_tail_inflight_aborts_when_batched_streams_become_active():
+    scheduler = Scheduler()
+    scheduler._exact_resident_cache = SimpleNamespace(put=MagicMock(return_value=True))
+    core = core_with_scheduler(scheduler)
+    core._keepwarm.configure(True)
+    core.config.keepwarm_config = core._keepwarm.config
+    assert core.schedule_prompt_tail_prewarm("prompt") is True
+    prompt, due, epoch = core._prompt_tail_plan
+    assert core._take_prompt_tail_prewarm(due) == (prompt, epoch)
+
+    scheduler.busy = True
+
+    assert core._prompt_tail_abort_requested(epoch) is True
+    assert (
+        core._publish_prompt_tail_if_current(epoch, [1, 2], [object()], 128, 0)
+        is False
+    )
+    scheduler._exact_resident_cache.put.assert_not_called()
+
+
+def test_prompt_tail_process_global_gate_refuses_another_engine_prefill():
+    owner = core_with_scheduler(Scheduler())
+    other = core_with_scheduler(Scheduler(busy=True))
+    owner._keepwarm.configure(True)
+    owner.config.keepwarm_config = owner._keepwarm.config
+    engine_core_module._register_prompt_tail_engine(owner)
+    engine_core_module._register_prompt_tail_engine(other)
+    try:
+        assert owner.schedule_prompt_tail_prewarm("prompt") is True
+        prompt, due, epoch = owner._prompt_tail_plan
+        assert owner._take_prompt_tail_prewarm(due) == (prompt, epoch)
+
+        result = owner._run_prompt_tail_prewarm(prompt, epoch)
+
+        assert result == {
+            "status": "skipped",
+            "reason": "engine-busy-or-disabled",
+        }
+    finally:
+        engine_core_module._unregister_prompt_tail_engine(owner)
+        engine_core_module._unregister_prompt_tail_engine(other)
+
+
+def test_prompt_tail_global_epoch_invalidates_on_any_engine_admission():
+    owner = core_with_scheduler(Scheduler())
+    engine_core_module._register_prompt_tail_engine(owner)
+    try:
+        epoch = engine_core_module._global_prompt_tail_epoch()
+        assert engine_core_module._global_prompt_tail_invalid(owner, epoch) is False
+
+        engine_core_module._invalidate_global_prompt_tail()
+
+        assert engine_core_module._global_prompt_tail_invalid(owner, epoch) is True
+    finally:
+        engine_core_module._unregister_prompt_tail_engine(owner)
 
 
 def test_resident_cache_tokens_include_exact_resident_l0():
@@ -361,14 +556,38 @@ def test_idle_lane_rechecks_pending_admission_before_touching():
     assert core._keepwarm.snapshot()["request_active"] is True
 
 
-def test_loaded_engine_live_reconfigure_updates_config_and_controller():
-    core = core_with_scheduler(Scheduler())
+def test_loaded_engine_live_reconfigure_updates_config_and_controller(monkeypatch):
+    monkeypatch.delenv("OMLX_EXACT_RESIDENT_MAX_ENTRIES", raising=False)
+    monkeypatch.delenv("OMLX_EXACT_RESIDENT_CACHE_SLOTS", raising=False)
+    scheduler = Scheduler()
+    scheduler._exact_resident_cache = SimpleNamespace(
+        max_entries=0,
+        max_bytes=8 * 1024**3,
+    )
+    core = core_with_scheduler(scheduler)
     core.configure_keepwarm(False)
     assert core.config.keepwarm_config.enabled is False
     assert core._keepwarm.snapshot()["enabled"] is False
     core.configure_keepwarm(True)
     assert core.config.keepwarm_config.enabled is True
     assert core._keepwarm.snapshot()["enabled"] is True
+    assert scheduler._exact_resident_cache.max_entries == 2
+    core.configure_keepwarm(False)
+    assert scheduler._exact_resident_cache.max_entries == 0
+
+
+def test_explicit_zero_resident_slots_remains_a_hard_disable(monkeypatch):
+    monkeypatch.setenv("OMLX_EXACT_RESIDENT_MAX_ENTRIES", "0")
+    scheduler = Scheduler()
+    scheduler._exact_resident_cache = SimpleNamespace(
+        max_entries=0,
+        max_bytes=8 * 1024**3,
+    )
+    core = core_with_scheduler(scheduler)
+
+    core.configure_keepwarm(True)
+
+    assert scheduler._exact_resident_cache.max_entries == 0
 
 
 class Value:

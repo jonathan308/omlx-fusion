@@ -20,6 +20,7 @@ import os
 import threading
 import time
 import uuid
+import weakref
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import (
@@ -59,6 +60,71 @@ from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
 from .utils.hardware import format_bytes
 
 logger = logging.getLogger(__name__)
+
+
+# Prompt-tail maintenance is process-global GPU work even though each model
+# has its own EngineCore and MLX stream.  A single execution lease prevents
+# two individually-safe memory estimates from overcommitting together, while
+# a cheap epoch lets any engine admission cancel hidden work without waiting
+# for its full suffix.  Weak membership never extends an engine lifetime.
+_prompt_tail_global_state_lock = threading.RLock()
+_prompt_tail_global_run_lock = threading.Lock()
+_prompt_tail_global_epoch = 0
+_prompt_tail_global_engines: weakref.WeakSet[Any] = weakref.WeakSet()
+
+
+def _register_prompt_tail_engine(engine: Any) -> None:
+    global _prompt_tail_global_epoch
+    with _prompt_tail_global_state_lock:
+        _prompt_tail_global_epoch += 1
+        _prompt_tail_global_engines.add(engine)
+
+
+def _unregister_prompt_tail_engine(engine: Any) -> None:
+    global _prompt_tail_global_epoch
+    with _prompt_tail_global_state_lock:
+        _prompt_tail_global_epoch += 1
+        _prompt_tail_global_engines.discard(engine)
+
+
+def _invalidate_global_prompt_tail() -> int:
+    global _prompt_tail_global_epoch
+    with _prompt_tail_global_state_lock:
+        _prompt_tail_global_epoch += 1
+        return _prompt_tail_global_epoch
+
+
+def _global_prompt_tail_epoch() -> int:
+    with _prompt_tail_global_state_lock:
+        return _prompt_tail_global_epoch
+
+
+def _other_prompt_tail_engine_busy(owner: Any) -> bool:
+    with _prompt_tail_global_state_lock:
+        engines = list(_prompt_tail_global_engines)
+    for engine in engines:
+        if engine is owner or getattr(engine, "_closed", True):
+            continue
+        if not getattr(engine, "_running", False):
+            continue
+        try:
+            if (
+                engine._pending_admission_count()
+                or engine._scheduler_has_active_user_requests()
+                or engine.scheduler.has_requests()
+            ):
+                return True
+        except Exception:
+            # Unknown engine state is not an idle guarantee.
+            return True
+    return False
+
+
+def _global_prompt_tail_invalid(owner: Any, epoch: int) -> bool:
+    with _prompt_tail_global_state_lock:
+        if epoch != _prompt_tail_global_epoch:
+            return True
+    return _other_prompt_tail_engine_busy(owner)
 
 
 def _raise_request_output_error(output: RequestOutput) -> None:
@@ -212,7 +278,7 @@ class EngineCore:
         tokenizer: Any,
         config: Optional[EngineConfig] = None,
         engine_id: Optional[str] = None,
-        force_model_ownership: bool = True,
+        force_model_ownership: bool = False,
     ):
         """
         Initialize the engine.
@@ -222,9 +288,9 @@ class EngineCore:
             tokenizer: The tokenizer
             config: Engine configuration
             engine_id: Optional unique ID for this engine (auto-generated if None)
-            force_model_ownership: If True (default), forcibly take model ownership
-                                   from any existing engine. If False, raises
-                                   ModelOwnershipError if model is in use.
+            force_model_ownership: Legacy compatibility flag. A stale registry
+                entry may be replaced, but a different live owner always raises
+                ModelOwnershipError and must be closed first.
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -234,6 +300,10 @@ class EngineCore:
         self._closed = False
 
         # Acquire model ownership
+        # Engine construction is itself a process-global admission: cancel any
+        # hidden idle maintenance before a forced ownership transfer can queue
+        # teardown on the previous owner's executor.
+        _invalidate_global_prompt_tail()
         registry = get_registry()
         registry.acquire(
             model=model,
@@ -280,7 +350,12 @@ class EngineCore:
         self._wake_event: Optional[asyncio.Event] = None
         self._start_time: Optional[float] = None
         self._steps_executed = 0
+        resident_cache = getattr(self.scheduler, "_exact_resident_cache", None)
+        self._prompt_tail_resident_baseline_entries = int(
+            getattr(resident_cache, "max_entries", 0) or 0
+        )
         self._keepwarm = KeepwarmController(self.config.keepwarm_config)
+        self._ensure_prompt_tail_resident_capacity()
         # The pulse lazily creates its own stream from idle/post-response work
         # on _mlx_executor, so its fence never drains the model stream. It
         # retains one four-byte input and no model/cache state, and closes on
@@ -289,6 +364,19 @@ class EngineCore:
         self._pending_admissions = 0
         self._pending_admissions_lock = threading.Lock()
         self._next_keepwarm_check_at = 0.0
+        self._prompt_tail_lock = threading.Lock()
+        self._prompt_tail_plan: tuple[str | list[int], float, int] | None = None
+        self._prompt_tail_epoch = 0
+        self._prompt_tail_inflight_epoch: int | None = None
+        self._prompt_tail_stats = {
+            "scheduled": 0,
+            "published": 0,
+            "skipped": 0,
+            "cancelled": 0,
+            "failures": 0,
+            "last_result": None,
+        }
+        _register_prompt_tail_engine(self)
 
         # Drop transient aliases after ownership moves to the engine/scheduler
         # graph, so close()/deep_reset() can make that graph unreachable.
@@ -311,6 +399,7 @@ class EngineCore:
 
     async def stop(self) -> None:
         """Stop the engine loop."""
+        self._cancel_prompt_tail_prewarm("engine-stop")
         self._running = False
         if self._wake_event is not None:
             self._wake_event.set()
@@ -396,12 +485,326 @@ class EngineCore:
 
         self._keepwarm.configure(enabled)
         self.config.keepwarm_config = self._keepwarm.config
+        if enabled:
+            self._ensure_prompt_tail_resident_capacity()
+        else:
+            self._restore_prompt_tail_resident_capacity()
+        if not enabled:
+            self._cancel_prompt_tail_prewarm("keepwarm-disabled")
         self._wake_engine_loop()
+
+    def _ensure_prompt_tail_resident_capacity(self) -> None:
+        """Give prompt-tail fallback two slots under the existing byte cap.
+
+        One slot keeps the longer validated terminal state; the second can
+        hold the guaranteed input-prompt prefix when chat-template rendering
+        makes that terminal diverge on the next turn.  The configured byte
+        ceiling remains authoritative, and an explicit zero-slot environment
+        setting remains a hard disable.
+        """
+
+        config = getattr(self, "_keepwarm", None)
+        config = getattr(config, "config", None)
+        if not (
+            config is not None
+            and config.enabled
+            and config.prompt_tail_prewarm_enabled
+        ):
+            return
+        resident = getattr(getattr(self, "scheduler", None), "_exact_resident_cache", None)
+        if resident is None or int(getattr(resident, "max_bytes", 0) or 0) <= 0:
+            return
+        explicit_slots = os.environ.get(
+            "OMLX_EXACT_RESIDENT_MAX_ENTRIES",
+            os.environ.get("OMLX_EXACT_RESIDENT_CACHE_SLOTS"),
+        )
+        if explicit_slots is not None:
+            try:
+                if int(explicit_slots) <= 0:
+                    return
+            except ValueError:
+                return
+        resident.max_entries = max(2, int(resident.max_entries or 0))
+
+    def _restore_prompt_tail_resident_capacity(self) -> None:
+        """Restore the resident-tier limit that preceded UI keepwarm."""
+
+        resident = getattr(
+            getattr(self, "scheduler", None),
+            "_exact_resident_cache",
+            None,
+        )
+        if resident is None:
+            return
+        baseline = max(
+            0,
+            int(getattr(self, "_prompt_tail_resident_baseline_entries", 0) or 0),
+        )
+        resize = getattr(resident, "resize", None)
+        if callable(resize):
+            resize(baseline)
+        else:
+            resident.max_entries = baseline
+            if baseline == 0 and hasattr(resident, "clear"):
+                resident.clear()
 
     def disarm_keepwarm_cache(self) -> None:
         """Stop idle touches after an explicit in-memory cache clear."""
 
         self._keepwarm.disarm_cache()
+        self._cancel_prompt_tail_prewarm("cache-disarmed")
+
+    def schedule_prompt_tail_prewarm(self, prompt: str | list[int]) -> bool:
+        """Arm one latest-wins, idle-only prompt-tail prewarm candidate."""
+
+        config = self.config.keepwarm_config
+        if (
+            self._closed
+            or not self._running
+            or not config.enabled
+            or not config.prompt_tail_prewarm_enabled
+            or not isinstance(prompt, (str, list))
+        ):
+            return False
+        if (
+            self._pending_admission_count()
+            or self._scheduler_has_active_user_requests()
+        ):
+            with self._prompt_tail_lock:
+                self._prompt_tail_stats["skipped"] += 1
+                self._prompt_tail_stats["last_result"] = {
+                    "status": "skipped",
+                    "reason": "request-already-active",
+                }
+            return False
+        value = list(prompt) if isinstance(prompt, list) else prompt
+        due = time.monotonic() + config.prompt_tail_prewarm_delay_seconds
+        with self._prompt_tail_lock:
+            self._prompt_tail_epoch += 1
+            self._prompt_tail_plan = (value, due, self._prompt_tail_epoch)
+            self._prompt_tail_stats["scheduled"] += 1
+        self._wake_engine_loop()
+        return True
+
+    def notify_admission_pending(self) -> None:
+        """Cancel hidden maintenance at the public request boundary.
+
+        Chat/VLM engines can perform template or media preparation on this
+        same one-worker MLX lane before ``add_request`` is reached. Signalling
+        here prevents that preparation from sitting behind an idle prompt-tail
+        pass; the pass observes the epoch between bounded chunks and exits.
+        """
+
+        _invalidate_global_prompt_tail()
+        self._cancel_prompt_tail_prewarm("external-admission")
+        self._wake_engine_loop()
+
+    def _cancel_prompt_tail_prewarm(self, reason: str) -> None:
+        lock = getattr(self, "_prompt_tail_lock", None)
+        if lock is None:
+            return
+        with lock:
+            had_work = bool(
+                self._prompt_tail_plan is not None
+                or self._prompt_tail_inflight_epoch is not None
+            )
+            self._prompt_tail_epoch += 1
+            self._prompt_tail_plan = None
+            if had_work:
+                self._prompt_tail_stats["cancelled"] += 1
+                self._prompt_tail_stats["last_result"] = {
+                    "status": "cancelled",
+                    "reason": reason,
+                }
+
+    def _take_prompt_tail_prewarm(
+        self,
+        now: float,
+    ) -> tuple[str | list[int], int] | None:
+        with self._prompt_tail_lock:
+            plan = self._prompt_tail_plan
+            if plan is None or now < plan[1]:
+                return None
+            if (
+                self._pending_admission_count()
+                or self._scheduler_has_active_user_requests()
+            ):
+                self._prompt_tail_plan = None
+                self._prompt_tail_epoch += 1
+                self._prompt_tail_stats["skipped"] += 1
+                self._prompt_tail_stats["last_result"] = {
+                    "status": "skipped",
+                    "reason": "request-became-active",
+                }
+                return None
+            # Async store/deferred-clear work belongs to the completed source
+            # request. Keep the latest plan queued until that housekeeping
+            # drains; the durable prefix must exist before prewarm rebuilds
+            # its non-block tail.
+            if self.scheduler.has_requests():
+                return None
+            self._prompt_tail_plan = None
+            self._prompt_tail_inflight_epoch = plan[2]
+            return plan[0], plan[2]
+
+    def _scheduler_has_active_user_requests(self) -> bool:
+        active = getattr(self.scheduler, "has_active_user_requests", None)
+        if callable(active):
+            return bool(active())
+        return bool(
+            getattr(self.scheduler, "waiting", ())
+            or getattr(self.scheduler, "prefilling", ())
+            or getattr(self.scheduler, "running", {})
+        )
+
+    def _prompt_tail_abort_requested(self, epoch: int) -> bool:
+        with self._prompt_tail_lock:
+            invalidated = bool(
+                epoch != self._prompt_tail_epoch
+                or self._prompt_tail_inflight_epoch != epoch
+            )
+        return bool(
+            invalidated
+            or self._closed
+            or not self._running
+            or not self.config.keepwarm_config.enabled
+            or not self.config.keepwarm_config.prompt_tail_prewarm_enabled
+            or self._pending_admission_count()
+            or self._scheduler_has_active_user_requests()
+            or self.scheduler.has_requests()
+        )
+
+    def _run_prompt_tail_prewarm(
+        self,
+        prompt: str | list[int],
+        epoch: int,
+    ) -> dict[str, Any]:
+        if not _prompt_tail_global_run_lock.acquire(blocking=False):
+            return {"status": "skipped", "reason": "global-maintenance-busy"}
+        try:
+            config = self.config.keepwarm_config
+            global_epoch = _global_prompt_tail_epoch()
+            if (
+                not config.enabled
+                or not config.prompt_tail_prewarm_enabled
+                or self._prompt_tail_abort_requested(epoch)
+                or _other_prompt_tail_engine_busy(self)
+            ):
+                return {"status": "skipped", "reason": "engine-busy-or-disabled"}
+
+            def abort_requested() -> bool:
+                return bool(
+                    self._prompt_tail_abort_requested(epoch)
+                    or _global_prompt_tail_invalid(self, global_epoch)
+                )
+
+            return self.scheduler.prewarm_prompt_tail(
+                prompt,
+                min_tokens=config.prompt_tail_prewarm_min_tokens,
+                max_tokens=config.prompt_tail_prewarm_max_tokens,
+                max_suffix_tokens=config.prompt_tail_prewarm_max_suffix_tokens,
+                chunk_size=config.prompt_tail_prewarm_chunk_size,
+                abort_requested=abort_requested,
+                publish_if_current=lambda tokens, cache, nbytes, durable: (
+                    self._publish_prompt_tail_if_current(
+                        epoch,
+                        tokens,
+                        cache,
+                        nbytes,
+                        durable,
+                        global_epoch=global_epoch,
+                    )
+                ),
+            )
+        finally:
+            _prompt_tail_global_run_lock.release()
+
+    def _publish_prompt_tail_if_current(
+        self,
+        epoch: int,
+        tokens: list[int],
+        cache: list[Any],
+        cache_nbytes: int,
+        durable_tokens: int,
+        *,
+        global_epoch: int | None = None,
+    ) -> bool:
+        """Atomically validate the lifecycle epoch and replace resident L0."""
+
+        with _prompt_tail_global_state_lock:
+            if global_epoch is not None:
+                if global_epoch != _prompt_tail_global_epoch:
+                    logger.info(
+                        "Latent prompt-tail publication rejected: global-epoch-changed"
+                    )
+                    return False
+                if _other_prompt_tail_engine_busy(self):
+                    logger.info(
+                        "Latent prompt-tail publication rejected: other-engine-busy"
+                    )
+                    return False
+            with self._prompt_tail_lock:
+                reject_reason = None
+                if epoch != self._prompt_tail_epoch:
+                    reject_reason = "local-epoch-changed"
+                elif self._prompt_tail_inflight_epoch != epoch:
+                    reject_reason = "inflight-epoch-changed"
+                elif self._closed or not self._running:
+                    reject_reason = "engine-stopped"
+                elif not self.config.keepwarm_config.enabled:
+                    reject_reason = "keepwarm-disabled"
+                elif not self.config.keepwarm_config.prompt_tail_prewarm_enabled:
+                    reject_reason = "tail-disabled"
+                elif self._pending_admission_count():
+                    reject_reason = "admission-pending"
+                elif self._scheduler_has_active_user_requests():
+                    reject_reason = "user-request-active"
+                elif self.scheduler.has_requests():
+                    reject_reason = "scheduler-housekeeping"
+                if reject_reason is not None:
+                    logger.info(
+                        "Latent prompt-tail publication rejected: %s",
+                        reject_reason,
+                    )
+                    return False
+                published = self.scheduler._exact_resident_cache.put(
+                    tokens,
+                    cache,
+                    cache_nbytes=cache_nbytes,
+                    durable_tokens=durable_tokens,
+                    protect_longer_prefix=True,
+                )
+                if not published:
+                    logger.info(
+                        "Latent prompt-tail publication rejected: resident-policy"
+                    )
+                return published
+
+    def _record_prompt_tail_result(self, epoch: int, result: dict[str, Any]) -> None:
+        with self._prompt_tail_lock:
+            if self._prompt_tail_inflight_epoch == epoch:
+                self._prompt_tail_inflight_epoch = None
+            status = result.get("status")
+            if status == "published":
+                self._prompt_tail_stats["published"] += 1
+            elif status == "cancelled":
+                self._prompt_tail_stats["cancelled"] += 1
+            elif status == "skipped":
+                self._prompt_tail_stats["skipped"] += 1
+            else:
+                self._prompt_tail_stats["failures"] += 1
+            self._prompt_tail_stats["last_result"] = dict(result)
+        logger.info(
+            "Latent prompt-tail result: epoch=%d status=%s reason=%s "
+            "prompt=%s cached=%s suffix=%s elapsed=%.1fms",
+            epoch,
+            result.get("status", "unknown"),
+            result.get("reason", "unknown"),
+            result.get("prompt_tokens", 0),
+            result.get("cached_tokens", 0),
+            result.get("suffix_tokens", 0),
+            float(result.get("elapsed_ms", 0.0) or 0.0),
+        )
 
     def _resident_cache_tokens(self) -> int:
         """Best-effort current prefix-cache size, read on the MLX lane."""
@@ -658,6 +1061,20 @@ class EngineCore:
                                 )
                 else:
                     self._keepwarm.observe_request_state(False)
+                    prompt_tail = self._take_prompt_tail_prewarm(now)
+                    if prompt_tail is not None:
+                        prompt, prompt_epoch = prompt_tail
+                        prompt_tail_result = await loop.run_in_executor(
+                            self._mlx_executor,
+                            self._run_prompt_tail_prewarm,
+                            prompt,
+                            prompt_epoch,
+                        )
+                        self._record_prompt_tail_result(
+                            prompt_epoch,
+                            prompt_tail_result,
+                        )
+                        continue
                     if (
                         self.config.keepwarm_config.enabled
                         and now >= self._next_keepwarm_check_at
@@ -750,6 +1167,8 @@ class EngineCore:
         Returns:
             The request ID
         """
+        _invalidate_global_prompt_tail()
+        self._cancel_prompt_tail_prewarm("new-admission")
         if request_id is None:
             request_id = str(uuid.uuid4())
 
@@ -1292,6 +1711,9 @@ class EngineCore:
                 if getattr(self, "_keepwarm", None) is not None
                 else None
             ),
+            "prompt_tail_prewarm": dict(
+                getattr(self, "_prompt_tail_stats", {})
+            ),
             **scheduler_stats,
         }
 
@@ -1317,6 +1739,13 @@ class EngineCore:
         if self._closed:
             return
 
+        # Preserve only the registry's non-owning integer key. Holding a strong
+        # model reference through final executor-thread reclaim would keep all
+        # weights alive and defeat that reclaim.
+        owned_model_id = id(self.model) if self._owns_model else None
+        self._cancel_prompt_tail_prewarm("engine-close")
+        _unregister_prompt_tail_engine(self)
+
         keepwarm = getattr(self, "_keepwarm", None)
         if keepwarm is not None:
             keepwarm.shutdown()
@@ -1332,14 +1761,6 @@ class EngineCore:
                     compiled_touch.close()
             finally:
                 self.scheduler.shutdown()
-
-        # Release model ownership BEFORE setting _closed
-        # (_release_model checks not self._closed)
-        if self._owns_model:
-            registry = get_registry()
-            registry.release(self.model, self._engine_id)
-            self._owns_model = False
-            logger.debug(f"Engine {self._engine_id} released model ownership")
 
         self._closed = True
 
@@ -1484,6 +1905,18 @@ class EngineCore:
                 _immortal_mlx_streams.append(self._mlx_stream)
             self._mlx_executor = None
 
+        # This is the model-ownership barrier, not merely the request-worker
+        # barrier above.  Keep the lease while release_resources(), reference
+        # detachment, final Metal reclaim, and compile-cache retirement can
+        # still touch the old graph.  A replacement engine may acquire this
+        # object only after every old-engine operation is complete.
+        if self._owns_model and owned_model_id is not None:
+            registry = get_registry()
+            registry.release_by_id(owned_model_id, self._engine_id)
+            self._owns_model = False
+            logger.debug(f"Engine {self._engine_id} released model ownership")
+        owned_model_id = None
+
         logger.debug(f"Engine {self._engine_id} closed")
 
     def __del__(self):
@@ -1570,6 +2003,21 @@ class AsyncEngineCore:
             )
             return False
         return await engine.abort_request(request_id)
+
+    def schedule_prompt_tail_prewarm(self, prompt: str | list[int]) -> bool:
+        """Arm an idle-only exact prompt-tail prewarm on the owning engine."""
+
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            return False
+        return engine.schedule_prompt_tail_prewarm(prompt)
+
+    def notify_admission_pending(self) -> None:
+        """Tell the owning core that real request preparation has begun."""
+
+        engine = getattr(self, "engine", None)
+        if engine is not None:
+            engine.notify_admission_pending()
 
     async def abort_all_requests(
         self,

@@ -165,7 +165,11 @@ def burst_decode_env(mode: str) -> dict[str, str]:
 def latent_metal_keepwarm_env(enabled: bool) -> dict[str, str]:
     """Map the persisted experimental switch to the engine environment."""
 
-    return {"OMLX_KEEPWARM": "1" if enabled else "0"}
+    value = "1" if enabled else "0"
+    return {
+        "OMLX_KEEPWARM": value,
+        "OMLX_KEEPWARM_PROMPT_TAIL": value,
+    }
 
 
 @dataclass

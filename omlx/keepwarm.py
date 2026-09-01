@@ -68,6 +68,12 @@ class KeepwarmConfig:
     slow_threshold_seconds: float = 1.0
     slow_backoff_seconds: float = 60.0
     dataplane_ping: bool = True
+    prompt_tail_prewarm_enabled: bool = False
+    prompt_tail_prewarm_delay_seconds: float = 1.0
+    prompt_tail_prewarm_min_tokens: int = 256
+    prompt_tail_prewarm_max_suffix_tokens: int = 4096
+    prompt_tail_prewarm_max_tokens: int = 262144
+    prompt_tail_prewarm_chunk_size: int = 128
 
     @classmethod
     def from_env(cls) -> "KeepwarmConfig":
@@ -108,6 +114,36 @@ class KeepwarmConfig:
             slow_threshold_seconds=_float("OMLX_KEEPWARM_SLOW_THRESHOLD_SECONDS", 1.0),
             slow_backoff_seconds=_float("OMLX_KEEPWARM_SLOW_BACKOFF_SECONDS", 60.0),
             dataplane_ping=_enabled("OMLX_CLUSTER_KEEPWARM_DATAPLANE_PING", True),
+            prompt_tail_prewarm_enabled=_enabled(
+                "OMLX_KEEPWARM_PROMPT_TAIL",
+                False,
+            ),
+            prompt_tail_prewarm_delay_seconds=_float(
+                "OMLX_KEEPWARM_PROMPT_TAIL_DELAY_SECONDS",
+                1.0,
+                minimum=0.0,
+            ),
+            prompt_tail_prewarm_min_tokens=_int(
+                "OMLX_KEEPWARM_PROMPT_TAIL_MIN_TOKENS",
+                256,
+                minimum=2,
+            ),
+            prompt_tail_prewarm_max_suffix_tokens=_int(
+                "OMLX_KEEPWARM_PROMPT_TAIL_MAX_SUFFIX_TOKENS",
+                4096,
+                minimum=1,
+            ),
+            prompt_tail_prewarm_max_tokens=_int(
+                "OMLX_KEEPWARM_PROMPT_TAIL_MAX_TOKENS",
+                262144,
+                minimum=2,
+            ),
+            prompt_tail_prewarm_chunk_size=_int(
+                "OMLX_KEEPWARM_PROMPT_TAIL_CHUNK_SIZE",
+                128,
+                minimum=64,
+                maximum=4096,
+            ),
         )
 
     @classmethod
@@ -185,7 +221,11 @@ class KeepwarmController:
         """Apply the master switch live without replacing request state."""
 
         with self._lock:
-            self.config = replace(self.config, enabled=bool(enabled))
+            self.config = replace(
+                self.config,
+                enabled=bool(enabled),
+                prompt_tail_prewarm_enabled=bool(enabled),
+            )
             if not enabled:
                 self._post_response_pending = False
 
