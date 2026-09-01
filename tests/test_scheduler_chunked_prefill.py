@@ -288,6 +288,41 @@ class TestChunkedPrefillMRoPE:
         assert model.chunk_lengths == [4, 4]
         assert model.delta_history == [[7.0], [7.0]]
 
+    def test_request_without_rope_delta_uses_text_default(self):
+        """Minimal/legacy request doubles retain the canonical text delta."""
+
+        class MRoPERecordingModel(_RecordingModel):
+            _uses_mrope = True
+
+            def __init__(self):
+                super().__init__("vlm")
+                self.delta_history = []
+
+            def set_text_prefill_rope_delta(self, delta):
+                self.delta_history.append([delta])
+
+        model = MRoPERecordingModel()
+        tokenizer = MagicMock()
+        tokenizer.eos_token_id = 2
+        scheduler = Scheduler(
+            model=model,
+            tokenizer=tokenizer,
+            config=SchedulerConfig(
+                prefill_step_size=4,
+                chunked_prefill=True,
+                paged_cache_block_size=0,
+            ),
+        )
+        request = _make_request("mock-without-rope-delta", n_tokens=5)
+        del request.rope_deltas
+        state = _make_prefill_state(scheduler, request, n_remaining=4)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            assert scheduler._step_prefill_chunk(state)
+
+        assert model.chunk_lengths == [4]
+        assert model.delta_history == [[0.0]]
+
 
 # ---------------------------------------------------------------------------
 # get_stats includes num_prefilling

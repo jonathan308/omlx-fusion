@@ -3963,7 +3963,7 @@ class Scheduler:
                     # local position zero inside an absolute QSA timeline.
                     _bind_text_prefill_rope_delta(
                         self.model,
-                        request.rope_deltas,
+                        getattr(request, "rope_deltas", 0.0),
                     )
                 if embeds_array is not None and embeds_array.shape[1] > 0:
                     model_kwargs["inputs_embeds"] = embeds_array[:, :n_to_process]
@@ -5616,7 +5616,7 @@ class Scheduler:
             # local position zero.
             _bind_text_prefill_rope_delta(
                 self.model,
-                state.request.rope_deltas,
+                getattr(state.request, "rope_deltas", 0.0),
             )
             if self._supports_skip_lm_head():
                 self.model(chunk, cache=state.cache, skip_lm_head=True)
