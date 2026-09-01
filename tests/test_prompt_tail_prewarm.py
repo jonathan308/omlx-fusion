@@ -50,9 +50,9 @@ def _scheduler():
 
     def prepare(request):
         request.prompt_cache = cache
-        request.cached_tokens = 8
-        request.remaining_tokens = [8, 9]
-        request._exact_resident_durable_fallback_tokens = 8
+        request.cached_tokens = min(8, len(request.prompt_token_ids))
+        request.remaining_tokens = request.prompt_token_ids[request.cached_tokens :]
+        request._exact_resident_durable_fallback_tokens = request.cached_tokens
 
     scheduler._prepare_prefix_cache_for_request.side_effect = prepare
     return scheduler, cache, state
@@ -92,19 +92,23 @@ def test_prompt_tail_prewarm_processes_all_suffix_and_publishes_exact_l0(monkeyp
     )
 
     assert result["status"] == "published"
+    assert result["source_prompt_tokens"] == 10
+    assert result["prompt_tokens"] == 9
+    assert result["stable_boundary_trimmed_tokens"] == 1
     assert result["cached_tokens"] == 8
-    assert result["suffix_tokens"] == 2
+    assert result["suffix_tokens"] == 1
     scheduler._begin_prefill.assert_called_once()
     args, kwargs = scheduler._begin_prefill.call_args
-    assert args[1] == [8, 9]
+    assert args[1] == [8]
     assert args[2] == cache
     assert kwargs["process_all_tokens"] is True
     assert state.boundary_enabled is False
     assert capture_states == [True]
     assert drop_ctx.call_count == 2
     assert all(call.args == (scheduler.model,) for call in drop_ctx.call_args_list)
+    scheduler._resident_cache_matches_token_count.assert_called_once_with(cache, 9)
     scheduler._exact_resident_cache.put.assert_called_once_with(
-        list(range(10)),
+        list(range(9)),
         cache,
         cache_nbytes=1024,
         durable_tokens=8,
@@ -114,6 +118,22 @@ def test_prompt_tail_prewarm_processes_all_suffix_and_publishes_exact_l0(monkeyp
     tracker.update.assert_not_called()
     tracker.remove.assert_called_once()
     sync_clear.assert_not_called()
+
+
+def test_prompt_tail_stable_boundary_respects_minimum_after_trim():
+    scheduler, _cache, _state = _scheduler()
+    scheduler.tokenizer = SimpleNamespace(encode=lambda _prompt: [1, 2])
+
+    result = scheduler.prewarm_prompt_tail("short", min_tokens=2)
+
+    assert result == {
+        "status": "skipped",
+        "reason": "prompt-too-short",
+        "source_prompt_tokens": 2,
+        "stable_boundary_trimmed_tokens": 1,
+        "prompt_tokens": 1,
+    }
+    scheduler._prepare_prefix_cache_for_request.assert_not_called()
 
 
 def test_prompt_tail_prefix_restore_does_not_change_user_cache_metrics(monkeypatch):

@@ -9477,9 +9477,12 @@ class Scheduler:
         This is the target-only counterpart to ThunderMLX visible transcript
         prewarm. It reuses the ordinary durable prefix, evaluates only a
         bounded suffix on the owning MLX lane, performs no sampling or MTP
-        work, and publishes cache state at all ``N`` prompt tokens. A future
-        request must add a non-empty suffix before ExactResidentPrefixCache
-        will transfer ownership, so generation kickoff never needs a generic
+        work, and publishes cache state at the stable ``N - 1`` prompt
+        boundary. Chat clients commonly replace the final assistant-generation
+        marker when they render the next turn; retaining that marker therefore
+        misses even though every earlier token is unchanged. A future request
+        must still add a non-empty suffix before ExactResidentPrefixCache will
+        transfer ownership, so generation kickoff never needs a generic
         recurrent-cache trim.
         """
 
@@ -9504,7 +9507,7 @@ class Scheduler:
             return result
 
         try:
-            prompt_tokens = (
+            source_prompt_tokens = (
                 self.tokenizer.encode(prompt)
                 if isinstance(prompt, str)
                 else [int(token) for token in prompt]
@@ -9512,6 +9515,21 @@ class Scheduler:
         except Exception as exc:
             result.update(reason="tokenize-failed", error=str(exc)[:200])
             return result
+        # The final token in a rendered chat prompt is the unstable generation
+        # boundary for OpenWebUI-style clients: on the following turn it is
+        # replaced by the prior assistant content. Materialize exactly one token
+        # before it. This remains a conservative exact prefix for ordinary
+        # completion clients too; they merely reprocess one extra token.
+        stable_boundary_trimmed_tokens = 1 if source_prompt_tokens else 0
+        prompt_tokens = (
+            source_prompt_tokens[:-stable_boundary_trimmed_tokens]
+            if stable_boundary_trimmed_tokens
+            else []
+        )
+        result.update(
+            source_prompt_tokens=len(source_prompt_tokens),
+            stable_boundary_trimmed_tokens=stable_boundary_trimmed_tokens,
+        )
         if len(prompt_tokens) < max(2, int(min_tokens)):
             result.update(reason="prompt-too-short", prompt_tokens=len(prompt_tokens))
             return result

@@ -175,6 +175,34 @@ def test_prompt_fallback_coexists_with_longer_terminal_under_shared_byte_cap():
     assert divergent.cache is fallback
 
 
+def test_n_minus_one_stable_boundary_handles_rewritten_generation_marker():
+    tier = ExactResidentPrefixCache(max_entries=2, max_bytes=1_000)
+    terminal = [object()]
+    stable = [object()]
+    # Previous input ends in generation marker 99. The terminal cache extends
+    # that exact input with generated tokens, while the next client rendering
+    # replaces marker 99 with assistant content beginning at token 42.
+    assert tier.put([1, 2, 3, 99, 5], terminal, cache_nbytes=400)
+    assert tier.put(
+        [1, 2, 3],
+        stable,
+        cache_nbytes=200,
+        protect_longer_prefix=True,
+    )
+
+    rewritten = tier.acquire_prefix([1, 2, 3, 42, 6])
+    assert rewritten is not None
+    assert rewritten.cache is stable
+    assert rewritten.cached_tokens == 3
+
+    # Acquiring the stable fallback does not consume the longer terminal entry;
+    # a true append still receives the most specific exact prefix.
+    appended = tier.acquire_prefix([1, 2, 3, 99, 5, 7])
+    assert appended is not None
+    assert appended.cache is terminal
+    assert appended.cached_tokens == 5
+
+
 def test_prompt_fallback_evicts_unrelated_lru_before_protected_terminal():
     tier = ExactResidentPrefixCache(max_entries=2, max_bytes=1_000)
     unrelated = [object()]
