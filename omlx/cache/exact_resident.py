@@ -65,6 +65,9 @@ class ExactResidentPrefixCache:
         self.evictions = 0
         self.oversize_rejections = 0
         self.protected_rejections = 0
+        self.last_miss_prompt_tokens = 0
+        self.last_miss_entry_tokens = 0
+        self.last_miss_common_prefix_tokens = 0
 
     @staticmethod
     def _tokens_equal_prefix(stored: array, prompt: list[int]) -> bool:
@@ -219,19 +222,41 @@ class ExactResidentPrefixCache:
 
         if self.max_entries <= 0 or not prompt_tokens:
             self.misses += 1
+            self.last_miss_prompt_tokens = len(prompt_tokens)
+            self.last_miss_entry_tokens = 0
+            self.last_miss_common_prefix_tokens = 0
             return None
         with self._lock:
             best_id = None
             best_len = -1
+            miss_entry_len = 0
+            miss_common_prefix = 0
             for entry_id, entry in reversed(self._entries.items()):
+                common_prefix = 0
+                for saved, current in zip(entry.tokens, prompt_tokens):
+                    if saved != current:
+                        break
+                    common_prefix += 1
+                if common_prefix > miss_common_prefix or (
+                    common_prefix == miss_common_prefix
+                    and len(entry.tokens) > miss_entry_len
+                ):
+                    miss_common_prefix = common_prefix
+                    miss_entry_len = len(entry.tokens)
                 if len(entry.tokens) <= best_len:
                     continue
-                if self._tokens_equal_prefix(entry.tokens, prompt_tokens):
+                if (
+                    len(entry.tokens) < len(prompt_tokens)
+                    and common_prefix == len(entry.tokens)
+                ):
                     best_id = entry_id
                     best_len = len(entry.tokens)
 
             if best_id is None:
                 self.misses += 1
+                self.last_miss_prompt_tokens = len(prompt_tokens)
+                self.last_miss_entry_tokens = miss_entry_len
+                self.last_miss_common_prefix_tokens = miss_common_prefix
                 return None
 
             entry = self._entries.pop(best_id)
@@ -287,4 +312,9 @@ class ExactResidentPrefixCache:
                 "evictions": self.evictions,
                 "oversize_rejections": self.oversize_rejections,
                 "protected_rejections": self.protected_rejections,
+                "last_miss_prompt_tokens": self.last_miss_prompt_tokens,
+                "last_miss_entry_tokens": self.last_miss_entry_tokens,
+                "last_miss_common_prefix_tokens": (
+                    self.last_miss_common_prefix_tokens
+                ),
             }

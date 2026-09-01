@@ -100,7 +100,11 @@ def test_exact_resident_requires_exact_token_identity():
     assert tier.put([1, 2, 3], [object()])
 
     assert tier.acquire_prefix([1, 9, 3, 4]) is None
-    assert tier.stats()["entries"] == 1
+    stats = tier.stats()
+    assert stats["entries"] == 1
+    assert stats["last_miss_prompt_tokens"] == 4
+    assert stats["last_miss_entry_tokens"] == 3
+    assert stats["last_miss_common_prefix_tokens"] == 1
 
 
 def test_exact_resident_rejects_zero_suffix_without_generic_trim():

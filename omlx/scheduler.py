@@ -8892,12 +8892,22 @@ class Scheduler:
             position_exact = False
             planes_equal = None
             raw_logical_equal = False
+            position_first = None
+            position_last = None
+            position_unit_stride = None
+            position_first_mismatch = None
+            position_mismatch_expected = None
+            position_mismatch_actual = None
+            position_mismatch_count = None
+            position_mismatch_window = None
             try:
                 if isinstance(logical_positions, mx.array):
+                    position_row = None
                     if logical_positions.ndim == 2:
+                        position_row = logical_positions[0].astype(mx.int32)
                         position_exact = bool(
                             mx.array_equal(
-                                logical_positions[0].astype(mx.int32),
+                                position_row,
                                 expected,
                             ).item()
                         )
@@ -8914,12 +8924,42 @@ class Scheduler:
                                 )
                             ).item()
                         )
+                        position_row = logical_positions[0, 0].astype(mx.int32)
                         position_exact = bool(
                             mx.array_equal(
-                                logical_positions[0, 0].astype(mx.int32),
+                                position_row,
                                 expected,
                             ).item()
                         )
+                    if position_row is not None and int(position_row.size) > 0:
+                        position_first = int(position_row[0].item())
+                        position_last = int(position_row[-1].item())
+                        position_unit_stride = bool(
+                            mx.all(position_row[1:] - position_row[:-1] == 1).item()
+                        ) if int(position_row.size) > 1 else True
+                        if not position_exact:
+                            matches = position_row == expected
+                            position_mismatch_count = int(
+                                mx.sum(~matches).item()
+                            )
+                            position_first_mismatch = int(mx.argmin(matches).item())
+                            position_mismatch_expected = int(
+                                expected[position_first_mismatch].item()
+                            )
+                            position_mismatch_actual = int(
+                                position_row[position_first_mismatch].item()
+                            )
+                            window_start = max(0, position_first_mismatch - 4)
+                            window_end = min(
+                                int(position_row.size),
+                                position_first_mismatch + 5,
+                            )
+                            position_mismatch_window = [
+                                int(value)
+                                for value in position_row[
+                                    window_start:window_end
+                                ].tolist()
+                            ]
                 if (
                     isinstance(raw_positions, mx.array)
                     and isinstance(logical_positions, mx.array)
@@ -8964,6 +9004,14 @@ class Scheduler:
                     ),
                     "position_exact": position_exact,
                     "planes_equal": planes_equal,
+                    "position_first": position_first,
+                    "position_last": position_last,
+                    "position_unit_stride": position_unit_stride,
+                    "position_first_mismatch": position_first_mismatch,
+                    "position_mismatch_expected": position_mismatch_expected,
+                    "position_mismatch_actual": position_mismatch_actual,
+                    "position_mismatch_count": position_mismatch_count,
+                    "position_mismatch_window": position_mismatch_window,
                     "raw_logical_equal": raw_logical_equal,
                     "qualified": getattr(
                         cache_obj,
@@ -9028,9 +9076,13 @@ class Scheduler:
         if not self._resident_cache_matches_token_count(cache_list, len(tokens)):
             logger.warning(
                 "Skipping terminal prompt-boundary source for %s: cache "
-                "timeline does not match its %s-token ledger",
+                "timeline does not match its %s-token ledger qsa=%s",
                 request.request_id,
                 len(tokens),
+                self._resident_qsa_timeline_observation(
+                    cache_list,
+                    len(tokens),
+                ),
             )
             return
         request._terminal_prompt_boundary_source = (tokens, cache_list)
@@ -9099,10 +9151,14 @@ class Scheduler:
             log = logger.info if attempted_qwen4 else logger.debug
             log(
                 "Skipping exact resident cache for %s: reason=timeline-mismatch "
-                "tokens=%d %s",
+                "tokens=%d %s qsa=%s",
                 request.request_id,
                 len(tokens),
                 self._resident_cache_timeline_observation(cache_list),
+                self._resident_qsa_timeline_observation(
+                    cache_list,
+                    len(tokens),
+                ),
             )
             return
         cache_nbytes = self._resident_cache_nbytes(cache_list)
@@ -9245,6 +9301,21 @@ class Scheduler:
             hit = resident_cache.acquire_prefix(prompt_tokens)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         if hit is None:
+            miss = resident_cache.stats()
+            common_prefix = int(
+                miss.get("last_miss_common_prefix_tokens", 0) or 0
+            )
+            if common_prefix > 0:
+                logger.info(
+                    "Exact resident miss for %s: prompt=%d candidate=%d "
+                    "common_prefix=%d divergent_suffix=%d lookup=%.3fms",
+                    request.request_id,
+                    len(prompt_tokens),
+                    int(miss.get("last_miss_entry_tokens", 0) or 0),
+                    common_prefix,
+                    max(0, len(prompt_tokens) - common_prefix),
+                    elapsed_ms,
+                )
             return False
         if not self._invalidate_resident_pool_with_telemetry(
             hit.cache, phase="lease"
