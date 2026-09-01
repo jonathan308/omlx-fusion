@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from omlx import server
+from omlx.api.anthropic_models import MessagesRequest
 from omlx.api.openai_models import ChatCompletionRequest, Message
 from omlx.api.responses_models import ResponsesRequest
 
@@ -62,6 +63,25 @@ class _PlainEngine(_ReasoningOnlyEngine):
             prompt_tokens=10,
             completion_tokens=1,
             cached_tokens=0,
+        )
+
+
+class _ReasoningToolEngine(_ReasoningOnlyEngine):
+    async def stream_chat(self, **_kwargs):
+        yield SimpleNamespace(
+            new_text='I should call a private tool',
+            text='I should call a private tool',
+            tool_calls=[
+                {
+                    "name": "private_lookup",
+                    "arguments": '{"query":"secret"}',
+                }
+            ],
+            finish_reason="tool_calls",
+            finished=True,
+            prompt_tokens=20,
+            completion_tokens=7,
+            cached_tokens=19,
         )
 
 
@@ -179,3 +199,65 @@ async def test_responses_actual_prompt_overrides_native_reasoning_capability():
         if payload.get("type") == "response.output_text.done"
     ) == "hello"
     assert any(payload.get("type") == "response.completed" for payload in payloads)
+
+
+@pytest.mark.asyncio
+async def test_openai_drops_tool_call_from_unfinished_reasoning():
+    request = ChatCompletionRequest(
+        model="qwen4-exp-test",
+        messages=[Message(role="user", content="Right!")],
+        stream=True,
+    )
+    events = [
+        event
+        async for event in server.stream_chat_completion(
+            _ReasoningToolEngine(),
+            [{"role": "user", "content": "Right!"}],
+            request,
+        )
+    ]
+    payloads = [payload for event in events if (payload := _sse_payload(event))]
+    deltas = [choice["delta"] for item in payloads for choice in item["choices"]]
+    finish_reasons = [
+        choice.get("finish_reason")
+        for item in payloads
+        for choice in item["choices"]
+        if choice.get("finish_reason") is not None
+    ]
+
+    assert not any(delta.get("tool_calls") for delta in deltas)
+    assert not any(delta.get("content") for delta in deltas)
+    assert finish_reasons == ["length"]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_drops_tool_call_from_unfinished_reasoning():
+    request = MessagesRequest(
+        model="qwen4-exp-test",
+        max_tokens=256,
+        messages=[{"role": "user", "content": "Right!"}],
+        stream=True,
+    )
+    events = [
+        event
+        async for event in server.stream_anthropic_messages(
+            _ReasoningToolEngine(),
+            [{"role": "user", "content": "Right!"}],
+            request,
+        )
+    ]
+    payloads = []
+    for event in events:
+        for line in event.splitlines():
+            if line.startswith("data: "):
+                payloads.append(json.loads(line[6:]))
+
+    assert not any(
+        payload.get("type") == "content_block_start"
+        and payload.get("content_block", {}).get("type") == "tool_use"
+        for payload in payloads
+    )
+    stop = next(
+        payload for payload in payloads if payload.get("type") == "message_delta"
+    )
+    assert stop["delta"]["stop_reason"] == "max_tokens"
