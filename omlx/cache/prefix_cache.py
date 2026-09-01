@@ -3220,6 +3220,35 @@ class BlockAwarePrefixCache(CacheManager):
                     )
                     break  # Stop here, use valid prefix
 
+                # Qwen4 text position IDs are part of the sparse-attention
+                # cache state, not reconstructible metadata.  Older cache
+                # writers could persist an equal-plane text block with a
+                # reset inside the block (for example ``20281, 0..8,
+                # 20291`` after speculative rollback).  Tensor shapes still
+                # look valid and the recurrent/QSA offsets later advance to
+                # the requested token count, but the resulting cache cannot
+                # be an exact text prefix.  Reject the first malformed block
+                # here so reconstruction walks back to the last proved
+                # boundary and the request heals the suffix losslessly.
+                qsa_timeline_ok, qsa_timeline_reason = (
+                    self._validate_qwen4_qsa_block_position_timeline(
+                        block_data,
+                        layer_cache_types,
+                    )
+                )
+                if not qsa_timeline_ok:
+                    logger.warning(
+                        "Qwen4 QSA cache timeline mismatch at block %s: %s. "
+                        "Truncating cached prefix before this block.",
+                        block_id,
+                        qsa_timeline_reason,
+                    )
+                    self._forget_incompatible_ssd_block(
+                        block.block_hash,
+                        block.block_id,
+                    )
+                    break
+
                 all_block_data.append(block_data)
                 valid_block_count += 1
                 valid_token_count += block.token_count
@@ -4812,6 +4841,94 @@ class BlockAwarePrefixCache(CacheManager):
                 return False
 
         return True
+
+    @staticmethod
+    def _validate_qwen4_qsa_block_position_timeline(
+        cache_data: list[Any],
+        layer_cache_types: list[str] | None,
+    ) -> tuple[bool, str]:
+        """Prove that equal-plane QSA position blocks never reset internally.
+
+        Qwen4 serializes QSA positions as ``[B, C, S]`` where ``C`` is one
+        for text or three for MRoPE.  Genuine multimodal blocks may have
+        different coordinate planes and are deliberately left to the normal
+        VLM cache identity gates.  When every plane is equal, however, the
+        block is text-shaped and adjacent positions must increase by exactly
+        one.  This is a structural, token-independent proof and therefore
+        remains lossless for both text and multimodal caches.
+        """
+
+        if not cache_data or not layer_cache_types:
+            return True, "not-applicable"
+
+        qsa_types = {"QSAKVCache", "QSAQuantizedKVCache"}
+        predicates: list[Any] = []
+        qsa_layers = 0
+        for layer_idx, layer_data in enumerate(cache_data):
+            cache_type = (
+                layer_cache_types[layer_idx]
+                if layer_idx < len(layer_cache_types)
+                else None
+            )
+            if cache_type not in qsa_types:
+                continue
+            qsa_layers += 1
+
+            if (
+                isinstance(layer_data, tuple)
+                and len(layer_data) >= 3
+                and layer_data[0] == "__nstate__"
+            ):
+                marker_class = layer_data[1] or cache_type
+                elements = layer_data[2]
+                if marker_class not in qsa_types:
+                    return False, f"layer {layer_idx} marker={marker_class!r}"
+            else:
+                elements = layer_data
+
+            if not isinstance(elements, (list, tuple)) or len(elements) < 4:
+                return False, f"layer {layer_idx} has no four-plane QSA state"
+            keys, values, index_keys, positions = elements[:4]
+            if not all(isinstance(value, mx.array) for value in elements[:4]):
+                return False, f"layer {layer_idx} has non-array QSA state"
+            if (
+                keys.ndim < 3
+                or values.ndim < 3
+                or index_keys.ndim != 3
+                or positions.ndim != 3
+                or positions.shape[0] != 1
+                or positions.shape[1] not in {1, 3}
+            ):
+                return False, f"layer {layer_idx} has malformed QSA shapes"
+
+            seq_len = int(positions.shape[-1])
+            if (
+                seq_len <= 0
+                or int(keys.shape[2]) != seq_len
+                or int(values.shape[2]) != seq_len
+                or int(index_keys.shape[1]) != seq_len
+            ):
+                return False, f"layer {layer_idx} has misaligned QSA lengths"
+
+            planes_equal = (
+                mx.array(True)
+                if positions.shape[1] == 1
+                else mx.all(positions[:, 1:, :] == positions[:, :1, :])
+            )
+            contiguous = (
+                mx.array(True)
+                if seq_len == 1
+                else mx.all(positions[..., 1:] == positions[..., :-1] + 1)
+            )
+            predicates.append((~planes_equal) | contiguous)
+
+        if qsa_layers == 0:
+            return True, "not-applicable"
+        if not predicates:
+            return False, "QSA layers had no position predicates"
+        if not bool(mx.all(mx.stack(predicates)).item()):
+            return False, "equal-plane text positions reset within the block"
+        return True, "ok"
 
     def _find_best_prefix_match(
         self,

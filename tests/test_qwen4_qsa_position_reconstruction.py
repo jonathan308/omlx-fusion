@@ -5,6 +5,7 @@ import mlx.core as mx
 import pytest
 
 from omlx.cache.type_handlers import Qwen4QSAKVCacheHandler
+from omlx.cache.prefix_cache import BlockAwarePrefixCache
 
 
 def _state(positions):
@@ -123,3 +124,88 @@ def test_card_572_fourteen_block_topology_reconstructs_exact_prefix():
         assert result[0, channel, 9 * block_size : 10 * block_size].tolist() == (
             [value] * block_size
         )
+
+
+def _qsa_block(positions):
+    length = int(positions.shape[-1])
+    elements = (
+        mx.zeros((1, 2, length, 4)),
+        mx.zeros((1, 2, length, 4)),
+        mx.zeros((1, length, 8)),
+        positions,
+    )
+    return [("__nstate__", "QSAKVCache", elements)]
+
+
+def test_equal_plane_qsa_block_requires_unit_position_timeline():
+    positions = mx.broadcast_to(mx.arange(16)[None, None], (1, 3, 16))
+
+    valid, reason = (
+        BlockAwarePrefixCache._validate_qwen4_qsa_block_position_timeline(
+            _qsa_block(positions),
+            ["QSAKVCache"],
+        )
+    )
+
+    assert valid
+    assert reason == "ok"
+
+
+def test_equal_plane_qsa_block_rejects_speculative_position_reset():
+    # Reproduces the physical failure found in an old 4K SSD block:
+    # 16,384..20,281, then 0..8, then 20,291...
+    positions = mx.concatenate(
+        [
+            mx.arange(16_384, 20_282),
+            mx.arange(9),
+            mx.arange(20_291, 20_480),
+        ]
+    )[None, None]
+    positions = mx.broadcast_to(positions, (1, 3, 4096))
+
+    valid, reason = (
+        BlockAwarePrefixCache._validate_qwen4_qsa_block_position_timeline(
+            _qsa_block(positions),
+            ["QSAKVCache"],
+        )
+    )
+
+    assert not valid
+    assert reason == "equal-plane text positions reset within the block"
+
+
+def test_genuine_mrope_qsa_block_is_not_forced_to_text_timeline():
+    positions = mx.stack(
+        [
+            mx.array([[0, 1, 2, 3]]),
+            mx.array([[0, 0, 1, 1]]),
+            mx.array([[0, 1, 0, 1]]),
+        ],
+        axis=1,
+    )
+
+    valid, reason = (
+        BlockAwarePrefixCache._validate_qwen4_qsa_block_position_timeline(
+            _qsa_block(positions),
+            ["QSAKVCache"],
+        )
+    )
+
+    assert valid
+    assert reason == "ok"
+
+
+def test_qsa_block_position_validation_checks_all_qsa_layers():
+    good = mx.arange(8)[None, None]
+    bad = mx.array([0, 1, 2, 0, 1, 2, 3, 4])[None, None]
+    cache_data = _qsa_block(good) + _qsa_block(bad)
+
+    valid, reason = (
+        BlockAwarePrefixCache._validate_qwen4_qsa_block_position_timeline(
+            cache_data,
+            ["QSAKVCache", "QSAQuantizedKVCache"],
+        )
+    )
+
+    assert not valid
+    assert reason == "equal-plane text positions reset within the block"
