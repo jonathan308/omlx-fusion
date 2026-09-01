@@ -5593,6 +5593,19 @@ class Scheduler:
         with mx.stream(self._stream):
             chunk = state.tokens_remaining[:, :n]
             state.tokens_remaining = state.tokens_remaining[:, n:]
+            # A chunked text prefill can yield to active decode between
+            # forwards. Completion cleanup or the intervening decode batch may
+            # replace the VLM adapter's process-local mRoPE state. Rebind this
+            # request at the model-call boundary so the next scalar-cache chunk
+            # continues from its absolute cache offset instead of restarting at
+            # local position zero.
+            set_batch_rope = getattr(
+                self.model,
+                "set_batch_rope_deltas",
+                None,
+            )
+            if callable(set_batch_rope):
+                set_batch_rope(mx.array([state.request.rope_deltas]))
             if self._supports_skip_lm_head():
                 self.model(chunk, cache=state.cache, skip_lm_head=True)
             else:
