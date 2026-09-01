@@ -8686,13 +8686,17 @@ class Scheduler:
         if source_cache_tokens < 2:
             return False
 
-        from .cache.exact_boundary import plan_plain_kv_boundary
+        from .cache.exact_boundary import (
+            plan_hybrid_arrays_kv_boundary,
+            plan_plain_kv_boundary,
+        )
 
         qwen4_provider = self._resident_cache_qwen4_target_only_enabled()
         provider_name = "qwen4-qsa" if qwen4_provider else "plain-kv-v1"
         block_size = int(self.config.paged_cache_block_size or 0)
         stable_token_count = source_cache_tokens
         plain_kv_plan = None
+        hybrid_plan = None
         if not qwen4_provider:
             # Generic V1 is target-only plain KV. Any speculative drafter or
             # non-exact cache graph remains outside its proof.
@@ -8713,7 +8717,20 @@ class Scheduler:
                 target_tokens=stable_token_count,
             )
             if plain_kv_plan is None:
-                return False
+                # Recurrent state cannot be inverted to the coarse block
+                # boundary. A finalized B1 ArraysCache+KVCache graph can,
+                # however, be copied exactly at its already-computed N-1
+                # timeline. Exact token matching makes a changed template tail
+                # a safe miss rather than a correctness risk.
+                stable_token_count = source_cache_tokens
+                hybrid_plan = plan_hybrid_arrays_kv_boundary(
+                    cache_list,
+                    source_tokens=len(source_tokens),
+                    target_tokens=stable_token_count,
+                )
+                if hybrid_plan is None:
+                    return False
+                provider_name = "hybrid-arrays-kv-v1"
         stable_tokens = source_tokens[:stable_token_count]
         required_durable = (
             (len(stable_tokens) // block_size) * block_size
@@ -8732,7 +8749,11 @@ class Scheduler:
         estimated_bytes = (
             self._resident_cache_nbytes(cache_list)
             if qwen4_provider
-            else plain_kv_plan.estimated_nbytes
+            else (
+                plain_kv_plan.estimated_nbytes
+                if plain_kv_plan is not None
+                else hybrid_plan.estimated_nbytes
+            )
         )
         if estimated_bytes is None or estimated_bytes <= 0:
             return False
@@ -8768,7 +8789,10 @@ class Scheduler:
 
         started = time.perf_counter()
         try:
-            from .cache.exact_boundary import materialize_plain_kv_boundary
+            from .cache.exact_boundary import (
+                materialize_hybrid_arrays_kv_boundary,
+                materialize_plain_kv_boundary,
+            )
             from .patches.mlx_lm_mtp import prompt_priming
 
             generation = self._exact_resident_cache.generation()
@@ -8783,9 +8807,18 @@ class Scheduler:
                         len(stable_tokens),
                     )
                     provider_nbytes = None
-                else:
+                elif plain_kv_plan is not None:
                     detached = materialize_plain_kv_boundary(
                         plain_kv_plan,
+                        stream=self._stream,
+                    )
+                    cloned = detached.cache if detached is not None else None
+                    provider_nbytes = (
+                        detached.nbytes if detached is not None else None
+                    )
+                else:
+                    detached = materialize_hybrid_arrays_kv_boundary(
+                        hybrid_plan,
                         stream=self._stream,
                     )
                     cloned = detached.cache if detached is not None else None
