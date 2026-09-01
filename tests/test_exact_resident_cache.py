@@ -349,6 +349,28 @@ def test_resize_restores_entry_limit_and_evicts_oldest():
     assert tier.acquire_prefix([2, 3]).cache is second
 
 
+def test_lifecycle_generation_makes_deferred_publication_atomic():
+    tier = ExactResidentPrefixCache(max_entries=2, max_bytes=1_000)
+    generation = tier.generation()
+
+    assert tier.put(
+        [1, 2],
+        [object()],
+        cache_nbytes=10,
+        expected_generation=generation,
+    )
+    tier.clear()
+    assert not tier.put(
+        [3, 4],
+        [object()],
+        cache_nbytes=10,
+        expected_generation=generation,
+    )
+    resized_generation = tier.generation()
+    tier.resize(1)
+    assert tier.generation() == resized_generation + 1
+
+
 def test_scheduler_stages_and_restores_exact_terminal_cache():
     scheduler = _scheduler()
     completed = _request([1, 2, 3])

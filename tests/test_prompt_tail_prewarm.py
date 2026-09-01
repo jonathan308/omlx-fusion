@@ -136,6 +136,22 @@ def test_prompt_tail_stable_boundary_respects_minimum_after_trim():
     scheduler._prepare_prefix_cache_for_request.assert_not_called()
 
 
+def test_prompt_tail_skips_hidden_recompute_when_stable_boundary_is_resident():
+    scheduler, _cache, _state = _scheduler()
+    scheduler._exact_resident_cache.contains_exact = MagicMock(return_value=True)
+
+    result = scheduler.prewarm_prompt_tail(list(range(10)), min_tokens=2)
+
+    assert result == {
+        "status": "skipped",
+        "reason": "stable-boundary-already-resident",
+        "source_prompt_tokens": 10,
+        "stable_boundary_trimmed_tokens": 1,
+        "prompt_tokens": 9,
+    }
+    scheduler._prepare_prefix_cache_for_request.assert_not_called()
+
+
 def test_prompt_tail_prefix_restore_does_not_change_user_cache_metrics(monkeypatch):
     scheduler, _cache, _state = _scheduler()
     tracker = MagicMock()

@@ -5850,6 +5850,13 @@ class Scheduler:
                 return
 
         self._finalize_chunked_prefill_cache_for_insert(request, state.cache)
+        stage_stable_boundary = getattr(
+            self,
+            "_stage_stable_prompt_boundary",
+            None,
+        )
+        if callable(stage_stable_boundary):
+            stage_stable_boundary(request, state.cache)
 
         per_row_lps = state.per_row_lps if state.per_row_lps is not None else []
         # insert() merges the prompt cache into the batch KV caches with lazy
@@ -8596,6 +8603,249 @@ class Scheduler:
         return total if seen_arrays else None
 
     @classmethod
+    def _resident_cache_arrays(cls, cache_list: list[Any]) -> list[mx.array]:
+        """Collect concrete cache-owned arrays once for owner-stream eval."""
+
+        arrays: list[mx.array] = []
+        seen_objects: set[int] = set()
+        seen_containers: set[int] = set()
+        seen_arrays: set[int] = set()
+
+        def visit(value: Any) -> None:
+            if isinstance(value, mx.array):
+                identity = id(value)
+                if identity not in seen_arrays:
+                    seen_arrays.add(identity)
+                    arrays.append(value)
+                return
+            if value is None or isinstance(value, (str, bytes, int, float, bool)):
+                return
+            if isinstance(value, dict):
+                identity = id(value)
+                if identity in seen_containers:
+                    return
+                seen_containers.add(identity)
+                for item in value.values():
+                    visit(item)
+                return
+            if isinstance(value, (list, tuple)):
+                identity = id(value)
+                if identity in seen_containers:
+                    return
+                seen_containers.add(identity)
+                for item in value:
+                    visit(item)
+
+        def visit_cache(cache_obj: Any) -> None:
+            identity = id(cache_obj)
+            if identity in seen_objects:
+                return
+            seen_objects.add(identity)
+            for name, value in vars(cache_obj).items():
+                if name == "_pooled_index_tag":
+                    continue
+                if name == "_inner":
+                    visit_cache(value)
+                else:
+                    visit(value)
+
+        for cache_obj in cls._resident_cache_leaf_objects(cache_list):
+            visit_cache(cache_obj)
+        return arrays
+
+    def _stage_stable_prompt_boundary(
+        self,
+        request: Request,
+        cache_list: list[Any] | None,
+    ) -> bool:
+        """Detach Qwen4's already-computed prompt N-1 boundary for L0.
+
+        This is staged on the request and published only after normal terminal
+        cleanup proves the request stayed singleton.  It therefore adds no
+        claimable cache while BatchGenerator still owns the source merge.
+        """
+
+        request._stable_prompt_resident_candidate = None
+        if (
+            not isinstance(cache_list, list)
+            or not cache_list
+            or getattr(request, "skip_cache_store", False)
+            or not self._request_is_text_only_for_resident_cache(request)
+            or not self._resident_cache_qwen4_target_only_enabled()
+            or self._exact_resident_cache.max_entries < 2
+            or self.running
+            or self.waiting
+            or any(
+                candidate.request_id != request.request_id
+                for candidate in self.prefilling
+            )
+        ):
+            return False
+
+        source_tokens = list(request.prompt_token_ids or [])
+        stable_tokens = source_tokens[:-1]
+        if len(stable_tokens) < 2:
+            return False
+        block_size = int(self.config.paged_cache_block_size or 0)
+        required_durable = (
+            (len(stable_tokens) // block_size) * block_size
+            if block_size > 0
+            else 0
+        )
+        durable_tokens = int(
+            getattr(request, "_exact_resident_durable_fallback_tokens", 0) or 0
+        )
+        # Initial cold turns still use the ordinary prompt store plus idle
+        # prewarm. Immediate publication is reserved for a boundary whose crash
+        # fallback is already independently durable.
+        if required_durable > durable_tokens:
+            return False
+
+        estimated_bytes = self._resident_cache_nbytes(cache_list)
+        if estimated_bytes is None or estimated_bytes <= 0:
+            return False
+        can_fit = getattr(
+            self._exact_resident_cache,
+            "can_fit_protected_candidate",
+            None,
+        )
+        if callable(can_fit) and not can_fit(
+            stable_tokens,
+            estimated_cache_nbytes=estimated_bytes,
+        ):
+            return False
+
+        cap_candidates = [
+            int(getattr(self, name, 0) or 0)
+            for name in (
+                "_memory_abort_limit_bytes",
+                "_memory_metal_cap_bytes",
+                "_memory_static_ceiling_bytes",
+            )
+        ]
+        with suppress(Exception):
+            cap_candidates.append(int(get_max_working_set_bytes() or 0))
+        cap_candidates = [value for value in cap_candidates if value > 0]
+        physical_cap = min(cap_candidates) if cap_candidates else 0
+        if (
+            physical_cap <= 0
+            or self._current_usage_bytes() + estimated_bytes > physical_cap
+            or estimated_bytes > self._exact_resident_cache.max_bytes
+        ):
+            return False
+
+        started = time.perf_counter()
+        try:
+            from .patches.mlx_lm_mtp import prompt_priming
+
+            generation = self._exact_resident_cache.generation()
+            source_arrays = self._resident_cache_arrays(cache_list)
+            if not source_arrays:
+                return False
+            source_array_ids = {id(array) for array in source_arrays}
+            with mx.stream(self._stream):
+                cloned = prompt_priming._cache_at_offset(
+                    cache_list,
+                    len(stable_tokens),
+                )
+                if not cloned:
+                    return False
+                if not self._invalidate_resident_pool_with_telemetry(
+                    cloned,
+                    phase="stable-prompt-capture",
+                ):
+                    return False
+                arrays = self._resident_cache_arrays(cloned)
+                if not arrays:
+                    return False
+                # The resident entry must own every mutable MLX array.  A
+                # shallow cache-object copy is not enough: source decode can
+                # otherwise mutate a published boundary after validation.
+                if source_array_ids.intersection(id(array) for array in arrays):
+                    logger.warning(
+                        "Stable prompt boundary rejected for %s: detached "
+                        "clone shares cache-owned arrays with the live source",
+                        request.request_id,
+                    )
+                    return False
+                mx.eval(*arrays)
+            if not self._resident_cache_matches_token_count(
+                cloned,
+                len(stable_tokens),
+            ):
+                return False
+            cache_nbytes = self._resident_cache_nbytes(cloned)
+            if (
+                cache_nbytes is None
+                or cache_nbytes <= 0
+                or cache_nbytes > self._exact_resident_cache.max_bytes
+                or self._current_usage_bytes() > physical_cap
+            ):
+                return False
+        except Exception as exc:  # noqa: BLE001 - cache providers fail closed
+            request._stable_prompt_resident_candidate = None
+            logger.warning(
+                "Stable prompt boundary capture failed closed for %s: %s",
+                request.request_id,
+                exc,
+            )
+            return False
+        capture_ms = (time.perf_counter() - started) * 1000.0
+        request._stable_prompt_resident_candidate = (
+            stable_tokens,
+            cloned,
+            cache_nbytes,
+            min(durable_tokens, len(stable_tokens)),
+            generation,
+            capture_ms,
+        )
+        logger.info(
+            "Stable prompt boundary captured for %s: tokens=%d size=%.2fGiB "
+            "clone=%.1fms publication=deferred-until-terminal",
+            request.request_id,
+            len(stable_tokens),
+            cache_nbytes / 1024**3,
+            capture_ms,
+        )
+        return True
+
+    def _publish_stable_prompt_boundary(self, request: Request) -> bool:
+        """Publish a staged N-1 boundary after singleton terminal cleanup."""
+
+        candidate = getattr(request, "_stable_prompt_resident_candidate", None)
+        request._stable_prompt_resident_candidate = None
+        if not (isinstance(candidate, tuple) and len(candidate) == 6):
+            return False
+        tokens, cache_list, cache_nbytes, durable_tokens, generation, capture_ms = (
+            candidate
+        )
+        if not (
+            isinstance(tokens, list)
+            and isinstance(cache_list, list)
+            and self._resident_cache_matches_token_count(cache_list, len(tokens))
+        ):
+            return False
+        published = self._exact_resident_cache.put(
+            tokens,
+            cache_list,
+            cache_nbytes=cache_nbytes,
+            durable_tokens=durable_tokens,
+            protect_longer_prefix=True,
+            expected_generation=generation,
+        )
+        if published:
+            logger.info(
+                "Stable prompt boundary published for %s: tokens=%d size=%.2fGiB "
+                "capture=%.1fms durable_tokens=%d",
+                request.request_id,
+                len(tokens),
+                cache_nbytes / 1024**3,
+                capture_ms,
+                durable_tokens,
+            )
+        return published
+
+    @classmethod
     def _invalidate_resident_derived_state(
         cls, cache_list: list[Any]
     ) -> tuple[bool, int]:
@@ -9535,6 +9785,17 @@ class Scheduler:
             return result
         if max_tokens > 0 and len(prompt_tokens) > int(max_tokens):
             result.update(reason="prompt-too-large", prompt_tokens=len(prompt_tokens))
+            return result
+        contains_exact = getattr(
+            self._exact_resident_cache,
+            "contains_exact",
+            None,
+        )
+        if callable(contains_exact) and contains_exact(prompt_tokens):
+            result.update(
+                reason="stable-boundary-already-resident",
+                prompt_tokens=len(prompt_tokens),
+            )
             return result
         if (
             (abort_requested is not None and abort_requested())
@@ -12464,6 +12725,13 @@ class Scheduler:
             # See vllm-mlx-patched commit 8d4052b for the same root cause
             # in a sibling project, and #934 for the user-visible symptom.
             per_row_lps = list(logits_processors) if logits_processors else []
+            stage_stable_boundary = getattr(
+                self,
+                "_stage_stable_prompt_boundary",
+                None,
+            )
+            if callable(stage_stable_boundary):
+                stage_stable_boundary(request, cache_to_use)
             # insert() merges the prompt cache into the batch KV caches with
             # lazy ops; keep them on the engine stream so the next decode
             # step's eval graph stays single-stream (#2235, see
@@ -13070,6 +13338,8 @@ class Scheduler:
                     )
                 else:
                     resident_handoff = self._publish_exact_resident_cache(request)
+                stable_handoff = self._publish_stable_prompt_boundary(request)
+                resident_handoff = resident_handoff or stable_handoff
             elif request is not None and getattr(
                 request, "_exact_resident_candidate", None
             ) is not None:
@@ -13078,6 +13348,9 @@ class Scheduler:
                     "completion keeps normal durable persistence",
                     request_id,
                 )
+                request._stable_prompt_resident_candidate = None
+            if request is not None and not singleton_resident_eligible:
+                request._stable_prompt_resident_candidate = None
 
             # Store cache for future reuse (G2-async): submit to background
             # executor so the post-finish 28GB+ memcpy doesn't block response

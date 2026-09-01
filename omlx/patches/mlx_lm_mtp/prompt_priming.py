@@ -563,7 +563,17 @@ def _clone_mtp_cache(cache: List[Any]) -> Optional[List[Any]]:
             # _cache_at_offset has selected the target, then compact once.
             return copy.copy(entry)
         clone = copy.copy(entry)
+        # oMLX wraps restored recurrent ArraysCache state in
+        # SizedArraysCache. A shallow wrapper copy still shares ``_inner`` and
+        # its live slot list, so later decode would mutate a supposedly detached
+        # prompt-boundary candidate. Clone the owned inner cache recursively
+        # before copying the wrapper's remaining scalar/array metadata.
+        inner = vars(entry).get("_inner")
+        if inner is not None:
+            clone._inner = clone_one(inner)
         for attr, value in vars(entry).items():
+            if attr == "_inner":
+                continue
             if attr in _SNAPSHOT_REFERENCE_FIELDS:
                 continue
             if isinstance(value, (mx.array, list, tuple, dict)):
