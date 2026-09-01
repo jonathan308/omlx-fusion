@@ -8658,7 +8658,7 @@ class Scheduler:
         request: Request,
         cache_list: list[Any] | None,
     ) -> bool:
-        """Detach Qwen4's already-computed prompt N-1 boundary for L0.
+        """Detach an already-computed, provider-proved prompt N-1 boundary.
 
         This is staged on the request and published only after normal terminal
         cleanup proves the request stayed singleton.  It therefore adds no
@@ -8671,7 +8671,6 @@ class Scheduler:
             or not cache_list
             or getattr(request, "skip_cache_store", False)
             or not self._request_is_text_only_for_resident_cache(request)
-            or not self._resident_cache_qwen4_target_only_enabled()
             or self._exact_resident_cache.max_entries < 2
             or self.running
             or self.waiting
@@ -8686,6 +8685,24 @@ class Scheduler:
         stable_tokens = source_tokens[:-1]
         if len(stable_tokens) < 2:
             return False
+
+        from .cache.exact_boundary import plan_plain_kv_boundary
+
+        qwen4_provider = self._resident_cache_qwen4_target_only_enabled()
+        provider_name = "qwen4-qsa" if qwen4_provider else "plain-kv-v1"
+        plain_kv_plan = None
+        if not qwen4_provider:
+            # Generic V1 is target-only plain KV. Any speculative drafter or
+            # non-exact cache graph remains outside its proof.
+            if self._resident_cache_spec_decode_active():
+                return False
+            plain_kv_plan = plan_plain_kv_boundary(
+                cache_list,
+                source_tokens=len(source_tokens),
+                target_tokens=len(stable_tokens),
+            )
+            if plain_kv_plan is None:
+                return False
         block_size = int(self.config.paged_cache_block_size or 0)
         required_durable = (
             (len(stable_tokens) // block_size) * block_size
@@ -8701,7 +8718,11 @@ class Scheduler:
         if required_durable > durable_tokens:
             return False
 
-        estimated_bytes = self._resident_cache_nbytes(cache_list)
+        estimated_bytes = (
+            self._resident_cache_nbytes(cache_list)
+            if qwen4_provider
+            else plain_kv_plan.estimated_nbytes
+        )
         if estimated_bytes is None or estimated_bytes <= 0:
             return False
         can_fit = getattr(
@@ -8736,6 +8757,7 @@ class Scheduler:
 
         started = time.perf_counter()
         try:
+            from .cache.exact_boundary import materialize_plain_kv_boundary
             from .patches.mlx_lm_mtp import prompt_priming
 
             generation = self._exact_resident_cache.generation()
@@ -8744,10 +8766,21 @@ class Scheduler:
                 return False
             source_array_ids = {id(array) for array in source_arrays}
             with mx.stream(self._stream):
-                cloned = prompt_priming._cache_at_offset(
-                    cache_list,
-                    len(stable_tokens),
-                )
+                if qwen4_provider:
+                    cloned = prompt_priming._cache_at_offset(
+                        cache_list,
+                        len(stable_tokens),
+                    )
+                    provider_nbytes = None
+                else:
+                    detached = materialize_plain_kv_boundary(
+                        plain_kv_plan,
+                        stream=self._stream,
+                    )
+                    cloned = detached.cache if detached is not None else None
+                    provider_nbytes = (
+                        detached.nbytes if detached is not None else None
+                    )
                 if not cloned:
                     return False
                 if not self._invalidate_resident_pool_with_telemetry(
@@ -8778,6 +8811,10 @@ class Scheduler:
             if (
                 cache_nbytes is None
                 or cache_nbytes <= 0
+                or (
+                    provider_nbytes is not None
+                    and cache_nbytes != provider_nbytes
+                )
                 or cache_nbytes > self._exact_resident_cache.max_bytes
                 or self._current_usage_bytes() > physical_cap
             ):
@@ -8800,9 +8837,10 @@ class Scheduler:
             capture_ms,
         )
         logger.info(
-            "Stable prompt boundary captured for %s: tokens=%d size=%.2fGiB "
-            "clone=%.1fms publication=deferred-until-terminal",
+            "Stable prompt boundary captured for %s: provider=%s tokens=%d "
+            "size=%.2fGiB clone=%.1fms publication=deferred-until-terminal",
             request.request_id,
+            provider_name,
             len(stable_tokens),
             cache_nbytes / 1024**3,
             capture_ms,
