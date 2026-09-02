@@ -340,6 +340,24 @@ class ExactResidentPrefixCache:
                 terminal_proof=entry.terminal_proof,
             )
 
+    def snapshot_entries(self) -> list[tuple[list[int], list[Any], str | None]]:
+        """Return newest-to-oldest entries for lifecycle persistence.
+
+        The returned cache objects remain owned by this tier until the caller
+        explicitly clears it.  This is used only during serialized engine
+        shutdown, after request/store workers have drained.
+        """
+
+        with self._lock:
+            return [
+                (
+                    list(entry.tokens),
+                    entry.cache,
+                    entry.terminal_proof,
+                )
+                for entry in reversed(self._entries.values())
+            ]
+
     def clear(self) -> int:
         """Drop resident references without touching the durable cache tier."""
 
