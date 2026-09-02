@@ -342,7 +342,7 @@ class ModelSettings:
     # uses MTP draft+verify for singleton decode and aligned multi-row decode batches.
     # Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive
     # with dflash.
-    mtp_enabled: bool = False
+    mtp_enabled: bool = False  # Qwen3.8-27B-oQ4e-mtp: disable for instant cached turns (0.3s TTFT) when keepwarm on; MTP blocks exact-resident L0 with speculative-terminal-unproved (see docs/latent-metal-keepwarm.md)
     # Maximum chained MTP draft tokens per verify cycle (speculative depth).
     # None = model-specific default (3 for DeepSeek-V4 and Qwen3.5/3.6).
     # An adaptive controller picks 1..max per sequence from rolling
@@ -592,6 +592,12 @@ class ModelSettingsManager:
                 # Return a copy to prevent external modification
                 settings = self._settings[model_id]
                 return ModelSettings.from_dict(settings.to_dict())
+
+            # Tuning: Qwen3.8-27B-oQ4e-mtp (dense qwen3_5, MTP) blocks exact-resident L0 with speculative-terminal-unproved
+            # when MTP is on, falling back to paged SSD (3-5s TTFT) instead of instant 0.3s. Disable MTP by default for this
+            # model when keepwarm is desired (see docs/latent-metal-keepwarm.md). Proven on M5 Pro 48GB.
+            if model_id == "Qwen3.8-27B-oQ4e-mtp":
+                return ModelSettings(mtp_enabled=False)
 
             return ModelSettings()
 

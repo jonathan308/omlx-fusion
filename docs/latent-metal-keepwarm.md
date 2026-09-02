@@ -99,3 +99,24 @@ longer raw terminal misses but the exact input-prefix fallback matches. Cold
 prefill, sustained generated-token rate, tool calls, output hashes, and MTP
 acceptance must remain equivalent; keepwarm changes readiness and cache
 availability only, never model math.
+
+## Model-specific tuning: Qwen3.8-27B-oQ4e-mtp
+
+Validated on Qwen3.8-Next (80B-A3B) with instant cached turns at ~0.3s TTFT. For the dense 27B `Jundot/Qwen3.8-27B-oQ4e-mtp` (`Qwen3_5ForConditionalGeneration`, `mtp_num_hidden_layers=1`, `qwen3_5`), the Lightning MTP draft+verify path (`mtp_enabled true`) blocks the exact-resident L0 handoff with `speculative-terminal-unproved` (`omlx/scheduler.py:9504` `self._resident_cache_spec_decode_active()`). Result: cached turns fall back to paged `hot_cache`/`SSD` (`Prefix cache restore source=paged cached=4096` 3–5s TTFT) instead of `source=exact-resident cached=5067 suffix=1 lookup 0.28ms retained 0.45GiB` 0.41s/0.77s TTFT.
+
+**Tuning (proven on M5 Pro 48GB, block 2048, hot 4GB write-through, SSD 398GB):**
+
+- Disable MTP for this model when `latent_metal_keepwarm_enabled` is desired:
+  ```bash
+  curl -s -b /tmp/cookie.jar -X PUT -H "Content-Type: application/json" \
+    -d '{"mtp_enabled": false}' \
+    http://127.0.0.1:8000/admin/api/models/Qwen3.8-27B-oQ4e-mtp/settings
+  # then reload
+  curl -s -X POST -H "Authorization: Bearer test" http://127.0.0.1:8000/v1/models/Qwen3.8-27B-oQ4e-mtp/unload
+  curl -s -X POST -H "Authorization: Bearer test" http://127.0.0.1:8000/v1/models/Qwen3.8-27B-oQ4e-mtp/load
+  ```
+  Persisted in `~/.omlx/model_settings.json` `Qwen3.8-27B-oQ4e-mtp.mtp_enabled false`. After restart, `exact_resident_cache` shows `entries 2 max_entries 2 hits 1` vs `0` with MTP on, and `stream_model_ttft 0.41s stream_visible_ttft 0.77s` for 5067→5067 hit vs 3.24s/5.65s paged.
+
+- Trade-off: MTP gives 2.5–3.3 tok/cycle for cold/long generation (26 tok/s) but disables instant L0. With MTP off, cold generation is ~15 tok/s but cached TTFT is 0.3–0.4s (vs 3–5s paged) and `cache_efficiency` 44.8%→68.6% for opencode-style 7635-token system prompts. For opencode (long system+tools, short follow-ups), instant 0.3s dominates.
+
+- Alternative (future): enable Qwen3.5 target-only proof similar to Qwen4 `qwen4-target-only-v1` (`omlx/scheduler.py:8540` `_resident_cache_qwen4_target_only_enabled`) to allow MTP + exact resident. Until proven, the per-model disable is the validated tuning.
