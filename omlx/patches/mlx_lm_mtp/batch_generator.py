@@ -2673,6 +2673,46 @@ def _clear_rollback(prompt_cache: List[Any]) -> None:
             c._undo_chain = False
 
 
+def _generic_mtp_terminal_cache_is_exact(gen_batch: Any) -> bool:
+    """Prove a generic-MTP target cache already matches visible output.
+
+    The first/bonus token of several Qwen3.5 MTP queue shapes is materialized
+    in the target backbone before it is emitted.  When that token also ends the
+    request, replaying the whole committed ledger is unnecessary and delays the
+    terminal (sometimes first) stream event.  Accept the live cache only when
+    every readable target leaf agrees with the public token count and no
+    speculative rollback/undo payload remains.  Unknown cache shapes fail
+    closed to the existing full standard reconciliation.
+    """
+
+    if _model_qwen4_terminal_commit_enabled(getattr(gen_batch, "model", None)):
+        return False
+    tokens = getattr(gen_batch, "tokens", None)
+    prompt_cache = getattr(gen_batch, "prompt_cache", None)
+    if (
+        not isinstance(tokens, list)
+        or len(tokens) != 1
+        or not isinstance(tokens[0], list)
+        or not tokens[0]
+        or not isinstance(prompt_cache, list)
+        or not prompt_cache
+    ):
+        return False
+    if _prompt_priming.target_cache_offset(prompt_cache) != len(tokens[0]):
+        return False
+    for cache in _iter_mtp_cache_leaves(prompt_cache):
+        for marker in (
+            "rollback_state",
+            "_mtp_draft_stash",
+            "_mtp_undo",
+            "_qwen4_exp_ple_speculative_state",
+            "_undo",
+        ):
+            if getattr(cache, marker, None) is not None:
+                return False
+    return True
+
+
 def _iter_mtp_cache_leaves(cache_list: List[Any]):
     pending = list(reversed(cache_list))
     while pending:
@@ -7994,8 +8034,35 @@ def _emit_response(
                 )
             ]
 
-        prompt_cache = gen_batch.extract_cache(0)
-        all_tokens = gen_batch.tokens[0]
+        # Legacy Qwen3.5-style MTP does not have Qwen4's explicit two-phase
+        # target transaction.  Its verifier may leave the backbone cache ahead
+        # of the visible terminal token while a queued draft is still parked.
+        # Never publish that speculative cache to the exact resident tier:
+        # reconcile the singleton by replaying the committed token ledger into
+        # a fresh standard cache first.  This work is paid at request
+        # completion, off the TTFT-critical next-turn path, and preserves the
+        # lossless target distribution.  If reconciliation fails closed, the
+        # response remains usable but exposes no cache candidate.
+        standard_terminal_exact = False
+        active_state = getattr(gen_batch, "_omlx_mtp_state", None)
+        if active_state is not None:
+            standard_terminal_exact = _generic_mtp_terminal_cache_is_exact(
+                gen_batch
+            )
+            if not standard_terminal_exact:
+                standard_terminal_exact = _reconcile_mtp_to_standard(
+                    gen_batch,
+                    active_state,
+                )
+            if not standard_terminal_exact:
+                logger.warning(
+                    "MTP terminal cache reconciliation failed closed; "
+                    "suppressing resident cache for uid=%s",
+                    getattr(active_state, "uid", "?"),
+                )
+
+        prompt_cache = gen_batch.extract_cache(0) if standard_terminal_exact else None
+        all_tokens = gen_batch.tokens[0] if standard_terminal_exact else None
         response = Response(
             uid=gen_batch.uids[0],
             token=token_id,
@@ -8006,6 +8073,8 @@ def _emit_response(
             prompt_cache=prompt_cache,
             all_tokens=all_tokens,
         )
+        if standard_terminal_exact:
+            response._omlx_mtp_standard_terminal_exact = True
         if stats is not None:
             _log_mtp_stats(gen_batch.uids[0], stats, finish_reason)
         # Drop state *before* filter([]) so the patched_filter epilogue

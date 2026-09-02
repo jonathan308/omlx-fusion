@@ -23,12 +23,16 @@ Enabling it can use additional RAM and a small amount of idle power.
 The mechanism is adapted from the Apache-2.0
 [ThunderMLX](https://github.com/jonathan308/ThunderMLX) keepwarm design, with
 oMLX-specific continuous-batching, cache, model-load, and live-settings gates.
-The scheduler facility is model-agnostic for text-only, non-speculative cache
-families that pass exact timeline validation. Speculative families fail closed;
-Qwen4 is the first qualified exception because its target-only terminal commit,
-QSA K/V, raw index keys, MRoPE positions, and recurrent state can all be proven
-at the same token boundary. Image/video/media-keyed requests remain on the
-existing multimodal cache path and never enter prompt-tail L0.
+The scheduler facility is model-agnostic for text-only cache families that pass
+exact timeline validation. Speculative terminal state is never published
+directly: Qwen3.5-style MTP reconciles its visible token ledger into a fresh
+standard target cache at completion, while Qwen4 uses its native target-only
+transaction (including QSA K/V, raw index keys, MRoPE positions, and recurrent
+state). Only those explicit proof tags can be leased while MTP is enabled;
+unproved entries fail closed to the durable/paged path. This keeps MTP on for
+the next turn without trading away exact cache correctness. Image/video/media-
+keyed requests remain on the existing multimodal cache path and never enter
+prompt-tail L0.
 
 Fusion also preserves the optional distributed data-plane ping for cluster
 ranks; the local Advanced toggle controls the shared master switch without
