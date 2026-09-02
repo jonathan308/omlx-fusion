@@ -7994,8 +7994,31 @@ def _emit_response(
                 )
             ]
 
-        prompt_cache = gen_batch.extract_cache(0)
-        all_tokens = gen_batch.tokens[0]
+        # Legacy Qwen3.5-style MTP does not have Qwen4's explicit two-phase
+        # target transaction.  Its verifier may leave the backbone cache ahead
+        # of the visible terminal token while a queued draft is still parked.
+        # Never publish that speculative cache to the exact resident tier:
+        # reconcile the singleton by replaying the committed token ledger into
+        # a fresh standard cache first.  This work is paid at request
+        # completion, off the TTFT-critical next-turn path, and preserves the
+        # lossless target distribution.  If reconciliation fails closed, the
+        # response remains usable but exposes no cache candidate.
+        standard_terminal_exact = False
+        active_state = getattr(gen_batch, "_omlx_mtp_state", None)
+        if active_state is not None:
+            standard_terminal_exact = _reconcile_mtp_to_standard(
+                gen_batch,
+                active_state,
+            )
+            if not standard_terminal_exact:
+                logger.warning(
+                    "MTP terminal cache reconciliation failed closed; "
+                    "suppressing resident cache for uid=%s",
+                    getattr(active_state, "uid", "?"),
+                )
+
+        prompt_cache = gen_batch.extract_cache(0) if standard_terminal_exact else None
+        all_tokens = gen_batch.tokens[0] if standard_terminal_exact else None
         response = Response(
             uid=gen_batch.uids[0],
             token=token_id,
@@ -8006,6 +8029,8 @@ def _emit_response(
             prompt_cache=prompt_cache,
             all_tokens=all_tokens,
         )
+        if standard_terminal_exact:
+            response._omlx_mtp_standard_terminal_exact = True
         if stats is not None:
             _log_mtp_stats(gen_batch.uids[0], stats, finish_reason)
         # Drop state *before* filter([]) so the patched_filter epilogue

@@ -9486,10 +9486,12 @@ class Scheduler:
         arrays are never handed to the asynchronous writer.
         """
 
-        attempted_qwen4 = (
-            getattr(request, "_mtp_exact_terminal_proved", None)
-            == "qwen4-target-only-v1"
-        )
+        terminal_proof = getattr(request, "_mtp_exact_terminal_proved", None)
+        attempted_qwen4 = terminal_proof == "qwen4-target-only-v1"
+        terminal_proved = terminal_proof in {
+            "qwen4-target-only-v1",
+            "mtp-standard-terminal-v1",
+        }
         resident_tier = getattr(self, "_exact_resident_cache", None)
         reject_reason = None
         if resident_tier is None:
@@ -9501,7 +9503,11 @@ class Scheduler:
         elif getattr(request, "skip_cache_store", False):
             reject_reason = "request-skip-cache"
         elif self._resident_cache_spec_decode_active() and not (
-            attempted_qwen4 and self._resident_cache_qwen4_target_only_enabled()
+            terminal_proved
+            and (
+                (attempted_qwen4 and self._resident_cache_qwen4_target_only_enabled())
+                or terminal_proof == "mtp-standard-terminal-v1"
+            )
         ):
             reject_reason = "speculative-terminal-unproved"
         elif not self._request_is_text_only_for_resident_cache(request):
@@ -9597,6 +9603,7 @@ class Scheduler:
             cache_list,
             cache_nbytes=cache_nbytes,
             durable_tokens=durable_tokens,
+            terminal_proof=getattr(request, "_mtp_exact_terminal_proved", None),
         ):
             logger.info(
                 "Exact resident cache staged for %s: tokens=%d size=%.2fGiB "
@@ -9664,13 +9671,7 @@ class Scheduler:
     def _restore_exact_resident_cache(self, request: Request) -> bool:
         """Transfer one exact terminal cache directly into ``request``."""
 
-        if (
-            (
-                self._resident_cache_spec_decode_active()
-                and not self._resident_cache_qwen4_target_only_enabled()
-            )
-            or not self._request_is_text_only_for_resident_cache(request)
-        ):
+        if not self._request_is_text_only_for_resident_cache(request):
             return False
         resident_cache = getattr(self, "_exact_resident_cache", None)
         if (
@@ -9682,7 +9683,16 @@ class Scheduler:
         prompt_tokens = request.prompt_token_ids or []
         started = time.perf_counter()
         with self._phase_timer("exact_resident_lookup"):
-            hit = resident_cache.acquire_prefix(prompt_tokens)
+            allowed_terminal_proofs = None
+            if self._resident_cache_spec_decode_active():
+                allowed_terminal_proofs = {
+                    "qwen4-target-only-v1",
+                    "mtp-standard-terminal-v1",
+                }
+            hit = resident_cache.acquire_prefix(
+                prompt_tokens,
+                allowed_terminal_proofs=allowed_terminal_proofs,
+            )
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         if hit is None:
             miss = resident_cache.stats()
@@ -13288,6 +13298,18 @@ class Scheduler:
                     # wrapper's timeline is not exact.
                     resident_tokens = list(request.prompt_token_ids or []) + list(
                         request.output_token_ids or []
+                    )
+                if getattr(
+                    response,
+                    "_omlx_mtp_standard_terminal_exact",
+                    False,
+                ):
+                    # Generic MTP was reconciled into a fresh standard target
+                    # cache before extraction.  Carry that proof to the
+                    # resident-tier gate so MTP-on turns can reuse it without
+                    # admitting an ahead-of-visible-token verifier cache.
+                    request._mtp_exact_terminal_proved = (
+                        "mtp-standard-terminal-v1"
                     )
                 self._stage_terminal_prompt_boundary_source(
                     request,
