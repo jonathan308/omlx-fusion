@@ -268,7 +268,7 @@ def test_plain_kv_materialization_rejects_source_array_alias(monkeypatch):
     )
 
 
-def test_scheduler_stages_plain_kv_b1_and_fails_closed_for_b2_and_speculation():
+def test_scheduler_stages_plain_kv_b1_and_fails_closed_for_b2_and_media():
     scheduler = _scheduler()
     request = _request()
     assert scheduler._stage_stable_prompt_boundary(request, [_plain_kv()])
@@ -286,7 +286,13 @@ def test_scheduler_stages_plain_kv_b1_and_fails_closed_for_b2_and_speculation():
     request.images = None
 
     scheduler.model._omlx_mtp_decode_enabled = True
-    assert not scheduler._stage_stable_prompt_boundary(request, [_plain_kv()])
+    request._mtp_exact_terminal_proved = "mtp-standard-terminal-v1"
+    assert scheduler._stage_stable_prompt_boundary(request, [_plain_kv()])
+    assert scheduler._publish_stable_prompt_boundary(request)
+    follow = _request([1, 2, 3, 4, 42])
+    follow.request_id = "rewritten-plain"
+    assert scheduler._restore_exact_resident_cache(follow)
+    assert follow.cached_tokens == 4
 
 
 def test_qwen3_style_four_token_marker_rewrite_hits_durable_boundary():

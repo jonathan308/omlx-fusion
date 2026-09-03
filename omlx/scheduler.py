@@ -2881,9 +2881,7 @@ class Scheduler:
                 # self.requests and drop the cache buffer references so MLX
                 # arrays can be freed.
                 req_to_remove = self.requests.pop(request_id, None)
-                if req_to_remove is not None:
-                    req_to_remove._extracted_cache = None
-                    req_to_remove.prompt_cache = None
+                self._release_request_owned_arrays(req_to_remove)
             finally:
                 gate = self._store_cache_gate
                 if gate is not None:
@@ -8722,9 +8720,13 @@ class Scheduler:
         plain_kv_plan = None
         hybrid_plan = None
         if not qwen4_provider:
-            # Generic V1 is target-only plain KV. Any speculative drafter or
-            # non-exact cache graph remains outside its proof.
-            if self._resident_cache_spec_decode_active() or block_size <= 0:
+            # Generic V1 is target-only plain KV. This snapshot is taken after
+            # target-only prefill and before BatchGenerator insert, so MTP has
+            # not dirtied the graph. Speculative fail-closed stays on terminal
+            # publish/lease (mtp-standard-terminal-v1). Refusing to stage here
+            # was a regression: OpenWebUI rewrite misses the full terminal and
+            # had no proved N-1 to claim.
+            if block_size <= 0:
                 return False
             # Plain chat templates may rewrite more than one generation-marker
             # token between turns. The preceding already-durable block boundary
@@ -8931,6 +8933,10 @@ class Scheduler:
             and self._resident_cache_matches_token_count(cache_list, len(tokens))
         ):
             return False
+        # Inherit the request's proved terminal tag. MTP lookup only accepts
+        # those proofs; an untagged boundary is published then ignored, so the
+        # next OpenWebUI turn (thinking stripped, tail rewritten) misses L0
+        # and falls back to a paged block + suffix prefill.
         published = self._exact_resident_cache.put(
             tokens,
             cache_list,
@@ -8938,6 +8944,7 @@ class Scheduler:
             durable_tokens=durable_tokens,
             protect_longer_prefix=True,
             expected_generation=generation,
+            terminal_proof=getattr(request, "_mtp_exact_terminal_proved", None),
         )
         if published:
             logger.info(
@@ -9517,13 +9524,13 @@ class Scheduler:
         elif not isinstance(cache_tokens, (list, tuple)) or not cache_tokens:
             reject_reason = "token-ledger-missing"
         if reject_reason is not None:
-            if attempted_qwen4:
-                logger.info(
-                    "Qwen4 exact resident candidate rejected for %s: reason=%s %s",
-                    request.request_id,
-                    reject_reason,
-                    self._resident_cache_timeline_observation(cache_list),
-                )
+            logger.info(
+                "%s exact resident candidate rejected for %s: reason=%s %s",
+                "Qwen4" if attempted_qwen4 else "Exact",
+                request.request_id,
+                reject_reason,
+                self._resident_cache_timeline_observation(cache_list),
+            )
             return
         # In non-speculative mlx-lm GenerationBatch.next(), ``_step`` appends
         # the forwarded token to both the physical cache and ``all_tokens``
@@ -11415,11 +11422,49 @@ class Scheduler:
         """Drain and process pending abort requests.
 
         Called from step() to ensure aborts are processed in the same
-        execution context as generation (thread-safe).
+        execution context as generation (thread-safe). If cleanup must wait
+        for an in-flight store_cache worker, keep the abort id so the next
+        step retries instead of dropping the cancel.
         """
+        leftover: list[str] = []
         while self._pending_abort_ids:
             request_id = self._pending_abort_ids.pop()
-            self._do_abort_request(request_id)
+            if not self._do_abort_request(request_id) and request_id in self.requests:
+                leftover.append(request_id)
+        if leftover:
+            self._pending_abort_ids.update(leftover)
+
+    def _release_request_owned_arrays(self, request: Request | None) -> None:
+        """Drop request-owned MLX graphs that abort never publishes.
+
+        Finish already clears extracted/prompt cache. Abort also has to drop
+        the staged N-1 resident clone and VLM embeddings; those are not store
+        payloads and otherwise stay reachable after the request is popped.
+        """
+        if request is None:
+            return
+        request._extracted_cache = None
+        request.prompt_cache = None
+        request._stable_prompt_resident_candidate = None
+        request.vlm_inputs_embeds = None
+        request.vlm_extra_kwargs = None
+        request.images = None
+        request.videos = None
+
+    def _drop_batch_mtp_state(self, reason: str) -> None:
+        """Release BatchGenerator MTP graphs after the owning uid is gone."""
+        gen_batch = self.batch_generator
+        if gen_batch is None:
+            return
+        try:
+            from .patches.mlx_lm_mtp.batch_generator import (
+                _drop_mtp_batch_state,
+                _drop_mtp_state,
+            )
+        except Exception:
+            return
+        _drop_mtp_state(gen_batch, reason)
+        _drop_mtp_batch_state(gen_batch, reason)
 
     def _cleanup_prefill_abort_request(
         self, request: "Request", temp_uid: int | None = None
@@ -11547,6 +11592,13 @@ class Scheduler:
         # deciding whether there is anything left to abort.
         store_future = self._inflight_store_futures.get(request_id)
         if store_future is not None:
+            # Store owns extracted KV. The staged N-1 clone and vision
+            # tensors are not part of that worker and must not stay pinned.
+            request._stable_prompt_resident_candidate = None
+            request.vlm_inputs_embeds = None
+            request.vlm_extra_kwargs = None
+            request.images = None
+            request.videos = None
             if not store_future.done():
                 logger.debug(
                     "Deferring abort cleanup for %s until async store_cache completes",
@@ -11584,6 +11636,7 @@ class Scheduler:
             # can hit 'completeMemory() prepare count underflow'.
             _safe_sync_stream(self._stream)
             self._remove_uid_from_active_batch(uid)
+            self._drop_batch_mtp_state("abort")
             if hasattr(self.model, "unregister_rope_delta"):
                 self.model.unregister_rope_delta(uid)
             if uid < 0:
@@ -11605,24 +11658,11 @@ class Scheduler:
         # forever (#766).
         self._cleanup_specprefill(request_id)
 
-        # Release blocks for eviction (same as _cleanup_finished)
-        if self.paged_cache_manager is not None:
-            block_table = self.paged_cache_manager.get_block_table(request_id)
-            if block_table is None and hasattr(request, "block_table"):
-                block_table = request.block_table
-            if block_table:
-                released = self.paged_cache_manager.release_for_eviction(
-                    block_table.block_ids
-                )
-                if released > 0:
-                    logger.debug(
-                        f"Released {released} blocks for eviction on abort "
-                        f"(request {request_id})"
-                    )
-
-        # Clear request entry from block_aware_cache
-        if self.block_aware_cache is not None:
-            self.block_aware_cache.clear_request_entry(request_id)
+        # Abort is not a successful store. Retain-for-reuse
+        # (release_for_eviction + clear_request_entry) keeps paged blocks in
+        # allocated_blocks and leaves the request table pinned. Use the same
+        # free path as prefill rejection so cancelled work actually releases.
+        self._release_paged_cache_for_request(request_id)
 
         # Clean up streaming detokenizer to prevent state contamination
         self._cleanup_detokenizer(request_id)
@@ -11653,9 +11693,7 @@ class Scheduler:
         # _cleanup_request (engine_core) no longer calls remove_finished_request,
         # so this is the single cleanup point for aborted requests.
         req_to_remove = self.requests.pop(request_id, None)
-        if req_to_remove is not None:
-            req_to_remove._extracted_cache = None
-            req_to_remove.prompt_cache = None
+        self._release_request_owned_arrays(req_to_remove)
 
         # Schedule the deferred Metal clear that _cleanup_finished would have
         # scheduled: aborts free KV/activation arrays into MLX's buffer pool
@@ -11683,6 +11721,7 @@ class Scheduler:
             or self.prefilling
             or self.running
             or self._pending_async_removes
+            or self._pending_abort_ids
             or self._deferred_clear_at is not None
             or self._pending_reclaim_request
             or self._pending_pressure_clear
@@ -13222,6 +13261,27 @@ class Scheduler:
                 ):
                     qwen4_terminal_cache_proved = True
                     request._mtp_exact_terminal_proved = "qwen4-target-only-v1"
+                elif (
+                    is_finished
+                    and getattr(request, "_mtp_exact_terminal_proved", None) is None
+                    and self._resident_cache_spec_decode_active()
+                    and self.batch_generator is not None
+                    and getattr(self.batch_generator, "_omlx_mtp_state", None) is None
+                    and getattr(self.batch_generator, "_omlx_mtp_batch_state", None)
+                    is None
+                    and getattr(
+                        self.batch_generator,
+                        "_omlx_standard_target_exact_v1",
+                        False,
+                    )
+                    is True
+                ):
+                    # Standard mlx-lm next() already committed the public
+                    # ledger. MTP never attached, so this is the same exact
+                    # target terminal generic MTP publishes after reconcile.
+                    request._mtp_exact_terminal_proved = (
+                        "mtp-standard-terminal-v1"
+                    )
 
             # Prepend <think> tag for first chunk if this is a reasoning model.
             # Protocol parsers may expose a normalized prefix when their prompt
@@ -14012,9 +14072,7 @@ class Scheduler:
             if store_future is None:
                 req_to_remove = self.requests.pop(request_id, None)
                 self._clear_request_admission_bookkeeping(request_id)
-                if req_to_remove is not None:
-                    req_to_remove._extracted_cache = None
-                    req_to_remove.prompt_cache = None
+                self._release_request_owned_arrays(req_to_remove)
             else:
                 # Drop request from running but keep in self.requests so the
                 # async worker keeps the cache buffers alive via reachability.

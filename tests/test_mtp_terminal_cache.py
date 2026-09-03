@@ -94,3 +94,40 @@ def test_exact_generic_terminal_skips_full_replay(monkeypatch):
 
     assert response.prompt_cache is cache
     assert response._omlx_mtp_standard_terminal_exact is True
+
+
+def test_standard_path_terminal_gets_generic_mtp_proof():
+    """A request that never entered MTP is already an exact target terminal."""
+    response = SimpleNamespace(
+        finish_reason="stop",
+        prompt_cache=["target-cache"],
+        all_tokens=[1, 2, 3],
+    )
+    batch = SimpleNamespace(
+        _omlx_mtp_state=None,
+        _omlx_mtp_batch_state=None,
+        _omlx_standard_target_exact_v1=True,
+        model=SimpleNamespace(_omlx_mtp_decode_enabled=True),
+    )
+
+    stamped = bg._stamp_standard_terminal_responses(batch, [response])
+
+    assert stamped[0]._omlx_mtp_standard_terminal_exact is True
+
+
+def test_standard_path_does_not_forge_proof_while_mtp_state_is_live():
+    response = SimpleNamespace(
+        finish_reason="stop",
+        prompt_cache=["dirty-cache"],
+        all_tokens=[1, 2, 3],
+    )
+    batch = SimpleNamespace(
+        _omlx_mtp_state=SimpleNamespace(uid=1),
+        _omlx_mtp_batch_state=None,
+        _omlx_standard_target_exact_v1=True,
+        model=SimpleNamespace(_omlx_mtp_decode_enabled=True),
+    )
+
+    stamped = bg._stamp_standard_terminal_responses(batch, [response])
+
+    assert getattr(stamped[0], "_omlx_mtp_standard_terminal_exact", False) is False

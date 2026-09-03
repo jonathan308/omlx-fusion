@@ -90,9 +90,10 @@ def _tiny_config():
 def test_qwen4_exp_compat_registers_model_and_media_formatter():
     assert compat.apply_mlx_vlm_qwen4_exp_compat_patch() in {True, False}
     from mlx_vlm.models import qwen4_exp
-    from mlx_vlm.prompt_utils import get_message_json
+    from mlx_vlm.prompt_utils import MODEL_CONFIG, get_message_json
 
     assert qwen4_exp.ModelConfig is not None
+    assert MODEL_CONFIG.get("qwen4_exp") is not None
     message = get_message_json(
         "qwen4_exp", "inspect", "user", num_images=1, skip_image_token=False
     )
