@@ -86,7 +86,7 @@ def priming_enabled() -> bool:
     )
 
 
-_GENERIC_QWEN35_SAFE_PRIME_WINDOW = 4096
+_GENERIC_QWEN35_SAFE_PRIME_WINDOW = 512
 
 
 def _host_model_type(host: Any) -> str:
@@ -123,7 +123,7 @@ def prime_window(host: Any | None = None) -> int:
     safely restore partial drafter history after a target-cache hit.  Leaving
     that family unlimited lets an ordinary long prompt materialize a second
     full history and can exceed unified memory before the target path has a
-    chance to run.  Give that *known* family a 4096-token default.  This is a
+    chance to run.  Give that *known* family a 512-token default.  This is a
     lossless admission choice: a skipped prime simply uses the existing
     unprimed MTP verifier, whose target model still verifies every emitted
     token.  Operators can explicitly set ``OMLX_MTP_PRIME_WINDOW=0`` if they

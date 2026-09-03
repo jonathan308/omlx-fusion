@@ -827,7 +827,7 @@ class TestCaptureSkips:
     def test_qwen35_default_prime_window_is_bounded(self, model, monkeypatch):
         """A generic Qwen3.5 MTP head must not duplicate an unbounded prompt."""
         monkeypatch.delenv("OMLX_MTP_PRIME_WINDOW", raising=False)
-        assert prompt_priming.prime_window(model) == 4096
+        assert prompt_priming.prime_window(model) == 512
 
     def test_explicit_zero_keeps_unlimited_prime_window(self, model, monkeypatch):
         """Operators may opt back into full-history priming after measuring it."""
