@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 _FP16_BYTES = 2
 _MAX_AFFINE_BYTES_PER_WEIGHT = 1.0625  # q8 plus fp16 scale/bias per group
 _CPU_SHARE_MATERIALIZATION_HEADROOM = 1.5
+_SINGLE_LOCAL_MODEL_ENV = "OMLX_SINGLE_LOCAL_MODEL"
 
 _CLUSTER_RANK_STATE_DIR = "~/.omlx/cluster/runtime"
 
@@ -1865,6 +1866,12 @@ class EnginePool:
             self._raise_if_model_path_missing_locked(model_id, entry)
             self._raise_if_load_failed(model_id, entry)
 
+            if (
+                self._single_local_model_enabled()
+                and self._distributed_deployment_for_entry(entry) is None
+            ):
+                await self._enforce_single_local_model(model_id)
+
             # Pre-load admission against the memory ceiling from the
             # process memory enforcer (min of static and dynamic). Try
             # evicting LRU non-pinned models first; if the model still
@@ -2191,6 +2198,59 @@ class EnginePool:
             logger.info(
                 "Unloading DFlash model '%s' before loading '%s' because "
                 "dflash runtime hooks/cache are process-global",
+                victim,
+                model_id,
+            )
+            await self._unload_engine(victim)
+
+    @staticmethod
+    def _single_local_model_enabled() -> bool:
+        """Whether this host should keep exactly one local inference engine."""
+
+        return os.environ.get(_SINGLE_LOCAL_MODEL_ENV, "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    async def _enforce_single_local_model(self, model_id: str) -> None:
+        """Unload idle local engines before admitting a different model.
+
+        The normal pool supports multi-model serving. A workstation running
+        large VLMs may instead opt into one-model mode: admitting a second
+        model while the first remains resident can push macOS into compressor
+        and swap even when a static RAM ceiling says both weights fit. Never
+        interrupt an active/pinned engine here; fail loudly so the caller can
+        use the explicit unload lifecycle rather than creating overlapping
+        model graphs.
+        """
+
+        victims: list[str] = []
+        blocked: list[str] = []
+        for mid, entry in self._entries.items():
+            if mid == model_id or entry.engine is None:
+                continue
+            if self._distributed_deployment_for_entry(entry) is not None:
+                continue
+            if (
+                entry.is_loading
+                or entry.is_pinned
+                or entry.in_use > 0
+                or self._entry_has_active_requests(entry)
+            ):
+                blocked.append(mid)
+                continue
+            victims.append(mid)
+        if blocked:
+            raise ModelBusyError(
+                model_id,
+                "single-local-model mode requires unloading active model(s): "
+                + ", ".join(blocked),
+            )
+        for victim in victims:
+            logger.info(
+                "Single-local-model mode unloading '%s' before loading '%s'",
                 victim,
                 model_id,
             )
