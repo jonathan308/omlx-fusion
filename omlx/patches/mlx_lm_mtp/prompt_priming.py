@@ -86,8 +86,31 @@ def priming_enabled() -> bool:
     )
 
 
-def prime_window() -> int:
-    """Max tokens to fold into one prime context; 0 = unlimited.
+_GENERIC_QWEN35_SAFE_PRIME_WINDOW = 4096
+
+
+def _host_model_type(host: Any) -> str:
+    """Best-effort model-family identifier without importing model modules.
+
+    The priming hook is shared by mlx-lm and mlx-vlm wrappers, whose config
+    object can live on either ``host`` or its ``args`` object.  A failure to
+    identify the family deliberately retains the historic unlimited policy;
+    only the known full-history Qwen3.5 path receives the safe default below.
+    """
+    for candidate in (
+        host,
+        getattr(host, "args", None),
+        getattr(host, "config", None),
+        getattr(getattr(host, "model", None), "config", None),
+    ):
+        value = getattr(candidate, "model_type", None)
+        if isinstance(value, str) and value:
+            return value.lower()
+    return ""
+
+
+def prime_window(host: Any | None = None) -> int:
+    """Max tokens to fold into one prime context; explicit 0 = unlimited.
 
     Escape hatch for the head-cache memory cost of priming (one
     full-attention layer of KV over the folded span). The cap is measured
@@ -95,9 +118,28 @@ def prime_window() -> int:
     that is only the boundary remainder, not the full prompt — so a
     long-context request with a small remainder still primes. A remainder
     larger than the window runs unprimed.
+
+    Generic Qwen3.5/VLM MTP has a full-attention drafter cache but cannot
+    safely restore partial drafter history after a target-cache hit.  Leaving
+    that family unlimited lets an ordinary long prompt materialize a second
+    full history and can exceed unified memory before the target path has a
+    chance to run.  Give that *known* family a 4096-token default.  This is a
+    lossless admission choice: a skipped prime simply uses the existing
+    unprimed MTP verifier, whose target model still verifies every emitted
+    token.  Operators can explicitly set ``OMLX_MTP_PRIME_WINDOW=0`` if they
+    have measured headroom for full-history priming.
     """
+    configured = os.environ.get("OMLX_MTP_PRIME_WINDOW")
+    if configured is not None:
+        try:
+            return max(0, int(configured))
+        except ValueError:
+            return 0
+    if host is not None and not _qwen4_suffix_local_host(host):
+        if _host_model_type(host).startswith("qwen3_5"):
+            return _GENERIC_QWEN35_SAFE_PRIME_WINDOW
     try:
-        return max(0, int(os.environ.get("OMLX_MTP_PRIME_WINDOW", "0")))
+        return 0
     except ValueError:
         return 0
 
@@ -1232,7 +1274,7 @@ def maybe_capture(
         ):
             drop_ctx(host)
             return
-    window = prime_window()
+    window = prime_window(host)
     if window:
         # Cap by the primed span (the head-KV the window exists to bound),
         # not the absolute prompt offset: on a warm prefix cache only the
