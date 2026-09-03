@@ -6247,7 +6247,14 @@ class Scheduler:
             snapshot_cache,
             total_tokens,
         )
-        if self._qwen35_mtp_incremental_store_active(request):
+        incremental_store_active = getattr(
+            self,
+            "_qwen35_mtp_incremental_store_active",
+            None,
+        )
+        if callable(incremental_store_active) and incremental_store_active(
+            request
+        ):
             self._store_qwen35_mtp_prefill_boundary(
                 request,
                 prompt_cache,
