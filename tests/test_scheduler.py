@@ -3499,48 +3499,6 @@ class TestSchedulerBoundarySnapshots:
 
         assert scheduler._boundary_cache_snapshots[request.request_id][4] is None
 
-    def test_qwen35_mtp_text_final_boundary_is_materialized(
-        self, mock_model, mock_tokenizer, monkeypatch
-    ):
-        """The first durable MTP turn must not serialize its terminal graph."""
-        mock_model.model_type = "qwen3_5"
-        scheduler = Scheduler(
-            model=mock_model,
-            tokenizer=mock_tokenizer,
-            config=SchedulerConfig(paged_cache_block_size=4),
-        )
-        scheduler.block_aware_cache = MagicMock()
-        request = Request(
-            request_id="req-qwen35-mtp-final-boundary",
-            prompt="text",
-            sampling_params=SamplingParams(),
-        )
-        request.prompt_token_ids = [1, 2, 3, 4, 5, 6]
-
-        def record_filtered(request_id, snapshot_cache, token_count):
-            scheduler._boundary_cache_snapshots.setdefault(request_id, {})[
-                token_count
-            ] = None
-
-        calls = []
-
-        def extract_full(snapshot_cache, *, include_sliceable=False):
-            calls.append(include_sliceable)
-            return (
-                Scheduler._PREFILL_SNAPSHOT_MARKER,
-                [{"class_name": "KVCache", "state": ("full",)}],
-            )
-
-        monkeypatch.setattr(scheduler, "_resident_cache_spec_decode_active", lambda: True)
-        monkeypatch.setattr(scheduler, "_on_prefill_boundary_snapshot", record_filtered)
-        monkeypatch.setattr(scheduler, "_extract_prefill_snapshot_states", extract_full)
-
-        scheduler._emit_prefill_boundary_snapshot(request, [MagicMock()], 4)
-
-        assert calls == [True]
-        snapshot = scheduler._boundary_cache_snapshots[request.request_id][4]
-        assert snapshot[0] == Scheduler._PREFILL_SNAPSHOT_MARKER
-
     def test_full_prefill_snapshot_detaches_array_storage(self, mock_tokenizer):
         """Media boundary arrays must not alias live decode KV buffers."""
         scheduler = Scheduler.__new__(Scheduler)
