@@ -138,10 +138,7 @@ def prime_window(host: Any | None = None) -> int:
     if host is not None and not _qwen4_suffix_local_host(host):
         if _host_model_type(host).startswith("qwen3_5"):
             return _GENERIC_QWEN35_SAFE_PRIME_WINDOW
-    try:
-        return 0
-    except ValueError:
-        return 0
+    return 0
 
 
 @contextmanager
