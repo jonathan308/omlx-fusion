@@ -23,13 +23,13 @@ class _Batch(SimpleNamespace):
             self.uids = []
 
 
-def test_mtp_terminal_reconciles_before_publishing_cache(monkeypatch):
+def test_unproved_mtp_terminal_never_replays_full_history(monkeypatch):
     state = SimpleNamespace(uid=9)
     calls = []
 
     def reconcile(batch, observed):
         calls.append((batch, observed))
-        return True
+        raise AssertionError("completed requests must not replay their prompt")
 
     monkeypatch.setattr(bg, "_reconcile_mtp_to_standard", reconcile)
     batch = _Batch(
@@ -50,10 +50,10 @@ def test_mtp_terminal_reconciles_before_publishing_cache(monkeypatch):
         logprobs_1d=mx.zeros((8,), dtype=mx.float32),
     )[0]
 
-    assert calls == [(batch, state)]
-    assert response.prompt_cache == ["reconciled-cache"]
-    assert response.all_tokens == [101, 7]
-    assert response._omlx_mtp_standard_terminal_exact is True
+    assert calls == []
+    assert response.prompt_cache is None
+    assert response.all_tokens is None
+    assert not hasattr(response, "_omlx_mtp_standard_terminal_exact")
     assert batch.uids == []
 
 

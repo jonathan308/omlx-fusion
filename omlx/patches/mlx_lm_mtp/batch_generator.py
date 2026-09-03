@@ -8073,14 +8073,15 @@ def _emit_response(
             ]
 
         # Legacy Qwen3.5-style MTP does not have Qwen4's explicit two-phase
-        # target transaction.  Its verifier may leave the backbone cache ahead
+        # target transaction. Its verifier may leave the backbone cache ahead
         # of the visible terminal token while a queued draft is still parked.
-        # Never publish that speculative cache to the exact resident tier:
-        # reconcile the singleton by replaying the committed token ledger into
-        # a fresh standard cache first.  This work is paid at request
-        # completion, off the TTFT-critical next-turn path, and preserves the
-        # lossless target distribution.  If reconciliation fails closed, the
-        # response remains usable but exposes no cache candidate.
+        # Never replay the full committed ledger merely to manufacture a cache
+        # candidate after the response is already complete: at long context
+        # that one-shot attention graph can consume hundreds of GB. The output
+        # is already target-verified and final. Publish the live cache only when
+        # its exact target timeline is proved; otherwise fail closed on cache
+        # reuse and let oMLX's block-aligned durable prefix plus idle target-only
+        # tail reconstruction create the next exact resident entry.
         standard_terminal_exact = False
         active_state = getattr(gen_batch, "_omlx_mtp_state", None)
         if active_state is not None:
@@ -8088,14 +8089,9 @@ def _emit_response(
                 gen_batch
             )
             if not standard_terminal_exact:
-                standard_terminal_exact = _reconcile_mtp_to_standard(
-                    gen_batch,
-                    active_state,
-                )
-            if not standard_terminal_exact:
-                logger.warning(
-                    "MTP terminal cache reconciliation failed closed; "
-                    "suppressing resident cache for uid=%s",
+                logger.info(
+                    "MTP terminal cache proof missed; skipping full-history "
+                    "replay and suppressing terminal candidate for uid=%s",
                     getattr(active_state, "uid", "?"),
                 )
 

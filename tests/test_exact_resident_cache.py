@@ -594,6 +594,26 @@ def test_scheduler_accepts_reconciled_mtp_terminal_and_restores_with_mtp_on():
     assert next_turn.remaining_tokens == [4]
 
 
+def test_scheduler_accepts_target_only_idle_stable_proof_with_mtp_on():
+    scheduler = _scheduler()
+    scheduler.model = type(
+        "MtpModel", (), {"_omlx_mtp_decode_enabled": True}
+    )()
+    cache = [_OffsetCache(3, nbytes=9)]
+    assert scheduler._exact_resident_cache.put(
+        [1, 2, 3],
+        cache,
+        cache_nbytes=9,
+        durable_tokens=2,
+        terminal_proof="mtp-target-only-stable-v1",
+    )
+
+    next_turn = _request([1, 2, 3, 4])
+    assert scheduler._restore_exact_resident_cache(next_turn)
+    assert next_turn.cached_tokens == 3
+    assert next_turn.remaining_tokens == [4]
+
+
 def test_scheduler_cancelled_lease_is_not_reinserted():
     scheduler = _scheduler()
     completed = _request([1, 2, 3])

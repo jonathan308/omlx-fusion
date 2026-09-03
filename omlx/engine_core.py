@@ -773,6 +773,11 @@ class EngineCore:
                     cache_nbytes=cache_nbytes,
                     durable_tokens=durable_tokens,
                     protect_longer_prefix=True,
+                    terminal_proof=(
+                        "mtp-target-only-stable-v1"
+                        if self.scheduler._qwen35_mtp_target_only_prewarm_enabled()
+                        else None
+                    ),
                 )
                 if not published:
                     logger.info(

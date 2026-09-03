@@ -3421,6 +3421,97 @@ class TestSchedulerBoundarySnapshots:
         assert request.request_id in scheduler._boundary_cache_snapshots
         assert 4 in scheduler._boundary_cache_snapshots[request.request_id]
 
+    def test_qwen35_mtp_prefill_boundary_store_extends_one_block(
+        self, mock_model, mock_tokenizer, monkeypatch
+    ):
+        mock_model.model_type = "qwen3_5"
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        request = Request(
+            request_id="req-qwen35-prefill-store",
+            prompt="text",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = list(range(9))
+        extracted = [{"class_name": "KVCache", "state": ("k", "v")}]
+        monkeypatch.setattr(
+            scheduler,
+            "_extract_cache_states",
+            lambda cache: (extracted, None),
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_bypass_hot_cache_under_pressure",
+            lambda: False,
+        )
+        table = SimpleNamespace(num_tokens=4)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.block_aware_cache.store_cache.return_value = table
+
+        scheduler._store_qwen35_mtp_prefill_boundary(request, [object()], 4)
+
+        call = scheduler.block_aware_cache.store_cache.call_args
+        assert call.args[1] == [0, 1, 2, 3]
+        assert call.kwargs["boundary_snapshots"] == {4: extracted}
+        assert request._qwen35_mtp_prefill_durable_tokens == 4
+        assert request._exact_resident_durable_fallback_tokens == 4
+
+    def test_qwen35_prefill_store_coverage_uses_prompt_boundary(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        request = Request(
+            request_id="req-qwen35-store-cover",
+            prompt="text",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = list(range(11))
+        request._qwen35_mtp_prefill_durable_tokens = 8
+        assert scheduler._qwen35_mtp_prefill_store_covers_prompt(request)
+        request._qwen35_mtp_prefill_durable_tokens = 4
+        assert not scheduler._qwen35_mtp_prefill_store_covers_prompt(request)
+
+    def test_long_qwen35_mtp_boundary_defers_to_idle_prewarm(
+        self, mock_model, mock_tokenizer, monkeypatch
+    ):
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(
+                paged_cache_block_size=4,
+                exact_resident_cache_slots=2,
+            ),
+        )
+        scheduler.block_aware_cache = MagicMock()
+        request = Request(
+            request_id="req-qwen35-idle-stable",
+            prompt="text",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = list(range(10))
+        request._qwen35_mtp_prefill_durable_tokens = 8
+        monkeypatch.setattr(
+            scheduler,
+            "_qwen35_mtp_target_only_prewarm_enabled",
+            lambda: True,
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_resident_cache_arrays",
+            lambda cache: (_ for _ in ()).throw(
+                AssertionError("long boundary cloned before decode")
+            ),
+        )
+
+        assert not scheduler._stage_stable_prompt_boundary(request, [object()])
+
 
 class TestSchedulerRotatingBlockAlignment:
     """Tests for rotating window/block-size alignment."""

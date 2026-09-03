@@ -6247,6 +6247,127 @@ class Scheduler:
             snapshot_cache,
             total_tokens,
         )
+        if self._qwen35_mtp_incremental_store_active(request):
+            self._store_qwen35_mtp_prefill_boundary(
+                request,
+                prompt_cache,
+                total_tokens,
+            )
+
+    def _qwen35_mtp_incremental_store_active(self, request: "Request") -> bool:
+        """Whether this request needs prefill-owned block materialization.
+
+        Generic Qwen3.5 MTP can leave terminal cache views attached to a lazy
+        verifier graph.  Serializing those views after generation has finished
+        can re-evaluate the whole context.  Qwen4 owns a separate exact target
+        transaction and is deliberately excluded by its distinct model type.
+        """
+        if getattr(request, "skip_cache_store", False):
+            return False
+        if self.block_aware_cache is None:
+            return False
+        return self._qwen35_mtp_target_only_prewarm_enabled()
+
+    def _qwen35_mtp_target_only_prewarm_enabled(self) -> bool:
+        """Whether idle target-only reconstruction is valid for this model."""
+        if not self._resident_cache_spec_decode_active():
+            return False
+        candidates = [self.model]
+        for attr in ("language_model", "_language_model", "model"):
+            candidate = getattr(self.model, attr, None)
+            if candidate is not None and candidate not in candidates:
+                candidates.append(candidate)
+        return any(
+            str(
+                getattr(candidate, "model_type", None)
+                or getattr(getattr(candidate, "config", None), "model_type", "")
+                or ""
+            ).startswith("qwen3_5")
+            for candidate in candidates
+        )
+
+    def _store_qwen35_mtp_prefill_boundary(
+        self,
+        request: "Request",
+        prompt_cache: list[Any],
+        total_tokens: int,
+    ) -> None:
+        """Persist one newly completed Qwen3.5 block on the owner thread.
+
+        ``store_cache`` extends the request's existing block table, so each
+        invocation slices and copies only the newest block.  No full cache
+        snapshot is retained, and completion can release the block table
+        without touching the terminal MTP graph.
+        """
+        block_size = int(self.config.paged_cache_block_size or 0)
+        prompt_tokens = list(request.prompt_token_ids or [])
+        if (
+            block_size <= 0
+            or total_tokens <= 0
+            or total_tokens % block_size != 0
+            or total_tokens > len(prompt_tokens)
+        ):
+            return
+        try:
+            with mx.stream(self._stream):
+                extracted, model_cache_config = self._extract_cache_states(prompt_cache)
+                if not extracted:
+                    return
+                block_table = self.block_aware_cache.store_cache(
+                    request.request_id,
+                    prompt_tokens[:total_tokens],
+                    extracted,
+                    model_cache_config=model_cache_config,
+                    boundary_snapshots={total_tokens: extracted},
+                    extra_keys=request.vlm_extra_keys_for_cache,
+                    extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+                    extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+                    hot_cache_write_back=not self._bypass_hot_cache_under_pressure(),
+                )
+            stored_tokens = int(getattr(block_table, "num_tokens", 0) or 0)
+            if stored_tokens < total_tokens:
+                logger.warning(
+                    "Qwen3.5 MTP incremental store stopped at %d/%d tokens for %s",
+                    stored_tokens,
+                    total_tokens,
+                    request.request_id,
+                )
+                return
+            request.block_table = block_table
+            request._qwen35_mtp_prefill_durable_tokens = stored_tokens
+            request._exact_resident_durable_fallback_tokens = max(
+                int(
+                    getattr(
+                        request,
+                        "_exact_resident_durable_fallback_tokens",
+                        0,
+                    )
+                    or 0
+                ),
+                stored_tokens,
+            )
+            logger.info(
+                "Qwen3.5 MTP prefill boundary persisted incrementally for %s: "
+                "tokens=%d block_size=%d",
+                request.request_id,
+                stored_tokens,
+                block_size,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Qwen3.5 MTP incremental boundary store failed closed for %s: %s",
+                request.request_id,
+                exc,
+            )
+
+    def _qwen35_mtp_prefill_store_covers_prompt(self, request: "Request") -> bool:
+        block_size = int(self.config.paged_cache_block_size or 0)
+        prompt_len = len(request.prompt_token_ids or [])
+        required = ((prompt_len - 1) // block_size) * block_size if block_size else 0
+        stored = int(
+            getattr(request, "_qwen35_mtp_prefill_durable_tokens", 0) or 0
+        )
+        return required > 0 and stored >= required
 
     def _build_sampler_and_processors(
         self, sampling_params: SamplingParams, request: Any = None
@@ -8708,6 +8829,29 @@ class Scheduler:
         if source_cache_tokens < 2:
             return False
 
+        # Do not hold a context-sized N-1 clone while long generic-Qwen3.5
+        # MTP decode mutates the live target graph. The prompt's full blocks
+        # were already persisted during prefill; idle prompt-tail maintenance
+        # reconstructs only the bounded non-block suffix after decode and then
+        # publishes this exact boundary without any live mutation beside it.
+        block_size = int(self.config.paged_cache_block_size or 0)
+        if (
+            block_size > 0
+            and source_cache_tokens >= block_size
+            and self._qwen35_mtp_target_only_prewarm_enabled()
+            and int(
+                getattr(request, "_qwen35_mtp_prefill_durable_tokens", 0) or 0
+            )
+            >= (source_cache_tokens // block_size) * block_size
+        ):
+            logger.info(
+                "Deferring long Qwen3.5 MTP stable boundary for %s to idle "
+                "prompt-tail reconstruction (tokens=%d)",
+                request.request_id,
+                source_cache_tokens,
+            )
+            return False
+
         from .cache.exact_boundary import (
             plan_hybrid_arrays_kv_boundary,
             plan_plain_kv_boundary,
@@ -9756,6 +9900,7 @@ class Scheduler:
                 allowed_terminal_proofs = {
                     "qwen4-target-only-v1",
                     "mtp-standard-terminal-v1",
+                    "mtp-target-only-stable-v1",
                 }
             hit = resident_cache.acquire_prefix(
                 prompt_tokens,
@@ -9930,6 +10075,7 @@ class Scheduler:
         if (
             self._resident_cache_spec_decode_active()
             and not self._resident_cache_qwen4_target_only_enabled()
+            and not self._qwen35_mtp_target_only_prewarm_enabled()
         ):
             # A hidden target-only pass is reusable during speculative decode
             # only when the model advertises the same verified Qwen4 terminal
@@ -13709,9 +13855,13 @@ class Scheduler:
                     # prep, no host memcpy, no SSD write. They still take
                     # the block leak-guard branch below so their paged
                     # blocks are released for eviction.
+                    prefill_store_complete = (
+                        self._qwen35_mtp_prefill_store_covers_prompt(request)
+                    )
                     skip_store = (
                         getattr(request, "skip_cache_store", False)
                         or resident_handoff
+                        or prefill_store_complete
                     )
                     if resident_handoff:
                         # Do not let the async durable writer read arrays held
@@ -13724,6 +13874,14 @@ class Scheduler:
                             "exact resident handoff is immediately claimable",
                             request_id,
                         )
+                    elif prefill_store_complete:
+                        logger.info(
+                            "Skipping terminal cache materialization for %s: "
+                            "Qwen3.5 MTP prompt blocks were persisted during prefill",
+                            request_id,
+                        )
+                        self.block_aware_cache.release_cache(request_id)
+                        request.block_table = None
                     if skip_store or (
                         hasattr(request, "_extracted_cache")
                         and request._extracted_cache is not None
