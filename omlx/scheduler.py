@@ -6248,14 +6248,14 @@ class Scheduler:
             total_tokens,
         )
 
-        # Media requests cannot use the text-only exact-resident handoff, so
-        # completion must publish a durable salted boundary.  Refilling the
-        # sliceable members from the terminal MTP cache at that point can
-        # materialize its entire lazy long-context graph after generation has
-        # already finished.  Capture exactly one FULL boundary while prefill
-        # owns an already-evaluated cache instead.  Choosing only the final
-        # reachable prompt boundary keeps retained KV linear in context rather
-        # than one full-prefix copy per block.
+        # Media requests cannot use the text-only exact-resident handoff, and
+        # generic Qwen3.5 MTP cannot publish L0 until its first durable prompt
+        # boundary exists. In both cases, refilling sliceable members from the
+        # terminal cache can materialize its entire lazy long-context graph
+        # after generation has finished. Capture exactly one FULL, detached
+        # boundary while prefill owns an already-evaluated cache instead.
+        # Choosing only the final reachable prompt boundary keeps retained KV
+        # linear in context rather than one full-prefix copy per block.
         block_size = int(self.config.paged_cache_block_size or 0)
         prompt_tokens = list(request.prompt_token_ids or [])
         final_boundary = (
@@ -6266,7 +6266,7 @@ class Scheduler:
         if (
             total_tokens == final_boundary
             and final_boundary > 0
-            and not self._request_is_text_only_for_resident_cache(request)
+            and self._needs_materialized_final_boundary(request)
         ):
             full_snapshot = self._extract_prefill_snapshot_states(
                 prompt_cache,
@@ -6277,11 +6277,31 @@ class Scheduler:
                     total_tokens
                 ] = full_snapshot
                 logger.info(
-                    "Captured materialized media final boundary for %s at %d "
+                    "Captured materialized final boundary for %s at %d "
                     "tokens; completion store will not evaluate terminal graph",
                     request.request_id,
                     total_tokens,
                 )
+
+    def _needs_materialized_final_boundary(self, request: "Request") -> bool:
+        """Whether terminal persistence must avoid live-cache materialization."""
+        if not self._request_is_text_only_for_resident_cache(request):
+            return True
+        if not self._resident_cache_spec_decode_active():
+            return False
+        candidates = [self.model]
+        for attr in ("language_model", "_language_model", "model"):
+            candidate = getattr(self.model, attr, None)
+            if candidate is not None and candidate not in candidates:
+                candidates.append(candidate)
+        return any(
+            str(
+                getattr(candidate, "model_type", None)
+                or getattr(getattr(candidate, "config", None), "model_type", "")
+                or ""
+            ).startswith("qwen3_5")
+            for candidate in candidates
+        )
 
     def _build_sampler_and_processors(
         self, sampling_params: SamplingParams, request: Any = None
