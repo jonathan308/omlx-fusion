@@ -9616,6 +9616,67 @@ class Scheduler:
             return True
         return False
 
+    def _persist_exact_resident_cache_on_shutdown(self) -> int:
+        """Persist the newest validated terminal cache before engine teardown.
+
+        Exact-resident L0 is intentionally RAM-only during serving so the next
+        turn is instantaneous.  A model swap/reload must not discard that
+        terminal tail, however.  The existing exact-terminal SSD domain stores
+        the complete (possibly partial-block) chain without exposing it to
+        ordinary prefix matching; reload can then probe it as an extending
+        exact prefix.  This runs only after async request stores have drained
+        and on the scheduler owner thread, so MLX arrays are materialized
+        safely before the SSD writer takes ownership.
+        """
+
+        prefix_cache = getattr(self, "block_aware_cache", None)
+        if (
+            prefix_cache is None
+            or getattr(prefix_cache, "paged_ssd_cache", None) is None
+            or not hasattr(self._exact_resident_cache, "snapshot_entries")
+        ):
+            return 0
+        persisted = 0
+        for index, (tokens, raw_cache, _proof) in enumerate(
+            self._exact_resident_cache.snapshot_entries()
+        ):
+            if not tokens or not isinstance(raw_cache, list) or not raw_cache:
+                continue
+            try:
+                with mx.stream(self._stream):
+                    _safe_sync_stream(self._stream)
+                    extracted, model_cache_config = self._extract_cache_states(
+                        raw_cache
+                    )
+                if not extracted:
+                    continue
+                request_id = f"shutdown-exact-{time.time_ns()}-{index}"
+                stored = prefix_cache.store_exact_prefix(
+                    request_id,
+                    tokens,
+                    extracted,
+                    model_cache_config=model_cache_config,
+                )
+                if stored is not None and stored.num_tokens == len(tokens):
+                    persisted += 1
+                    logger.info(
+                        "Persisted exact resident terminal for reload: "
+                        "tokens=%d blocks=%d",
+                        len(tokens),
+                        len(stored.block_ids),
+                    )
+                else:
+                    logger.info(
+                        "Exact resident terminal persistence skipped: tokens=%d",
+                        len(tokens),
+                    )
+            except Exception as exc:  # noqa: BLE001 - teardown must continue
+                logger.warning(
+                    "Exact resident terminal persistence failed closed: %s",
+                    exc,
+                )
+        return persisted
+
     def _exact_resident_required_durable_tokens(self, request: Request) -> int:
         """Largest full-block prompt boundary safe for generation kickoff."""
 
@@ -10244,6 +10305,71 @@ class Scheduler:
                 self._try_specprefill_scoring(request)
             self._prefix_cache_prepared.add(request.request_id)
             return
+
+        # Reload-safe exact terminal chain: unlike RAM L0 this survives an
+        # engine/model swap. It is all-or-nothing and text-only; ordinary
+        # paged lookup remains the fallback when no terminal chain matches.
+        if (
+            not getattr(request, "_cache_prewarm_only", False)
+            and self.block_aware_cache is not None
+            and self.paged_ssd_cache_manager is not None
+            and self._request_is_text_only_for_resident_cache(request)
+        ):
+            try:
+                restored_exact, exact_tokens = (
+                    self.block_aware_cache.restore_exact_terminal_prefix(
+                        request.request_id,
+                        list(request.prompt_token_ids or []),
+                        promote_to_hot_cache=True,
+                    )
+                )
+            except Exception as exc:
+                restored_exact, exact_tokens = None, 0
+                logger.debug(
+                    "Persistent exact-terminal restore failed closed for %s: %s",
+                    request.request_id,
+                    exc,
+                )
+            if (
+                restored_exact is not None
+                and exact_tokens > 0
+                and exact_tokens < len(request.prompt_token_ids or [])
+            ):
+                request.prompt_cache = restored_exact
+                request.cached_tokens = exact_tokens
+                request.remaining_tokens = request.prompt_token_ids[exact_tokens:]
+                request.shared_prefix_blocks = 0
+                request.block_table = None
+                request._exact_resident_durable_fallback_tokens = exact_tokens
+                logger.info(
+                    "Prefix cache restore for %s: source=ssd-exact-terminal "
+                    "cached=%d suffix=%d",
+                    request.request_id,
+                    exact_tokens,
+                    len(request.remaining_tokens),
+                )
+                try:
+                    from .patches.mlx_lm_mtp import prompt_priming
+
+                    prompt_priming.prepare_prefix_context(
+                        self.model,
+                        request_id=request.request_id,
+                        prompt_tokens=request.prompt_token_ids,
+                        cached_tokens=request.cached_tokens,
+                        prefix_cache=self.block_aware_cache,
+                        extra_keys=request.vlm_extra_keys_for_cache,
+                        extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+                        extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "MTP persistent exact-terminal preparation failed closed "
+                        "for %s: %s",
+                        request.request_id,
+                        exc,
+                    )
+                self._prefix_cache_prepared.add(request.request_id)
+                return
 
         # Check prefix cache for cached KV state
         if self.block_aware_cache is not None:
@@ -14868,6 +14994,10 @@ class Scheduler:
         self._close_specprefill_draft_cache_manager()
         self._draft_prefix_cache = None
         self._specprefill_draft_model = None
+        # Preserve the newest validated exact terminal before dropping the
+        # engine-owned RAM L0. The SSD manager then flushes its normal hot
+        # blocks and closes below.
+        self._persist_exact_resident_cache_on_shutdown()
         self._exact_resident_cache.clear()
         self._exact_resident_leases.clear()
         if self.paged_ssd_cache_manager is not None:
