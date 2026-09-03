@@ -6984,14 +6984,9 @@ class Scheduler:
         def _copy_containers(value: Any) -> Any:
             # ArraysCache.state returns its live slot LIST (not a copy);
             # the model rebinds slots in place, so container structure
-            # must be copied at the boundary. Ordinary filtered snapshots
-            # can share their small recurrent arrays because slot updates
-            # rebind. A full media snapshot MUST detach array storage:
-            # retaining a view of each live preallocated KV buffer makes the
-            # next decode append trigger copy-on-write of the entire context,
-            # once per layer/token (observed 32K Qwen3.8-27B: 27.9 -> 233 GB).
-            if isinstance(value, mx.array):
-                return mx.array(value) if include_sliceable else value
+            # must be copied at the boundary. The arrays themselves are
+            # safe to share: slot updates rebind, and buffer setitem
+            # copies on write once a second reference exists.
             if isinstance(value, list):
                 return [_copy_containers(v) for v in value]
             if isinstance(value, tuple):

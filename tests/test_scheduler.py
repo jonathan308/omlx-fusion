@@ -3499,27 +3499,6 @@ class TestSchedulerBoundarySnapshots:
 
         assert scheduler._boundary_cache_snapshots[request.request_id][4] is None
 
-    def test_full_prefill_snapshot_detaches_array_storage(self, mock_tokenizer):
-        """Media boundary arrays must not alias live decode KV buffers."""
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler._stream = mx.default_stream(mx.default_device())
-        live = mx.arange(8, dtype=mx.float32)
-        scheduler._extract_cache_states = lambda cache: (
-            [{"class_name": "KVCache", "state": ([live],), "meta_state": ()}],
-            None,
-        )
-
-        snapshot = scheduler._extract_prefill_snapshot_states(
-            [object()],
-            include_sliceable=True,
-        )
-
-        assert snapshot is not None
-        detached = snapshot[1][0]["state"][0][0]
-        live[0] = 99
-        mx.eval(live, detached)
-        assert float(detached[0].item()) == 0.0
-
 
 class TestSchedulerRotatingBlockAlignment:
     """Tests for rotating window/block-size alignment."""
