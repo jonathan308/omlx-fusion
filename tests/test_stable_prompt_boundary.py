@@ -131,6 +131,33 @@ def test_terminal_and_stable_candidates_coexist_and_choose_longest_exact():
     assert appended is not None and appended.cached_tokens == 5
 
 
+def test_mtp_restore_uses_proved_stable_boundary_when_terminal_is_rewritten():
+    """OpenWebUI strips thinking, so the next prompt is not an extension of the
+    full terminal. Instant TTFT depends on the N-1 boundary being claimable
+    under the MTP proof filter."""
+
+    scheduler = _scheduler()
+    scheduler.model._omlx_mtp_decode_enabled = True
+    request = _request()
+    request._mtp_exact_terminal_proved = "qwen4-target-only-v1"
+    assert scheduler._stage_stable_prompt_boundary(request, _qwen_cache())
+    terminal = _qwen_cache(5)
+    assert scheduler._exact_resident_cache.put(
+        [1, 2, 3, 4, 99],
+        terminal,
+        cache_nbytes=Scheduler._resident_cache_nbytes(terminal),
+        durable_tokens=4,
+        terminal_proof="qwen4-target-only-v1",
+    )
+    assert scheduler._publish_stable_prompt_boundary(request)
+
+    follow = _request([1, 2, 3, 4, 42])
+    follow.request_id = "rewritten-follow"
+    assert scheduler._restore_exact_resident_cache(follow)
+    assert follow.cached_tokens == 4
+    assert follow.remaining_tokens == [42]
+
+
 def test_clear_generation_prevents_staged_candidate_repopulation():
     scheduler = _scheduler()
     request = _request()

@@ -50,6 +50,10 @@ def _patch_prompt_utils() -> None:
     """Teach the pinned formatter Qwen4's Qwen3.5-compatible media layout."""
     import mlx_vlm.prompt_utils as prompt_utils
 
+    format_type = getattr(prompt_utils.MessageFormat, "LIST_WITH_IMAGE_FIRST", None)
+    if format_type is not None and hasattr(prompt_utils, "MODEL_CONFIG"):
+        prompt_utils.MODEL_CONFIG.setdefault("qwen4_exp", format_type)
+
     current = prompt_utils.get_message_json
     if getattr(current, "_omlx_qwen4_exp", False):
         return

@@ -2881,9 +2881,7 @@ class Scheduler:
                 # self.requests and drop the cache buffer references so MLX
                 # arrays can be freed.
                 req_to_remove = self.requests.pop(request_id, None)
-                if req_to_remove is not None:
-                    req_to_remove._extracted_cache = None
-                    req_to_remove.prompt_cache = None
+                self._release_request_owned_arrays(req_to_remove)
             finally:
                 gate = self._store_cache_gate
                 if gate is not None:
@@ -6249,6 +6247,134 @@ class Scheduler:
             snapshot_cache,
             total_tokens,
         )
+        incremental_store_active = getattr(
+            self,
+            "_qwen35_mtp_incremental_store_active",
+            None,
+        )
+        if callable(incremental_store_active) and incremental_store_active(
+            request
+        ):
+            self._store_qwen35_mtp_prefill_boundary(
+                request,
+                prompt_cache,
+                total_tokens,
+            )
+
+    def _qwen35_mtp_incremental_store_active(self, request: "Request") -> bool:
+        """Whether this request needs prefill-owned block materialization.
+
+        Generic Qwen3.5 MTP can leave terminal cache views attached to a lazy
+        verifier graph.  Serializing those views after generation has finished
+        can re-evaluate the whole context.  Qwen4 owns a separate exact target
+        transaction and is deliberately excluded by its distinct model type.
+        """
+        if getattr(request, "skip_cache_store", False):
+            return False
+        if self.block_aware_cache is None:
+            return False
+        return self._qwen35_mtp_target_only_prewarm_enabled()
+
+    def _qwen35_mtp_target_only_prewarm_enabled(self) -> bool:
+        """Whether idle target-only reconstruction is valid for this model."""
+        if not self._resident_cache_spec_decode_active():
+            return False
+        candidates = [self.model]
+        for attr in ("language_model", "_language_model", "model"):
+            candidate = getattr(self.model, attr, None)
+            if candidate is not None and candidate not in candidates:
+                candidates.append(candidate)
+        return any(
+            str(
+                getattr(candidate, "model_type", None)
+                or getattr(getattr(candidate, "config", None), "model_type", "")
+                or ""
+            ).startswith("qwen3_5")
+            for candidate in candidates
+        )
+
+    def _store_qwen35_mtp_prefill_boundary(
+        self,
+        request: "Request",
+        prompt_cache: list[Any],
+        total_tokens: int,
+    ) -> None:
+        """Persist one newly completed Qwen3.5 block on the owner thread.
+
+        ``store_cache`` extends the request's existing block table, so each
+        invocation slices and copies only the newest block.  No full cache
+        snapshot is retained, and completion can release the block table
+        without touching the terminal MTP graph.
+        """
+        block_size = int(self.config.paged_cache_block_size or 0)
+        prompt_tokens = list(request.prompt_token_ids or [])
+        if (
+            block_size <= 0
+            or total_tokens <= 0
+            or total_tokens % block_size != 0
+            or total_tokens > len(prompt_tokens)
+        ):
+            return
+        try:
+            with mx.stream(self._stream):
+                extracted, model_cache_config = self._extract_cache_states(prompt_cache)
+                if not extracted:
+                    return
+                block_table = self.block_aware_cache.store_cache(
+                    request.request_id,
+                    prompt_tokens[:total_tokens],
+                    extracted,
+                    model_cache_config=model_cache_config,
+                    boundary_snapshots={total_tokens: extracted},
+                    extra_keys=request.vlm_extra_keys_for_cache,
+                    extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+                    extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+                    hot_cache_write_back=not self._bypass_hot_cache_under_pressure(),
+                )
+            stored_tokens = int(getattr(block_table, "num_tokens", 0) or 0)
+            if stored_tokens < total_tokens:
+                logger.warning(
+                    "Qwen3.5 MTP incremental store stopped at %d/%d tokens for %s",
+                    stored_tokens,
+                    total_tokens,
+                    request.request_id,
+                )
+                return
+            request.block_table = block_table
+            request._qwen35_mtp_prefill_durable_tokens = stored_tokens
+            request._exact_resident_durable_fallback_tokens = max(
+                int(
+                    getattr(
+                        request,
+                        "_exact_resident_durable_fallback_tokens",
+                        0,
+                    )
+                    or 0
+                ),
+                stored_tokens,
+            )
+            logger.info(
+                "Qwen3.5 MTP prefill boundary persisted incrementally for %s: "
+                "tokens=%d block_size=%d",
+                request.request_id,
+                stored_tokens,
+                block_size,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Qwen3.5 MTP incremental boundary store failed closed for %s: %s",
+                request.request_id,
+                exc,
+            )
+
+    def _qwen35_mtp_prefill_store_covers_prompt(self, request: "Request") -> bool:
+        block_size = int(self.config.paged_cache_block_size or 0)
+        prompt_len = len(request.prompt_token_ids or [])
+        required = ((prompt_len - 1) // block_size) * block_size if block_size else 0
+        stored = int(
+            getattr(request, "_qwen35_mtp_prefill_durable_tokens", 0) or 0
+        )
+        return required > 0 and stored >= required
 
     def _build_sampler_and_processors(
         self, sampling_params: SamplingParams, request: Any = None
@@ -8710,6 +8836,29 @@ class Scheduler:
         if source_cache_tokens < 2:
             return False
 
+        # Do not hold a context-sized N-1 clone while long generic-Qwen3.5
+        # MTP decode mutates the live target graph. The prompt's full blocks
+        # were already persisted during prefill; idle prompt-tail maintenance
+        # reconstructs only the bounded non-block suffix after decode and then
+        # publishes this exact boundary without any live mutation beside it.
+        block_size = int(self.config.paged_cache_block_size or 0)
+        if (
+            block_size > 0
+            and source_cache_tokens >= block_size
+            and self._qwen35_mtp_target_only_prewarm_enabled()
+            and int(
+                getattr(request, "_qwen35_mtp_prefill_durable_tokens", 0) or 0
+            )
+            >= (source_cache_tokens // block_size) * block_size
+        ):
+            logger.info(
+                "Deferring long Qwen3.5 MTP stable boundary for %s to idle "
+                "prompt-tail reconstruction (tokens=%d)",
+                request.request_id,
+                source_cache_tokens,
+            )
+            return False
+
         from .cache.exact_boundary import (
             plan_hybrid_arrays_kv_boundary,
             plan_plain_kv_boundary,
@@ -8722,9 +8871,13 @@ class Scheduler:
         plain_kv_plan = None
         hybrid_plan = None
         if not qwen4_provider:
-            # Generic V1 is target-only plain KV. Any speculative drafter or
-            # non-exact cache graph remains outside its proof.
-            if self._resident_cache_spec_decode_active() or block_size <= 0:
+            # Generic V1 is target-only plain KV. This snapshot is taken after
+            # target-only prefill and before BatchGenerator insert, so MTP has
+            # not dirtied the graph. Speculative fail-closed stays on terminal
+            # publish/lease (mtp-standard-terminal-v1). Refusing to stage here
+            # was a regression: OpenWebUI rewrite misses the full terminal and
+            # had no proved N-1 to claim.
+            if block_size <= 0:
                 return False
             # Plain chat templates may rewrite more than one generation-marker
             # token between turns. The preceding already-durable block boundary
@@ -8931,6 +9084,10 @@ class Scheduler:
             and self._resident_cache_matches_token_count(cache_list, len(tokens))
         ):
             return False
+        # Inherit the request's proved terminal tag. MTP lookup only accepts
+        # those proofs; an untagged boundary is published then ignored, so the
+        # next OpenWebUI turn (thinking stripped, tail rewritten) misses L0
+        # and falls back to a paged block + suffix prefill.
         published = self._exact_resident_cache.put(
             tokens,
             cache_list,
@@ -8938,6 +9095,7 @@ class Scheduler:
             durable_tokens=durable_tokens,
             protect_longer_prefix=True,
             expected_generation=generation,
+            terminal_proof=getattr(request, "_mtp_exact_terminal_proved", None),
         )
         if published:
             logger.info(
@@ -9517,13 +9675,13 @@ class Scheduler:
         elif not isinstance(cache_tokens, (list, tuple)) or not cache_tokens:
             reject_reason = "token-ledger-missing"
         if reject_reason is not None:
-            if attempted_qwen4:
-                logger.info(
-                    "Qwen4 exact resident candidate rejected for %s: reason=%s %s",
-                    request.request_id,
-                    reject_reason,
-                    self._resident_cache_timeline_observation(cache_list),
-                )
+            logger.info(
+                "%s exact resident candidate rejected for %s: reason=%s %s",
+                "Qwen4" if attempted_qwen4 else "Exact",
+                request.request_id,
+                reject_reason,
+                self._resident_cache_timeline_observation(cache_list),
+            )
             return
         # In non-speculative mlx-lm GenerationBatch.next(), ``_step`` appends
         # the forwarded token to both the physical cache and ``all_tokens``
@@ -9749,6 +9907,7 @@ class Scheduler:
                 allowed_terminal_proofs = {
                     "qwen4-target-only-v1",
                     "mtp-standard-terminal-v1",
+                    "mtp-target-only-stable-v1",
                 }
             hit = resident_cache.acquire_prefix(
                 prompt_tokens,
@@ -9923,6 +10082,7 @@ class Scheduler:
         if (
             self._resident_cache_spec_decode_active()
             and not self._resident_cache_qwen4_target_only_enabled()
+            and not self._qwen35_mtp_target_only_prewarm_enabled()
         ):
             # A hidden target-only pass is reusable during speculative decode
             # only when the model advertises the same verified Qwen4 terminal
@@ -11415,11 +11575,49 @@ class Scheduler:
         """Drain and process pending abort requests.
 
         Called from step() to ensure aborts are processed in the same
-        execution context as generation (thread-safe).
+        execution context as generation (thread-safe). If cleanup must wait
+        for an in-flight store_cache worker, keep the abort id so the next
+        step retries instead of dropping the cancel.
         """
+        leftover: list[str] = []
         while self._pending_abort_ids:
             request_id = self._pending_abort_ids.pop()
-            self._do_abort_request(request_id)
+            if not self._do_abort_request(request_id) and request_id in self.requests:
+                leftover.append(request_id)
+        if leftover:
+            self._pending_abort_ids.update(leftover)
+
+    def _release_request_owned_arrays(self, request: Request | None) -> None:
+        """Drop request-owned MLX graphs that abort never publishes.
+
+        Finish already clears extracted/prompt cache. Abort also has to drop
+        the staged N-1 resident clone and VLM embeddings; those are not store
+        payloads and otherwise stay reachable after the request is popped.
+        """
+        if request is None:
+            return
+        request._extracted_cache = None
+        request.prompt_cache = None
+        request._stable_prompt_resident_candidate = None
+        request.vlm_inputs_embeds = None
+        request.vlm_extra_kwargs = None
+        request.images = None
+        request.videos = None
+
+    def _drop_batch_mtp_state(self, reason: str) -> None:
+        """Release BatchGenerator MTP graphs after the owning uid is gone."""
+        gen_batch = self.batch_generator
+        if gen_batch is None:
+            return
+        try:
+            from .patches.mlx_lm_mtp.batch_generator import (
+                _drop_mtp_batch_state,
+                _drop_mtp_state,
+            )
+        except Exception:
+            return
+        _drop_mtp_state(gen_batch, reason)
+        _drop_mtp_batch_state(gen_batch, reason)
 
     def _cleanup_prefill_abort_request(
         self, request: "Request", temp_uid: int | None = None
@@ -11547,6 +11745,13 @@ class Scheduler:
         # deciding whether there is anything left to abort.
         store_future = self._inflight_store_futures.get(request_id)
         if store_future is not None:
+            # Store owns extracted KV. The staged N-1 clone and vision
+            # tensors are not part of that worker and must not stay pinned.
+            request._stable_prompt_resident_candidate = None
+            request.vlm_inputs_embeds = None
+            request.vlm_extra_kwargs = None
+            request.images = None
+            request.videos = None
             if not store_future.done():
                 logger.debug(
                     "Deferring abort cleanup for %s until async store_cache completes",
@@ -11584,6 +11789,7 @@ class Scheduler:
             # can hit 'completeMemory() prepare count underflow'.
             _safe_sync_stream(self._stream)
             self._remove_uid_from_active_batch(uid)
+            self._drop_batch_mtp_state("abort")
             if hasattr(self.model, "unregister_rope_delta"):
                 self.model.unregister_rope_delta(uid)
             if uid < 0:
@@ -11605,24 +11811,11 @@ class Scheduler:
         # forever (#766).
         self._cleanup_specprefill(request_id)
 
-        # Release blocks for eviction (same as _cleanup_finished)
-        if self.paged_cache_manager is not None:
-            block_table = self.paged_cache_manager.get_block_table(request_id)
-            if block_table is None and hasattr(request, "block_table"):
-                block_table = request.block_table
-            if block_table:
-                released = self.paged_cache_manager.release_for_eviction(
-                    block_table.block_ids
-                )
-                if released > 0:
-                    logger.debug(
-                        f"Released {released} blocks for eviction on abort "
-                        f"(request {request_id})"
-                    )
-
-        # Clear request entry from block_aware_cache
-        if self.block_aware_cache is not None:
-            self.block_aware_cache.clear_request_entry(request_id)
+        # Abort is not a successful store. Retain-for-reuse
+        # (release_for_eviction + clear_request_entry) keeps paged blocks in
+        # allocated_blocks and leaves the request table pinned. Use the same
+        # free path as prefill rejection so cancelled work actually releases.
+        self._release_paged_cache_for_request(request_id)
 
         # Clean up streaming detokenizer to prevent state contamination
         self._cleanup_detokenizer(request_id)
@@ -11653,9 +11846,7 @@ class Scheduler:
         # _cleanup_request (engine_core) no longer calls remove_finished_request,
         # so this is the single cleanup point for aborted requests.
         req_to_remove = self.requests.pop(request_id, None)
-        if req_to_remove is not None:
-            req_to_remove._extracted_cache = None
-            req_to_remove.prompt_cache = None
+        self._release_request_owned_arrays(req_to_remove)
 
         # Schedule the deferred Metal clear that _cleanup_finished would have
         # scheduled: aborts free KV/activation arrays into MLX's buffer pool
@@ -11683,6 +11874,7 @@ class Scheduler:
             or self.prefilling
             or self.running
             or self._pending_async_removes
+            or self._pending_abort_ids
             or self._deferred_clear_at is not None
             or self._pending_reclaim_request
             or self._pending_pressure_clear
@@ -13222,6 +13414,27 @@ class Scheduler:
                 ):
                     qwen4_terminal_cache_proved = True
                     request._mtp_exact_terminal_proved = "qwen4-target-only-v1"
+                elif (
+                    is_finished
+                    and getattr(request, "_mtp_exact_terminal_proved", None) is None
+                    and self._resident_cache_spec_decode_active()
+                    and self.batch_generator is not None
+                    and getattr(self.batch_generator, "_omlx_mtp_state", None) is None
+                    and getattr(self.batch_generator, "_omlx_mtp_batch_state", None)
+                    is None
+                    and getattr(
+                        self.batch_generator,
+                        "_omlx_standard_target_exact_v1",
+                        False,
+                    )
+                    is True
+                ):
+                    # Standard mlx-lm next() already committed the public
+                    # ledger. MTP never attached, so this is the same exact
+                    # target terminal generic MTP publishes after reconcile.
+                    request._mtp_exact_terminal_proved = (
+                        "mtp-standard-terminal-v1"
+                    )
 
             # Prepend <think> tag for first chunk if this is a reasoning model.
             # Protocol parsers may expose a normalized prefix when their prompt
@@ -13649,9 +13862,13 @@ class Scheduler:
                     # prep, no host memcpy, no SSD write. They still take
                     # the block leak-guard branch below so their paged
                     # blocks are released for eviction.
+                    prefill_store_complete = (
+                        self._qwen35_mtp_prefill_store_covers_prompt(request)
+                    )
                     skip_store = (
                         getattr(request, "skip_cache_store", False)
                         or resident_handoff
+                        or prefill_store_complete
                     )
                     if resident_handoff:
                         # Do not let the async durable writer read arrays held
@@ -13664,6 +13881,14 @@ class Scheduler:
                             "exact resident handoff is immediately claimable",
                             request_id,
                         )
+                    elif prefill_store_complete:
+                        logger.info(
+                            "Skipping terminal cache materialization for %s: "
+                            "Qwen3.5 MTP prompt blocks were persisted during prefill",
+                            request_id,
+                        )
+                        self.block_aware_cache.release_cache(request_id)
+                        request.block_table = None
                     if skip_store or (
                         hasattr(request, "_extracted_cache")
                         and request._extracted_cache is not None
@@ -14012,9 +14237,7 @@ class Scheduler:
             if store_future is None:
                 req_to_remove = self.requests.pop(request_id, None)
                 self._clear_request_admission_bookkeeping(request_id)
-                if req_to_remove is not None:
-                    req_to_remove._extracted_cache = None
-                    req_to_remove.prompt_cache = None
+                self._release_request_owned_arrays(req_to_remove)
             else:
                 # Drop request from running but keep in self.requests so the
                 # async worker keeps the cache buffers alive via reachability.

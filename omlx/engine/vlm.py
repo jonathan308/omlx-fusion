@@ -3252,6 +3252,17 @@ class VLMBatchedEngine(BaseEngine):
             if num_images > 0:
                 image_hash = compute_image_hash(images)
                 image_token_count = self._image_token_count(input_ids)
+                try:
+                    prompt_tokens = int(getattr(input_ids, "shape", [None])[-1])
+                except Exception:
+                    prompt_tokens = -1
+                logger.info(
+                    "VLM official vision path: images=%d image_tokens=%s "
+                    "prompt_tokens=%d (media stays outside text exact-resident)",
+                    num_images,
+                    image_token_count,
+                    prompt_tokens,
+                )
 
             if (
                 num_images > 0

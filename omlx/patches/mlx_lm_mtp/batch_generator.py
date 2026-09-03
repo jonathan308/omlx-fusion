@@ -307,12 +307,18 @@ def apply() -> bool:
                     )
                 if park_state is not None:
                     _record_parked_standard_step(self)
-                return _stamp_qwen4_standard_terminal_responses(self, result)
-            return _stamp_qwen4_standard_terminal_responses(
-                self,
-                _standard_multirow_next(
+                return _stamp_standard_terminal_responses(
                     self,
-                    lambda: original_next(self, *args, **kwargs),
+                    _stamp_qwen4_standard_terminal_responses(self, result),
+                )
+            return _stamp_standard_terminal_responses(
+                self,
+                _stamp_qwen4_standard_terminal_responses(
+                    self,
+                    _standard_multirow_next(
+                        self,
+                        lambda: original_next(self, *args, **kwargs),
+                    ),
                 ),
             )
 
@@ -478,6 +484,38 @@ def _model_qwen4_terminal_commit_enabled(model: Any) -> bool:
         getattr(candidate, "_omlx_mtp_terminal_commit_v1", False) is True
         for candidate in candidates
     )
+
+
+def _stamp_standard_terminal_responses(
+    gen_batch: Any,
+    responses: Any,
+) -> Any:
+    """Prove a standard-path finish is an exact target terminal.
+
+    Generic MTP families (Qwen3.5, DeepSeek-V4) only publish L0 when the
+    response carries ``_omlx_mtp_standard_terminal_exact``. That flag used
+    to be set only after an MTP verify cycle reconciled back to the public
+    ledger. A request that never entered MTP already is that ledger — the
+    same exact target transaction — and must carry the same proof so L0 is
+    universal instead of Qwen4-only.
+    """
+
+    if (
+        getattr(gen_batch, "_omlx_mtp_state", None) is not None
+        or getattr(gen_batch, "_omlx_mtp_batch_state", None) is not None
+        or getattr(gen_batch, "_omlx_standard_target_exact_v1", False) is not True
+    ):
+        return responses
+    if not _model_mtp_decode_enabled(getattr(gen_batch, "model", None)):
+        return responses
+    for response in responses or ():
+        if (
+            getattr(response, "finish_reason", None) is not None
+            and isinstance(getattr(response, "prompt_cache", None), list)
+            and isinstance(getattr(response, "all_tokens", None), list)
+        ):
+            response._omlx_mtp_standard_terminal_exact = True
+    return responses
 
 
 def _stamp_qwen4_standard_terminal_responses(
@@ -8035,14 +8073,15 @@ def _emit_response(
             ]
 
         # Legacy Qwen3.5-style MTP does not have Qwen4's explicit two-phase
-        # target transaction.  Its verifier may leave the backbone cache ahead
+        # target transaction. Its verifier may leave the backbone cache ahead
         # of the visible terminal token while a queued draft is still parked.
-        # Never publish that speculative cache to the exact resident tier:
-        # reconcile the singleton by replaying the committed token ledger into
-        # a fresh standard cache first.  This work is paid at request
-        # completion, off the TTFT-critical next-turn path, and preserves the
-        # lossless target distribution.  If reconciliation fails closed, the
-        # response remains usable but exposes no cache candidate.
+        # Never replay the full committed ledger merely to manufacture a cache
+        # candidate after the response is already complete: at long context
+        # that one-shot attention graph can consume hundreds of GB. The output
+        # is already target-verified and final. Publish the live cache only when
+        # its exact target timeline is proved; otherwise fail closed on cache
+        # reuse and let oMLX's block-aligned durable prefix plus idle target-only
+        # tail reconstruction create the next exact resident entry.
         standard_terminal_exact = False
         active_state = getattr(gen_batch, "_omlx_mtp_state", None)
         if active_state is not None:
@@ -8050,14 +8089,9 @@ def _emit_response(
                 gen_batch
             )
             if not standard_terminal_exact:
-                standard_terminal_exact = _reconcile_mtp_to_standard(
-                    gen_batch,
-                    active_state,
-                )
-            if not standard_terminal_exact:
-                logger.warning(
-                    "MTP terminal cache reconciliation failed closed; "
-                    "suppressing resident cache for uid=%s",
+                logger.info(
+                    "MTP terminal cache proof missed; skipping full-history "
+                    "replay and suppressing terminal candidate for uid=%s",
                     getattr(active_state, "uid", "?"),
                 )
 
