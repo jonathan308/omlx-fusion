@@ -6248,6 +6248,41 @@ class Scheduler:
             total_tokens,
         )
 
+        # Media requests cannot use the text-only exact-resident handoff, so
+        # completion must publish a durable salted boundary.  Refilling the
+        # sliceable members from the terminal MTP cache at that point can
+        # materialize its entire lazy long-context graph after generation has
+        # already finished.  Capture exactly one FULL boundary while prefill
+        # owns an already-evaluated cache instead.  Choosing only the final
+        # reachable prompt boundary keeps retained KV linear in context rather
+        # than one full-prefix copy per block.
+        block_size = int(self.config.paged_cache_block_size or 0)
+        prompt_tokens = list(request.prompt_token_ids or [])
+        final_boundary = (
+            ((len(prompt_tokens) - 1) // block_size) * block_size
+            if block_size > 0 and prompt_tokens
+            else 0
+        )
+        if (
+            total_tokens == final_boundary
+            and final_boundary > 0
+            and not self._request_is_text_only_for_resident_cache(request)
+        ):
+            full_snapshot = self._extract_prefill_snapshot_states(
+                prompt_cache,
+                include_sliceable=True,
+            )
+            if full_snapshot is not None:
+                self._boundary_cache_snapshots.setdefault(request.request_id, {})[
+                    total_tokens
+                ] = full_snapshot
+                logger.info(
+                    "Captured materialized media final boundary for %s at %d "
+                    "tokens; completion store will not evaluate terminal graph",
+                    request.request_id,
+                    total_tokens,
+                )
+
     def _build_sampler_and_processors(
         self, sampling_params: SamplingParams, request: Any = None
     ) -> tuple[Callable[[mx.array], mx.array], list[Callable]]:
@@ -6927,7 +6962,10 @@ class Scheduler:
         )
 
     def _extract_prefill_snapshot_states(
-        self, snapshot_cache: list[Any]
+        self,
+        snapshot_cache: list[Any],
+        *,
+        include_sliceable: bool = False,
     ) -> tuple[str, list[dict[str, Any]]] | None:
         """Extract-and-eval boundary states captured mid-prefill.
 
@@ -6960,7 +6998,12 @@ class Scheduler:
                 mx.default_device()
             )
             with mx.stream(stream):
-                extracted, _ = self._extract_snapshot_cache_states(snapshot_cache)
+                extract = (
+                    self._extract_cache_states
+                    if include_sliceable
+                    else self._extract_snapshot_cache_states
+                )
+                extracted, _ = extract(snapshot_cache)
                 if not extracted:
                     return None
                 for layer_state in extracted:
