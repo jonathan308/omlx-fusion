@@ -1183,6 +1183,53 @@ class TestEnginePoolDFlashIsolation:
         pool._unload_engine.assert_not_awaited()
 
 
+class TestEnginePoolSingleLocalModel:
+    @staticmethod
+    def _entry(model_id: str, engine) -> EngineEntry:
+        return EngineEntry(
+            model_id=model_id,
+            model_path=f"/models/{model_id}",
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=1024,
+            engine=engine,
+        )
+
+    @pytest.mark.asyncio
+    async def test_single_local_model_unloads_idle_engines(self, monkeypatch):
+        monkeypatch.setenv("OMLX_SINGLE_LOCAL_MODEL", "1")
+        pool = EnginePool()
+        old = MagicMock()
+        old.has_active_requests.return_value = False
+        pool._entries["old"] = self._entry("old", old)
+        pool._entries["new"] = self._entry("new", None)
+        unloaded = []
+
+        async def fake_unload(model_id):
+            unloaded.append(model_id)
+            pool._entries[model_id].engine = None
+
+        pool._unload_engine = fake_unload
+        await pool._enforce_single_local_model("new")
+
+        assert unloaded == ["old"]
+
+    @pytest.mark.asyncio
+    async def test_single_local_model_refuses_active_engine(self, monkeypatch):
+        monkeypatch.setenv("OMLX_SINGLE_LOCAL_MODEL", "1")
+        pool = EnginePool()
+        active = MagicMock()
+        active.has_active_requests.return_value = True
+        pool._entries["active"] = self._entry("active", active)
+        pool._entries["new"] = self._entry("new", None)
+        pool._unload_engine = AsyncMock()
+
+        with pytest.raises(ModelBusyError, match="active"):
+            await pool._enforce_single_local_model("new")
+
+        pool._unload_engine.assert_not_awaited()
+
+
 class TestEnginePoolAsync:
     """Async tests for EnginePool (mocked)."""
 

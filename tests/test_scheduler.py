@@ -1348,6 +1348,92 @@ class TestSchedulerAbortRequest:
         # stepping until it fires.
         assert scheduler.has_requests() is True
 
+    def test_abort_releases_paged_cache_like_rejection(
+        self, mock_model, mock_tokenizer
+    ):
+        """Abort must free paged/prefix blocks, not retain them for reuse."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="req-abort-release",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1]
+        request.num_prompt_tokens = 1
+        request.status = RequestStatus.RUNNING
+        scheduler.requests[request.request_id] = request
+        scheduler.running[request.request_id] = request
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = MagicMock()
+        scheduler._draft_prefix_cache = MagicMock()
+
+        assert scheduler._do_abort_request(request.request_id) is True
+
+        scheduler.block_aware_cache.release_cache.assert_called_once_with(
+            request.request_id
+        )
+        scheduler.block_aware_cache.clear_request_entry.assert_not_called()
+        scheduler.paged_cache_manager.release_for_eviction.assert_not_called()
+        scheduler._draft_prefix_cache.release_cache.assert_called_once_with(
+            request.request_id
+        )
+        assert request.request_id not in scheduler.requests
+
+    def test_abort_drops_staged_resident_and_vlm_tensors(
+        self, mock_model, mock_tokenizer
+    ):
+        """Cancelled work must drop the N-1 clone and vision embeddings."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="req-abort-tensors",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1]
+        request.num_prompt_tokens = 1
+        request.status = RequestStatus.RUNNING
+        request._extracted_cache = object()
+        request.prompt_cache = object()
+        request._stable_prompt_resident_candidate = (object(), object(), 1, 1, 1, 0.0)
+        request.vlm_inputs_embeds = object()
+        request.vlm_extra_kwargs = {"pixel_values": object()}
+        request.images = [object()]
+        request.videos = [object()]
+        scheduler.requests[request.request_id] = request
+        scheduler.running[request.request_id] = request
+
+        assert scheduler._do_abort_request(request.request_id) is True
+        assert request._extracted_cache is None
+        assert request.prompt_cache is None
+        assert request._stable_prompt_resident_candidate is None
+        assert request.vlm_inputs_embeds is None
+        assert request.vlm_extra_kwargs is None
+        assert request.images is None
+        assert request.videos is None
+
+    def test_pending_abort_is_not_dropped_while_store_is_inflight(
+        self, mock_model, mock_tokenizer
+    ):
+        """A cancel that waits for store_cache must stay queued for the next step."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="req-abort-retry",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+        request.set_finished(RequestStatus.FINISHED_STOPPED)
+        scheduler.requests[request.request_id] = request
+        future = concurrent.futures.Future()
+        scheduler._inflight_store_futures[request.request_id] = future
+        scheduler.abort_request(request.request_id)
+
+        scheduler._process_pending_aborts()
+
+        assert request.request_id in scheduler.requests
+        assert request.request_id in scheduler._pending_abort_ids
+        assert scheduler.has_requests() is True
+        assert request._stable_prompt_resident_candidate is None
+
     def test_abort_defers_cleanup_while_async_store_is_pending(
         self, mock_model, mock_tokenizer
     ):
@@ -3334,6 +3420,97 @@ class TestSchedulerBoundarySnapshots:
 
         assert request.request_id in scheduler._boundary_cache_snapshots
         assert 4 in scheduler._boundary_cache_snapshots[request.request_id]
+
+    def test_qwen35_mtp_prefill_boundary_store_extends_one_block(
+        self, mock_model, mock_tokenizer, monkeypatch
+    ):
+        mock_model.model_type = "qwen3_5"
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        request = Request(
+            request_id="req-qwen35-prefill-store",
+            prompt="text",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = list(range(9))
+        extracted = [{"class_name": "KVCache", "state": ("k", "v")}]
+        monkeypatch.setattr(
+            scheduler,
+            "_extract_cache_states",
+            lambda cache: (extracted, None),
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_bypass_hot_cache_under_pressure",
+            lambda: False,
+        )
+        table = SimpleNamespace(num_tokens=4)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.block_aware_cache.store_cache.return_value = table
+
+        scheduler._store_qwen35_mtp_prefill_boundary(request, [object()], 4)
+
+        call = scheduler.block_aware_cache.store_cache.call_args
+        assert call.args[1] == [0, 1, 2, 3]
+        assert call.kwargs["boundary_snapshots"] == {4: extracted}
+        assert request._qwen35_mtp_prefill_durable_tokens == 4
+        assert request._exact_resident_durable_fallback_tokens == 4
+
+    def test_qwen35_prefill_store_coverage_uses_prompt_boundary(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        request = Request(
+            request_id="req-qwen35-store-cover",
+            prompt="text",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = list(range(11))
+        request._qwen35_mtp_prefill_durable_tokens = 8
+        assert scheduler._qwen35_mtp_prefill_store_covers_prompt(request)
+        request._qwen35_mtp_prefill_durable_tokens = 4
+        assert not scheduler._qwen35_mtp_prefill_store_covers_prompt(request)
+
+    def test_long_qwen35_mtp_boundary_defers_to_idle_prewarm(
+        self, mock_model, mock_tokenizer, monkeypatch
+    ):
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(
+                paged_cache_block_size=4,
+                exact_resident_cache_slots=2,
+            ),
+        )
+        scheduler.block_aware_cache = MagicMock()
+        request = Request(
+            request_id="req-qwen35-idle-stable",
+            prompt="text",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = list(range(10))
+        request._qwen35_mtp_prefill_durable_tokens = 8
+        monkeypatch.setattr(
+            scheduler,
+            "_qwen35_mtp_target_only_prewarm_enabled",
+            lambda: True,
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_resident_cache_arrays",
+            lambda cache: (_ for _ in ()).throw(
+                AssertionError("long boundary cloned before decode")
+            ),
+        )
+
+        assert not scheduler._stage_stable_prompt_boundary(request, [object()])
 
 
 class TestSchedulerRotatingBlockAlignment:

@@ -443,7 +443,7 @@ def test_scheduler_stages_durable_restored_sized_arrays_topology():
     assert scheduler._publish_stable_prompt_boundary(request)
 
 
-def test_scheduler_hybrid_fails_before_provider_for_spec_media_and_b2(monkeypatch):
+def test_scheduler_hybrid_fails_before_provider_for_media_and_b2(monkeypatch):
     import omlx.cache.exact_boundary as provider
 
     scheduler = _scheduler()
@@ -456,10 +456,53 @@ def test_scheduler_hybrid_fails_before_provider_for_spec_media_and_b2(monkeypatc
     scheduler.running.clear()
     request.images = [object()]
     assert not scheduler._stage_stable_prompt_boundary(request, _graph())
-    request.images = None
-    scheduler.model._omlx_mtp_decode_enabled = True
-    assert not scheduler._stage_stable_prompt_boundary(request, _graph())
     plan_spy.assert_not_called()
+
+
+def test_scheduler_hybrid_mtp_rewrite_claims_proved_n_minus_one():
+    """27B OpenWebUI turns rewrite the last assistant marker. The prompt N-1
+    snapshot is target-only prefill state and must stay claimable under the
+    generic MTP proof filter, same as Qwen4's qwen4-target-only-v1 handoff."""
+
+    scheduler = _scheduler()
+    scheduler.model._omlx_mtp_decode_enabled = True
+    request = _request()
+    request._mtp_exact_terminal_proved = "mtp-standard-terminal-v1"
+    assert scheduler._stage_stable_prompt_boundary(request, _graph())
+    terminal = _graph(5)
+    assert scheduler._exact_resident_cache.put(
+        [1, 2, 3, 4, 99],
+        terminal,
+        cache_nbytes=Scheduler._resident_cache_nbytes(terminal),
+        durable_tokens=4,
+        terminal_proof="mtp-standard-terminal-v1",
+    )
+    assert scheduler._publish_stable_prompt_boundary(request)
+
+    follow = _request([1, 2, 3, 4, 42])
+    follow.request_id = "rewritten-27b"
+    assert scheduler._restore_exact_resident_cache(follow)
+    assert follow.cached_tokens == 4
+    assert follow.remaining_tokens == [42]
+
+    media = _request([1, 2, 3, 4, 42])
+    media.request_id = "image-follow"
+    media.images = [object()]
+    assert not scheduler._restore_exact_resident_cache(media)
+
+
+def test_scheduler_hybrid_mtp_ignores_unproved_boundary():
+    """Untagged N-1 entries must not cross into an MTP restore."""
+
+    scheduler = _scheduler()
+    scheduler.model._omlx_mtp_decode_enabled = True
+    request = _request()
+    assert scheduler._stage_stable_prompt_boundary(request, _graph())
+    assert scheduler._publish_stable_prompt_boundary(request)
+
+    follow = _request([1, 2, 3, 4, 42])
+    follow.request_id = "unproved-follow"
+    assert not scheduler._restore_exact_resident_cache(follow)
 
 
 def test_hidden_prewarm_skips_when_hybrid_n_minus_one_is_resident():

@@ -23,13 +23,13 @@ class _Batch(SimpleNamespace):
             self.uids = []
 
 
-def test_mtp_terminal_reconciles_before_publishing_cache(monkeypatch):
+def test_unproved_mtp_terminal_never_replays_full_history(monkeypatch):
     state = SimpleNamespace(uid=9)
     calls = []
 
     def reconcile(batch, observed):
         calls.append((batch, observed))
-        return True
+        raise AssertionError("completed requests must not replay their prompt")
 
     monkeypatch.setattr(bg, "_reconcile_mtp_to_standard", reconcile)
     batch = _Batch(
@@ -50,10 +50,10 @@ def test_mtp_terminal_reconciles_before_publishing_cache(monkeypatch):
         logprobs_1d=mx.zeros((8,), dtype=mx.float32),
     )[0]
 
-    assert calls == [(batch, state)]
-    assert response.prompt_cache == ["reconciled-cache"]
-    assert response.all_tokens == [101, 7]
-    assert response._omlx_mtp_standard_terminal_exact is True
+    assert calls == []
+    assert response.prompt_cache is None
+    assert response.all_tokens is None
+    assert not hasattr(response, "_omlx_mtp_standard_terminal_exact")
     assert batch.uids == []
 
 
@@ -94,3 +94,40 @@ def test_exact_generic_terminal_skips_full_replay(monkeypatch):
 
     assert response.prompt_cache is cache
     assert response._omlx_mtp_standard_terminal_exact is True
+
+
+def test_standard_path_terminal_gets_generic_mtp_proof():
+    """A request that never entered MTP is already an exact target terminal."""
+    response = SimpleNamespace(
+        finish_reason="stop",
+        prompt_cache=["target-cache"],
+        all_tokens=[1, 2, 3],
+    )
+    batch = SimpleNamespace(
+        _omlx_mtp_state=None,
+        _omlx_mtp_batch_state=None,
+        _omlx_standard_target_exact_v1=True,
+        model=SimpleNamespace(_omlx_mtp_decode_enabled=True),
+    )
+
+    stamped = bg._stamp_standard_terminal_responses(batch, [response])
+
+    assert stamped[0]._omlx_mtp_standard_terminal_exact is True
+
+
+def test_standard_path_does_not_forge_proof_while_mtp_state_is_live():
+    response = SimpleNamespace(
+        finish_reason="stop",
+        prompt_cache=["dirty-cache"],
+        all_tokens=[1, 2, 3],
+    )
+    batch = SimpleNamespace(
+        _omlx_mtp_state=SimpleNamespace(uid=1),
+        _omlx_mtp_batch_state=None,
+        _omlx_standard_target_exact_v1=True,
+        model=SimpleNamespace(_omlx_mtp_decode_enabled=True),
+    )
+
+    stamped = bg._stamp_standard_terminal_responses(batch, [response])
+
+    assert getattr(stamped[0], "_omlx_mtp_standard_terminal_exact", False) is False
