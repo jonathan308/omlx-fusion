@@ -9084,14 +9084,48 @@ class Scheduler:
             and self._resident_cache_matches_token_count(cache_list, len(tokens))
         ):
             return False
+        # Same head-trim as terminal entries: stable boundaries are full
+        # KV clones whose head the paged tier already serves.  Without this,
+        # every turn retains a second N-token copy and the tier grows
+        # without bound on long conversations.
+        store_cache = cache_list
+        store_nbytes = cache_nbytes
+        tail_trim_allowed = os.environ.get(
+            "OMLX_EXACT_TAIL_TRIM", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        if tail_trim_allowed and 0 < durable_tokens < len(tokens):
+            try:
+                trimmed = self._trim_exact_resident_head(
+                    cache_list,
+                    len(tokens),
+                    durable_tokens,
+                    max_tail_tokens=self._exact_tail_trim_budget(),
+                )
+            except Exception:
+                trimmed = None
+            if trimmed is not None:
+                trimmed_nbytes = self._resident_cache_nbytes(trimmed)
+                if trimmed_nbytes is not None and 0 < trimmed_nbytes < (
+                    cache_nbytes or 0
+                ):
+                    store_cache = trimmed
+                    store_nbytes = trimmed_nbytes
+                    logger.info(
+                        "Stable boundary tail-trim for %s: tokens=%d "
+                        "durable=%d retained=%.2fGiB",
+                        request.request_id,
+                        len(tokens),
+                        durable_tokens,
+                        trimmed_nbytes / 1024**3,
+                    )
         # Inherit the request's proved terminal tag. MTP lookup only accepts
         # those proofs; an untagged boundary is published then ignored, so the
         # next OpenWebUI turn (thinking stripped, tail rewritten) misses L0
         # and falls back to a paged block + suffix prefill.
         published = self._exact_resident_cache.put(
             tokens,
-            cache_list,
-            cache_nbytes=cache_nbytes,
+            store_cache,
+            cache_nbytes=store_nbytes,
             durable_tokens=durable_tokens,
             protect_longer_prefix=True,
             expected_generation=generation,
@@ -9103,7 +9137,7 @@ class Scheduler:
                 "capture=%.1fms durable_tokens=%d",
                 request.request_id,
                 len(tokens),
-                cache_nbytes / 1024**3,
+                store_nbytes / 1024**3,
                 capture_ms,
                 durable_tokens,
             )
@@ -9629,6 +9663,253 @@ class Scheduler:
             return
         request._terminal_prompt_boundary_source = (tokens, cache_list)
 
+    @staticmethod
+    def _is_tail_trimmed_cache(cache_list: Any) -> bool:
+        """Whether an entry cache was head-trimmed to its post-boundary tail.
+
+        Trimmed entries keep the full token ledger for prefix matching but
+        retain live arrays only for tokens at or after the durable paged
+        boundary, plus position-independent recurrent state.  The trimmed KV
+        layers carry an ``_omlx_kv_tail_span`` ``(durable_from, total_to)``
+        marker; fixed-state layers are kept by reference unchanged.
+        """
+        if not isinstance(cache_list, list):
+            return False
+        for leaf in cache_list:
+            if isinstance(getattr(leaf, "_omlx_kv_tail_span", None), tuple):
+                return True
+        return False
+
+    @staticmethod
+    def _tail_trim_array_has_token_dim(value: Any, total_tokens: int) -> bool:
+        """Whether any array under ``value`` spans the full token ledger.
+
+        Recurses through plain containers and object attributes (cycle
+        guarded), mirroring the resident nbytes walker but additionally
+        skipping the QSA pooled-indexer tag, which references the model
+        module itself.
+        """
+        stack: list[Any] = [value]
+        seen: set[int] = set()
+        while stack:
+            item = stack.pop()
+            if isinstance(item, mx.array):
+                if total_tokens in tuple(item.shape):
+                    return True
+            elif isinstance(item, dict):
+                identity = id(item)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                stack.extend(item.values())
+            elif isinstance(item, (list, tuple)):
+                identity = id(item)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                stack.extend(item)
+            else:
+                if item is None or isinstance(
+                    item, (str, bytes, int, float, bool)
+                ):
+                    continue
+                if isinstance(item, type):
+                    continue
+                try:
+                    import types as _types
+
+                    if isinstance(item, _types.ModuleType):
+                        continue
+                    attributes = vars(item)
+                except Exception:
+                    continue
+                identity = id(item)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                for name, subvalue in attributes.items():
+                    if name == "_pooled_index_tag":
+                        continue
+                    stack.append(subvalue)
+        return False
+
+    @staticmethod
+    def _copy_kv_tail_array(
+        arr: Any, durable_from: int, total_to: int
+    ) -> Any | None:
+        """Copy a ``[durable_from:total_to]`` token slice into a fresh buffer.
+
+        Device-side multiply-by-one (not a NumPy round-trip: NumPy cannot
+        represent bf16, and a lazy device slice may alias the live parent
+        buffer).  The multiply kernel materializes a new output buffer with
+        bit-exact values, so the retained tail stays valid after the live
+        cache is freed, while the live arrays are never mutated.
+        """
+        try:
+            view = arr[:, :, durable_from:total_to]
+            fresh = view * 1
+            mx.eval(fresh)
+            if tuple(fresh.shape) != tuple(view.shape) or fresh.dtype != (
+                arr.dtype
+            ):
+                return None
+            return fresh
+        except Exception:
+            return None
+
+    @classmethod
+    def _trim_exact_resident_head(
+        cls,
+        cache_list: Any,
+        total_tokens: int,
+        durable_tokens: int,
+        max_tail_tokens: int | None = None,
+    ) -> list[Any] | None:
+        """Drop the paged-durable KV head from a terminal cache candidate.
+
+        Returns a trimmed layer list holding only post-boundary tail KV
+        (bounded by one block) plus the original fixed recurrent-state
+        objects, or ``None`` to keep today's full-retain behavior.  The
+        token ledger is untouched: matching still uses the full terminal
+        list, and restore composes the paged head with this tail.
+
+        Fail-closed rules (any violation returns ``None``):
+        - non-positive/covering ``durable_tokens`` (nothing to trim);
+        - a tail longer than ``max_tail_tokens`` (multi-block tails stay
+          full-retain; the durable tier is still catching up);
+        - KV layers whose ``keys``/``values`` layout is unexpected
+          (ndim, token-axis length, or ``offset`` mismatch);
+        - any other token-length array on any layer (QSA index keys,
+          position rows, masks), which a head-drop would silently corrupt;
+        - top-level composite cache objects (nested fixed state without
+          token arrays is kept by reference and stays correct).
+        """
+        if not isinstance(cache_list, list) or not cache_list:
+            return None
+        if (
+            type(durable_tokens) is not int
+            or type(total_tokens) is not int
+            or durable_tokens <= 0
+            or durable_tokens >= total_tokens
+        ):
+            return None
+        if (
+            max_tail_tokens is not None
+            and (total_tokens - durable_tokens) > max_tail_tokens
+        ):
+            return None
+        trimmed: list[Any] = []
+        saw_tail = False
+        for leaf in cache_list:
+            if isinstance(getattr(leaf, "caches", None), (list, tuple)):
+                return None
+            keys = getattr(leaf, "keys", None)
+            values = getattr(leaf, "values", None)
+            if isinstance(keys, mx.array) and isinstance(values, mx.array):
+                offset = getattr(leaf, "offset", None)
+                if (
+                    type(offset) is not int
+                    or offset != total_tokens
+                    or keys.ndim < 3
+                    or values.ndim < 3
+                    or keys.shape[2] < total_tokens
+                    or values.shape[2] < total_tokens
+                ):
+                    return None
+                try:
+                    attributes = vars(leaf)
+                except TypeError:
+                    return None
+                for name, value in attributes.items():
+                    if name in ("keys", "values"):
+                        continue
+                    if cls._tail_trim_array_has_token_dim(value, total_tokens):
+                        return None
+                tail_keys = cls._copy_kv_tail_array(
+                    keys, durable_tokens, total_tokens
+                )
+                tail_values = cls._copy_kv_tail_array(
+                    values, durable_tokens, total_tokens
+                )
+                if tail_keys is None or tail_values is None:
+                    return None
+                try:
+                    new_leaf = copy.copy(leaf)
+                except Exception:
+                    return None
+                new_leaf.keys = tail_keys
+                new_leaf.values = tail_values
+                new_leaf._omlx_kv_tail_span = (durable_tokens, total_tokens)
+                trimmed.append(new_leaf)
+                saw_tail = True
+                continue
+            try:
+                attributes = vars(leaf)
+            except TypeError:
+                return None
+            for value in attributes.values():
+                if cls._tail_trim_array_has_token_dim(value, total_tokens):
+                    return None
+            trimmed.append(leaf)
+        if not trimmed or not saw_tail:
+            return None
+        return trimmed
+
+    def _validate_trimmed_tail(
+        self, cache_list: Any, total_tokens: int, durable_tokens: int
+    ) -> bool:
+        """Validate a head-trimmed tail cache before restore composition."""
+        if not isinstance(cache_list, list) or not cache_list:
+            return False
+        if (
+            type(durable_tokens) is not int
+            or type(total_tokens) is not int
+            or durable_tokens <= 0
+            or durable_tokens >= total_tokens
+        ):
+            return False
+        tail_len = total_tokens - durable_tokens
+        saw_tail = False
+        for leaf in cache_list:
+            span = getattr(leaf, "_omlx_kv_tail_span", None)
+            if isinstance(span, tuple):
+                saw_tail = True
+                if tuple(span) != (durable_tokens, total_tokens):
+                    return False
+                keys = getattr(leaf, "keys", None)
+                values = getattr(leaf, "values", None)
+                if (
+                    not isinstance(keys, mx.array)
+                    or not isinstance(values, mx.array)
+                    or keys.ndim < 3
+                    or values.ndim < 3
+                    or keys.shape[2] != tail_len
+                    or values.shape[2] != tail_len
+                    or getattr(leaf, "offset", None) != total_tokens
+                ):
+                    return False
+        return saw_tail
+
+    def _exact_tail_trim_budget(self) -> int | None:
+        """Maximum tail tokens a trimmed exact entry may retain.
+
+        One paged block: the common case (terminal tails and caught-up
+        stable boundaries) always fits, while multi-block tails stay
+        full-retain until the durable tier catches up.  Prefers the live
+        manager block size over the possibly stale config value.
+        """
+        try:
+            manager = getattr(self, "paged_cache_manager", None)
+            size = int(getattr(manager, "block_size", 0) or 0)
+            if size <= 0:
+                size = int(
+                    getattr(getattr(self, "config", None), "paged_cache_block_size", 0)
+                    or 0
+                )
+            return size if size > 0 else None
+        except Exception:
+            return None
+
     def _stage_exact_resident_cache(
         self,
         request: Request,
@@ -9756,10 +10037,78 @@ class Scheduler:
         if type(durable_tokens) is not int:
             durable_tokens = 0
         durable_tokens = max(0, min(durable_tokens, len(tokens)))
+        store_cache = cache_list
+        store_nbytes = cache_nbytes
+        # Drop the paged-durable KV head so the retained entry holds only
+        # the post-boundary tail (bounded by one block) plus fixed
+        # recurrent state.  The paged tier already serves the head; keeping
+        # a second full copy here is the unbounded growth term.  Any trim
+        # failure keeps today's full-retain behavior.
+        # OMLX_EXACT_TAIL_TRIM=0 disables trimming (full-retain legacy).
+        tail_trim_allowed = os.environ.get(
+            "OMLX_EXACT_TAIL_TRIM", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        if tail_trim_allowed and 0 < durable_tokens < len(tokens):
+            try:
+                tail_budget = self._exact_tail_trim_budget()
+                trimmed = self._trim_exact_resident_head(
+                    cache_list,
+                    len(tokens),
+                    durable_tokens,
+                    max_tail_tokens=tail_budget,
+                )
+            except Exception:
+                trimmed = None
+            if trimmed is not None:
+                trimmed_nbytes = self._resident_cache_nbytes(trimmed)
+                if (
+                    trimmed_nbytes is not None
+                    and 0 < trimmed_nbytes < cache_nbytes
+                ):
+                    store_cache = trimmed
+                    store_nbytes = trimmed_nbytes
+                    logger.info(
+                        "Exact resident tail-trim for %s: tokens=%d "
+                        "durable=%d retained=%.2fGiB (saved %.2fGiB)",
+                        request.request_id,
+                        len(tokens),
+                        durable_tokens,
+                        trimmed_nbytes / 1024**3,
+                        (cache_nbytes - trimmed_nbytes) / 1024**3,
+                    )
+                else:
+                    logger.info(
+                        "Exact resident tail-trim skipped for %s: "
+                        "trimmed=%s",
+                        request.request_id,
+                        trimmed_nbytes,
+                    )
+            else:
+                try:
+                    layout = ",".join(
+                        "%s:%s"
+                        % (
+                            type(leaf).__name__,
+                            getattr(
+                                getattr(leaf, "keys", None), "shape", None
+                            ),
+                        )
+                        for leaf in cache_list
+                    )
+                except Exception:
+                    layout = "unreadable"
+                logger.info(
+                    "Exact resident tail-trim skipped for %s: "
+                    "tokens=%d durable=%d layout=[%s]",
+                    request.request_id,
+                    len(tokens),
+                    durable_tokens,
+                    layout,
+                )
         if self._exact_resident_cache.put(
             tokens,
-            cache_list,
-            cache_nbytes=cache_nbytes,
+            store_cache,
+            cache_nbytes=store_nbytes,
             durable_tokens=durable_tokens,
             terminal_proof=getattr(request, "_mtp_exact_terminal_proved", None),
         ):
@@ -9799,6 +10148,16 @@ class Scheduler:
             self._exact_resident_cache.snapshot_entries()
         ):
             if not tokens or not isinstance(raw_cache, list) or not raw_cache:
+                continue
+            if self._is_tail_trimmed_cache(raw_cache):
+                # Trimmed entries hold only the post-boundary tail; the
+                # reload probe restores complete chains, so reload falls
+                # back to the ordinary paged tier for these (pre-existing
+                # behavior for oversize entries) instead of persisting a
+                # partial chain.
+                logger.debug(
+                    "Skipping trimmed exact-resident entry at shutdown persist"
+                )
                 continue
             try:
                 with mx.stream(self._stream):
@@ -9887,6 +10246,171 @@ class Scheduler:
             )
         return published
 
+    def _restore_trimmed_exact_hit(
+        self, request: Request, hit: Any, prompt_tokens: list[int]
+    ) -> bool:
+        """Restore a head-trimmed exact entry by composing paged head + tail.
+
+        The entry retains only post-boundary tail KV (bounded by one block)
+        plus fixed recurrent state; the paged tier already serves the head.
+        Composition rebuilds the identical full-terminal state today's
+        full-retain hits install: same token coverage, same N-1/kickoff
+        accounting, same downstream behavior — without a second full copy
+        in RAM.  Any validation failure returns False so the caller falls
+        through to the ordinary paged/SSD paths.
+        """
+        durable = getattr(hit, "durable_tokens", 0)
+        total = getattr(hit, "cached_tokens", 0)
+        # acquire_prefix guarantees the entry ledger is a strict prefix of
+        # the prompt, so entry length (== total coverage) is below the
+        # prompt length here.
+        if (
+            type(durable) is not int
+            or type(total) is not int
+            or not 0 < durable < total
+            or total >= len(prompt_tokens)
+        ):
+            return False
+        if not self._validate_trimmed_tail(hit.cache, total, durable):
+            return False
+        # Entries without any retained fixed (recurrent-state) layer are
+        # KV-only stable boundaries: composing them would install a cache
+        # with no GDN state and silently corrupt generation on GDN-split
+        # models.  Fall through to the ordinary paged path (which rebuilds
+        # recurrent state via its final-block re-prefill) instead.
+        try:
+            needs_gdn_state = bool(self._gdn_split_active())
+        except Exception:
+            needs_gdn_state = True
+        if needs_gdn_state and not any(
+            getattr(leaf, "_omlx_kv_tail_span", None) is None
+            for leaf in hit.cache
+        ):
+            # Return the valid entry to the tier: a later turn with the
+            # same prefix can retry it (e.g. after its GDN state becomes
+            # available), and dropping it here would turn every divergent
+            # follow-up into a permanent miss.
+            try:
+                self._exact_resident_cache.put(
+                    list(prompt_tokens[:total]),
+                    hit.cache,
+                    cache_nbytes=hit.cache_nbytes,
+                    durable_tokens=hit.durable_tokens,
+                    terminal_proof=hit.terminal_proof,
+                )
+            except Exception:
+                pass
+            logger.info(
+                "Trimmed stable entry for %s has no retained recurrent "
+                "state; falling back to paged prefix cache",
+                request.request_id,
+            )
+            return False
+        if self.block_aware_cache is None or self.paged_cache_manager is None:
+            return False
+        try:
+            fetch = self.block_aware_cache.fetch_cache(
+                request.request_id,
+                list(prompt_tokens[:durable]),
+                extra_keys=request.vlm_extra_keys_for_cache,
+                extra_key_token_start=(
+                    request.vlm_extra_key_token_start_for_cache
+                ),
+                extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+            )
+        except Exception:
+            return False
+        if not isinstance(fetch, tuple) or len(fetch) != 2:
+            return False
+        block_table, _remaining = fetch
+        if block_table is None or getattr(block_table, "num_tokens", -1) != (
+            durable
+        ):
+            return False
+        # NOTE: deliberately no GDN-split last-block pop here (unlike the
+        # fallthrough below): the retained tail supplies post-boundary
+        # state, so the head must end exactly at the durable boundary.
+        try:
+            bypass_hot_cache = bool(self._bypass_hot_cache_under_pressure())
+        except Exception:
+            bypass_hot_cache = False
+        try:
+            if bypass_hot_cache:
+                reconstructed = self.block_aware_cache.reconstruct_cache(
+                    block_table, promote_to_hot_cache=False
+                )
+            else:
+                reconstructed = self.block_aware_cache.reconstruct_cache(
+                    block_table
+                )
+        except Exception:
+            return False
+        if not reconstructed or len(reconstructed) != len(hit.cache):
+            return False
+        composed: list[Any] = []
+        tail_eval: list[Any] = []
+        try:
+            for head_layer, tail_layer in zip(reconstructed, hit.cache):
+                if type(head_layer) is not type(tail_layer):
+                    return False
+                span = getattr(tail_layer, "_omlx_kv_tail_span", None)
+                if isinstance(span, tuple):
+                    if tuple(span) != (durable, total):
+                        return False
+                    head_keys = getattr(head_layer, "keys", None)
+                    head_values = getattr(head_layer, "values", None)
+                    tail_keys = getattr(tail_layer, "keys", None)
+                    tail_values = getattr(tail_layer, "values", None)
+                    if not all(
+                        isinstance(a, mx.array)
+                        for a in (head_keys, head_values, tail_keys, tail_values)
+                    ):
+                        return False
+                    full_keys = mx.concatenate([head_keys, tail_keys], axis=2)
+                    full_values = mx.concatenate(
+                        [head_values, tail_values], axis=2
+                    )
+                    head_layer.keys = full_keys
+                    head_layer.values = full_values
+                    if hasattr(head_layer, "offset"):
+                        head_layer.offset = total
+                    tail_eval.extend([full_keys, full_values])
+                    composed.append(head_layer)
+                else:
+                    composed.append(tail_layer)
+            mx.eval(*tail_eval)
+        except Exception:
+            return False
+        if not self._resident_cache_matches_token_count(composed, total):
+            logger.warning(
+                "Trimmed exact-resident composition failed token validation "
+                "for %s; falling back to paged prefix cache",
+                request.request_id,
+            )
+            return False
+        request.prompt_cache = composed
+        request.cached_tokens = hit.cached_tokens
+        request.remaining_tokens = prompt_tokens[hit.cached_tokens :]
+        request.shared_prefix_blocks = 0
+        request.block_table = None
+        request._exact_resident_hit = True
+        request._exact_resident_durable_fallback_tokens = hit.durable_tokens
+        leases = getattr(self, "_exact_resident_leases", None)
+        if leases is None:
+            leases = set()
+            self._exact_resident_leases = leases
+        leases.add(request.request_id)
+        logger.info(
+            "Prefix cache restore for %s: source=exact-resident-tail "
+            "cached=%d suffix=%d durable=%d retained=%.2fGiB",
+            request.request_id,
+            hit.cached_tokens,
+            len(request.remaining_tokens),
+            durable,
+            hit.cache_nbytes / 1024**3,
+        )
+        return True
+
     def _restore_exact_resident_cache(self, request: Request) -> bool:
         """Transfer one exact terminal cache directly into ``request``."""
 
@@ -9934,6 +10458,19 @@ class Scheduler:
         if not self._invalidate_resident_pool_with_telemetry(
             hit.cache, phase="lease"
         ):
+            return False
+        if self._is_tail_trimmed_cache(hit.cache):
+            # Head-trimmed entry: compose the paged durable head with the
+            # retained tail instead of installing a second full copy.
+            # Any composition failure falls through to the ordinary
+            # paged/SSD paths below.
+            if self._restore_trimmed_exact_hit(request, hit, prompt_tokens):
+                return True
+            logger.info(
+                "Trimmed exact-resident composition failed closed for %s; "
+                "falling back to paged prefix cache",
+                request.request_id,
+            )
             return False
         if not self._resident_cache_matches_token_count(
             hit.cache, hit.cached_tokens
