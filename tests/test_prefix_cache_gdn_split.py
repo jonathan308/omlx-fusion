@@ -911,3 +911,52 @@ def test_split_restore_retry_budget_is_one_per_block(tmp_path):
     finally:
         boundary.shutdown()
         ssd.close()
+
+
+def test_split_store_without_commit_hook_falls_back_to_embedded(tmp_path):
+    """MTP incremental prefill passes a plain boundary dict, not a store.
+
+    Split layout requires a commit-capable snapshot provider; without one
+    the store must degrade to the embedded layout (restorable pre-split
+    format) instead of persisting zero blocks and leaving every MTP
+    request permanently cache-cold.
+    """
+    cache_dir = tmp_path / "cache"
+    paged = PagedCacheManager(
+        block_size=BLOCK_SIZE,
+        max_blocks=100,
+        model_name="hybrid-model",
+        initial_blocks=100,
+    )
+    ssd = PagedSSDCacheManager(
+        cache_dir=cache_dir,
+        max_size_bytes=100 * 1024**2,
+        expected_model_name="hybrid-model",
+        expected_num_layers=2,
+        expected_block_size=BLOCK_SIZE,
+        expected_layer_cache_types=LAYER_TYPES,
+        gdn_ssd_split_enabled=True,
+        gdn_sidecar_state_dtype="rht_int8",
+    )
+    prefix = BlockAwarePrefixCache(
+        model=_HybridModel(),
+        paged_cache_manager=paged,
+        paged_ssd_cache_manager=ssd,
+        gdn_ssd_split_enabled=True,
+    )
+    request_id = "mtp-incremental-request"
+    tokens = list(range(12))
+    stored = prefix.store_cache(
+        request_id,
+        tokens,
+        _hybrid_extracted(12, 12.0),
+        boundary_snapshots={12: "placeholder-without-commit-hook"},
+    )
+    assert stored is not None and stored.num_tokens == 12
+    hit_table, remaining = prefix.fetch_cache("restore-mtp", tokens)
+    assert hit_table is not None and remaining == []
+    assert hit_table.num_tokens == 12
+    restored = prefix.reconstruct_cache(hit_table)
+    assert restored is not None
+    assert restored[0].state[0].shape[2] == 12
+    prefix.release_cache("restore-mtp")

@@ -952,6 +952,23 @@ class BlockAwarePrefixCache(CacheManager):
             ]
 
         split_gdn_layout = self._gdn_split_layout_supported(layer_cache_types)
+        if split_gdn_layout and not callable(
+            getattr(boundary_snapshots, "commit_gdn_checkpoint", None)
+        ):
+            # Callers without a snapshot store (notably the Qwen3.5 MTP
+            # incremental prefill path, which passes a plain boundary dict)
+            # cannot publish recurrent sidecars.  Stopping at zero blocks
+            # here leaves every such request permanently cache-cold, so
+            # fall back to the embedded GDN layout instead: recurrent state
+            # rides inline in the block payload (the pre-split format the
+            # restore path already reads).  Split resumes automatically
+            # whenever a commit-capable provider is present.
+            logger.info(
+                "Split-GDN store downgraded to embedded layout for %s: "
+                "boundary snapshot provider has no checkpoint commit hook",
+                request_id,
+            )
+            split_gdn_layout = False
 
         # Get or create block table
         block_table = self.paged_cache.get_block_table(request_id)
@@ -3569,49 +3586,53 @@ class BlockAwarePrefixCache(CacheManager):
                         break
 
                 if chosen_idx is None or chosen_payloads is None:
+                    # Blocks stored without sidecars (e.g. MTP incremental
+                    # prefill without a commit-capable snapshot provider)
+                    # carry recurrent state inline; continue to the generic
+                    # embedded path below instead of rejecting the restore.
                     logger.info(
-                        "Split GDN restore found no compatible recurrent checkpoint"
+                        "Split GDN restore found no compatible recurrent "
+                        "checkpoint; falling back to embedded block state"
                     )
-                    return None
-
-                if chosen_idx + 1 < len(all_block_data):
-                    self._gdn_checkpoint_walkbacks += (
-                        len(all_block_data) - chosen_idx - 1
-                    )
-                    for bid in block_table.block_ids[chosen_idx + 1 :]:
-                        self.paged_cache.free_block(bid)
-                    all_block_data = all_block_data[: chosen_idx + 1]
-                    block_table.block_ids = block_table.block_ids[: chosen_idx + 1]
-                    block_table.num_tokens = sum(
-                        self.paged_cache.allocated_blocks[bid].token_count
-                        for bid in block_table.block_ids
-                        if bid in self.paged_cache.allocated_blocks
-                    )
-                    valid_token_count = block_table.num_tokens
-                    all_block_meta_states = all_block_meta_states[: chosen_idx + 1]
-
-                if chosen_idx < len(all_block_meta_states):
-                    last_block_meta_states = all_block_meta_states[chosen_idx]
-
-                # Overlay only Arrays-family layer payloads on the endpoint
-                # block. Sliceable KV layers continue to come exclusively
-                # from the main hot/SSD block chain.
-                endpoint_data = all_block_data[-1]
-                endpoint_meta = list(last_block_meta_states or [])
-                for layer_idx, (cache_data, meta_state) in chosen_payloads.items():
-                    endpoint_data[layer_idx] = cache_data
-                    while len(endpoint_meta) <= layer_idx:
-                        endpoint_meta.append(())
-                    endpoint_meta[layer_idx] = meta_state
-                last_block_meta_states = endpoint_meta
-                if all_block_meta_states:
-                    all_block_meta_states[-1] = endpoint_meta
-                # Publish the per-attempt diagnostic only after the snapshot
-                # has passed structural validation and has been overlaid on
-                # every Arrays-family layer.  A malformed sidecar must not be
-                # observable as a successful restore.
-                self._last_gdn_restore = chosen_diagnostic
-                self._gdn_checkpoint_loads += 1
+                else:
+                    if chosen_idx + 1 < len(all_block_data):
+                        self._gdn_checkpoint_walkbacks += (
+                            len(all_block_data) - chosen_idx - 1
+                        )
+                        for bid in block_table.block_ids[chosen_idx + 1 :]:
+                            self.paged_cache.free_block(bid)
+                        all_block_data = all_block_data[: chosen_idx + 1]
+                        block_table.block_ids = block_table.block_ids[: chosen_idx + 1]
+                        block_table.num_tokens = sum(
+                            self.paged_cache.allocated_blocks[bid].token_count
+                            for bid in block_table.block_ids
+                            if bid in self.paged_cache.allocated_blocks
+                        )
+                        valid_token_count = block_table.num_tokens
+                        all_block_meta_states = all_block_meta_states[: chosen_idx + 1]
+    
+                    if chosen_idx < len(all_block_meta_states):
+                        last_block_meta_states = all_block_meta_states[chosen_idx]
+    
+                    # Overlay only Arrays-family layer payloads on the endpoint
+                    # block. Sliceable KV layers continue to come exclusively
+                    # from the main hot/SSD block chain.
+                    endpoint_data = all_block_data[-1]
+                    endpoint_meta = list(last_block_meta_states or [])
+                    for layer_idx, (cache_data, meta_state) in chosen_payloads.items():
+                        endpoint_data[layer_idx] = cache_data
+                        while len(endpoint_meta) <= layer_idx:
+                            endpoint_meta.append(())
+                        endpoint_meta[layer_idx] = meta_state
+                    last_block_meta_states = endpoint_meta
+                    if all_block_meta_states:
+                        all_block_meta_states[-1] = endpoint_meta
+                    # Publish the per-attempt diagnostic only after the snapshot
+                    # has passed structural validation and has been overlaid on
+                    # every Arrays-family layer.  A malformed sidecar must not be
+                    # observable as a successful restore.
+                    self._last_gdn_restore = chosen_diagnostic
+                    self._gdn_checkpoint_loads += 1
             # Get number of layers from first block
             num_layers = len(all_block_data[0])
             if num_layers == 0:
