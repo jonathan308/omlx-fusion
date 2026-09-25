@@ -23,10 +23,11 @@ def _reference_window_attention(q, k, v, scale, window, sinks):
 
 @pytest.mark.parametrize("prefix", [0, 50, 127, 128, 300])
 @pytest.mark.parametrize("dims", [(64, 64), (192, 128)])
-def test_blocked_sliding_window_matches_masked(prefix, dims):
-    mx.random.seed(prefix)
+@pytest.mark.parametrize("L", [512, 511, 300])
+def test_blocked_sliding_window_matches_masked(prefix, dims, L):
+    mx.random.seed(prefix + L)
     qk_dim, v_dim = dims
-    H, Hk, L, window = 8, 2, 512, 128
+    H, Hk, window = 8, 2, 128
     S = prefix + L
     q = mx.random.normal((1, H, L, qk_dim))
     k = mx.random.normal((1, Hk, S, qk_dim))
@@ -72,7 +73,7 @@ def test_blocked_sliding_window_declines_unsupported_layouts():
     k = mx.zeros((1, 4, 200, 64))
     assert (
         blocked_sliding_window_attention(q, k, k, scale=1.0, window=128) is None
-    )  # not a multiple of the block
+    )  # shorter than two blocks
 
 
 def test_mixed_head_dim_sdpa_matches_unfused():

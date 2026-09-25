@@ -113,7 +113,6 @@ def blocked_sliding_window_attention(
         or window <= 0
         or prefix < 0
         or L < 2 * block
-        or L % block
         or keys.shape[2] != values.shape[2]
     ):
         return None
@@ -124,6 +123,21 @@ def blocked_sliding_window_attention(
         user_mask = mask.reshape(L, S)
     elif mask is not None and mask != "causal":
         return None
+    # Prompt chunks are rarely a multiple of the block (the scheduler keeps the
+    # last prompt token for generation, so 4095 is typical): pad the queries
+    # and the corresponding key/value positions and drop the padded rows at
+    # the end. Padded keys sit after every real query position, so the causal
+    # window never lets a real query see them.
+    L_real = L
+    pad_q = (-L) % block
+    if pad_q:
+        queries = mx.pad(queries, [(0, 0), (0, 0), (0, pad_q), (0, 0)])
+        keys = mx.pad(keys, [(0, 0), (0, 0), (0, pad_q), (0, 0)])
+        values = mx.pad(values, [(0, 0), (0, 0), (0, pad_q), (0, 0)])
+        if user_mask is not None:
+            user_mask = mx.pad(user_mask, [(0, pad_q), (0, pad_q)])
+        L += pad_q
+        S += pad_q
     Hk = keys.shape[1]
     v_dim = values.shape[-1]
     nb = L // block
@@ -164,6 +178,5 @@ def blocked_sliding_window_attention(
     out = mx.fast.scaled_dot_product_attention(
         qb, kb, vb, scale=scale, mask=block_mask, sinks=sinks
     )
-    return out.reshape(B, nb, H, block, v_dim).transpose(0, 2, 1, 3, 4).reshape(
-        B, H, L, v_dim
-    )
+    out = out.reshape(B, nb, H, block, v_dim).transpose(0, 2, 1, 3, 4)
+    return out.reshape(B, H, L, v_dim)[:, :, :L_real]
