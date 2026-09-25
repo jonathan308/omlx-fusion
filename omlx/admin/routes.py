@@ -630,6 +630,7 @@ class GlobalSettingsRequest(BaseModel):
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
     preserve_mid_system_cache: bool | None = None
     latent_metal_keepwarm_enabled: bool | None = None
+    gpu_keep_warm_interval: float | None = None
     qwen4_gdn_decode_wide_proj: bool | None = None
     distributed_inference_enabled: bool | None = None
     max_audio_upload_size: str | None = None
@@ -4711,6 +4712,11 @@ def _global_settings_response(global_settings):
                 "latent_metal_keepwarm_enabled",
                 False,
             ),
+            "gpu_keep_warm_interval": getattr(
+                global_settings.server,
+                "gpu_keep_warm_interval",
+                0.5,
+            ),
             "distributed_inference_enabled": getattr(
                 global_settings.server,
                 "distributed_inference_enabled",
@@ -5045,6 +5051,16 @@ async def update_global_settings(
             "Latent Metal keepwarm %s",
             "enabled" if enabled else "disabled",
         )
+    if request.gpu_keep_warm_interval is not None:
+        from ..server import _server_state
+
+        interval = max(0.0, float(request.gpu_keep_warm_interval))
+        global_settings.server.gpu_keep_warm_interval = interval
+        keep_warm_pool = _server_state.engine_pool
+        if keep_warm_pool is not None:
+            keep_warm_pool.configure_gpu_keep_warm(interval)
+            keep_warm_pool._ensure_gpu_keep_warm_task()
+        runtime_applied.append("gpu_keep_warm_interval")
     if request.distributed_inference_enabled is not None:
         # Route exposure and Bonjour publication are fixed at process startup,
         # so this intentionally takes effect after the normal settings restart.
