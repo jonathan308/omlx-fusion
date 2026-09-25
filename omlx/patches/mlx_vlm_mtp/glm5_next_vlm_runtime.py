@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from omlx.utils.layer_pipeline import LayerPipeline
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -409,6 +410,7 @@ def _patch_model_call(g5_lang: Any) -> None:
 
         # This replaces Glm5NextModel.__call__; preserve its prefill memory policy.
         prefill = h.shape[1] >= 256
+        pipeline = LayerPipeline() if prefill else None
 
         for layer, c in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
@@ -416,9 +418,8 @@ def _patch_model_call(g5_lang: Any) -> None:
                 h = layer(h, mask=mask, cache=c, gdn_sink=gdn_sink)
             else:
                 h = layer(h, mask=mask, cache=c)
-            if prefill:
-                mx.eval(h)
-                mx.clear_cache()
+            if pipeline is not None:
+                pipeline.push(h)
 
         # Collapse the mHC streams first: everything downstream (the final
         # norm, the lm_head, and the nextn head) consumes the ordinary
