@@ -436,12 +436,16 @@ def _fused_shape_model(seed):
     return model
 
 
-def _check_small_model(seed=41):
-    """Fused vs reference logits of a small model, bitwise; returns families used."""
+def _check_small_model(seed=41, prompt_len=2101):
+    """Fused vs reference logits of a small model, bitwise; returns families used.
+
+    Prompts beyond index_topk (2048) run the sparse DSA paths, shorter ones
+    the dense latent attention.
+    """
     language = _language()
     fused_model = _fused_shape_model(seed)
     reference_model = _fused_shape_model(seed)
-    prompt = mx.random.randint(0, 256, (1, 2101)).astype(mx.int32)
+    prompt = mx.random.randint(0, 256, (1, prompt_len)).astype(mx.int32)
     caches = []
     for model in (fused_model, reference_model):
         cache = model.make_cache()
@@ -471,7 +475,9 @@ def _check_small_model(seed=41):
     return {k for k, v in _stats().items() if v > before.get(k, 0)}
 
 
-_ALWAYS_FUSED = {"hc_mix", "moe_gate_up", "moe_down", "dsa_scores", "kda", "router"}
+_ALWAYS_FUSED = {
+    "hc_mix", "moe_gate_up", "moe_down", "dsa_scores", "kda", "router", "latent_attn"
+}
 
 
 def test_small_model_decode_and_verify_logits_are_bitwise_reference():
@@ -481,10 +487,20 @@ def test_small_model_decode_and_verify_logits_are_bitwise_reference():
     assert _ALWAYS_FUSED <= used, used
 
 
+def test_small_model_dense_attention_is_bitwise_reference():
+    from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
+
+    used = _check_small_model(seed=43, prompt_len=300)
+    assert {"hc_mix", "kda", "router", "moe_gate_up"} <= used, used
+    assert ("latent_attn" in used) == dk.nax_available(), used
+
+
 def test_small_model_bitwise_reference_with_nax_tf32():
     if not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
-    out = _run_with_tf32("print(sorted(t._check_small_model()))\n")
+    out = _run_with_tf32(
+        "print(sorted(t._check_small_model() | t._check_small_model(43, 300)))\n"
+    )
     used = set(eval(out.strip().splitlines()[-1]))
     assert _ALWAYS_FUSED <= used, used
     from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
@@ -689,3 +705,66 @@ def test_router_rows_bitwise_reference_with_nax_tf32():
     if "no-nax" in out:
         pytest.skip("this GPU runs fp32 GEMMs without NAX")
     assert "checked" in out
+
+
+# ---------------------------------------------------------------------------
+# Latent MLA attention (64 heads, as in GLM-5.3)
+# ---------------------------------------------------------------------------
+
+
+def _latent_ready():
+    from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
+
+    if not dk.nax_available():
+        pytest.skip("latent attention replicas need NAX GEMMs")
+    return dk
+
+
+@pytest.mark.parametrize("keys", [1, 200, 256, 1029, 2051])
+def test_latent_attention_dense_decode_is_bitwise_sdpa(keys):
+    dk = _latent_ready()
+    mx.random.seed(keys)
+    q = (mx.random.normal((1, 64, 1, 512)) * 0.6).astype(mx.bfloat16)
+    kv = (mx.random.normal((1, 1, keys, 512)) * 0.8).astype(mx.bfloat16)
+    reference = mx.fast.scaled_dot_product_attention(q, kv, kv, scale=256**-0.5)
+    fused = dk.latent_attention(q, kv, 256**-0.5)
+    assert fused is not None
+    assert _mismatches(fused, reference) == 0
+
+
+@pytest.mark.parametrize("width,cache_len", [(2051, 4100), (515, 3000)])
+def test_latent_attention_sparse_decode_is_bitwise_gathered_sdpa(width, cache_len):
+    dk = _latent_ready()
+    mx.random.seed(width)
+    q = (mx.random.normal((1, 64, 1, 512)) * 0.6).astype(mx.bfloat16)
+    kv = (mx.random.normal((1, 1, cache_len, 512)) * 0.8).astype(mx.bfloat16)
+    idx = mx.random.randint(-1, cache_len + 3, (width,)).astype(mx.int32)
+    clamped = mx.clip(idx, 0, cache_len - 1)
+    gathered = mx.take_along_axis(
+        kv, mx.broadcast_to(clamped[None, None, :, None], (1, 1, width, 512)), axis=2
+    )
+    mask = (idx >= 0).reshape(1, 1, 1, width)
+    reference = mx.fast.scaled_dot_product_attention(
+        q, gathered, gathered, scale=256**-0.5, mask=mask
+    )
+    fused = dk.latent_attention(q, kv, 256**-0.5, indices=idx)
+    assert _mismatches(fused, reference) == 0
+
+
+@pytest.mark.parametrize("length", [2, 4, 5, 8])
+@pytest.mark.parametrize("keys", [30, 1030, 2040])
+def test_latent_attention_dense_verify_is_bitwise_masked_sdpa(length, keys):
+    dk = _latent_ready()
+    mx.random.seed(length * keys)
+    q = (mx.random.normal((1, 64, length, 512)) * 0.6).astype(mx.bfloat16)
+    kv = (mx.random.normal((1, 1, keys, 512)) * 0.8).astype(mx.bfloat16)
+    offset = keys - length
+    mask = mx.arange(offset, offset + length)[:, None] >= mx.arange(keys)[None]
+    reference = mx.fast.scaled_dot_product_attention(
+        q, kv, kv, scale=256**-0.5, mask=mask
+    )
+    assert _mismatches(dk.latent_attention(q, kv, 256**-0.5, mask=mask), reference) == 0
+    causal = mx.fast.scaled_dot_product_attention(
+        q, kv, kv, scale=256**-0.5, mask="causal"
+    )
+    assert _mismatches(dk.latent_attention(q, kv, 256**-0.5, causal=True), causal) == 0

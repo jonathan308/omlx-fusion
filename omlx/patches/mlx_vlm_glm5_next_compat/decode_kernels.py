@@ -1733,17 +1733,10 @@ def _atoi(text: str) -> int:
 
 
 @lru_cache(maxsize=None)
-def nax_relaxed_fp32_matmul() -> bool:
-    """True when MLX runs fp32 GEMMs on NAX with relaxed (TF32) precision.
-
-    Mirrors ``metal::is_nax_available()`` (macOS >= 26.2, GPU generation >=
-    17, 18 for phones) and ``env::enable_tf32()`` (MLX_ENABLE_TF32, default
-    1). Kernels that reproduce the NAX product are only valid when both hold.
-    """
+def nax_available() -> bool:
+    """Mirror of ``metal::is_nax_available()``: macOS >= 26.2 and a GPU of
+    generation >= 17 (18 for phones). MLX runs fp16/bf16 GEMMs on NAX then."""
     try:
-        value = os.environ.get("MLX_ENABLE_TF32")
-        if value is not None and _atoi(value) == 0:
-            return False
         if not mx.metal.is_available():
             return False
         arch = str(mx.device_info().get("architecture", ""))
@@ -1754,6 +1747,33 @@ def nax_relaxed_fp32_matmul() -> bool:
         return (int(parts[0]), int(parts[1])) >= (26, 2)
     except Exception:  # noqa: BLE001 - any doubt keeps the reference path
         return False
+
+
+@lru_cache(maxsize=None)
+def nax_relaxed_fp32_matmul() -> bool:
+    """True when MLX runs fp32 GEMMs on NAX with relaxed (TF32) precision:
+    NAX available and ``env::enable_tf32()`` (MLX_ENABLE_TF32, default 1).
+    Kernels that reproduce the fp32 NAX product are only valid then."""
+    value = os.environ.get("MLX_ENABLE_TF32")
+    if value is not None and _atoi(value) == 0:
+        return False
+    return nax_available()
+
+
+def _steel_nax_partition(M: int, N: int, K: int) -> int:
+    """K partition width MLX's steel_matmul uses for a NAX GEMM (K itself
+    when it does not split K): steel_matmul_axpby case 2 and
+    steel_gemm_splitk_axpby_nax."""
+    mn = max(M, N)
+    if not (K >= 3 * mn or (mn <= 1024 and K > 2 * mn)):
+        return K
+    if K <= 1024:
+        return K // 2
+    if K <= 2048:
+        return 1024
+    if K <= 4096:
+        return 2048
+    return 4096
 
 
 @lru_cache(maxsize=None)
@@ -1942,3 +1962,412 @@ def moe_router_rows(
     )
     STATS["router_rows"] += 1
     return indices, scores
+
+
+# ---------------------------------------------------------------------------
+# NoPE latent attention (GLM-5.3 DSA layers, 512-wide latent keys = values)
+# ---------------------------------------------------------------------------
+#
+# mx.fast.scaled_dot_product_attention takes its op fallback for the 512-wide
+# latent head: q * bf16(scale); scores = q @ k^T (NAX GEMM, heads folded into
+# M, split along K per steel_matmul's rules); where(mask, scores,
+# finfo.min); precise softmax (softmax_single_row); out = p @ v (NAX GEMM,
+# split-K for long contexts). The three kernels below replay that: the same
+# bf16 16x32x16 matmul2d chains per K partition (two 16-wide steps per
+# 32-wide k step, zero-padded tails) summed in partition order, the
+# block-softmax reduction tree, and the same rounding points. Sparse decode
+# reads the selected (clamped) latent rows directly instead of gathering.
+_LATENT_SCORES_SOURCE = r"""
+  const int N = dims[0];
+  const int NKV = dims[1];
+  const int PART = dims[2];
+  const int R = dims[3];
+  const ushort lane = thread_index_in_simdgroup;
+  const int p = int(simdgroup_index_in_threadgroup);
+  const int mb = int(threadgroup_position_in_grid.y);
+  const int n0 = int(threadgroup_position_in_grid.x) * 32;
+  const short qid = lane >> 2;
+  const short fm = ((qid & 4) | ((lane >> 1) & 3));
+  const short fn = ((qid & 2) | (lane & 1)) * 4;
+  constexpr auto desc = matmul2d_descriptor(
+      16, 32, 16, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  auto ct_a = op.template get_left_input_cooperative_tensor<T, T, float>();
+  auto ct_b = op.template get_right_input_cooperative_tensor<T, T, float>();
+  auto ct_c = op.template get_destination_cooperative_tensor<
+      metal::remove_addrspace_t<decltype(ct_a)>,
+      metal::remove_addrspace_t<decltype(ct_b)>,
+      float>();
+  for (short i = 0; i < 16; i++) {
+    ct_c[i] = 0.0f;
+  }
+  const T sc = scale[0];
+  // Latent rows feeding this lane's right-operand fragment elements.
+  const device T* krow[2][2];
+  bool kvalid[2][2];
+  for (short hh = 0; hh < 2; hh++) {
+    for (short rr = 0; rr < 2; rr++) {
+      const int n = n0 + hh * 16 + fm + rr * 8;
+      kvalid[hh][rr] = n < N;
+#if GATHER
+      int j = n < N ? int(indices[n]) : 0;
+      j = j < 0 ? 0 : (j > NKV - 1 ? NKV - 1 : j);
+#else
+      const int j = n < N ? n : 0;
+#endif
+      krow[hh][rr] = keys + size_t(j) * D;
+    }
+  }
+  const int k_begin = p * PART;
+  const int k_end = min(k_begin + PART, D);
+  const int chunks = 2 * ((k_end - k_begin + 31) / 32);
+  for (int kc = 0; kc < chunks; kc++) {
+    const int k0 = k_begin + kc * 16;
+    for (short i = 0; i < 8; i++) {
+      const short r = fm + (i >> 2) * 8;
+      const short c = fn + (i & 3);
+      const int k = k0 + c;
+      const bool kin = k < k_end;
+      const bool ain = kin && (mb * 16 + r) < R;
+      const T qv = ain ? q[(mb * 16 + r) * D + k] : static_cast<T>(0.0f);
+      const T qs = sc * qv;
+      ct_a[i] = ain ? qs : static_cast<T>(0.0f);
+      const short rr = i >> 2;
+      ct_b[i] = (kin && kvalid[0][rr]) ? krow[0][rr][k] : static_cast<T>(0.0f);
+      ct_b[8 + i] = (kin && kvalid[1][rr]) ? krow[1][rr][k] : static_cast<T>(0.0f);
+    }
+    op.run(ct_a, ct_b, ct_c);
+  }
+  // NPART is a template argument: a compile-time branch, not #if.
+  threadgroup float parts[NPART][16][32];
+  if (NPART > 1) {
+    for (short i = 0; i < 8; i++) {
+      const short r = fm + (i >> 2) * 8;
+      const short c = fn + (i & 3);
+      parts[p][r][c] = ct_c[i];
+      parts[p][r][16 + c] = ct_c[8 + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (p != 0) {
+      return;
+    }
+  }
+  for (short i = 0; i < 8; i++) {
+    const short r = fm + (i >> 2) * 8;
+    const short c = fn + (i & 3);
+    const int row = mb * 16 + r;
+    for (short hh = 0; hh < 2; hh++) {
+      const int col = n0 + hh * 16 + c;
+      if (col >= N || row >= R) {
+        continue;
+      }
+      float acc;
+      if (NPART > 1) {
+        // gemm_splitk_accum: AccT out = 0; out += C_split[q] in order.
+        acc = 0;
+        for (int q2 = 0; q2 < NPART; q2++) {
+          acc += parts[q2][r][hh * 16 + c];
+        }
+      } else {
+        acc = ct_c[hh * 8 + i];
+      }
+      T s = static_cast<T>(acc);
+#if MASK_KIND == 1
+      const bool keep = int(indices[col]) >= 0;
+#elif MASK_KIND == 2
+      const bool keep = mask[(row % LQ) * N + col];
+#elif MASK_KIND == 3
+      const bool keep = (row % LQ) + (N - LQ) >= col;
+#else
+      const bool keep = true;
+#endif
+      out[size_t(row) * N + col] = keep ? s : as_type<T>(ushort(FINFO_MIN_BITS));
+    }
+  }
+"""
+
+_LATENT_SOFTMAX_SOURCE = r"""
+  const int N = dims[0];
+  const int row = int(threadgroup_position_in_grid.x);
+  const int lid = int(thread_position_in_threadgroup.x);
+  const uint simd_lane_id = thread_index_in_simdgroup;
+  const uint simd_group_id = simdgroup_index_in_threadgroup;
+  constexpr int N_READS = 4;
+  threadgroup float local_max[32];
+  threadgroup float local_normalizer[32];
+  float ld[N_READS];
+  const device T* in = scores + size_t(row) * N + lid * N_READS;
+  if (lid * N_READS + N_READS <= N) {
+    for (int i = 0; i < N_READS; i++) {
+      ld[i] = float(in[i]);
+    }
+  } else {
+    for (int i = 0; i < N_READS; i++) {
+      ld[i] = ((lid * N_READS + i) < N) ? float(in[i]) : Limits<float>::min;
+    }
+  }
+  if (simd_group_id == 0) {
+    local_max[simd_lane_id] = Limits<float>::min;
+    local_normalizer[simd_lane_id] = 0;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float maxval = Limits<float>::finite_min;
+  for (int i = 0; i < N_READS; i++) {
+    maxval = (maxval < ld[i]) ? ld[i] : maxval;
+  }
+  maxval = simd_max(maxval);
+  if (simd_lane_id == 0) {
+    local_max[simd_group_id] = maxval;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_group_id == 0) {
+    maxval = simd_max(local_max[simd_lane_id]);
+    if (simd_lane_id == 0) {
+      local_max[0] = maxval;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  maxval = local_max[0];
+  float normalizer = 0;
+  for (int i = 0; i < N_READS; i++) {
+    float exp_x = fast::exp(ld[i] - maxval);
+    ld[i] = exp_x;
+    normalizer += exp_x;
+  }
+  normalizer = simd_sum(normalizer);
+  if (simd_lane_id == 0) {
+    local_normalizer[simd_group_id] = normalizer;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_group_id == 0) {
+    normalizer = simd_sum(local_normalizer[simd_lane_id]);
+    if (simd_lane_id == 0) {
+      local_normalizer[0] = normalizer;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  normalizer = 1 / local_normalizer[0];
+  device T* o = probs + size_t(row) * N + lid * N_READS;
+  if (lid * N_READS + N_READS <= N) {
+    for (int i = 0; i < N_READS; i++) {
+      o[i] = T(ld[i] * normalizer);
+    }
+  } else {
+    for (int i = 0; i < N_READS; i++) {
+      if ((lid * N_READS + i) < N) {
+        o[i] = T(ld[i] * normalizer);
+      }
+    }
+  }
+"""
+
+_LATENT_VALUES_SOURCE = r"""
+  const int N = dims[0];
+  const int NKV = dims[1];
+  const int PART = dims[2];
+  const int R = dims[3];
+  const ushort lane = thread_index_in_simdgroup;
+  const int p = int(simdgroup_index_in_threadgroup);
+  const int mb = int(threadgroup_position_in_grid.y);
+  const int n0 = int(threadgroup_position_in_grid.x) * 32;
+  const short qid = lane >> 2;
+  const short fm = ((qid & 4) | ((lane >> 1) & 3));
+  const short fn = ((qid & 2) | (lane & 1)) * 4;
+  constexpr auto desc = matmul2d_descriptor(
+      16, 32, 16, false, false, true, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  auto ct_a = op.template get_left_input_cooperative_tensor<T, T, float>();
+  auto ct_b = op.template get_right_input_cooperative_tensor<T, T, float>();
+  auto ct_c = op.template get_destination_cooperative_tensor<
+      metal::remove_addrspace_t<decltype(ct_a)>,
+      metal::remove_addrspace_t<decltype(ct_b)>,
+      float>();
+  for (short i = 0; i < 16; i++) {
+    ct_c[i] = 0.0f;
+  }
+  const int k_begin = p * PART;
+  const int k_end = min(k_begin + PART, N);
+  const int chunks = 2 * ((k_end - k_begin + 31) / 32);
+  for (int kc = 0; kc < chunks; kc++) {
+    const int k0 = k_begin + kc * 16;
+    for (short i = 0; i < 8; i++) {
+      const short r = fm + (i >> 2) * 8;
+      const short c = fn + (i & 3);
+      const int ka = k0 + c;
+      ct_a[i] = (ka < k_end && (mb * 16 + r) < R)
+          ? probs[size_t(mb * 16 + r) * N + ka] : static_cast<T>(0.0f);
+      const int kb = k0 + r;
+      if (kb < k_end) {
+#if GATHER
+        int j = int(indices[kb]);
+        j = j < 0 ? 0 : (j > NKV - 1 ? NKV - 1 : j);
+#else
+        const int j = kb;
+#endif
+        const device T* vrow = vals + size_t(j) * D + n0;
+        ct_b[i] = vrow[c];
+        ct_b[8 + i] = vrow[16 + c];
+      } else {
+        ct_b[i] = static_cast<T>(0.0f);
+        ct_b[8 + i] = static_cast<T>(0.0f);
+      }
+    }
+    op.run(ct_a, ct_b, ct_c);
+  }
+  // NPART is a template argument: a compile-time branch, not #if.
+  threadgroup float parts[NPART][16][32];
+  if (NPART > 1) {
+    for (short i = 0; i < 8; i++) {
+      const short r = fm + (i >> 2) * 8;
+      const short c = fn + (i & 3);
+      parts[p][r][c] = ct_c[i];
+      parts[p][r][16 + c] = ct_c[8 + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (p != 0) {
+      return;
+    }
+  }
+  for (short i = 0; i < 8; i++) {
+    const short r = fm + (i >> 2) * 8;
+    const short c = fn + (i & 3);
+    for (short hh = 0; hh < 2; hh++) {
+      float acc;
+      if (NPART > 1) {
+        // gemm_splitk_accum: AccT out = 0; out += C_split[q] in order.
+        acc = 0;
+        for (int q2 = 0; q2 < NPART; q2++) {
+          acc += parts[q2][r][hh * 16 + c];
+        }
+      } else {
+        acc = ct_c[hh * 8 + i];
+      }
+      if (mb * 16 + r < R) {
+        out[size_t(mb * 16 + r) * D + n0 + hh * 16 + c] = static_cast<T>(acc);
+      }
+    }
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _latent_kernels(gather: bool, mask_kind: int):
+    # Sizes that change every decode step (keys, cache length, K partition)
+    # are runtime `dims`, so one compiled pipeline serves all steps.
+    scores = mx.fast.metal_kernel(
+        name=f"glm5_latent_scores_g{int(gather)}_m{mask_kind}",
+        input_names=["q", "keys", "scale", "dims"]
+        + (["indices"] if gather or mask_kind == 1 else [])
+        + (["mask"] if mask_kind == 2 else []),
+        output_names=["out"],
+        header=_NAX_HEADER,
+        source=_source(_LATENT_SCORES_SOURCE, GATHER=int(gather), MASK_KIND=mask_kind),
+    )
+    softmax = mx.fast.metal_kernel(
+        name="glm5_latent_softmax",
+        input_names=["scores", "dims"],
+        output_names=["probs"],
+        source=_LATENT_SOFTMAX_SOURCE,
+    )
+    values = mx.fast.metal_kernel(
+        name=f"glm5_latent_values_g{int(gather)}",
+        input_names=["probs", "vals", "dims"] + (["indices"] if gather else []),
+        output_names=["out"],
+        header=_NAX_HEADER,
+        source=_source(_LATENT_VALUES_SOURCE, GATHER=int(gather)),
+    )
+    return scores, softmax, values
+
+
+_FINFO_MIN_BITS = {mx.bfloat16: 0xFF7F, mx.float16: 0xFBFF}
+
+
+def latent_attention(
+    q: mx.array,
+    keys: mx.array,
+    scale: float,
+    *,
+    indices: Optional[mx.array] = None,
+    mask: Optional[mx.array] = None,
+    causal: bool = False,
+) -> Optional[mx.array]:
+    """``mx.fast.scaled_dot_product_attention(q, k, k, scale, mask)`` for
+    GLM's latent MLA, bit-identical to its op fallback.
+
+    ``q`` [1, H, L, D] (queries after embed_q), ``keys`` [1, 1, NKV, D] (the
+    latent cache, used as keys and values). ``indices`` [W] selects (L == 1
+    sparse decode: clamped rows, masked where negative); otherwise ``mask``
+    ([L, NKV] bool) or ``causal`` masks the dense keys. Returns [1, H, L, D]
+    or None when not covered.
+    """
+    if q.ndim != 4 or keys.ndim != 4 or q.shape[0] != 1 or keys.shape[:2] != (1, 1):
+        return None
+    _, H, L, D = q.shape
+    NKV = keys.shape[2]
+    if keys.shape[3] != D or keys.dtype != q.dtype or q.dtype not in _FINFO_MIN_BITS:
+        return None
+    if D % 32 or not 1 <= L <= 8 or not nax_available():
+        return None
+    gather = indices is not None
+    if gather:
+        if L != 1 or mask is not None or causal or indices.ndim != 1:
+            return None
+        N = indices.shape[0]
+        mask_kind = 1
+    else:
+        N = NKV
+        if mask is not None:
+            if mask.dtype != mx.bool_ or mask.size != L * N or causal:
+                return None
+            mask_kind = 2
+        else:
+            mask_kind = 3 if causal else 0
+    if N < 1 or N > 4096:  # softmax_single_row range
+        return None
+    R = H * L
+    # steel_matmul NAX routing for scores (M=R, N, K=D) and values (M=R, N=D, K=N).
+    s_part = _steel_nax_partition(R, N, D)
+    v_part = _steel_nax_partition(R, D, N)
+    s_npart = -(-D // s_part)
+    v_npart = -(-N // v_part)
+    if s_npart > 8 or v_npart > 8 or (s_npart > 1 and s_part % 16) or (v_npart > 1 and v_part % 16):
+        return None
+    k_scores, k_softmax, k_values = _latent_kernels(gather, mask_kind)
+    q2 = q.reshape(R, D)
+    kv = keys.reshape(NKV, D)
+    scale_arr = mx.array([scale], dtype=q.dtype)
+    s_inputs = [q2, kv, scale_arr, mx.array([N, NKV, s_part, R], dtype=mx.int32)]
+    if gather:
+        s_inputs.append(indices.astype(mx.int32))
+    if mask_kind == 2:
+        s_inputs.append(mask.reshape(L, N))
+    scores = k_scores(
+        inputs=s_inputs,
+        template=[("T", q.dtype), ("D", D), ("LQ", L), ("NPART", s_npart),
+                  ("FINFO_MIN_BITS", _FINFO_MIN_BITS[q.dtype])],
+        grid=(32 * s_npart * (-(-N // 32)), -(-R // 16), 1),
+        threadgroup=(32 * s_npart, 1, 1),
+        output_shapes=[(R, N)],
+        output_dtypes=[q.dtype],
+    )[0]
+    threads = ((-(-N // 4)) + 31) // 32 * 32
+    probs = k_softmax(
+        inputs=[scores, mx.array([N], dtype=mx.int32)],
+        template=[("T", q.dtype)],
+        grid=(threads * R, 1, 1),
+        threadgroup=(threads, 1, 1),
+        output_shapes=[(R, N)],
+        output_dtypes=[q.dtype],
+    )[0]
+    v_inputs = [probs, kv, mx.array([N, NKV, v_part, R], dtype=mx.int32)]
+    v_inputs += [indices.astype(mx.int32)] if gather else []
+    out = k_values(
+        inputs=v_inputs,
+        template=[("T", q.dtype), ("D", D), ("NPART", v_npart)],
+        grid=(32 * v_npart * (D // 32), -(-R // 16), 1),
+        threadgroup=(32 * v_npart, 1, 1),
+        output_shapes=[(R, D)],
+        output_dtypes=[q.dtype],
+    )[0]
+    STATS["latent_attn"] += 1
+    return out.reshape(1, H, L, D)

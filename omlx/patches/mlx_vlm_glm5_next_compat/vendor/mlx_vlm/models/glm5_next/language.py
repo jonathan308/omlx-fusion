@@ -872,10 +872,21 @@ class Glm5NextSparseAttention(nn.Module):
             if mask is not None:
                 mask = mask[..., dense_rows:, :]
         attn_mask = mask
+        fused_attn = None
+        q_latent = None
         if topk_indices is not None:
             Kv = kv_latent.shape[2]
             valid_sel = topk_indices >= 0
-            if L == 1:
+            if L == 1 and mask is None:
+                # Exact fused latent attention reading the selected rows in
+                # place (no gathered copy of the latent keys).
+                q_latent = self.embed_q(q)
+                fused_attn = self._decode_latent(
+                    q_latent, kv_latent, None, cache, indices=topk_indices[0, 0, 0]
+                )
+            if fused_attn is not None:
+                pass
+            elif L == 1:
                 clamped = mx.clip(topk_indices[:, :, 0, :], 0, Kv - 1)
                 idx = clamped[..., None]
                 kv_latent = mx.take_along_axis(
@@ -957,6 +968,9 @@ class Glm5NextSparseAttention(nn.Module):
                 if mask is not None and mask.dtype == mx.bool_:
                     sparse_mask = sparse_mask & mask
                 attn_mask = sparse_mask
+        elif L <= 8:
+            q_latent = self.embed_q(q)
+            fused_attn = self._decode_latent(q_latent, kv_latent, attn_mask, cache)
 
         if (
             cache is not None
@@ -968,11 +982,16 @@ class Glm5NextSparseAttention(nn.Module):
             if deps:
                 cache[0].keys = mx.depends(cache[0].keys, deps)
 
+        if fused_attn is not None:
+            output = self.unembed_out(fused_attn)
+            output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+            return self._finish(output, out_dense)
+
         # Short verification blocks use the same latent-space attention as
         # decode. Expanding every cached key and value into all heads makes
         # verification cost grow with the complete context length.
         if L <= 8:
-            q = self.embed_q(q)
+            q = q_latent if q_latent is not None else self.embed_q(q)
             k = v = kv_latent
         else:
             k = self.embed_q(kv_latent, transpose=False)
@@ -986,6 +1005,46 @@ class Glm5NextSparseAttention(nn.Module):
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self._finish(output, out_dense)
+
+    def _decode_latent(self, q_latent, kv_latent, attn_mask, cache, indices=None):
+        """Latent-space attention of a decode/verify block (B == 1, L <= 8)
+        on the exact fused kernels (``decode_kernels.latent_attention``).
+
+        Covers the reference ``scaled_dot_product_attention`` call with the
+        embed_q queries ``q_latent`` and the latent cache as keys and values:
+        dense with no mask, a bool mask or "causal", and one-token sparse
+        decode through the selected indices. Returns the output or None.
+        """
+        q = q_latent
+        if (
+            _decode_kernels is None
+            or not _DECODE_FUSION
+            or q.shape[0] != 1
+            or not 1 <= q.shape[2] <= _DECODE_BLOCK
+        ):
+            return None
+        kv_cache = cache[0] if cache is not None and hasattr(cache, "__getitem__") else None
+        if kv_cache is not None and (
+            hasattr(kv_cache, "bits") or "TurboQuant" in type(kv_cache).__name__
+        ):
+            return None
+        mask_arr, causal = None, False
+        if isinstance(attn_mask, str):
+            if attn_mask != "causal":
+                return None
+            causal = True
+        elif attn_mask is not None:
+            if attn_mask.dtype != mx.bool_:
+                return None
+            mask_arr = attn_mask
+        return _decode_kernels.latent_attention(
+            q_latent,
+            kv_latent,
+            self.scale,
+            indices=indices,
+            mask=mask_arr,
+            causal=causal,
+        )
 
     def _gathered_attention(self, q, kv_latent, topk_indices):
         """Latent-space gather for short query blocks; returns pre-o_proj flat."""
