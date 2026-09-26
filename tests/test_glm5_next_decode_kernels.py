@@ -771,7 +771,7 @@ def test_latent_attention_sparse_decode_is_bitwise_gathered_sdpa(width, cache_le
     assert _mismatches(fused, reference) == 0
 
 
-@pytest.mark.parametrize("length", [2, 4, 5, 8])
+@pytest.mark.parametrize("length", [2, 3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize("keys", [30, 1030, 2040])
 def test_latent_attention_dense_verify_is_bitwise_masked_sdpa(length, keys):
     dk = _latent_ready()
@@ -889,3 +889,104 @@ def test_disabled_families_take_the_reference_path(monkeypatch):
     assert _stats()["multi_qmv"] == before
     for layer, out in zip(layers, outs):
         assert _mismatches(out, language.linear_forward(layer, x)) == 0
+
+
+@pytest.mark.parametrize("prefetch", [1, 3, 8, 16])
+def test_latent_attention_prefetch_depths_are_bitwise_sdpa(prefetch, monkeypatch):
+    dk = _latent_ready()
+    monkeypatch.setattr(dk, "_LATENT_PREFETCH", prefetch)
+    mx.random.seed(prefetch)
+    q = (mx.random.normal((1, 64, 1, 512)) * 0.6).astype(mx.bfloat16)
+    kv = (mx.random.normal((1, 1, 3000, 512)) * 0.8).astype(mx.bfloat16)
+    for width in (2051, 100):
+        idx = mx.random.randint(-1, 3003, (width,)).astype(mx.int32)
+        clamped = mx.clip(idx, 0, 2999)
+        gathered = mx.take_along_axis(
+            kv, mx.broadcast_to(clamped[None, None, :, None], (1, 1, width, 512)), axis=2
+        )
+        reference = mx.fast.scaled_dot_product_attention(
+            q, gathered, gathered, scale=256**-0.5, mask=(idx >= 0).reshape(1, 1, 1, width)
+        )
+        fused = dk.latent_attention(q, kv, 256**-0.5, indices=idx)
+        assert _mismatches(fused, reference) == 0, width
+    q4 = (mx.random.normal((1, 64, 4, 512)) * 0.6).astype(mx.bfloat16)
+    dense = kv[:, :, :1500]
+    causal = mx.fast.scaled_dot_product_attention(
+        q4, dense, dense, scale=256**-0.5, mask="causal"
+    )
+    assert _mismatches(dk.latent_attention(q4, dense, 256**-0.5, causal=True), causal) == 0
+
+
+def _latent_production_cases():
+    """Every compile-time latent configuration GLM-5.3 decode/verify uses."""
+    mx.random.seed(21)
+    kv = (mx.random.normal((1, 1, 4100, 512)) * 0.8).astype(mx.bfloat16)
+    q1 = (mx.random.normal((1, 64, 1, 512)) * 0.6).astype(mx.bfloat16)
+    cases = []
+    for width in (2051, 100):
+        idx = mx.random.randint(-1, 4103, (width,)).astype(mx.int32)
+        rows = mx.clip(idx, 0, 4099)[None, None, :, None]
+        g = mx.take_along_axis(kv, mx.broadcast_to(rows, (1, 1, width, 512)), axis=2)
+        mask = (idx >= 0).reshape(1, 1, 1, width)
+        cases.append((
+            f"sparse {width}",
+            mx.fast.scaled_dot_product_attention(q1, g, g, scale=256**-0.5, mask=mask),
+            dict(q=q1, keys=kv, indices=idx),
+        ))
+    for keys in (100, 1000, 1500):
+        d = kv[:, :, :keys]
+        cases.append((
+            f"dense {keys}",
+            mx.fast.scaled_dot_product_attention(q1, d, d, scale=256**-0.5),
+            dict(q=q1, keys=d),
+        ))
+    for length in range(2, 9):
+        qL = (mx.random.normal((1, 64, length, 512)) * 0.6).astype(mx.bfloat16)
+        for keys in (120, 1500):
+            d = kv[:, :, :keys]
+            m = mx.arange(keys - length, keys)[:, None] >= mx.arange(keys)[None]
+            cases.append((
+                f"verify {length}x{keys} mask",
+                mx.fast.scaled_dot_product_attention(qL, d, d, scale=256**-0.5, mask=m),
+                dict(q=qL, keys=d, mask=m),
+            ))
+            cases.append((
+                f"verify {length}x{keys} causal",
+                mx.fast.scaled_dot_product_attention(qL, d, d, scale=256**-0.5, mask="causal"),
+                dict(q=qL, keys=d, causal=True),
+            ))
+    return cases
+
+
+def test_latent_attention_production_configurations_are_bitwise_sdpa(monkeypatch):
+    dk = _latent_ready()
+    monkeypatch.setattr(dk, "_LATENT_CHECKED", {})
+    for name, reference, kwargs in _latent_production_cases():
+        q, keys = kwargs.pop("q"), kwargs.pop("keys")
+        before = _stats()["latent_attn"]
+        fused = dk.latent_attention(q, keys, 256**-0.5, **kwargs)
+        assert fused is not None and _stats()["latent_attn"] == before + 1, name
+        assert _mismatches(fused, reference) == 0, name
+    assert all(dk._LATENT_CHECKED.values())
+
+
+def test_latent_attention_first_use_check_rejects_wrong_kernels(monkeypatch):
+    dk = _latent_ready()
+    monkeypatch.setattr(dk, "_LATENT_CHECKED", {})
+    real = dk._latent_kernels
+
+    def broken(gather, mask_kind):
+        scores, softmax, values = real(gather, mask_kind)
+
+        def wrong_values(**kw):
+            return [o + 1 for o in values(**kw)]
+
+        return scores, softmax, wrong_values
+
+    monkeypatch.setattr(dk, "_latent_kernels", broken)
+    mx.random.seed(2)
+    q = (mx.random.normal((1, 64, 1, 512)) * 0.6).astype(mx.bfloat16)
+    kv = (mx.random.normal((1, 1, 300, 512)) * 0.8).astype(mx.bfloat16)
+    assert dk.latent_attention(q, kv, 256**-0.5) is None
+    assert dk.latent_attention(q, kv, 256**-0.5) is None  # cached verdict
+    assert list(dk._LATENT_CHECKED.values()) == [False]

@@ -2041,11 +2041,12 @@ _LATENT_SCORES_SOURCE = r"""
     ct_c[i] = 0.0f;
   }
   const T sc = scale[0];
-  // Latent rows feeding this lane's right-operand fragment elements.
-  const device T* krow[2][2];
+  // Latent rows feeding this lane's right-operand fragment elements
+  // (element offsets; invalid columns read row 0 and are zeroed).
+  uint koff[2][2];
   bool kvalid[2][2];
-  for (short hh = 0; hh < 2; hh++) {
-    for (short rr = 0; rr < 2; rr++) {
+  _Pragma("unroll") for (short hh = 0; hh < 2; hh++) {
+    _Pragma("unroll") for (short rr = 0; rr < 2; rr++) {
       const int n = n0 + hh * 16 + fm + rr * 8;
       kvalid[hh][rr] = n < N;
 #if GATHER
@@ -2054,29 +2055,60 @@ _LATENT_SCORES_SOURCE = r"""
 #else
       const int j = n < N ? n : 0;
 #endif
-      krow[hh][rr] = keys + size_t(j) * D;
+      koff[hh][rr] = uint(j) * uint(D);
     }
   }
+  const int row0 = mb * 16 + fm;
+  const bool rok0 = row0 < R;
+  const bool rok1 = row0 + 8 < R;
+  const device T* qrow0 = q + size_t(rok0 ? row0 : 0) * D;
+  const device T* qrow1 = q + size_t(rok1 ? row0 + 8 : 0) * D;
   const int k_begin = p * PART;
   const int k_end = min(k_begin + PART, D);
   const int chunks = 2 * ((k_end - k_begin + 31) / 32);
-  for (int kc = 0; kc < chunks; kc++) {
-    const int k0 = k_begin + kc * 16;
-    for (short i = 0; i < 8; i++) {
-      const short r = fm + (i >> 2) * 8;
-      const short c = fn + (i & 3);
-      const int k = k0 + c;
-      const bool kin = k < k_end;
-      const bool ain = kin && (mb * 16 + r) < R;
-      const T qv = ain ? q[(mb * 16 + r) * D + k] : static_cast<T>(0.0f);
-      const T qs = sc * qv;
-      ct_a[i] = ain ? qs : static_cast<T>(0.0f);
-      const short rr = i >> 2;
-      ct_b[i] = (kin && kvalid[0][rr]) ? krow[0][rr][k] : static_cast<T>(0.0f);
-      ct_b[8 + i] = (kin && kvalid[1][rr]) ? krow[1][rr][k] : static_cast<T>(0.0f);
-    }
-    op.run(ct_a, ct_b, ct_c);
+  // Operands of the next G chunks are loaded ahead of the (accumulator
+  // dependent) matmul chain; the chain itself is unchanged.
+  T abuf[G][8];
+  T bbuf[G][16];
+#define GLM5_SCORES_LOAD(kc, s)                                              \
+  {                                                                          \
+    const int k0 = k_begin + (kc) * 16 + fn;                                 \
+    _Pragma("unroll") for (short e = 0; e < 4; e++) {                        \
+      const int k = k0 + e;                                                  \
+      const bool kin = k < k_end;                                            \
+      const T q0 = (kin && rok0) ? qrow0[k] : static_cast<T>(0.0f);          \
+      const T q1 = (kin && rok1) ? qrow1[k] : static_cast<T>(0.0f);          \
+      const T s0 = sc * q0;                                                  \
+      const T s1 = sc * q1;                                                  \
+      abuf[s][e] = (kin && rok0) ? s0 : static_cast<T>(0.0f);                \
+      abuf[s][4 + e] = (kin && rok1) ? s1 : static_cast<T>(0.0f);            \
+      _Pragma("unroll") for (short rr = 0; rr < 2; rr++) {                   \
+        bbuf[s][rr * 4 + e] = (kin && kvalid[0][rr])                         \
+            ? keys[koff[0][rr] + uint(k)] : static_cast<T>(0.0f);            \
+        bbuf[s][8 + rr * 4 + e] = (kin && kvalid[1][rr])                     \
+            ? keys[koff[1][rr] + uint(k)] : static_cast<T>(0.0f);            \
+      }                                                                      \
+    }                                                                        \
   }
+  _Pragma("unroll") for (short s = 0; s < G; s++) {
+    if (s < chunks) GLM5_SCORES_LOAD(s, s);
+  }
+  for (int kc0 = 0; kc0 < chunks; kc0 += G) {
+    _Pragma("unroll") for (short s = 0; s < G; s++) {
+      const int kc = kc0 + s;
+      if (kc < chunks) {
+        _Pragma("unroll") for (short i = 0; i < 8; i++) {
+          ct_a[i] = abuf[s][i];
+        }
+        _Pragma("unroll") for (short i = 0; i < 16; i++) {
+          ct_b[i] = bbuf[s][i];
+        }
+        if (kc + G < chunks) GLM5_SCORES_LOAD(kc + G, s);
+        op.run(ct_a, ct_b, ct_c);
+      }
+    }
+  }
+#undef GLM5_SCORES_LOAD
   // NPART is a template argument: a compile-time branch, not #if.
   threadgroup float parts[NPART][16][32];
   if (NPART > 1) {
@@ -2212,6 +2244,19 @@ _LATENT_VALUES_SOURCE = r"""
   const short qid = lane >> 2;
   const short fm = ((qid & 4) | ((lane >> 1) & 3));
   const short fn = ((qid & 2) | (lane & 1)) * 4;
+#if GATHER
+  // Selected rows (clamped like the reference gather), staged once so the
+  // operand loads below do not wait on an index load.
+  threadgroup int sel[4096];
+  for (int t = int(thread_position_in_threadgroup.x); t < N; t += 32 * NPART) {
+    int j = int(indices[t]);
+    sel[t] = j < 0 ? 0 : (j > NKV - 1 ? NKV - 1 : j);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+#define GLM5_VROW(kb) sel[kb]
+#else
+#define GLM5_VROW(kb) (kb)
+#endif
   constexpr auto desc = matmul2d_descriptor(
       16, 32, 16, false, false, true, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<desc, execution_simdgroup> op;
@@ -2224,35 +2269,56 @@ _LATENT_VALUES_SOURCE = r"""
   for (short i = 0; i < 16; i++) {
     ct_c[i] = 0.0f;
   }
+  const int row0 = mb * 16 + fm;
+  const bool rok0 = row0 < R;
+  const bool rok1 = row0 + 8 < R;
+  const device T* prow0 = probs + size_t(rok0 ? row0 : 0) * N;
+  const device T* prow1 = probs + size_t(rok1 ? row0 + 8 : 0) * N;
   const int k_begin = p * PART;
   const int k_end = min(k_begin + PART, N);
   const int chunks = 2 * ((k_end - k_begin + 31) / 32);
-  for (int kc = 0; kc < chunks; kc++) {
-    const int k0 = k_begin + kc * 16;
-    for (short i = 0; i < 8; i++) {
-      const short r = fm + (i >> 2) * 8;
-      const short c = fn + (i & 3);
-      const int ka = k0 + c;
-      ct_a[i] = (ka < k_end && (mb * 16 + r) < R)
-          ? probs[size_t(mb * 16 + r) * N + ka] : static_cast<T>(0.0f);
-      const int kb = k0 + r;
-      if (kb < k_end) {
-#if GATHER
-        int j = int(indices[kb]);
-        j = j < 0 ? 0 : (j > NKV - 1 ? NKV - 1 : j);
-#else
-        const int j = kb;
-#endif
-        const device T* vrow = vals + size_t(j) * D + n0;
-        ct_b[i] = vrow[c];
-        ct_b[8 + i] = vrow[16 + c];
-      } else {
-        ct_b[i] = static_cast<T>(0.0f);
-        ct_b[8 + i] = static_cast<T>(0.0f);
+  // Operands of the next G chunks are loaded ahead of the (accumulator
+  // dependent) matmul chain; the chain itself is unchanged.
+  T abuf[G][8];
+  T bbuf[G][16];
+#define GLM5_VALUES_LOAD(kc, s)                                              \
+  {                                                                          \
+    const int k0 = k_begin + (kc) * 16;                                      \
+    _Pragma("unroll") for (short e = 0; e < 4; e++) {                        \
+      const int ka = k0 + fn + e;                                            \
+      abuf[s][e] = (rok0 && ka < k_end) ? prow0[ka] : static_cast<T>(0.0f);  \
+      abuf[s][4 + e] = (rok1 && ka < k_end) ? prow1[ka] : static_cast<T>(0.0f); \
+    }                                                                        \
+    _Pragma("unroll") for (short rr = 0; rr < 2; rr++) {                     \
+      const int kb = k0 + fm + rr * 8;                                       \
+      const bool ok = kb < k_end;                                            \
+      const device T* vrow = vals + size_t(ok ? GLM5_VROW(kb) : 0) * D + n0 + fn; \
+      _Pragma("unroll") for (short e = 0; e < 4; e++) {                      \
+        bbuf[s][rr * 4 + e] = ok ? vrow[e] : static_cast<T>(0.0f);           \
+        bbuf[s][8 + rr * 4 + e] = ok ? vrow[16 + e] : static_cast<T>(0.0f);  \
+      }                                                                      \
+    }                                                                        \
+  }
+  _Pragma("unroll") for (short s = 0; s < G; s++) {
+    if (s < chunks) GLM5_VALUES_LOAD(s, s);
+  }
+  for (int kc0 = 0; kc0 < chunks; kc0 += G) {
+    _Pragma("unroll") for (short s = 0; s < G; s++) {
+      const int kc = kc0 + s;
+      if (kc < chunks) {
+        _Pragma("unroll") for (short i = 0; i < 8; i++) {
+          ct_a[i] = abuf[s][i];
+        }
+        _Pragma("unroll") for (short i = 0; i < 16; i++) {
+          ct_b[i] = bbuf[s][i];
+        }
+        if (kc + G < chunks) GLM5_VALUES_LOAD(kc + G, s);
+        op.run(ct_a, ct_b, ct_c);
       }
     }
-    op.run(ct_a, ct_b, ct_c);
   }
+#undef GLM5_VALUES_LOAD
+#undef GLM5_VROW
   // NPART is a template argument: a compile-time branch, not #if.
   threadgroup float parts[NPART][16][32];
   if (NPART > 1) {
@@ -2319,6 +2385,8 @@ def _latent_kernels(gather: bool, mask_kind: int):
 
 
 _FINFO_MIN_BITS = {mx.bfloat16: 0xFF7F, mx.float16: 0xFBFF}
+# Operand chunks (16 keys / latent dims each) loaded ahead of the NAX chain.
+_LATENT_PREFETCH = int(os.environ.get("OMLX_GLM5_LATENT_PREFETCH", "8"))
 
 
 def latent_attention(
@@ -2385,7 +2453,7 @@ def latent_attention(
     scores = k_scores(
         inputs=s_inputs,
         template=[("T", q.dtype), ("D", D), ("LQ", L), ("NPART", s_npart),
-                  ("FINFO_MIN_BITS", _FINFO_MIN_BITS[q.dtype])],
+                  ("FINFO_MIN_BITS", _FINFO_MIN_BITS[q.dtype]), ("G", _LATENT_PREFETCH)],
         grid=(32 * s_npart * (-(-N // 32)), -(-R // 16), 1),
         threadgroup=(32 * s_npart, 1, 1),
         output_shapes=[(R, N)],
@@ -2404,14 +2472,54 @@ def latent_attention(
     v_inputs += [indices.astype(mx.int32)] if gather else []
     out = k_values(
         inputs=v_inputs,
-        template=[("T", q.dtype), ("D", D), ("NPART", v_npart)],
+        template=[("T", q.dtype), ("D", D), ("NPART", v_npart), ("G", _LATENT_PREFETCH)],
         grid=(32 * v_npart * (D // 32), -(-R // 16), 1),
         threadgroup=(32 * v_npart, 1, 1),
         output_shapes=[(R, D)],
         output_dtypes=[q.dtype],
     )[0]
+    out = out.reshape(1, H, L, D)
+    key = (gather, mask_kind, q.dtype, D, L, s_npart, v_npart, _LATENT_PREFETCH)
+    if not _latent_verified(key, out, q, keys, scale, indices, mask, causal):
+        return None
     STATS["latent_attn"] += 1
-    return out.reshape(1, H, L, D)
+    return out
+
+
+# Compile-time configurations of the latent kernels checked against the
+# reference on their first call (the Metal compiler has produced wrong code
+# for some unrolled NAX loops, e.g. a 4-deep prefetch ring).
+_LATENT_CHECKED: dict = {}
+
+
+def _latent_verified(key, out, q, keys, scale, indices, mask, causal) -> bool:
+    ok = _LATENT_CHECKED.get(key)
+    if ok is not None:
+        return ok
+    if indices is not None:
+        width = indices.shape[0]
+        rows = mx.clip(indices, 0, keys.shape[2] - 1)
+        k = mx.take_along_axis(
+            keys, mx.broadcast_to(rows[None, None, :, None], (1, 1, width, keys.shape[3])), axis=2
+        )
+        ref_mask = (indices >= 0).reshape(1, 1, 1, width)
+    else:
+        k = keys
+        ref_mask = "causal" if causal else (
+            None if mask is None else mask.reshape(q.shape[2], keys.shape[2])
+        )
+    ref = mx.fast.scaled_dot_product_attention(q, k, k, scale=scale, mask=ref_mask)
+    bits = mx.uint16 if out.dtype.size == 2 else mx.uint32
+    ok = bool(mx.array_equal(out.view(bits), ref.view(bits)).item())
+    _LATENT_CHECKED[key] = ok
+    if not ok:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "GLM-5.3 fused latent attention %s differs from the reference; "
+            "using the reference path for it", key,
+        )
+    return ok
 
 
 # Sparse verify blocks (2..8 tokens, each with its own selected keys): the
