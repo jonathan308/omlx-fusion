@@ -486,7 +486,9 @@ def test_small_model_bitwise_reference_with_nax_tf32():
     assert _ALWAYS_FUSED <= used, used
     from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
 
-    if "hc_expand" not in used:
+    for family in ("hc_expand", "router_rows"):
+        if family in used:
+            continue
         # Only acceptable where MLX itself would not use NAX relaxed fp32.
         assert not _run_with_tf32(
             "from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk\n"
@@ -641,3 +643,46 @@ def test_router_declines_other_gemv_configurations():
     # K >= 16 * E selects MLX's split-K (bn=8) gemv, which is not replicated.
     x = mx.zeros((1, 1024), mx.bfloat16)
     assert dk.moe_router(x, mx.zeros((16, 1024)), mx.zeros((16,)), 8, 2.5, True) is None
+
+
+def _check_router_rows(experts=288, hidden=4096):
+    """Verify-block routers (2..8 rows), bitwise; returns engaged calls."""
+    language = _language()
+    gate = _router(experts, hidden, seed=7)
+    engaged = 0
+    for trial, rows in enumerate([2, 3, 4, 5, 8, 4]):
+        x = (mx.random.normal((1, rows, hidden)) * (0.3 + trial)).astype(mx.bfloat16)
+        before = _stats()["router_rows"]
+        indices, scores = gate(x)
+        engaged += _stats()["router_rows"] - before
+        language._DECODE_FUSION = False
+        try:
+            ref_indices, ref_scores = gate(x)
+        finally:
+            language._DECODE_FUSION = True
+        assert mx.array_equal(indices, ref_indices).item(), rows
+        assert _mismatches(scores, ref_scores) == 0, rows
+    return engaged
+
+
+def test_router_rows_declines_without_nax_tf32():
+    from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
+
+    if dk.nax_relaxed_fp32_matmul():
+        pytest.skip("TF32 NAX matmuls are enabled in this session")
+    assert _check_router_rows() == 0
+
+
+def test_router_rows_bitwise_reference_with_nax_tf32():
+    out = _run_with_tf32(
+        "from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk\n"
+        "if dk.nax_relaxed_fp32_matmul():\n"
+        "    assert t._check_router_rows() == 6\n"
+        "    assert t._check_router_rows(128, 1024) == 6\n"
+        "    print('checked')\n"
+        "else:\n"
+        "    print('no-nax')\n"
+    )
+    if "no-nax" in out:
+        pytest.skip("this GPU runs fp32 GEMMs without NAX")
+    assert "checked" in out

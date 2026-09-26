@@ -615,6 +615,91 @@ _HC_MIX_SOURCE = r"""
 """
 
 
+# One mix row per 256-thread threadgroup (MIX threadgroups per token instead
+# of MIX / 4 threadgroups of 1024 threads): the same rms_looped reduction tree,
+# with each real simdgroup playing four of the 32 virtual 1024-thread
+# simdgroups, and the same 8-simdgroup gemv split and sequential final sum.
+_HC_MIX1_SOURCE = r"""
+  const uint lid = thread_position_in_threadgroup.x;
+  const uint simd_lid = thread_index_in_simdgroup;
+  const uint simd_gid = simdgroup_index_in_threadgroup;
+  const int tok = int(threadgroup_position_in_grid.y);
+  const int row = int(threadgroup_position_in_grid.x);
+  constexpr int KSZ = HCD;
+  const device T* xr = x + size_t(tok) * KSZ;
+
+  threadgroup float local_inv_mean[1];
+  threadgroup float local_sums[32];
+  for (int v = 0; v < 4; v++) {
+    const uint vt = uint(v) * 256 + lid;
+    float acc = 0;
+    for (uint r = 0; r < uint(KSZ); r += 1024 * 4) {
+      for (int i = 0; i < 4; i++) {
+        float xi = static_cast<float>(xr[r + vt * 4 + i]);
+        acc += xi * xi;
+      }
+    }
+    acc = simd_sum(acc);
+    if (simd_lid == 0) {
+      local_sums[v * 8 + int(simd_gid)] = acc;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    float acc = simd_sum(local_sums[simd_lid]);
+    if (simd_lid == 0) {
+      local_inv_mean[0] = metal::precise::rsqrt(acc / KSZ + eps[0]);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = local_inv_mean[0];
+
+  threadgroup float partial[8];
+  const int sgN = int(simd_gid);
+  float result = 0;
+  const device float* mrow = fn + size_t(row) * KSZ;
+  int bn = (32 * sgN + int(simd_lid)) * 4;
+  for (int i = 0; i < KSZ / 1024; ++i) {
+    float v_coeff[4];
+    float inter[4];
+    for (int tn = 0; tn < 4; tn++) {
+      v_coeff[tn] = static_cast<float>(xr[bn + tn]) * inv;
+    }
+    for (int tn = 0; tn < 4; tn++) {
+      inter[tn] = mrow[bn + tn];
+    }
+    for (int tn = 0; tn < 4; tn++) {
+      result += inter[tn] * v_coeff[tn];
+    }
+    bn += 1024;
+  }
+  for (ushort sn = 16; sn >= 1; sn >>= 1) {
+    result += simd_shuffle_down(result, sn);
+  }
+  if (simd_lid == 0) {
+    partial[sgN] = result;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sgN == 0 && simd_lid == 0) {
+    float total = partial[0];
+    for (int s = 1; s < 8; s++) {
+      total += partial[s];
+    }
+    mixes[size_t(tok) * MIX + row] = total;
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _hc_mix1_kernel():
+    return mx.fast.metal_kernel(
+        name="glm5_hc_mix_rms_gemv_row",
+        input_names=["x", "fn", "eps"],
+        output_names=["mixes"],
+        source=_HC_MIX1_SOURCE,
+    )
+
+
 @lru_cache(maxsize=None)
 def _hc_mix_kernel():
     return mx.fast.metal_kernel(
@@ -625,7 +710,7 @@ def _hc_mix_kernel():
     )
 
 
-def hc_mix(x: mx.array, fn: mx.array, eps: float, *, rows_per_tg: int = 4) -> Optional[mx.array]:
+def hc_mix(x: mx.array, fn: mx.array, eps: float, *, rows_per_tg: int = 0) -> Optional[mx.array]:
     """``(rms_norm(x.astype(f32).flatten(-2)) @ fn.T)`` per token, M=1 exact.
 
     ``x`` is [B, L, HC, D] bf16/fp16, ``fn`` [MIX, HC*D] float32.  Returns
@@ -641,8 +726,17 @@ def hc_mix(x: mx.array, fn: mx.array, eps: float, *, rows_per_tg: int = 4) -> Op
         return None
     if x.dtype not in (mx.bfloat16, mx.float16, mx.float32):
         return None
-    tiles = (mix + rows_per_tg - 1) // rows_per_tg
     STATS["hc_mix"] += 1
+    if rows_per_tg == 0:
+        return _hc_mix1_kernel()(
+            inputs=[x, fn, mx.array([eps], dtype=mx.float32)],
+            template=[("T", x.dtype), ("HCD", K), ("MIX", mix)],
+            grid=(256 * mix, B * L, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(B, L, mix)],
+            output_dtypes=[mx.float32],
+        )[0]
+    tiles = (mix + rows_per_tg - 1) // rows_per_tg
     out = _hc_mix_kernel()(
         inputs=[x, fn, mx.array([eps], dtype=mx.float32)],
         template=[("T", x.dtype), ("HCD", K), ("MIX", mix), ("ROWS_PER_TG", rows_per_tg)],
@@ -1240,13 +1334,19 @@ _ROUTER_LOGITS_SOURCE = r"""
   const uint lane = thread_index_in_simdgroup;
   const uint sg = simdgroup_index_in_threadgroup;
   const int tok = int(threadgroup_position_in_grid.y);
-  const int out_row = (int(threadgroup_position_in_grid.x) * 4 + int(sg)) * 4;
+  // One row per simdgroup: MLX's gemv gives each thread TM = 4 rows, but
+  // every row's per-lane products and shuffle ladder are independent of TM.
+  constexpr int RPS = ROWS_PER_SIMD;
+  const int out_row = (int(threadgroup_position_in_grid.x) * 4 + int(sg)) * RPS;
   if (out_row >= E) {
     return;
   }
   const device float* mat = w + size_t(out_row) * K;
   const device T* xv = x + size_t(tok) * K;
-  float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float result[RPS];
+  for (int tm = 0; tm < RPS; tm++) {
+    result[tm] = 0.0f;
+  }
   int bn = int(lane) * 4;
   for (int i = 0; i < K / 128; ++i) {
     float v_coeff[4];
@@ -1254,7 +1354,7 @@ _ROUTER_LOGITS_SOURCE = r"""
       v_coeff[tn] = static_cast<float>(xv[bn + tn]);
     }
     int mat_offset = 0;
-    for (int tm = 0; tm < 4; tm++) {
+    for (int tm = 0; tm < RPS; tm++) {
       float inter[4];
       for (int tn = 0; tn < 4; tn++) {
         inter[tn] = mat[mat_offset + bn + tn];
@@ -1266,13 +1366,13 @@ _ROUTER_LOGITS_SOURCE = r"""
     }
     bn += 128;
   }
-  for (int tm = 0; tm < 4; tm++) {
+  for (int tm = 0; tm < RPS; tm++) {
     for (ushort sn = 16; sn >= 1; sn >>= 1) {
       result[tm] += simd_shuffle_down(result[tm], sn);
     }
   }
   if (lane == 0) {
-    for (int tm = 0; tm < 4; tm++) {
+    for (int tm = 0; tm < RPS; tm++) {
       const int e = out_row + tm;
       float sgm = glm_sigmoid<float>(result[tm]);
       float biased = sgm + bias[e];
@@ -1283,47 +1383,43 @@ _ROUTER_LOGITS_SOURCE = r"""
 """
 
 _ROUTER_SELECT_SOURCE = r"""
-  const uint lane = thread_index_in_simdgroup;
+  // One thread per expert: its rank in argpartition's order (a stable
+  // ascending sort of -biased: descending values, ties to the lower index,
+  // NaNs last in index order). Ranks < TOPK are the selected routes.
   const int tok = int(threadgroup_position_in_grid.x);
-  constexpr int PER = (E + 31) / 32;
+  const int e = int(thread_position_in_threadgroup.x);
   const device float* bz = biased + size_t(tok) * E;
   const device float* sz = sig + size_t(tok) * E;
-  float vals[PER];
-  bool taken[PER];
-  for (int j = 0; j < PER; j++) {
-    const int e = j * 32 + int(lane);
-    vals[j] = e < E ? bz[e] : -INFINITY;
-    taken[j] = e >= E;
+  threadgroup float vals[E];
+  threadgroup int picked[TOPK];
+  if (e < E) {
+    vals[e] = bz[e];
   }
-  int picked[TOPK];
-  for (int r = 0; r < TOPK; r++) {
-    // Best remaining candidate of this lane: highest value, lowest index.
-    float best = -INFINITY;
-    int best_e = 0x7fffffff;
-    for (int j = 0; j < PER; j++) {
-      const int e = j * 32 + int(lane);
-      if (!taken[j] && !isnan(vals[j]) &&
-          (best_e == 0x7fffffff || vals[j] > best || (vals[j] == best && e < best_e))) {
-        best = vals[j];
-        best_e = e;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (e < E) {
+    const float v = vals[e];
+    const bool v_nan = isnan(v);
+    int rank = 0;
+    int n_valid = 0;
+    for (int j = 0; j < E; j++) {
+      const float u = vals[j];
+      const bool u_nan = isnan(u);
+      n_valid += u_nan ? 0 : 1;
+      if (v_nan) {
+        rank += (u_nan && j < e) ? 1 : 0;
+      } else if (!u_nan && (u > v || (u == v && j < e))) {
+        rank += 1;
       }
     }
-    for (ushort off = 16; off >= 1; off >>= 1) {
-      float ob = simd_shuffle_xor(best, off);
-      int oe = simd_shuffle_xor(best_e, off);
-      const bool other_better = oe != 0x7fffffff &&
-          (best_e == 0x7fffffff || ob > best || (ob == best && oe < best_e));
-      if (other_better) {
-        best = ob;
-        best_e = oe;
-      }
+    if (v_nan) {
+      rank += n_valid;
     }
-    picked[r] = best_e;
-    if (best_e != 0x7fffffff && (best_e % 32) == int(lane)) {
-      taken[best_e / 32] = true;
+    if (rank < TOPK) {
+      picked[rank] = e;
     }
   }
-  if (lane == 0) {
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (e == 0) {
     float total = 0.0f;
     float gathered[TOPK];
     for (int r = 0; r < TOPK; r++) {
@@ -1332,9 +1428,9 @@ _ROUTER_SELECT_SOURCE = r"""
     }
     for (int r = 0; r < TOPK; r++) {
       float q = NORM ? gathered[r] / total : gathered[r];
-      float s = q * scaling[0];
+      float sc = q * scaling[0];
       indices[tok * TOPK + r] = uint(picked[r]);
-      scores[tok * TOPK + r] = s;
+      scores[tok * TOPK + r] = sc;
     }
   }
 """
@@ -1390,21 +1486,23 @@ def moe_router(
     # E < 4096 and K < 16 * E; full 128-wide blocks and whole 16-row tiles.
     if E < 16 or E >= 4096 or K >= 16 * E or K <= 64 or K % 128 or E % 16:
         return None
-    if not 1 <= top_k <= min(32, E):
+    if not 1 <= top_k <= min(32, E) or E > 1024:
         return None
+    rows_per_simd = 1
     sig, biased = _router_logits_kernel()(
         inputs=[x, weight, bias],
-        template=[("T", x.dtype), ("K", K), ("E", E)],
-        grid=(128 * (E // 16), T, 1),
+        template=[("T", x.dtype), ("K", K), ("E", E), ("ROWS_PER_SIMD", rows_per_simd)],
+        grid=(128 * (E // (4 * rows_per_simd)), T, 1),
         threadgroup=(128, 1, 1),
         output_shapes=[(T, E), (T, E)],
         output_dtypes=[mx.float32, mx.float32],
     )
+    threads = ((E + 31) // 32) * 32
     indices, scores = _router_select_kernel()(
         inputs=[sig, biased, mx.array([scaling], dtype=mx.float32)],
         template=[("E", E), ("TOPK", top_k), ("NORM", int(bool(norm_topk_prob) and top_k > 1))],
-        grid=(32 * T, 1, 1),
-        threadgroup=(32, 1, 1),
+        grid=(threads * T, 1, 1),
+        threadgroup=(threads, 1, 1),
         output_shapes=[(T, top_k), (T, top_k)],
         output_dtypes=[mx.uint32, mx.float32],
     )
@@ -1553,3 +1651,144 @@ def hc_expand_one(
         output_shapes=[residual.shape],
         output_dtypes=[x.dtype],
     )[0]
+
+
+# Multi-row (verify block) router logits. The reference x @ W.T for
+# 2 <= L <= 8 rows runs MLX's NAX split-K GEMM: relaxed-precision 16x32x16
+# matmul2d ops along each K partition (2048 wide for 2048 < K <= 4096),
+# then the partitions summed in order from 0. One simdgroup per (32-expert
+# tile, K partition) issues the same op sequence along its partition, and
+# the partitions are summed in the same order before the sigmoid/bias
+# epilogue.
+_ROUTER_NAX_SOURCE = r"""
+  const ushort lane = thread_index_in_simdgroup;
+  const int p = int(simdgroup_index_in_threadgroup);
+  const int n0 = int(threadgroup_position_in_grid.x) * 32;
+  const short qid = lane >> 2;
+  const short fm = ((qid & 4) | ((lane >> 1) & 3));
+  const short fn = ((qid & 2) | (lane & 1)) * 4;
+  constexpr auto desc = matmul2d_descriptor(
+      16, 32, 16, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  auto ct_a = op.template get_left_input_cooperative_tensor<float, float, float>();
+  auto ct_b = op.template get_right_input_cooperative_tensor<float, float, float>();
+  auto ct_c = op.template get_destination_cooperative_tensor<
+      metal::remove_addrspace_t<decltype(ct_a)>,
+      metal::remove_addrspace_t<decltype(ct_b)>,
+      float>();
+  for (short i = 0; i < 16; i++) {
+    ct_c[i] = 0.0f;
+  }
+  const int k_begin = p * PART;
+  for (int kc = 0; kc < PART / 16; kc++) {
+    const int k0 = k_begin + kc * 16;
+    for (short i = 0; i < 8; i++) {
+      const short r = fm + (i >> 2) * 8;
+      const short c = fn + (i & 3);
+      ct_a[i] = (r < M) ? static_cast<float>(x[r * K + k0 + c]) : 0.0f;
+      ct_b[i] = w[size_t(n0 + r) * K + k0 + c];
+      ct_b[8 + i] = w[size_t(n0 + 16 + r) * K + k0 + c];
+    }
+    op.run(ct_a, ct_b, ct_c);
+  }
+  threadgroup float parts[NPART][16][32];
+  for (short i = 0; i < 8; i++) {
+    const short r = fm + (i >> 2) * 8;
+    const short c = fn + (i & 3);
+    parts[p][r][c] = ct_c[i];
+    parts[p][r][16 + c] = ct_c[8 + i];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (p == 0) {
+    for (short i = 0; i < 8; i++) {
+      const short r = fm + (i >> 2) * 8;
+      const short c = fn + (i & 3);
+      if (r < M) {
+        for (short hh = 0; hh < 2; hh++) {
+          const int e = n0 + hh * 16 + c;
+          // gemm_splitk_accum: AccT out = 0; out += C_split[q] in order.
+          float logit = 0;
+          for (int q = 0; q < NPART; q++) {
+            logit += parts[q][r][hh * 16 + c];
+          }
+          float sgm = glm_sigmoid<float>(logit);
+          float biased = sgm + bias[e];
+          sig[r * E + e] = sgm;
+          biased_out[r * E + e] = biased;
+        }
+      }
+    }
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _router_nax_kernel():
+    return mx.fast.metal_kernel(
+        name="glm5_router_logits_nax_splitk",
+        input_names=["x", "w", "bias"],
+        output_names=["sig", "biased_out"],
+        header=_NAX_HEADER + _QMV_HEADER.replace("#include <metal_stdlib>\nusing namespace metal;\n", ""),
+        source=_ROUTER_NAX_SOURCE,
+    )
+
+
+def moe_router_rows(
+    x: mx.array,
+    weight: mx.array,
+    bias: mx.array,
+    top_k: int,
+    scaling: float,
+    norm_topk_prob: bool,
+):
+    """Router for 2..8 rows computed together (a verify block), bit-identical
+    to the reference's NAX split-K logits GEMM + group_expert_select.
+
+    Only valid (and only used) when MLX runs fp32 GEMMs on NAX with relaxed
+    precision; returns None otherwise or when the shape selects another
+    GEMM configuration.
+    """
+    if x.ndim != 2 or weight.ndim != 2 or bias.ndim != 1:
+        return None
+    T, K = x.shape
+    E = weight.shape[0]
+    if not 2 <= T <= 8 or weight.shape[1] != K or bias.shape[0] != E:
+        return None
+    if weight.dtype != mx.float32 or bias.dtype != mx.float32:
+        return None
+    if x.dtype not in (mx.bfloat16, mx.float16, mx.float32):
+        return None
+    # steel_matmul_axpby routes this product to the NAX split-K GEMM when
+    # K >= 3 * max(M, N) (or max(M, N) <= 1024 and K > 2 * max(M, N)); the
+    # partition size follows steel_gemm_splitk_axpby_nax. Tile sizes only
+    # group the per-element 16-wide k chain, so any aligned K is covered.
+    mn = max(T, E)
+    if not (K >= 3 * mn or (mn <= 1024 and K > 2 * mn)):
+        return None
+    part = K // 2 if K <= 1024 else 1024 if K <= 2048 else 2048 if K <= 4096 else 4096
+    if part % 16 or K % part or not 1 <= K // part <= 8:
+        return None
+    if E % 32 or E > 1024 or not 1 <= top_k <= min(32, E):
+        return None
+    if not nax_relaxed_fp32_matmul():
+        return None
+    npart = K // part
+    sig, biased = _router_nax_kernel()(
+        inputs=[x, weight, bias],
+        template=[("M", T), ("K", K), ("E", E), ("PART", part), ("NPART", npart)],
+        grid=(32 * npart * (E // 32), 1, 1),
+        threadgroup=(32 * npart, 1, 1),
+        output_shapes=[(T, E), (T, E)],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    threads = ((E + 31) // 32) * 32
+    indices, scores = _router_select_kernel()(
+        inputs=[sig, biased, mx.array([scaling], dtype=mx.float32)],
+        template=[("E", E), ("TOPK", top_k), ("NORM", int(bool(norm_topk_prob) and top_k > 1))],
+        grid=(threads * T, 1, 1),
+        threadgroup=(threads, 1, 1),
+        output_shapes=[(T, top_k), (T, top_k)],
+        output_dtypes=[mx.uint32, mx.float32],
+    )
+    STATS["router_rows"] += 1
+    return indices, scores

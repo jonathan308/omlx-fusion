@@ -1079,6 +1079,27 @@ class Glm5NextMoEGate(nn.Module):
             if routed is not None:
                 indices, scores = routed
                 return indices.reshape(1, 1, -1), scores.reshape(1, 1, -1)
+        if (
+            _decode_kernels is not None
+            and _DECODE_FUSION
+            and x.ndim == 3
+            and x.shape[0] == 1
+            and 2 <= x.shape[1] <= _DECODE_BLOCK
+            and self.n_group == 1
+        ):
+            # Verify block: the reference logits come from MLX's NAX split-K
+            # GEMM, which moe_router_rows reproduces op for op.
+            routed = _decode_kernels.moe_router_rows(
+                x.reshape(x.shape[1], -1),
+                self.weight,
+                self.e_score_correction_bias,
+                self.top_k,
+                self.routed_scaling_factor,
+                self.norm_topk_prob,
+            )
+            if routed is not None:
+                indices, scores = routed
+                return indices.reshape(1, x.shape[1], -1), scores.reshape(1, x.shape[1], -1)
         logits = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
         return group_expert_select(
             logits,
