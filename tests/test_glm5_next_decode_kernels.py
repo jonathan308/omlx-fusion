@@ -1176,3 +1176,23 @@ def test_router_rows_first_use_check_inside_compile_uses_reference():
     if "no-nax" in out:
         pytest.skip("this GPU runs fp32 GEMMs without NAX")
     assert "checked" in out
+
+
+def test_upstream_kda_prefill_then_fused_decode_is_bitwise_reference(monkeypatch):
+    """Caches written by upstream's fused KDA prefill (glm53_kda_prework,
+    >= 64-row chunks; the test prompts' 512-token chunks) feed the fused
+    decode and verify paths exactly like the stock prefill's."""
+    try:
+        from omlx.patches import glm53_kda_prework as prework
+    except ImportError:
+        pytest.skip("this build has no glm53 fused KDA prefill")
+    _language()
+    if not getattr(prework, "_GLM53_KDA_PREFILL_ENABLED", False):
+        pytest.skip("glm53 fused KDA prefill disabled")
+    if not _native_indexer_available():
+        pytest.skip("GLM DSA native indexer extension is not built")
+
+    monkeypatch.setattr(prework, "_GLM53_KDA_ENGAGED_LOGGED", False)
+    used = _check_small_model() | _check_small_model(43, 300)
+    assert prework._GLM53_KDA_ENGAGED_LOGGED
+    assert _ALWAYS_FUSED <= used, used
