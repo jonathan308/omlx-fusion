@@ -10,6 +10,11 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
+from omlx.utils.fast_attention import (
+    blocked_sliding_window_attention,
+    mixed_head_dim_sdpa,
+)
+
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .pipeline import PipelineMixin
@@ -79,6 +84,7 @@ class Attention(nn.Module):
         super().__init__()
         dim = args.hidden_size
         self.is_sliding_window = is_sliding_window
+        self.sliding_window_size = args.sliding_window_size if is_sliding_window else 0
         if is_sliding_window:
             self.n_heads = args.swa_num_attention_heads
             self.n_kv_heads = args.swa_num_key_value_heads
@@ -149,15 +155,40 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        output = scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            cache=cache,
-            scale=self.scale,
-            mask=mask,
-            sinks=self.attention_sink_bias,
-        )
+        output = None
+        if L > 8 and not hasattr(cache, "bits"):
+            # Prefill fast paths: MLX's fused SDPA has no sliding-window or
+            # 192/128 (qk/v head dim) prefill kernel, and its fallback scores
+            # the full [L, S] matrix. Both helpers decline unsupported layouts.
+            if self.is_sliding_window:
+                output = blocked_sliding_window_attention(
+                    queries,
+                    keys,
+                    values,
+                    scale=self.scale,
+                    window=self.sliding_window_size,
+                    sinks=self.attention_sink_bias,
+                    mask=mask,
+                )
+            else:
+                output = mixed_head_dim_sdpa(
+                    queries,
+                    keys,
+                    values,
+                    scale=self.scale,
+                    mask=mask,
+                    sinks=self.attention_sink_bias,
+                )
+        if output is None:
+            output = scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                cache=cache,
+                scale=self.scale,
+                mask=mask,
+                sinks=self.attention_sink_bias,
+            )
         return self.o_proj(output.swapaxes(1, 2).reshape(B, L, -1))
 
 
