@@ -2162,10 +2162,13 @@ def _router_rows_verified(key, indices, scores, x, weight, bias, top_k, scaling,
     ref_idx, ref = group_expert_select(
         x.astype(mx.float32) @ weight.T, bias, top_k, 1, 1, scaling, norm
     )
-    ok = bool(
-        (mx.array_equal(indices, ref_idx.astype(indices.dtype))
-         & mx.array_equal(scores.view(mx.uint32), ref.view(mx.uint32))).item()
-    )
+    try:
+        ok = bool(
+            (mx.array_equal(indices, ref_idx.astype(indices.dtype))
+             & mx.array_equal(scores.view(mx.uint32), ref.view(mx.uint32))).item()
+        )
+    except Exception:  # traced (mx.compile / vmap): check on an eager call
+        return False
     _ROUTER_ROWS_CHECKED[key] = ok
     if not ok:
         import logging
@@ -2688,7 +2691,10 @@ def _latent_verified(key, out, q, keys, scale, indices, mask, causal) -> bool:
         )
     ref = mx.fast.scaled_dot_product_attention(q, k, k, scale=scale, mask=ref_mask)
     bits = mx.uint16 if out.dtype.size == 2 else mx.uint32
-    ok = bool(mx.array_equal(out.view(bits), ref.view(bits)).item())
+    try:
+        ok = bool(mx.array_equal(out.view(bits), ref.view(bits)).item())
+    except Exception:  # traced (mx.compile / vmap): check on an eager call
+        return False
     _LATENT_CHECKED[key] = ok
     if not ok:
         import logging

@@ -1150,3 +1150,29 @@ def test_latent_attention_kernels_are_off_by_default():
         [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=300
     ).stdout
     assert out.strip().splitlines()[-1] == "['latent_attn', 'latent_sparse_rows']"
+
+
+def test_router_rows_first_use_check_inside_compile_uses_reference():
+    out = _run_with_tf32(
+        "import mlx.core as mx\n"
+        "from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk\n"
+        "if not dk.nax_relaxed_fp32_matmul():\n"
+        "    print('no-nax')\n"
+        "else:\n"
+        "    language = t._language()\n"
+        "    gate = t._router(64, 512, seed=6)\n"
+        "    x = mx.random.normal((1, 4, 512)).astype(mx.bfloat16)\n"
+        "    traced = mx.compile(lambda v: gate(v))(x)\n"
+        "    assert dk._ROUTER_ROWS_CHECKED == {}  # no check inside compile\n"
+        "    eager = gate(x)\n"
+        "    assert list(dk._ROUTER_ROWS_CHECKED.values()) == [True]\n"
+        "    mx.eval(traced)\n"
+        "    language._DECODE_FUSION = False\n"
+        "    ref_eager = gate(x)\n"
+        "    assert mx.array_equal(eager[0], ref_eager[0]).item()\n"
+        "    assert mx.array_equal(eager[1].view(mx.uint32), ref_eager[1].view(mx.uint32)).item()\n"
+        "    print('checked')\n"
+    )
+    if "no-nax" in out:
+        pytest.skip("this GPU runs fp32 GEMMs without NAX")
+    assert "checked" in out
