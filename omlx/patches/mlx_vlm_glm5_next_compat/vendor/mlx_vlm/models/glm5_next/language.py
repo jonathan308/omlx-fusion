@@ -2,6 +2,7 @@ import logging
 import threading
 from typing import Any, Optional
 
+from omlx.utils.layer_pipeline import LayerPipeline
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -970,16 +971,18 @@ class Glm5NextModel(nn.Module):
         )
         h = mx.contiguous(h)
 
-        # Evaluate each layer and release cached buffers to bound prefill memory.
-        # Keep decode lazy; the MTP replacement loop must use the same policy.
+        # Evaluate layer by layer to bound prefill memory, but pipelined: the
+        # GPU runs layer i while the host builds layer i + 1 (at most two
+        # layers in flight). Keep decode lazy; the MTP replacement loop must
+        # use the same policy.
         prefill = h.shape[1] >= 256
+        pipeline = LayerPipeline() if prefill else None
 
         for layer, c in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
             h = layer(h, mask=mask, cache=c)
-            if prefill:
-                mx.eval(h)
-                mx.clear_cache()
+            if pipeline is not None:
+                pipeline.push(h)
 
         h = h.mean(axis=2)
         return self.norm(h)
