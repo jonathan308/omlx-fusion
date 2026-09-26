@@ -38,6 +38,10 @@ import mlx.core as mx
 # Successful fused dispatches by kernel family (graph-build time counts; used
 # by tests and profilers to confirm the fused paths engage).
 STATS: Counter = Counter()
+# Fused families switched off for A/B measurements (STATS keys, comma
+# separated, e.g. OMLX_GLM5_DECODE_DISABLE=latent_attn,router_rows); the
+# callers then take the reference path.
+DISABLED = set(filter(None, os.environ.get("OMLX_GLM5_DECODE_DISABLE", "").split(",")))
 
 _QMV_HEADER = r"""
 #include <metal_simdgroup>
@@ -548,6 +552,8 @@ def moe_gate_up_swiglu(
     qmv_wide arithmetic the reference applies to T > 1 rows and the call
     returns ``(routed [T, TOPK, N], shared [T, N])``.
     """
+    if "moe_gate_up" in DISABLED:
+        return None
     parts = [_affine_parts(m) for m in (routed_gate, routed_up)]
     if any(p is None for p in parts) or x.ndim != 2 or indices.ndim != 2:
         return None
@@ -586,6 +592,8 @@ def moe_gate_up_swiglu(
             return None
         inputs += [sgw, sgs, sgb, suw, sus, sub]
         template += [("SBITS", sbits), ("SGS", sgsz)]
+    if shared_wide and "moe_shared_wide" in DISABLED:
+        return None
     kernel = _gate_up_kernel(has_shared, shared_wide)
     STATS["moe_gate_up"] += 1
     if shared_wide:
@@ -629,6 +637,8 @@ def moe_down_combine(
     last activation slot (``shared_down``) or added from a precomputed
     ``shared_y`` [T, N].  Returns [T, N] in ``act.dtype``.
     """
+    if "moe_down" in DISABLED:
+        return None
     p = _affine_parts(routed_down)
     if p is None or act.ndim != 3 or scores.dtype != mx.float32:
         return None
@@ -867,6 +877,8 @@ def hc_mix(x: mx.array, fn: mx.array, eps: float, *, rows_per_tg: int = 0) -> Op
     [B, L, MIX] float32 or None when the shape is outside the replicated
     kernel configuration.
     """
+    if "hc_mix" in DISABLED:
+        return None
     if x.ndim != 4 or fn.ndim != 2 or fn.dtype != mx.float32:
         return None
     B, L, hc, d = x.shape
@@ -1004,6 +1016,8 @@ def dsa_decode_scores(
     scores equal to the padded Steel kernel followed by the validity
     ``mx.where``.
     """
+    if "dsa_scores" in DISABLED:
+        return None
     if q.ndim != 4 or q.shape[0] != 1 or pool_keys.ndim != 3 or pool_keys.shape[0] != 1:
         return None
     _, L, H, D = q.shape
@@ -1398,6 +1412,8 @@ def kda_decode_step(
     ``(y [1, T, H * Dk], conv_state [1, 3, 3 * H * Dk], state [1, H, Dk, Dk])``
     or None when the shapes are not covered.
     """
+    if "kda" in DISABLED:
+        return None
     if proj.ndim != 3 or proj.shape[0] != 1 or proj.dtype not in (mx.bfloat16, mx.float16):
         return None
     _, T, width = proj.shape
@@ -1639,6 +1655,8 @@ def moe_router(
     [T, top_k])`` bit-identical to the reference for rows that the reference
     computes with the one-token gemv, or None when not covered.
     """
+    if "router" in DISABLED:
+        return None
     if x.ndim != 2 or weight.ndim != 2 or bias.ndim != 1:
         return None
     T, K = x.shape
@@ -1813,6 +1831,8 @@ def hc_expand_one(
     [1, 1, HC] and ``comb`` [1, 1, HC, HC] fp32. Returns [1, 1, HC, D] or
     None when not covered.
     """
+    if "hc_expand" in DISABLED:
+        return None
     if x.ndim != 3 or x.shape[:2] != (1, 1) or residual.ndim != 4:
         return None
     D = x.shape[2]
@@ -1935,6 +1955,8 @@ def moe_router_rows(
     precision; returns None otherwise or when the shape selects another
     GEMM configuration.
     """
+    if "router_rows" in DISABLED:
+        return None
     if x.ndim != 2 or weight.ndim != 2 or bias.ndim != 1:
         return None
     T, K = x.shape
@@ -2317,6 +2339,8 @@ def latent_attention(
     ([L, NKV] bool) or ``causal`` masks the dense keys. Returns [1, H, L, D]
     or None when not covered.
     """
+    if "latent_attn" in DISABLED:
+        return None
     if q.ndim != 4 or keys.ndim != 4 or q.shape[0] != 1 or keys.shape[:2] != (1, 1):
         return None
     _, H, L, D = q.shape
@@ -2544,6 +2568,8 @@ def latent_attention_sparse_rows(
     keys, bit-identical: ``q`` [1, H, L, D] (embed_q queries), ``keys``
     [1, 1, NKV, D] latent cache, ``indices`` [L, W] (negative = masked,
     rows clamped). Returns [1, H, L, D] or None."""
+    if "latent_sparse_rows" in DISABLED:
+        return None
     if q.ndim != 4 or q.shape[0] != 1 or keys.ndim != 4 or keys.shape[:2] != (1, 1):
         return None
     _, H, L, D = q.shape
@@ -2688,6 +2714,8 @@ def multi_qmv(x: mx.array, layers) -> Optional[list]:
     same bits/group size, K inputs and output rows divisible by 8. Returns
     the [T, N_i] outputs or None when not covered.
     """
+    if "multi_qmv" in DISABLED:
+        return None
     if x.ndim != 2 or not 1 <= len(layers) <= 4 or x.dtype not in (mx.bfloat16, mx.float16):
         return None
     T, K = x.shape

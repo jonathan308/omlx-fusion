@@ -873,3 +873,19 @@ def test_multi_linear_groups_projections_by_quantization():
     for layer, out in zip(layers, outs):
         assert _mismatches(out, language.linear_forward(layer, x)) == 0
     assert language._multi_linear(x, layers[:2]) is None
+
+
+def test_disabled_families_take_the_reference_path(monkeypatch):
+    from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
+
+    language = _language()
+    mx.random.seed(11)
+    x = (mx.random.normal((1, 2, 1024)) * 0.7).astype(mx.bfloat16)
+    layers = [_quantized_linear(256, 1024, 8), _quantized_linear(128, 1024, 8)]
+    monkeypatch.setattr(dk, "DISABLED", {"multi_qmv"})
+    before = _stats()["multi_qmv"]
+    assert dk.multi_qmv(x.reshape(2, 1024), layers) is None
+    outs = language._multi_linear(x, layers)
+    assert _stats()["multi_qmv"] == before
+    for layer, out in zip(layers, outs):
+        assert _mismatches(out, language.linear_forward(layer, x)) == 0
