@@ -459,6 +459,34 @@ _DOWN_SOURCE = r"""
         simd_lid, sres);
   }
 #endif
+#if SHARED_WIDE_DOWN
+  // Shared expert down projection of this token with the multi-row qmv_wide
+  // arithmetic its own [T, K] matmul uses (8 lanes per row; each token's
+  // accumulation is independent of the others).
+  {
+    static_assert(RPS == 4, "qmv_wide rows per simdgroup");
+    constexpr int SWB = K * SBITS / 8;
+    constexpr int SG = K / SGS;
+    const int k_lane = int(simd_lid) % 8;
+    const int srow = out_row + int(simd_lid) / 8;
+    float sv[1] = {0.0f};
+    glm_qmv_wide_row<T, K, SGS, SBITS, 1>(
+        (const device uint8_t*)sh_down_w + size_t(srow) * SWB, sh_down_s + srow * SG,
+        sh_down_b + srow * SG, sh_act + size_t(token) * K, 1, k_lane, sv);
+    sv[0] += simd_shuffle_down(sv[0], 4);
+    sv[0] += simd_shuffle_down(sv[0], 2);
+    sv[0] += simd_shuffle_down(sv[0], 1);
+    if (k_lane == 0) {
+      const int r = int(simd_lid) / 8;
+      float a = acc[0];
+      for (int row = 1; row < RPS; row++) {
+        a = row == r ? acc[row] : a;
+      }
+      out[size_t(token) * N + srow] = static_cast<T>(a) + static_cast<T>(sv[0]);
+    }
+  }
+  return;
+#endif
   device T* o = out + size_t(token) * N + out_row;
   for (int row = 0; row < RPS; row++) {
 #if HAS_SHARED
@@ -505,13 +533,19 @@ def _gate_up_kernel(has_shared: bool, shared_wide: bool = False, slot_major: boo
 
 
 @lru_cache(maxsize=None)
-def _down_kernel(has_shared: bool, add_shared_y: bool, slot_major: bool = False):
+def _down_kernel(
+    has_shared: bool, add_shared_y: bool, slot_major: bool = False, shared_wide: bool = False
+):
     inputs = ["act", "indices", "scores", "down_w", "down_s", "down_b"]
     if has_shared:
         inputs += ["sh_down_w", "sh_down_s", "sh_down_b"]
+        if shared_wide:
+            inputs += ["sh_act"]
     elif add_shared_y:
         inputs += ["shared_y"]
-    suffix = "_shared" if has_shared else ("_add" if add_shared_y else "")
+    suffix = "_widesh" if shared_wide else (
+        "_shared" if has_shared else ("_add" if add_shared_y else "")
+    )
     suffix += "_sm" if slot_major else ""
     return mx.fast.metal_kernel(
         name=f"glm5_moe_down_combine{suffix}",
@@ -520,9 +554,10 @@ def _down_kernel(has_shared: bool, add_shared_y: bool, slot_major: bool = False)
         header=_QMV_HEADER,
         source=_source(
             _DOWN_SOURCE,
-            HAS_SHARED=int(has_shared),
+            HAS_SHARED=int(has_shared and not shared_wide),
             ADD_SHARED_Y=int(add_shared_y and not has_shared),
             SLOT_MAJOR=int(slot_major),
+            SHARED_WIDE_DOWN=int(shared_wide),
         ),
     )
 
@@ -653,6 +688,7 @@ def moe_down_combine(
     shared_down=None,
     shared_y: Optional[mx.array] = None,
     *,
+    shared_act: Optional[mx.array] = None,
     rps: int = 4,
     nsg: int = 2,
 ) -> Optional[mx.array]:
@@ -660,8 +696,10 @@ def moe_down_combine(
 
     ``act`` is [T, TOPK (+1), K] from :func:`moe_gate_up_swiglu`, ``scores``
     [T, TOPK] float32.  The shared expert is either projected here from the
-    last activation slot (``shared_down``) or added from a precomputed
-    ``shared_y`` [T, N].  Returns [T, N] in ``act.dtype``.
+    last activation slot (``shared_down``), from ``shared_act`` [T, K] (the
+    ``shared_wide`` gate/up output, with the multi-row qmv_wide arithmetic)
+    or added from a precomputed ``shared_y`` [T, N].  Returns [T, N] in
+    ``act.dtype``.
     """
     if "moe_down" in DISABLED:
         return None
@@ -673,7 +711,12 @@ def moe_down_combine(
     E, N, _ = dw.shape
     topk = indices.shape[1]
     has_shared = shared_down is not None
-    if rt != topk + int(has_shared) or ds.dtype != act.dtype:
+    shared_wide = shared_act is not None
+    if shared_wide and (not has_shared or shared_y is not None or rps != 4):
+        return None
+    if shared_wide and ("moe_shared_wide" in DISABLED or not 2 <= T <= 8):
+        return None
+    if rt != topk + int(has_shared and not shared_wide) or ds.dtype != act.dtype:
         return None
     if not _qmv_fast_ok(rbits, rgs, N, K) or N % (rps * nsg):
         return None
@@ -687,17 +730,26 @@ def moe_down_combine(
         if sp is None:
             return None
         sdw, sds, sdb, sbits, sgsz = sp
-        if sdw.shape[0] != N or sds.dtype != act.dtype or not _qmv_fast_ok(sbits, sgsz, N, K):
+        if sdw.shape[0] != N or sds.dtype != act.dtype:
             return None
-        inputs += [sdw, sds, sdb]
+        if shared_wide:
+            if shared_act.shape != (T, K) or shared_act.dtype != act.dtype:
+                return None
+            if sbits not in (4, 5, 6, 8) or sgsz % 8 or K % sgsz or K in (64, 128):
+                return None
+        elif not _qmv_fast_ok(sbits, sgsz, N, K):
+            return None
+        inputs += [sdw, sds, sdb] + ([shared_act] if shared_wide else [])
         template += [("SBITS", sbits), ("SGS", sgsz)]
     elif shared_y is not None:
         if shared_y.shape != (T, N) or shared_y.dtype != act.dtype:
             return None
         inputs.append(shared_y)
     slot_major = _slot_major(T)
-    kernel = _down_kernel(has_shared, shared_y is not None, slot_major)
+    kernel = _down_kernel(has_shared, shared_y is not None, slot_major, shared_wide)
     STATS["moe_down"] += 1
+    if shared_wide:
+        STATS["moe_down_shared_wide"] += 1
     tiles = N // (rps * nsg)
     return kernel(
         inputs=inputs,

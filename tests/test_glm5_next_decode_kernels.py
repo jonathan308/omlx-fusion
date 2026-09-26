@@ -259,10 +259,12 @@ def test_decode_experts_are_bitwise_reference(length, shared_bits, slot_major, m
         x = (mx.random.normal((1, length, 1024)) * (0.5 + trial)).astype(mx.bfloat16)
         indices, scores = moe.gate(x)
         wide_before = _stats()["moe_shared_wide"]
+        down_before = _stats()["moe_down_shared_wide"]
         fused = moe._decode_experts(x, indices, scores)
         assert fused is not None
         wide_used = _stats()["moe_shared_wide"] - wide_before
         assert wide_used == (1 if shared_bits and length > 1 else 0)
+        assert _stats()["moe_down_shared_wide"] - down_before == wide_used
         monkeypatch.setattr(language, "_DECODE_FUSION", False)
         reference = moe(x)
         compiled = mx.compile(moe)(x) if length == 1 else reference
@@ -1019,3 +1021,23 @@ def test_router_rows_first_use_check_rejects_wrong_kernels():
     if "no-nax" in out:
         pytest.skip("this GPU runs fp32 GEMMs without NAX")
     assert "checked" in out
+
+
+@pytest.mark.parametrize("tokens", [2, 5, 8])
+def test_down_combine_folds_glm_shared_down_bitwise(tokens):
+    """GLM-5.3 shapes: routed down 4-bit [E, 4096, 2048], shared down 8-bit."""
+    from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
+
+    language = _language()
+    mx.random.seed(tokens)
+    routed = _switch_linear(10, 4096, 2048, 4)
+    shared = _quantized_linear(4096, 2048, 8)
+    act = (mx.random.normal((tokens, 8, 2048)) * 0.3).astype(mx.bfloat16)
+    shared_act = (mx.random.normal((tokens, 2048)) * 0.3).astype(mx.bfloat16)
+    idx = mx.stack([mx.random.permutation(10)[:8] for _ in range(tokens)]).astype(mx.uint32)
+    scores = mx.random.uniform(0.05, 0.4, (tokens, 8))
+    shared_y = language.linear_forward(shared, shared_act.reshape(1, tokens, -1)).reshape(tokens, -1)
+    reference = dk.moe_down_combine(act, idx, scores, routed, shared_y=shared_y)
+    fused = dk.moe_down_combine(act, idx, scores, routed, shared, shared_act=shared_act)
+    assert fused is not None and reference is not None
+    assert _mismatches(fused, reference) == 0

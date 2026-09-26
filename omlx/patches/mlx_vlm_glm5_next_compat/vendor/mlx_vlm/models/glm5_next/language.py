@@ -1339,6 +1339,14 @@ class Glm5NextMoE(nn.Module):
                 )
             if fused is not None:
                 act, shared_act = fused
+                # The shared expert's down projection (qmv_wide rows) folds
+                # into the combine kernel when covered.
+                y = dk.moe_down_combine(
+                    act, routes, weights, sw.down_proj, shared.down_proj,
+                    shared_act=shared_act,
+                )
+                if y is not None:
+                    return y.reshape(x.shape)
                 shared_y = linear_forward(
                     shared.down_proj, shared_act.reshape(1, T, -1)
                 ).reshape(T, D)
