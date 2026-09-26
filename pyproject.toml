@@ -48,20 +48,23 @@ dependencies = [
     # omlx.custom_kernels.* when built for release. The bundled kernel
     # binaries are ABI-coupled to this mlx version — bumping the pin
     # requires rebuilding them (OMLX_WITH_CUSTOM_KERNEL=1 setup.py build_ext).
-    # The floor admits the custom 0.32.2.dev wheel (JACCL guards/backports):
-    # an exact ==0.32.2 pin made a fresh resolve reinstall the stock PyPI
-    # wheel over the dev build, silently dropping those fixes. Install the
-    # dev wheel first with --no-deps (ops/install_mlx_variant.sh) so the
-    # resolver keeps it.
+    # The floor admits the custom 0.32.x dev wheel built from
+    # jonathan308/mlx branch fix/v0322-nax-moe-distributed-stability
+    # (JACCL guards/backports, rebased onto ml-explore/mlx main 073d2252,
+    # the 0.32.3 line; tip 2569313d): an exact ==0.32.2 pin made a fresh
+    # resolve reinstall the stock PyPI wheel over the dev build, silently
+    # dropping those fixes. Install the dev wheel first with --no-deps
+    # (ops/install_mlx_variant.sh) so the resolver keeps it.
     "mlx>=0.32.2.dev0,<0.33",
-    # mlx-lm 0.32.0 line (upstream oMLX needs 872ae88+: full cache state,
-    # per-stream stop matchers, and counters) plus the Fusion decode_fast
-    # wiring for Qwen3/Qwen3-MoE; using the stock ml-explore pin silently
-    # drops the fused decode path.
+    # jonathan308/mlx-lm branch omlx/v0.31.3-perf rebased onto ml-explore
+    # mlx-lm main 87b7b58 (0.32.0 line; upstream oMLX needs 872ae88+: full
+    # cache state, per-stream stop matchers, and counters) plus the Fusion
+    # decode_fast wiring for Qwen3/Qwen3-MoE; using the stock ml-explore
+    # pin silently drops the fused decode path.
     # NewlineTokenizer registration compatibility, DeepSeek/GLM DSA indexer
     # RoPE fix, trust_remote_code load gate, transformers 5.7.0
     # compatibility, and prior BatchGenerator/cache fixes.
-    "mlx-lm @ git+https://github.com/jonathan308/mlx-lm@043b43d5d0a61124895cded127bfe18b559f2849",
+    "mlx-lm @ git+https://github.com/jonathan308/mlx-lm@7bb5f77900c511465816367a874175314ca66649",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
     # mlx-embeddings from latest commit (32981fa)
@@ -292,7 +295,7 @@ include = ["omlx*"]
 # so dependency resolution retains the selected runtime versions.
 override-dependencies = [
     "mlx>=0.32.2.dev0,<0.33",
-    "mlx-lm @ git+https://github.com/jonathan308/mlx-lm@043b43d5d0a61124895cded127bfe18b559f2849",
+    "mlx-lm @ git+https://github.com/jonathan308/mlx-lm@7bb5f77900c511465816367a874175314ca66649",
 ]
 
 [tool.black]
