@@ -318,8 +318,15 @@ inline T glm_clamped_swiglu(T gate, T up, T limit, T neg_limit) {
 _GATE_UP_SOURCE = r"""
   const uint simd_lid = thread_index_in_simdgroup;
   const uint simd_gid = simdgroup_index_in_threadgroup;
+#if SLOT_MAJOR
+  // Route slots vary fastest, so the slots of an expert that several
+  // tokens share read its row block back to back (cache hits).
+  const int tile = int(threadgroup_position_in_grid.z);
+  const int z = int(threadgroup_position_in_grid.y);
+#else
   const int tile = int(threadgroup_position_in_grid.y);
   const int z = int(threadgroup_position_in_grid.z);
+#endif
   const T lim = T(limit[0]);
   const T neg_lim = T(-limit[0]);
 #if SHARED_WIDE
@@ -410,8 +417,14 @@ _GATE_UP_SOURCE = r"""
 _DOWN_SOURCE = r"""
   const uint simd_lid = thread_index_in_simdgroup;
   const uint simd_gid = simdgroup_index_in_threadgroup;
+#if SLOT_MAJOR
+  // Tokens vary fastest: experts they share are read back to back.
+  const int tile = int(threadgroup_position_in_grid.z);
+  const int token = int(threadgroup_position_in_grid.y);
+#else
   const int tile = int(threadgroup_position_in_grid.y);
   const int token = int(threadgroup_position_in_grid.z);
+#endif
   constexpr int RT = TOPK + HAS_SHARED;
   const int out_row = (tile * NSG + int(simd_gid)) * RPS;
 
@@ -471,11 +484,12 @@ def _source(body: str, **defines) -> str:
 
 
 @lru_cache(maxsize=None)
-def _gate_up_kernel(has_shared: bool, shared_wide: bool = False):
+def _gate_up_kernel(has_shared: bool, shared_wide: bool = False, slot_major: bool = False):
     inputs = ["x", "indices", "limit", "gate_w", "gate_s", "gate_b", "up_w", "up_s", "up_b"]
     if has_shared or shared_wide:
         inputs += ["sh_gate_w", "sh_gate_s", "sh_gate_b", "sh_up_w", "sh_up_s", "sh_up_b"]
     suffix = "_widesh" if shared_wide else ("_shared" if has_shared else "")
+    suffix += "_sm" if slot_major else ""
     return mx.fast.metal_kernel(
         name=f"glm5_moe_gate_up_swiglu{suffix}",
         input_names=inputs,
@@ -485,18 +499,20 @@ def _gate_up_kernel(has_shared: bool, shared_wide: bool = False):
             _GATE_UP_SOURCE,
             HAS_SHARED=int(has_shared and not shared_wide),
             SHARED_WIDE=int(shared_wide),
+            SLOT_MAJOR=int(slot_major),
         ),
     )
 
 
 @lru_cache(maxsize=None)
-def _down_kernel(has_shared: bool, add_shared_y: bool):
+def _down_kernel(has_shared: bool, add_shared_y: bool, slot_major: bool = False):
     inputs = ["act", "indices", "scores", "down_w", "down_s", "down_b"]
     if has_shared:
         inputs += ["sh_down_w", "sh_down_s", "sh_down_b"]
     elif add_shared_y:
         inputs += ["shared_y"]
     suffix = "_shared" if has_shared else ("_add" if add_shared_y else "")
+    suffix += "_sm" if slot_major else ""
     return mx.fast.metal_kernel(
         name=f"glm5_moe_down_combine{suffix}",
         input_names=inputs,
@@ -506,6 +522,7 @@ def _down_kernel(has_shared: bool, add_shared_y: bool):
             _DOWN_SOURCE,
             HAS_SHARED=int(has_shared),
             ADD_SHARED_Y=int(add_shared_y and not has_shared),
+            SLOT_MAJOR=int(slot_major),
         ),
     )
 
@@ -594,14 +611,18 @@ def moe_gate_up_swiglu(
         template += [("SBITS", sbits), ("SGS", sgsz)]
     if shared_wide and "moe_shared_wide" in DISABLED:
         return None
-    kernel = _gate_up_kernel(has_shared, shared_wide)
+    slot_major = _slot_major(T)
+    kernel = _gate_up_kernel(has_shared, shared_wide, slot_major)
     STATS["moe_gate_up"] += 1
+    tiles = N // (rps * nsg)
+    slots = T * topk + 1 if shared_wide else T * (topk + int(has_shared))
+    grid = (32, slots * nsg, tiles) if slot_major else (32, tiles * nsg, slots)
     if shared_wide:
         template += [("NTOK", T)]
         routed, shared = kernel(
             inputs=inputs,
             template=template,
-            grid=(32, (N // (rps * nsg)) * nsg, T * topk + 1),
+            grid=grid,
             threadgroup=(32, nsg, 1),
             output_shapes=[(T, topk, N), (T, N)],
             output_dtypes=[x.dtype, x.dtype],
@@ -612,11 +633,16 @@ def moe_gate_up_swiglu(
     return kernel(
         inputs=inputs,
         template=template,
-        grid=(32, (N // (rps * nsg)) * nsg, T * rt),
+        grid=grid,
         threadgroup=(32, nsg, 1),
         output_shapes=[(T, rt, N)],
         output_dtypes=[x.dtype],
     )[0]
+
+
+def _slot_major(tokens: int) -> bool:
+    """Route-slot-major grids for blocks of 2+ tokens (they share experts)."""
+    return tokens > 1 and "moe_slot_major" not in DISABLED
 
 
 def moe_down_combine(
@@ -669,12 +695,14 @@ def moe_down_combine(
         if shared_y.shape != (T, N) or shared_y.dtype != act.dtype:
             return None
         inputs.append(shared_y)
-    kernel = _down_kernel(has_shared, shared_y is not None)
+    slot_major = _slot_major(T)
+    kernel = _down_kernel(has_shared, shared_y is not None, slot_major)
     STATS["moe_down"] += 1
+    tiles = N // (rps * nsg)
     return kernel(
         inputs=inputs,
         template=template,
-        grid=(32, (N // (rps * nsg)) * nsg, T),
+        grid=(32, T * nsg, tiles) if slot_major else (32, tiles * nsg, T),
         threadgroup=(32, nsg, 1),
         output_shapes=[(T, N)],
         output_dtypes=[act.dtype],

@@ -246,10 +246,14 @@ def _moe(experts=16, hidden=1024, inter=512, top_k=8, shared_bits=8, seed=0):
     return moe
 
 
+@pytest.mark.parametrize("slot_major", [True, False])
 @pytest.mark.parametrize("shared_bits", [8, 4, 0])
 @pytest.mark.parametrize("length", [1, 2, 4, 7])
-def test_decode_experts_are_bitwise_reference(length, shared_bits, monkeypatch):
+def test_decode_experts_are_bitwise_reference(length, shared_bits, slot_major, monkeypatch):
+    from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
+
     language = _language()
+    monkeypatch.setattr(dk, "DISABLED", set() if slot_major else {"moe_slot_major"})
     moe = _moe(shared_bits=shared_bits, seed=length)
     for trial in range(2):
         x = (mx.random.normal((1, length, 1024)) * (0.5 + trial)).astype(mx.bfloat16)
