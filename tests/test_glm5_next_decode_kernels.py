@@ -390,7 +390,7 @@ def test_indexer_fast_selection_matches_general_path():
 # ---------------------------------------------------------------------------
 
 
-def _fused_shape_model(seed):
+def _fused_shape_model(seed, heads=16):
     from mlx_vlm.models import glm5_next
 
     from omlx.patches.deepseek_v4.switch_layers import SwitchLinear
@@ -399,7 +399,7 @@ def _fused_shape_model(seed):
     text = glm5_next.TextConfig(
         model_type="glm5_next_text", vocab_size=256, hidden_size=1024,
         intermediate_size=2048, moe_intermediate_size=512, num_hidden_layers=4,
-        num_attention_heads=8, num_key_value_heads=8, n_shared_experts=1,
+        num_attention_heads=heads, num_key_value_heads=heads, n_shared_experts=1,
         n_routed_experts=128, routed_scaling_factor=2.5, kv_lora_rank=512,
         q_lora_rank=256, qk_rope_head_dim=0, v_head_dim=64, qk_nope_head_dim=64,
         num_experts_per_tok=8, first_k_dense_replace=1, max_position_embeddings=8192,
@@ -442,15 +442,15 @@ def _fused_shape_model(seed):
     return model
 
 
-def _check_small_model(seed=41, prompt_len=2101):
+def _check_small_model(seed=41, prompt_len=2101, heads=16):
     """Fused vs reference logits of a small model, bitwise; returns families used.
 
     Prompts beyond index_topk (2048) run the sparse DSA paths, shorter ones
     the dense latent attention.
     """
     language = _language()
-    fused_model = _fused_shape_model(seed)
-    reference_model = _fused_shape_model(seed)
+    fused_model = _fused_shape_model(seed, heads)
+    reference_model = _fused_shape_model(seed, heads)
     prompt = mx.random.randint(0, 256, (1, prompt_len)).astype(mx.int32)
     caches = []
     for model in (fused_model, reference_model):
@@ -746,7 +746,7 @@ def _latent_ready():
     return dk
 
 
-@pytest.mark.parametrize("keys", [1, 200, 256, 1029, 2051])
+@pytest.mark.parametrize("keys", [2, 200, 256, 1029, 2051])
 def test_latent_attention_dense_decode_is_bitwise_sdpa(keys):
     dk = _latent_ready()
     mx.random.seed(keys)
@@ -1041,3 +1041,47 @@ def test_down_combine_folds_glm_shared_down_bitwise(tokens):
     fused = dk.moe_down_combine(act, idx, scores, routed, shared, shared_act=shared_act)
     assert fused is not None and reference is not None
     assert _mismatches(fused, reference) == 0
+
+
+def test_latent_attention_declines_gemv_routed_scores():
+    """Fewer than 16 query rows (heads x tokens) or a single key: MLX computes
+    the scores with gemv_wide / gemv, which the NAX replica does not follow."""
+    dk = _latent_ready()
+    mx.random.seed(8)
+    kv = (mx.random.normal((1, 1, 300, 512)) * 0.8).astype(mx.bfloat16)
+    for heads, length in ((8, 1), (4, 2), (15, 1)):
+        q = (mx.random.normal((1, heads, length, 512)) * 0.6).astype(mx.bfloat16)
+        assert dk.latent_attention(q, kv, 256**-0.5, causal=length > 1) is None
+    q = (mx.random.normal((1, 8, 2, 512)) * 0.6).astype(mx.bfloat16)
+    assert dk.latent_attention(q, kv, 256**-0.5, causal=True) is not None  # 16 rows
+    q64 = (mx.random.normal((1, 64, 1, 512)) * 0.6).astype(mx.bfloat16)
+    assert dk.latent_attention(q64, kv[:, :, :1], 256**-0.5) is None
+
+
+def test_kda_fast_prefill_then_fused_decode_is_bitwise_reference():
+    """Caches written by the fused KDA prefill (perf/glm-gdn-prefill, >= 64-token
+    chunks) feed the fused decode/verify path exactly like the stock ones."""
+    _language()
+    try:
+        from mlx_vlm.models.glm5_next import kda_prefill
+    except ImportError:
+        pytest.skip("this build has no fused KDA prefill")
+    if not getattr(kda_prefill, "ENABLED", False):
+        pytest.skip("fused KDA prefill disabled")
+    if not _native_indexer_available():
+        pytest.skip("GLM DSA native indexer extension is not built")
+    used = _check_small_model() | _check_small_model(43, 300)
+    assert getattr(kda_prefill, "_ENGAGED_LOGGED", True)
+    assert _ALWAYS_FUSED <= used, used
+
+
+@pytest.mark.parametrize("heads", [8, 16])
+@pytest.mark.parametrize("seed", [41, 44, 45, 48])
+@pytest.mark.parametrize("prompt_len", [300, 2101])
+def test_small_model_seed_sweep_is_bitwise_reference(seed, prompt_len, heads):
+    """Includes seed 48 / 300 tokens / 8 heads, where a latent-attention
+    replica of the NAX scores GEMM differed from MLX's gemv_wide route
+    (fewer than 16 query rows) in a few elements."""
+    if prompt_len > 2048 and not _native_indexer_available():
+        pytest.skip("GLM DSA native indexer extension is not built")
+    _check_small_model(seed, prompt_len, heads)

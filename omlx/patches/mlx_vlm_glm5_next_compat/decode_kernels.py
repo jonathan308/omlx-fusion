@@ -2582,9 +2582,13 @@ def latent_attention(
             mask_kind = 2
         else:
             mask_kind = 3 if causal else 0
-    if N < 1 or N > 4096:  # softmax_single_row range
+    if N < 2 or N > 4096:  # softmax_single_row range; one key is a gemv
         return None
     R = H * L
+    if R < 16:
+        # The reference scores q @ k.T then take MLX's gemv_wide route
+        # (2..15 rows, transposed right operand), not the NAX GEMM.
+        return None
     # steel_matmul NAX routing for scores (M=R, N, K=D) and values (M=R, N=D, K=N).
     s_part = _steel_nax_partition(R, N, D)
     v_part = _steel_nax_partition(R, D, N)
