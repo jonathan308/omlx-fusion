@@ -1212,52 +1212,67 @@ def test_sparse_attention_completes_at_32k_with_fp32_scale_projection(monkeypatc
     )
 
 
-def test_prefill_evals_stream_per_layer_to_bound_transient(monkeypatch):
-    """Prefill releases layer intermediates and cached buffers; decode stays lazy."""
+def test_prefill_pipelines_layers_with_bounded_inflight(monkeypatch):
+    """Prefill queues every layer asynchronously (bounded in flight); decode stays lazy.
+
+    perf/bounded-layer-pipelining replaced the blocking per-layer ``mx.eval`` +
+    ``mx.clear_cache`` with ``omlx.utils.layer_pipeline.LayerPipeline``: each
+    layer is queued with ``mx.async_eval`` and the host only waits for the
+    layer queued before it, so at most two layers are in flight and the
+    allocator pool is left intact between layers.
+    """
     import mlx_vlm.models.glm5_next.language as lang
+    from omlx.utils import layer_pipeline
 
     text = _tiny_config().text_config
     model = lang.Glm5NextModel(text)
 
-    calls = []
+    queued = []
+    waited = []
     clears = []
+    real_async = mx.async_eval
     real_eval = mx.eval
     real_clear = mx.clear_cache
 
-    def spy(*args, **kw):
-        calls.append(sum(len(a) if isinstance(a, (tuple, list)) else 1 for a in args))
+    def async_spy(*args, **kw):
+        queued.append(len(args))
+        return real_async(*args, **kw)
+
+    def eval_spy(*args, **kw):
+        waited.append(len(args))
         return real_eval(*args, **kw)
 
     def clear_spy(**kw):
         clears.append(1)
         return real_clear(**kw)
 
-    monkeypatch.setattr(lang.mx, "eval", spy)
+    monkeypatch.setattr(layer_pipeline.mx, "async_eval", async_spy)
+    monkeypatch.setattr(layer_pipeline.mx, "eval", eval_spy)
     monkeypatch.setattr(lang.mx, "clear_cache", clear_spy)
 
     ids = mx.zeros((1, 256), dtype=mx.int32)
     out = model(ids)
     real_eval(out)
-    assert len(calls) >= text.num_hidden_layers, (
-        f"prefill width must eval the stream per layer, got {len(calls)} eval calls"
-        f" for {text.num_hidden_layers} layers"
+    assert len(queued) >= text.num_hidden_layers, (
+        f"prefill width must queue every layer, got {len(queued)} async_eval"
+        f" calls for {text.num_hidden_layers} layers"
     )
-    # Layer-specific buffer sizes can accumulate in the allocator pool.
-    assert len(clears) >= text.num_hidden_layers, (
-        f"prefill must clear the allocator pool per layer, got {len(clears)}"
-        f" clears for {text.num_hidden_layers} layers"
+    assert len(waited) >= text.num_hidden_layers - 1, (
+        "prefill must wait on the previous layer (bounded in-flight depth),"
+        f" got {len(waited)} waits for {text.num_hidden_layers} layers"
     )
+    assert not clears, "prefill must leave the allocator pool intact between layers"
 
-    calls.clear()
+    queued.clear()
+    waited.clear()
     clears.clear()
     decode = mx.zeros((1, 1), dtype=mx.int32)
     out = model(decode)
     real_eval(out)
-    assert len(calls) < text.num_hidden_layers, (
+    assert len(queued) < text.num_hidden_layers, (
         "decode width must stay lazy (no per-layer eval)"
     )
     assert not clears, "decode width must not clear the pool per layer"
-
 
 def test_patch_overrides_site_packages_glm5_next_copy():
     """The vendor module must replace an already imported upstream module."""
@@ -1293,7 +1308,7 @@ def test_patch_overrides_site_packages_glm5_next_copy():
         ), f"patch did not override: {lang.__file__}"
         src = Path(lang.__file__).read_text()
         assert "native_dtype" in src, "vendor language.py fix missing"
-        assert "clear_cache" in src, "vendor eval backpressure missing"
+        assert "LayerPipeline" in src, "vendor layer pipeline missing"
     finally:
         for n in [n for n in list(sys.modules) if n == pkg or n.startswith(pkg + ".")]:
             del sys.modules[n]
