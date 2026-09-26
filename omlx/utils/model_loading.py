@@ -1283,6 +1283,20 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
     )
 
 
+def mimo_mtp_sidecar_config(model_name: str | Path) -> dict[str, str] | None:
+    """Model-config override that loads ``<model>/mtp/model_mtp.safetensors``.
+
+    MiMo V2 MLX conversions usually drop the next-token-prediction layers;
+    the upstream ``model_mtp.safetensors`` placed under ``mtp/`` restores
+    Lightning MTP decoding (``mimo_v2`` sanitize splits and dequantizes it).
+    """
+    mtp_sidecar = Path(model_name).expanduser() / "mtp" / "model_mtp.safetensors"
+    if not mtp_sidecar.is_file():
+        return None
+    logger.info("Loading MiMo MTP sidecar from %s", mtp_sidecar)
+    return {"omlx_mtp_sidecar": str(mtp_sidecar)}
+
+
 def load_text_model(
     model_name: str,
     tokenizer_config: dict[str, Any] | None = None,
@@ -1296,10 +1310,9 @@ def load_text_model(
         else False
     )
     load_kwargs = {}
-    mtp_sidecar = Path(model_name).expanduser() / "mtp" / "model_mtp.safetensors"
-    if mtp_sidecar.is_file():
-        load_kwargs["model_config"] = {"omlx_mtp_sidecar": str(mtp_sidecar)}
-        logger.info("Loading MiMo MTP sidecar from %s", mtp_sidecar)
+    sidecar_config = mimo_mtp_sidecar_config(model_name)
+    if sidecar_config is not None:
+        load_kwargs["model_config"] = sidecar_config
     return lm_load_compat(
         model_name,
         tokenizer_config=tokenizer_config,
