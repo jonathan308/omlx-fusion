@@ -81,6 +81,32 @@ def _decode_hc_pre(connection, norm, x: mx.array):
     return exact_hc_norm(connection, norm, x, mixes)
 
 
+def _multi_linear(x, layers):
+    """``[linear_forward(layer, x) for layer in layers]`` for a decode/verify
+    block ``x`` [1, L, D]: layers sharing (bits, group size) run as one exact
+    ``decode_kernels.multi_qmv`` dispatch, the others as the reference call.
+    Returns None when no two layers could share a dispatch."""
+    groups = {}
+    for i, layer in enumerate(layers):
+        key = (getattr(layer, "bits", None), getattr(layer, "group_size", None))
+        groups.setdefault(key, []).append(i)
+    if all(len(g) == 1 for g in groups.values()):
+        return None
+    L, D = x.shape[1], x.shape[2]
+    outs = [None] * len(layers)
+    for group in groups.values():
+        res = None
+        if len(group) > 1:
+            res = _decode_kernels.multi_qmv(x.reshape(L, D), [layers[i] for i in group])
+            if res is not None:
+                res = [r.reshape(1, L, -1) for r in res]
+        if res is None:
+            res = [linear_forward(layers[i], x) for i in group]
+        for i, r in zip(group, res):
+            outs[i] = r
+    return outs
+
+
 def _decode_hc_expand(x: mx.array, residual: mx.array, post, comb) -> mx.array:
     """``hc_expand`` with the one-token case in a single exact dispatch."""
     if (
@@ -530,7 +556,7 @@ class Glm5NextIndexer(nn.Module):
 
     def _fast_short_select(
         self, q, x, pool_keys, before, after, pool_lengths, kv_cache, S,
-        select_k, tail_on, output_width,
+        select_k, tail_on, output_width, w_raw=None,
     ):
         """Decode/verify (S <= 8, one sequence) selection on fused kernels.
 
@@ -546,7 +572,7 @@ class Glm5NextIndexer(nn.Module):
         if select_k * self.index_kpool > self.index_topk or _decode_kernels is None:
             return None
         dk = _decode_kernels
-        weights = linear_forward(self.weights_proj, x)
+        weights = w_raw if w_raw is not None else linear_forward(self.weights_proj, x)
         weights = (weights * self.weight_scale).astype(q.dtype)
         scores = dk.dsa_decode_scores(
             q, pool_keys, weights, before, pool_lengths, self.index_kpool
@@ -569,10 +595,19 @@ class Glm5NextIndexer(nn.Module):
             output_width,
         )
 
-    def __call__(self, x, qr, mask, cache=None, kv_cache=None, score_from=0):
+    def __call__(
+        self, x, qr, mask, cache=None, kv_cache=None, score_from=0, projected=None
+    ):
         B, S, _ = x.shape
-        q = linear_forward(self.wq_b, qr).reshape(B, S, self.n_heads, self.head_dim)
-        k = self.k_norm(linear_forward(self.wk, x)).reshape(B, S, self.head_dim)
+        # ``projected``: (wq_b(qr), wk(x), weights_proj(x)) already computed by
+        # the attention's fused decode projections (entries may be None).
+        q_raw, k_raw, w_raw = projected if projected is not None else (None, None, None)
+        if q_raw is None:
+            q_raw = linear_forward(self.wq_b, qr)
+        if k_raw is None:
+            k_raw = linear_forward(self.wk, x)
+        q = q_raw.reshape(B, S, self.n_heads, self.head_dim)
+        k = self.k_norm(k_raw).reshape(B, S, self.head_dim)
         gate_scores = x @ self.index_kpool_compress_gate.swapaxes(-1, -2)
 
         if cache is not None:
@@ -627,7 +662,7 @@ class Glm5NextIndexer(nn.Module):
         ):
             fast = self._fast_short_select(
                 q, x, pool_keys, before, after, pool_lengths, kv_cache, S,
-                select_k, tail_on, output_width,
+                select_k, tail_on, output_width, w_raw=w_raw,
             )
             if fast is not None:
                 return fast
@@ -648,7 +683,10 @@ class Glm5NextIndexer(nn.Module):
             c1 = min(c0 + chunk, S)
             cs = c1 - c0
             q_chunk = q[:, c0:c1]
-            weights = linear_forward(self.weights_proj, x[:, c0:c1])
+            if w_raw is not None and c0 == 0 and c1 == S:
+                weights = w_raw
+            else:
+                weights = linear_forward(self.weights_proj, x[:, c0:c1])
             weights = (weights * self.weight_scale).astype(q_chunk.dtype)
             index_scores = self._native_scores(q_chunk, pool_keys, weights)
             if index_scores is None:
@@ -835,11 +873,15 @@ class Glm5NextSparseAttention(nn.Module):
     ) -> mx.array:
         B, L, D = x.shape
 
-        qr = self.q_a_layernorm(linear_forward(self.q_a_proj, x))
-        q = linear_forward(self.q_b_proj, qr)
+        projected = self._decode_projections(x, cache)
+        if projected is None:
+            qr = self.q_a_layernorm(linear_forward(self.q_a_proj, x))
+            q = linear_forward(self.q_b_proj, qr)
+            compressed_kv = linear_forward(self.kv_a_proj_with_mqa, x)
+            indexer_projected = None
+        else:
+            qr, q, compressed_kv, indexer_projected = projected
         q = q.reshape(B, L, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
-
-        compressed_kv = linear_forward(self.kv_a_proj_with_mqa, x)
         kv_latent = self.kv_a_layernorm(compressed_kv)
         kv_latent = mx.expand_dims(kv_latent, axis=1)
 
@@ -859,6 +901,7 @@ class Glm5NextSparseAttention(nn.Module):
             cache=cache[1],
             kv_cache=cache[0],
             score_from=dense_rows,
+            projected=indexer_projected,
         )
         out_dense = None
         if dense_rows and topk_indices is not None:
@@ -1005,6 +1048,43 @@ class Glm5NextSparseAttention(nn.Module):
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self._finish(output, out_dense)
+
+    def _decode_projections(self, x, cache):
+        """Decode/verify (B == 1, L <= 8) projections, one dispatch per input
+        and quantization.
+
+        q_a, kv_a and the indexer's wk (and weights_proj when the indexer
+        will select) read ``x``; q_b (and the indexer's wq_b when selecting)
+        read ``qr``. Projections sharing an input and (bits, group size) run
+        as one ``decode_kernels.multi_qmv`` dispatch with the per-row
+        arithmetic of the separate matmuls; the rest are the reference calls.
+        Returns ``(qr, q, compressed_kv, indexer_projected)`` or None.
+        """
+        B, L, D = x.shape
+        if _decode_kernels is None or not _DECODE_FUSION or B != 1 or L > _DECODE_BLOCK:
+            return None
+        if cache is None:
+            return None
+        idx = self.indexer
+        processed = idx._processed(cache[1])
+        total = (max(processed) if isinstance(processed, list) else processed) + L
+        selecting = not (getattr(idx, "bypass_short", True) and total <= idx.index_topk)
+        x_layers = [self.q_a_proj, self.kv_a_proj_with_mqa, idx.wk]
+        if selecting:
+            x_layers.append(idx.weights_proj)
+        outs = _multi_linear(x, x_layers)
+        if outs is None:
+            return None
+        qr = self.q_a_layernorm(outs[0])
+        qr_outs = _multi_linear(qr, [self.q_b_proj] + ([idx.wq_b] if selecting else []))
+        if qr_outs is None:
+            qr_outs = [linear_forward(self.q_b_proj, qr)]
+        indexer_projected = (
+            qr_outs[1] if selecting and len(qr_outs) > 1 else None,
+            outs[2],
+            outs[3] if selecting else None,
+        )
+        return qr, qr_outs[0], outs[1], indexer_projected
 
     def _decode_latent(self, q_latent, kv_latent, attn_mask, cache, indices=None):
         """Latent-space attention of a decode/verify block (B == 1, L <= 8)

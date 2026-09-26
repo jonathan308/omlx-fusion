@@ -1533,43 +1533,60 @@ _ROUTER_LOGITS_SOURCE = r"""
 """
 
 _ROUTER_SELECT_SOURCE = r"""
-  // One thread per expert: its rank in argpartition's order (a stable
-  // ascending sort of -biased: descending values, ties to the lower index,
-  // NaNs last in index order). Ranks < TOPK are the selected routes.
+  const uint lane = thread_index_in_simdgroup;
   const int tok = int(threadgroup_position_in_grid.x);
-  const int e = int(thread_position_in_threadgroup.x);
+  constexpr int PER = (E + 31) / 32;
   const device float* bz = biased + size_t(tok) * E;
   const device float* sz = sig + size_t(tok) * E;
-  threadgroup float vals[E];
-  threadgroup int picked[TOPK];
-  if (e < E) {
-    vals[e] = bz[e];
+  float vals[PER];
+  bool taken[PER];
+  for (int j = 0; j < PER; j++) {
+    const int e = j * 32 + int(lane);
+    vals[j] = e < E ? bz[e] : -INFINITY;
+    taken[j] = e >= E;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (e < E) {
-    const float v = vals[e];
-    const bool v_nan = isnan(v);
-    int rank = 0;
-    int n_valid = 0;
-    for (int j = 0; j < E; j++) {
-      const float u = vals[j];
-      const bool u_nan = isnan(u);
-      n_valid += u_nan ? 0 : 1;
-      if (v_nan) {
-        rank += (u_nan && j < e) ? 1 : 0;
-      } else if (!u_nan && (u > v || (u == v && j < e))) {
-        rank += 1;
+  int picked[TOPK];
+  for (int r = 0; r < TOPK; r++) {
+    // Best remaining candidate of this lane: highest value, lowest index.
+    float best = -INFINITY;
+    int best_e = 0x7fffffff;
+    for (int j = 0; j < PER; j++) {
+      const int e = j * 32 + int(lane);
+      if (!taken[j] && !isnan(vals[j]) &&
+          (best_e == 0x7fffffff || vals[j] > best || (vals[j] == best && e < best_e))) {
+        best = vals[j];
+        best_e = e;
       }
     }
-    if (v_nan) {
-      rank += n_valid;
+    for (ushort off = 16; off >= 1; off >>= 1) {
+      float ob = simd_shuffle_xor(best, off);
+      int oe = simd_shuffle_xor(best_e, off);
+      const bool other_better = oe != 0x7fffffff &&
+          (best_e == 0x7fffffff || ob > best || (ob == best && oe < best_e));
+      if (other_better) {
+        best = ob;
+        best_e = oe;
+      }
     }
-    if (rank < TOPK) {
-      picked[rank] = e;
+    if (best_e == 0x7fffffff) {
+      // Only NaNs remain (uniform branch): argpartition's sort places them
+      // after every number, lowest index first.
+      for (int j = 0; j < PER; j++) {
+        const int e = j * 32 + int(lane);
+        if (!taken[j] && e < best_e) {
+          best_e = e;
+        }
+      }
+      for (ushort off = 16; off >= 1; off >>= 1) {
+        best_e = min(best_e, simd_shuffle_xor(best_e, off));
+      }
+    }
+    picked[r] = best_e;
+    if ((best_e % 32) == int(lane)) {
+      taken[best_e / 32] = true;
     }
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (e == 0) {
+  if (lane == 0) {
     float total = 0.0f;
     float gathered[TOPK];
     for (int r = 0; r < TOPK; r++) {
@@ -1578,9 +1595,9 @@ _ROUTER_SELECT_SOURCE = r"""
     }
     for (int r = 0; r < TOPK; r++) {
       float q = NORM ? gathered[r] / total : gathered[r];
-      float sc = q * scaling[0];
+      float s = q * scaling[0];
       indices[tok * TOPK + r] = uint(picked[r]);
-      scores[tok * TOPK + r] = sc;
+      scores[tok * TOPK + r] = s;
     }
   }
 """
@@ -1647,7 +1664,7 @@ def moe_router(
         output_shapes=[(T, E), (T, E)],
         output_dtypes=[mx.float32, mx.float32],
     )
-    threads = ((E + 31) // 32) * 32
+    threads = 32  # one simdgroup per token (eight selection rounds)
     indices, scores = _router_select_kernel()(
         inputs=[sig, biased, mx.array([scaling], dtype=mx.float32)],
         template=[("E", E), ("TOPK", top_k), ("NORM", int(bool(norm_topk_prob) and top_k > 1))],
@@ -1951,7 +1968,7 @@ def moe_router_rows(
         output_shapes=[(T, E), (T, E)],
         output_dtypes=[mx.float32, mx.float32],
     )
-    threads = ((E + 31) // 32) * 32
+    threads = 32  # one simdgroup per token (eight selection rounds)
     indices, scores = _router_select_kernel()(
         inputs=[sig, biased, mx.array([scaling], dtype=mx.float32)],
         template=[("E", E), ("TOPK", top_k), ("NORM", int(bool(norm_topk_prob) and top_k > 1))],
@@ -2575,3 +2592,137 @@ def latent_attention_sparse_rows(
     )[0]
     STATS["latent_sparse_rows"] += 1
     return out.reshape(1, L, H, D).transpose(0, 2, 1, 3)
+
+
+# ---------------------------------------------------------------------------
+# Several quantized projections of one input in a single dispatch
+# ---------------------------------------------------------------------------
+#
+# One-token rows reproduce MLX's qmv_fast (2 simdgroups x 4 rows per 8-row
+# tile, qdot per 512/256-wide K block, simd_sum); 2..8-token rows reproduce
+# qmv_wide (8 lanes per row, per-group dequantize in 8-value sub-chunks, 4/2/1
+# ladder) -- the kernels the separate projections run on. Each part keeps
+# its own contiguous output, so nothing downstream changes.
+_MULTI_QMV_SOURCE = r"""
+  const uint lane = thread_index_in_simdgroup;
+  const int sg = int(simdgroup_index_in_threadgroup);
+  const int row0 = int(threadgroup_position_in_grid.x) * 8;
+  constexpr int WB = K * BITS / 8;
+  constexpr int G = K / GS;
+  const device uint8_t* w;
+  const device T* sc;
+  const device T* bi;
+  device T* y;
+  int local;
+  int n_rows;
+  if (row0 < N0) {
+    w = (const device uint8_t*)w0; sc = s0; bi = b0; y = y0; local = row0; n_rows = N0;
+  }
+#if NP > 1
+  else if (row0 < N0 + N1) {
+    w = (const device uint8_t*)w1; sc = s1; bi = b1; y = y1; local = row0 - N0; n_rows = N1;
+  }
+#endif
+#if NP > 2
+  else if (row0 < N0 + N1 + N2) {
+    w = (const device uint8_t*)w2; sc = s2; bi = b2; y = y2; local = row0 - N0 - N1; n_rows = N2;
+  }
+#endif
+#if NP > 3
+  else {
+    w = (const device uint8_t*)w3; sc = s3; bi = b3; y = y3; local = row0 - N0 - N1 - N2; n_rows = N3;
+  }
+#endif
+#if TOK == 1
+  const int r0 = local + sg * 4;
+  float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  glm_qmv_rows<T, K, GS, BITS, 4>(
+      w + size_t(r0) * WB, sc + r0 * G, bi + r0 * G, x, lane, result);
+  for (int r = 0; r < 4; r++) {
+    float v = simd_sum(result[r]);
+    if (lane == 0) {
+      y[r0 + r] = static_cast<T>(v);
+    }
+  }
+#else
+  const int k_lane = int(lane) % 8;
+  const int row = local + sg * 4 + int(lane) / 8;
+  float res[TOK];
+  for (int v = 0; v < TOK; v++) {
+    res[v] = 0.0f;
+  }
+  glm_qmv_wide_row<T, K, GS, BITS, TOK>(
+      w + size_t(row) * WB, sc + row * G, bi + row * G, x, TOK, k_lane, res);
+  for (int v = 0; v < TOK; v++) {
+    res[v] += simd_shuffle_down(res[v], 4);
+    res[v] += simd_shuffle_down(res[v], 2);
+    res[v] += simd_shuffle_down(res[v], 1);
+  }
+  if (k_lane == 0) {
+    for (int v = 0; v < TOK; v++) {
+      y[size_t(v) * n_rows + row] = static_cast<T>(res[v]);
+    }
+  }
+#endif
+"""
+
+
+@lru_cache(maxsize=None)
+def _multi_qmv_kernel(n_parts: int, tokens: int):
+    inputs = ["x"]
+    for i in range(n_parts):
+        inputs += [f"w{i}", f"s{i}", f"b{i}"]
+    return mx.fast.metal_kernel(
+        name=f"glm5_multi_qmv_p{n_parts}_t{tokens}",
+        input_names=inputs,
+        output_names=[f"y{i}" for i in range(n_parts)],
+        header=_QMV_HEADER,
+        source=_source(_MULTI_QMV_SOURCE, NP=n_parts, TOK=tokens),
+    )
+
+
+def multi_qmv(x: mx.array, layers) -> Optional[list]:
+    """``[linear(x) for linear in layers]`` for 1..8 rows in one dispatch.
+
+    ``x`` [T, K]; ``layers`` 1..4 affine quantized linears (no bias) with the
+    same bits/group size, K inputs and output rows divisible by 8. Returns
+    the [T, N_i] outputs or None when not covered.
+    """
+    if x.ndim != 2 or not 1 <= len(layers) <= 4 or x.dtype not in (mx.bfloat16, mx.float16):
+        return None
+    T, K = x.shape
+    if not 1 <= T <= 8:
+        return None
+    parts = [_affine_parts(m) for m in layers]
+    if any(p is None for p in parts):
+        return None
+    bits, gs = parts[0][3], parts[0][4]
+    if any((p[3], p[4]) != (bits, gs) for p in parts):
+        return None
+    rows = []
+    for w, s, b, _, _ in parts:
+        if w.ndim != 2 or w.shape[1] * 32 // bits != K or s.dtype != x.dtype:
+            return None
+        rows.append(w.shape[0])
+    if any(n % 8 for n in rows):
+        return None
+    if T == 1:
+        # qmv_fast only (MLX routes the one-row product there when aligned).
+        if not all(_qmv_fast_ok(bits, gs, n, K) for n in rows):
+            return None
+    elif bits not in (4, 5, 6, 8) or gs % 8 or K % gs or K in (64, 128):
+        return None
+    inputs = [x]
+    for w, s, b, _, _ in parts:
+        inputs += [w, s, b]
+    template = [("T", x.dtype), ("K", K), ("BITS", bits), ("GS", gs)]
+    template += [(f"N{i}", rows[i] if i < len(rows) else 0) for i in range(4)]
+    STATS["multi_qmv"] += 1
+    return list(_multi_qmv_kernel(len(layers), T)(
+        inputs=inputs,
+        template=template,
+        grid=(64 * (sum(rows) // 8), 1, 1),
+        threadgroup=(64, 1, 1),
+        output_shapes=[(T, n) for n in rows],
+        output_dtypes=[x.dtype] * len(rows),
+    ))

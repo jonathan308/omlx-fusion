@@ -476,7 +476,8 @@ def _check_small_model(seed=41, prompt_len=2101):
 
 
 _ALWAYS_FUSED = {
-    "hc_mix", "moe_gate_up", "moe_down", "dsa_scores", "kda", "router", "latent_attn"
+    "hc_mix", "moe_gate_up", "moe_down", "dsa_scores", "kda", "router", "latent_attn",
+    "multi_qmv",
 }
 
 
@@ -491,7 +492,7 @@ def test_small_model_dense_attention_is_bitwise_reference():
     from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
 
     used = _check_small_model(seed=43, prompt_len=300)
-    assert {"hc_mix", "kda", "router", "moe_gate_up"} <= used, used
+    assert {"hc_mix", "kda", "router", "moe_gate_up", "multi_qmv"} <= used, used
     assert ("latent_attn" in used) == dk.nax_available(), used
 
 
@@ -656,6 +657,25 @@ def test_router_breaks_exact_ties_like_argpartition(monkeypatch):
     assert _mismatches(scores, ref_scores) == 0
 
 
+def test_router_orders_nan_scores_like_argpartition(monkeypatch):
+    language = _language()
+    gate = _router(64, 512, seed=9)
+    bias = gate.e_score_correction_bias
+    for e in range(64):
+        if e not in (5, 33, 60):
+            bias[e] = float("nan")
+    gate.e_score_correction_bias = bias
+    x = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)
+    before = _stats()["router"]
+    indices, scores = gate(x)
+    assert _stats()["router"] == before + 1
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    ref_indices, ref_scores = gate(x)
+    assert sorted(ref_indices[0, 0].tolist()[:3]) == [5, 33, 60]
+    assert mx.array_equal(indices, ref_indices).item()
+    assert _mismatches(scores, ref_scores) == 0
+
+
 def test_router_declines_other_gemv_configurations():
     from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
 
@@ -794,3 +814,62 @@ def test_latent_attention_sparse_verify_is_bitwise_gathered_sdpa(length, width, 
     ).reshape(1, length, 64, 512).transpose(0, 2, 1, 3)
     fused = dk.latent_attention_sparse_rows(q, kv, sel[0], 256**-0.5)
     assert _mismatches(fused, reference) == 0
+
+
+# ---------------------------------------------------------------------------
+# Projections sharing one input (MLA q_a / kv_a / indexer wk, weights_proj)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("tokens", [1, 2, 3, 5, 8])
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+def test_multi_qmv_is_bitwise_separate_projections(tokens, bits):
+    from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
+
+    language = _language()
+    mx.random.seed(tokens * 10 + bits)
+    k = 1024
+    layers = [_quantized_linear(n, k, bits) for n in (512, 136, 128, 32)]
+    x = (mx.random.normal((1, tokens, k)) * 0.7).astype(mx.bfloat16)
+    for count in (1, 2, 4):
+        group = layers[:count]
+        fused = dk.multi_qmv(x.reshape(tokens, k), group)
+        assert fused is not None
+        for layer, out in zip(group, fused):
+            reference = language.linear_forward(layer, x).reshape(tokens, -1)
+            assert _mismatches(out, reference) == 0, (count, layer.weight.shape)
+
+
+def test_multi_qmv_declines_uncovered_projections():
+    from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
+
+    mx.random.seed(3)
+    x = (mx.random.normal((1, 1024)) * 0.7).astype(mx.bfloat16)
+    eight, six = _quantized_linear(256, 1024, 8), _quantized_linear(256, 1024, 6)
+    assert dk.multi_qmv(x, [eight, six]) is None  # mixed bits
+    assert dk.multi_qmv(x, [eight, _quantized_linear(12, 1024, 8)]) is None
+    biased = nn.QuantizedLinear(1024, 256, bias=True, bits=8)
+    assert dk.multi_qmv(x, [eight, biased]) is None
+    assert dk.multi_qmv(x, [eight, nn.Linear(1024, 256, bias=False)]) is None
+    assert dk.multi_qmv(mx.zeros((9, 1024), mx.bfloat16), [eight]) is None
+    # one token: qmv_fast shapes only (4-bit needs K % 512 == 0)
+    four = _quantized_linear(256, 1280, 4)
+    assert dk.multi_qmv(mx.zeros((1, 1280), mx.bfloat16), [four, four]) is None
+
+
+def test_multi_linear_groups_projections_by_quantization():
+    language = _language()
+    mx.random.seed(5)
+    x = (mx.random.normal((1, 3, 1024)) * 0.7).astype(mx.bfloat16)
+    layers = [
+        _quantized_linear(512, 1024, 6),
+        _quantized_linear(256, 1024, 8),
+        _quantized_linear(128, 1024, 6),
+        _quantized_linear(32, 1024, 8),
+    ]
+    before = _stats()["multi_qmv"]
+    outs = language._multi_linear(x, layers)
+    assert _stats()["multi_qmv"] == before + 2
+    for layer, out in zip(layers, outs):
+        assert _mismatches(out, language.linear_forward(layer, x)) == 0
+    assert language._multi_linear(x, layers[:2]) is None
