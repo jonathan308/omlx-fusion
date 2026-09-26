@@ -990,3 +990,28 @@ def test_latent_attention_first_use_check_rejects_wrong_kernels(monkeypatch):
     assert dk.latent_attention(q, kv, 256**-0.5) is None
     assert dk.latent_attention(q, kv, 256**-0.5) is None  # cached verdict
     assert list(dk._LATENT_CHECKED.values()) == [False]
+
+
+def test_router_rows_first_use_check_rejects_wrong_kernels():
+    out = _run_with_tf32(
+        "import mlx.core as mx\n"
+        "from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk\n"
+        "if not dk.nax_relaxed_fp32_matmul():\n"
+        "    print('no-nax')\n"
+        "else:\n"
+        "    real = dk._router_select_kernel()\n"
+        "    def wrong(**kw):\n"
+        "        idx, sc = real(**kw)\n"
+        "        return idx, sc * 1.5\n"
+        "    dk._router_select_kernel = lambda: wrong\n"
+        "    gate = t._router(64, 512, seed=4)\n"
+        "    x = mx.random.normal((4, 512)).astype(mx.bfloat16)\n"
+        "    args = (gate.weight, gate.e_score_correction_bias, 8, 2.5, True)\n"
+        "    assert dk.moe_router_rows(x, *args) is None\n"
+        "    assert dk.moe_router_rows(x, *args) is None\n"
+        "    assert list(dk._ROUTER_ROWS_CHECKED.values()) == [False]\n"
+        "    print('checked')\n"
+    )
+    if "no-nax" in out:
+        pytest.skip("this GPU runs fp32 GEMMs without NAX")
+    assert "checked" in out

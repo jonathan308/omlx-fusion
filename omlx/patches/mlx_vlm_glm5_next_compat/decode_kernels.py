@@ -1887,17 +1887,49 @@ _ROUTER_NAX_SOURCE = r"""
     ct_c[i] = 0.0f;
   }
   const int k_begin = p * PART;
-  for (int kc = 0; kc < PART / 16; kc++) {
-    const int k0 = k_begin + kc * 16;
-    for (short i = 0; i < 8; i++) {
-      const short r = fm + (i >> 2) * 8;
-      const short c = fn + (i & 3);
-      ct_a[i] = (r < M) ? static_cast<float>(x[r * K + k0 + c]) : 0.0f;
-      ct_b[i] = w[size_t(n0 + r) * K + k0 + c];
-      ct_b[8 + i] = w[size_t(n0 + 16 + r) * K + k0 + c];
-    }
-    op.run(ct_a, ct_b, ct_c);
+  constexpr int CHUNKS = PART / 16;
+  // Operands of the next G chunks are loaded ahead of the (accumulator
+  // dependent) NAX chain; the chain itself is unchanged. Rows are addressed
+  // by offsets (an array of device pointers has been miscompiled).
+  const bool xok = fm < M;
+  const uint xoff = uint(xok ? fm : 0) * uint(K) + uint(k_begin + fn);
+  const uint w0 = uint(n0 + fm) * uint(K) + uint(k_begin + fn);
+  const uint w1 = w0 + 8u * uint(K);
+  const uint w2 = w0 + 16u * uint(K);
+  const uint w3 = w0 + 24u * uint(K);
+  float abuf[G][4];
+  float bbuf[G][16];
+#define GLM5_ROUTER_LOAD(kc, s)                                              \
+  {                                                                          \
+    const uint k0 = uint(kc) * 16u;                                          \
+    _Pragma("unroll") for (short e = 0; e < 4; e++) {                        \
+      abuf[s][e] = xok ? static_cast<float>(x[xoff + k0 + e]) : 0.0f;         \
+      bbuf[s][e] = w[w0 + k0 + e];                                           \
+      bbuf[s][4 + e] = w[w1 + k0 + e];                                       \
+      bbuf[s][8 + e] = w[w2 + k0 + e];                                       \
+      bbuf[s][12 + e] = w[w3 + k0 + e];                                      \
+    }                                                                        \
   }
+  _Pragma("unroll") for (short s = 0; s < G; s++) {
+    if (s < CHUNKS) GLM5_ROUTER_LOAD(s, s);
+  }
+  for (int kc0 = 0; kc0 < CHUNKS; kc0 += G) {
+    _Pragma("unroll") for (short s = 0; s < G; s++) {
+      const int kc = kc0 + s;
+      if (kc < CHUNKS) {
+        _Pragma("unroll") for (short i = 0; i < 4; i++) {
+          ct_a[i] = abuf[s][i];
+          ct_a[4 + i] = 0.0f;  // rows fm + 8 >= 8 >= M
+        }
+        _Pragma("unroll") for (short i = 0; i < 16; i++) {
+          ct_b[i] = bbuf[s][i];
+        }
+        if (kc + G < CHUNKS) GLM5_ROUTER_LOAD(kc + G, s);
+        op.run(ct_a, ct_b, ct_c);
+      }
+    }
+  }
+#undef GLM5_ROUTER_LOAD
   threadgroup float parts[NPART][16][32];
   for (short i = 0; i < 8; i++) {
     const short r = fm + (i >> 2) * 8;
@@ -1927,6 +1959,10 @@ _ROUTER_NAX_SOURCE = r"""
     }
   }
 """
+
+
+# Operand chunks (16 inputs each) loaded ahead of the router's NAX chain.
+_ROUTER_PREFETCH = int(os.environ.get("OMLX_GLM5_ROUTER_PREFETCH", "8"))
 
 
 @lru_cache(maxsize=None)
@@ -1984,7 +2020,8 @@ def moe_router_rows(
     npart = K // part
     sig, biased = _router_nax_kernel()(
         inputs=[x, weight, bias],
-        template=[("M", T), ("K", K), ("E", E), ("PART", part), ("NPART", npart)],
+        template=[("M", T), ("K", K), ("E", E), ("PART", part), ("NPART", npart),
+                  ("G", _ROUTER_PREFETCH)],
         grid=(32 * npart * (E // 32), 1, 1),
         threadgroup=(32 * npart, 1, 1),
         output_shapes=[(T, E), (T, E)],
@@ -1999,8 +2036,42 @@ def moe_router_rows(
         output_shapes=[(T, top_k), (T, top_k)],
         output_dtypes=[mx.uint32, mx.float32],
     )
+    key = (T, K, E, x.dtype, top_k, _ROUTER_PREFETCH)
+    if not _router_rows_verified(
+        key, indices, scores, x, weight, bias, top_k, scaling, norm_topk_prob
+    ):
+        return None
     STATS["router_rows"] += 1
     return indices, scores
+
+
+_ROUTER_ROWS_CHECKED: dict = {}
+
+
+def _router_rows_verified(key, indices, scores, x, weight, bias, top_k, scaling, norm) -> bool:
+    """First call of each configuration: compare with group_expert_select on
+    the reference logits (see ``_latent_verified``)."""
+    ok = _ROUTER_ROWS_CHECKED.get(key)
+    if ok is not None:
+        return ok
+    from omlx.patches.glm_moe_dsa.deepseek_v32 import group_expert_select
+
+    ref_idx, ref = group_expert_select(
+        x.astype(mx.float32) @ weight.T, bias, top_k, 1, 1, scaling, norm
+    )
+    ok = bool(
+        (mx.array_equal(indices, ref_idx.astype(indices.dtype))
+         & mx.array_equal(scores.view(mx.uint32), ref.view(mx.uint32))).item()
+    )
+    _ROUTER_ROWS_CHECKED[key] = ok
+    if not ok:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "GLM-5.3 fused verify router %s differs from the reference; "
+            "using the reference path for it", key,
+        )
+    return ok
 
 
 # ---------------------------------------------------------------------------
