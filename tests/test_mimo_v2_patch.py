@@ -743,3 +743,95 @@ def test_oq_preserves_mtp_shards_and_calibrates_all_heads(tmp_path, layout):
         assert mx.allclose(mx.array(actual_energy), expected_energy, atol=1e-5).item()
     finally:
         collector.restore(loaded)
+
+
+def _fp8_fused_qkv_sidecar(prefix, *, tp, n_h=4, n_kv=2, hd=32, vhd=24, cols=128):
+    """A pre-sharded FP8 fused qkv whose rows say which shard/part they are (values chosen to be exact in e4m3)."""
+    from omlx.patches.mimo_v2.fused_qkv_layout import (
+        FUSED_QKV_BLOCK_SIZE,
+        fused_qkv_part_rows,
+        fused_qkv_shard_rows,
+    )
+
+    q_pr, k_pr, v_pr = fused_qkv_part_rows(n_h, n_kv, hd, vhd, tp)
+    actual_pr, padded_pr = fused_qkv_shard_rows(n_h, n_kv, hd, vhd, tp)
+    # On disk the shards are stored back to back without padding; only the
+    # block scales are laid out on the per-shard padded grid.
+    rows = []
+    for shard in range(tp):
+        rows.extend([1.0 + shard] * q_pr + [10.0 + shard] * k_pr + [32.0 + 4 * shard] * v_pr)
+    assert len(rows) == tp * actual_pr
+    weight = mx.to_fp8(mx.array(rows, dtype=mx.float32)[:, None] * mx.ones((1, cols)))
+    scale = mx.ones((tp * padded_pr // FUSED_QKV_BLOCK_SIZE, cols // FUSED_QKV_BLOCK_SIZE))
+    return {f"{prefix}.weight": weight, f"{prefix}.weight_scale_inv": scale}, (q_pr, k_pr, v_pr)
+
+
+def _sanitized_qkv_rows(sidecar, config_extra, monkeypatch):
+    mimo_v2 = _load_patch_module()
+    from omlx.patches.mlx_lm_mtp import set_mtp_active
+
+    config = _minimal_config(
+        num_nextn_predict_layers=1,
+        omlx_mtp_sidecar="/models/mimo/mtp/model_mtp.safetensors",
+        **config_extra,
+    )
+    set_mtp_active(True)
+    try:
+        model = mimo_v2.Model(mimo_v2.ModelArgs.from_dict(config))
+    finally:
+        set_mtp_active(False)
+    monkeypatch.setattr(mimo_v2.mx, "load", lambda path: sidecar)
+    out = model.sanitize({})
+    prefix = "model.mtp.layers.0.self_attn"
+    return {
+        name: out[f"{prefix}.{name}_proj.weight"][:, 0].astype(mx.float32).tolist()
+        for name in ("q", "k", "v")
+    }
+
+
+def test_fp8_sidecar_qkv_assumes_the_official_tp4_layout_when_main_is_split(monkeypatch):
+    prefix = "model.mtp.layers.0.self_attn.qkv_proj"
+    sidecar, (q_pr, k_pr, v_pr) = _fp8_fused_qkv_sidecar(prefix, tp=4)
+    rows = _sanitized_qkv_rows(sidecar, {}, monkeypatch)
+    # Each projection is the concatenation of its per-shard parts, in order.
+    assert rows["q"] == [1.0 + s for s in range(4) for _ in range(q_pr)]
+    assert rows["k"] == [10.0 + s for s in range(4) for _ in range(k_pr)]
+    assert rows["v"] == [32.0 + 4 * s for s in range(4) for _ in range(v_pr)]
+
+
+def test_fp8_sidecar_qkv_tp_can_be_pinned(monkeypatch):
+    prefix = "model.mtp.layers.0.self_attn.qkv_proj"
+    sidecar, (q_pr, k_pr, v_pr) = _fp8_fused_qkv_sidecar(prefix, tp=2)
+    rows = _sanitized_qkv_rows(sidecar, {"omlx_mtp_sidecar_tp": 2}, monkeypatch)
+    assert rows["q"] == [1.0 + s for s in range(2) for _ in range(q_pr)]
+    assert rows["k"] == [10.0 + s for s in range(2) for _ in range(k_pr)]
+    assert rows["v"] == [32.0 + 4 * s for s in range(2) for _ in range(v_pr)]
+
+
+def test_prompt_priming_folds_the_prompt_into_the_mimo_heads():
+    mimo_v2 = _load_patch_module()
+    from omlx.patches.mlx_lm_mtp import prompt_priming, set_mtp_active
+
+    set_mtp_active(True)
+    try:
+        model = mimo_v2.Model(mimo_v2.ModelArgs.from_dict(_minimal_config(num_nextn_predict_layers=1)))
+    finally:
+        set_mtp_active(False)
+    cache = model.make_cache()
+    prompt_priming.drop_ctx(model)
+    model(mx.array([[1, 2, 3, 4, 5]]), cache=cache)
+    # Five prompt tokens give four (hidden, next-token) pairs for the heads.
+    assert prompt_priming.prime_ctx_stats(model) == 4
+    # A plain decode step extends the context; the activation forward
+    # (return_hidden=True) is left for take_primed to fold.
+    model(mx.array([[6]]), cache=cache)
+    assert prompt_priming.prime_ctx_stats(model) == 5
+    model(mx.array([[7]]), cache=cache, return_hidden=True)
+    assert prompt_priming.prime_ctx_stats(model) == 5
+    prompt_priming.drop_ctx(model)
+
+    # Longer prompts prime only the head window's tail (window 32 -> 16 here).
+    cache = model.make_cache()
+    model(mx.array([list(range(1, 41))]), cache=cache)
+    assert prompt_priming.prime_ctx_stats(model) == 16
+    prompt_priming.drop_ctx(model)
