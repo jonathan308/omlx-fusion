@@ -1085,3 +1085,44 @@ def test_small_model_seed_sweep_is_bitwise_reference(seed, prompt_len, heads):
     if prompt_len > 2048 and not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
     _check_small_model(seed, prompt_len, heads)
+
+
+def _fuse_gate_up(switch_mlp):
+    """The MoE gate/up fusion's layout: gate_up_proj = [gate; up] rows per
+    expert (omlx.patches.moe_gate_up_fusion._fuse_one)."""
+    gate, up = switch_mlp.gate_proj, switch_mlp.up_proj
+    fused = {f: mx.concatenate([gate[f], up[f]], axis=1) for f in ("weight", "scales", "biases")}
+    mx.eval(list(fused.values()))
+    for field, value in fused.items():
+        setattr(gate, field, value)
+    switch_mlp.gate_up_proj = gate
+    del switch_mlp.gate_proj
+    del switch_mlp.up_proj
+
+
+@pytest.mark.parametrize("length", [1, 2, 5, 8])
+def test_decode_experts_read_fused_gate_up_layout(length, monkeypatch):
+    language = _language()
+    moe = _moe(seed=10 + length)
+    x = (mx.random.normal((1, length, 1024)) * 0.7).astype(mx.bfloat16)
+    indices, scores = moe.gate(x)
+    split = moe._decode_experts(x, indices, scores)
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    reference = moe(x)
+    monkeypatch.setattr(language, "_DECODE_FUSION", True)
+    if split is None:  # 64 routes: sorted, left to SwitchGLU
+        assert length == 8
+    else:
+        assert _mismatches(split, reference) == 0
+    _fuse_gate_up(moe.switch_mlp)
+    fused = moe._decode_experts(x, indices, scores)
+    assert (fused is None) == (split is None)
+    if fused is not None:
+        assert _mismatches(fused, split) == 0
+    if hasattr(type(moe.switch_mlp), "projections"):
+        # This build's SwitchGLU runs the fused layout (MoE gate/up fusion).
+        monkeypatch.setattr(language, "_DECODE_FUSION", False)
+        fused_reference = moe(x)
+        monkeypatch.setattr(language, "_DECODE_FUSION", True)
+        assert _mismatches(fused_reference, reference) == 0
+        assert _mismatches(moe(x), reference) == 0

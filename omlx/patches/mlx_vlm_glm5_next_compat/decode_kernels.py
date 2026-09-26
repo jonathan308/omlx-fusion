@@ -380,13 +380,16 @@ _GATE_UP_SOURCE = r"""
     const int expert = int(indices[token * TOPK + r]);
     constexpr int WB = K * RBITS / 8;   // bytes per weight row
     constexpr int G = K / RGS;          // groups per row
-    const size_t row0 = size_t(expert) * N + out_row;
+    // ESTRIDE rows per expert; a fused [gate; up] tensor (ESTRIDE = 2N) is
+    // passed as both gate and up with the up rows UP_OFF = N further on.
+    const size_t row0 = size_t(expert) * ESTRIDE + out_row;
+    const size_t urow0 = row0 + UP_OFF;
     glm_qmv_rows<T, K, RGS, RBITS, RPS>(
         (const device uint8_t*)gate_w + row0 * WB, gate_s + row0 * G,
         gate_b + row0 * G, xr, simd_lid, g_res);
     glm_qmv_rows<T, K, RGS, RBITS, RPS>(
-        (const device uint8_t*)up_w + row0 * WB, up_s + row0 * G,
-        up_b + row0 * G, xr, simd_lid, u_res);
+        (const device uint8_t*)up_w + urow0 * WB, up_s + urow0 * G,
+        up_b + urow0 * G, xr, simd_lid, u_res);
   } else {
 #if HAS_SHARED
     constexpr int WB = K * SBITS / 8;
@@ -602,18 +605,29 @@ def moe_gate_up_swiglu(
     [T, TOPK (+1), N] in ``x.dtype`` or None when the shapes are not covered.
     With ``shared_wide`` (2 <= T <= 8) the shared expert uses the multi-row
     qmv_wide arithmetic the reference applies to T > 1 rows and the call
-    returns ``(routed [T, TOPK, N], shared [T, N])``.
+    returns ``(routed [T, TOPK, N], shared [T, N])``. ``routed_up=None``
+    means ``routed_gate`` is a fused ``gate_up_proj`` ([E, 2N, *]: gate rows
+    then up rows per expert, as the MoE gate/up fusion lays them out).
     """
     if "moe_gate_up" in DISABLED:
         return None
-    parts = [_affine_parts(m) for m in (routed_gate, routed_up)]
+    fused_gu = routed_up is None
+    parts = [_affine_parts(m) for m in ((routed_gate,) if fused_gu else (routed_gate, routed_up))]
     if any(p is None for p in parts) or x.ndim != 2 or indices.ndim != 2:
         return None
+    if fused_gu:
+        parts = parts * 2
     (gw, gs, gb, rbits, rgs), (uw, us, ub, ubits, ugs) = parts
     if (rbits, rgs) != (ubits, ugs) or gw.shape != uw.shape or gw.ndim != 3:
         return None
     T, K = x.shape
     E, N, _ = gw.shape
+    estride, up_off = N, 0
+    if fused_gu:
+        if N % 2:
+            return None
+        N //= 2
+        estride, up_off = 2 * N, N
     topk = indices.shape[1]
     if x.dtype not in (mx.bfloat16, mx.float16) or gs.dtype != x.dtype or us.dtype != x.dtype:
         return None
@@ -625,7 +639,7 @@ def moe_gate_up_swiglu(
     inputs = [x, indices, mx.array([limit], dtype=mx.float32), gw, gs, gb, uw, us, ub]
     template = [
         ("T", x.dtype), ("K", K), ("N", N), ("TOPK", topk), ("RBITS", rbits),
-        ("RGS", rgs), ("RPS", rps), ("NSG", nsg),
+        ("RGS", rgs), ("RPS", rps), ("NSG", nsg), ("ESTRIDE", estride), ("UP_OFF", up_off),
     ]
     if has_shared:
         sparts = [_affine_parts(m) for m in (shared_gate, shared_up)]

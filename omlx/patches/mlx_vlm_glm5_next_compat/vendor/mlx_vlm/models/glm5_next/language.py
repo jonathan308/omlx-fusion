@@ -81,6 +81,14 @@ def _decode_hc_pre(connection, norm, x: mx.array):
     return exact_hc_norm(connection, norm, x, mixes)
 
 
+def _switch_projections(sw):
+    """A SwitchGLU's expert projections in the order its forward passes them
+    to _sort_threshold (fused gate_up_proj or separate gate/up, then down)."""
+    if "gate_up_proj" in sw:
+        return (sw.gate_up_proj, sw.down_proj)
+    return (sw.up_proj, sw.gate_proj, sw.down_proj)
+
+
 def _multi_linear(x, layers):
     """``[linear_forward(layer, x) for layer in layers]`` for a decode/verify
     block ``x`` [1, L, D]: layers sharing (bits, group size) run as one exact
@@ -1309,9 +1317,15 @@ class Glm5NextMoE(nn.Module):
             or x.ndim != 3
             or x.shape[0] != 1
             or indices.shape[:2] != x.shape[:2]
-            or indices.size >= _sort_threshold(sw.gate_proj, sw.up_proj, sw.down_proj)
+            or indices.size >= _sort_threshold(*_switch_projections(sw))
         ):
             return None
+        # Separate gate/up projections, or one fused [gate; up] gate_up_proj
+        # (MoE gate/up fusion); the kernels read either layout in place.
+        if "gate_up_proj" in sw:
+            routed_gate, routed_up = sw.gate_up_proj, None
+        else:
+            routed_gate, routed_up = sw.gate_proj, sw.up_proj
         limit = getattr(sw.activation, "limit", None)
         if limit is None or (shared is not None and shared.limit != limit):
             return None
@@ -1322,7 +1336,7 @@ class Glm5NextMoE(nn.Module):
         dk = _decode_kernels
         if shared is not None and T == 1:
             act = dk.moe_gate_up_swiglu(
-                x2, routes, limit, sw.gate_proj, sw.up_proj,
+                x2, routes, limit, routed_gate, routed_up,
                 shared.gate_proj, shared.up_proj,
             )
             if act is None:
@@ -1334,7 +1348,7 @@ class Glm5NextMoE(nn.Module):
                 # One dispatch also computes the shared expert's gate/up with
                 # the multi-row qmv_wide arithmetic its own T > 1 call uses.
                 fused = dk.moe_gate_up_swiglu(
-                    x2, routes, limit, sw.gate_proj, sw.up_proj,
+                    x2, routes, limit, routed_gate, routed_up,
                     shared.gate_proj, shared.up_proj, shared_wide=True,
                 )
             if fused is not None:
@@ -1351,7 +1365,7 @@ class Glm5NextMoE(nn.Module):
                     shared.down_proj, shared_act.reshape(1, T, -1)
                 ).reshape(T, D)
             else:
-                act = dk.moe_gate_up_swiglu(x2, routes, limit, sw.gate_proj, sw.up_proj)
+                act = dk.moe_gate_up_swiglu(x2, routes, limit, routed_gate, routed_up)
                 if act is None:
                     return None
                 shared_y = None if shared is None else shared(x).reshape(T, D)
