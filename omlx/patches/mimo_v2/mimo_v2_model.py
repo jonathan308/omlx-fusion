@@ -15,6 +15,8 @@ from .cache import KVCache, RotatingKVCache
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
+import logging
+
 from omlx.patches.mimo_v2.fused_qkv_layout import (
     FUSED_QKV_BLOCK_SIZE,
     detect_fused_qkv_tp,
@@ -22,6 +24,8 @@ from omlx.patches.mimo_v2.fused_qkv_layout import (
     layer_head_geometry,
     split_fused_qkv,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -63,6 +67,10 @@ class ModelArgs(BaseModelArgs):
     tie_word_embeddings: bool = False
     num_nextn_predict_layers: int = 0
     omlx_mtp_sidecar: Optional[str] = None
+    # Tensor-parallel degree the sidecar's fused qkv was sharded for; None
+    # follows the main layers, or 4 (Xiaomi's release layout) when those are
+    # already split and the sliding-window geometry cannot tell.
+    omlx_mtp_sidecar_tp: Optional[int] = None
     n_shared_experts: Optional[int] = None
     scoring_func: str = "sigmoid"
 
@@ -537,6 +545,25 @@ class Model(nn.Module):
             return None if tensor is None else tensor.shape
 
         TP = detect_fused_qkv_tp(self.args, shape_of)
+        n_mtp = int(self.args.num_nextn_predict_layers or 0)
+        mtp_tp = self.args.omlx_mtp_sidecar_tp
+        if mtp_tp is None:
+            mtp_tp = TP
+            main_fused = any(
+                fused_qkv_keys(i)[1] in weights
+                for i in range(self.args.num_hidden_layers)
+            )
+            sidecar_fused = any(
+                f"model.mtp.layers.{i}.self_attn.qkv_proj.weight_scale_inv" in weights
+                for i in range(n_mtp)
+            )
+            if sidecar_fused and not main_fused:
+                mtp_tp = 4
+                logger.info(
+                    "MiMo MTP sidecar: the main layers are already split, so "
+                    "the fused qkv layout cannot be detected; assuming the "
+                    "official TP=4 layout (set omlx_mtp_sidecar_tp to override)"
+                )
 
         def dequant_block(weight, scale_inv):
             weight = mx.from_fp8(weight, dtype=bf16)
@@ -570,7 +597,7 @@ class Model(nn.Module):
             weights[f"{prefix}.k_proj.weight"] = k
             weights[f"{prefix}.v_proj.weight"] = v
 
-        for layer_idx in range(int(self.args.num_nextn_predict_layers or 0)):
+        for layer_idx in range(n_mtp):
             prefix = f"model.mtp.layers.{layer_idx}.self_attn"
             qkv_prefix = f"{prefix}.qkv_proj"
             qkv_key = f"{qkv_prefix}.weight"
@@ -579,7 +606,7 @@ class Model(nn.Module):
                 q, k, v = split_fused_qkv(
                     weights.pop(qkv_key),
                     weights.pop(scale_key),
-                    tp=TP,
+                    tp=mtp_tp,
                     n_h=self.args.swa_num_attention_heads,
                     n_kv=self.args.swa_num_key_value_heads,
                     hd=self.args.swa_head_dim,
