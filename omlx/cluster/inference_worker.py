@@ -33,6 +33,7 @@ from .deployment import (
     decode_worker_contract,
     decode_worker_path_map,
     decode_worker_speculation,
+    decode_worker_stage_links,
     distributed_mtp_model_supported,
 )
 from .jaccl_lease import acquire_jaccl_communicator_lease
@@ -60,6 +61,7 @@ from .pipeline_compat import (
 from .planner import PipelineAssignment
 from .prefill_guard import build_guard
 from .progressive_loading import install_progressive_loader
+from .rdma.stage_transport import install_stage_links
 from .runtime_optimizations import install_runtime_optimizations
 from .telemetry import install_server_telemetry
 
@@ -907,7 +909,9 @@ def _execution_settings(args: argparse.Namespace) -> ExecutionSettings:
         pipeline_microbatch_size=args.pipeline_microbatch_size,
         cache_affinity=args.cache_affinity,
         prompt_cache_ssd=args.prompt_cache_ssd,
-        prompt_cache_ssd_max_bytes=args.prompt_cache_ssd_max_bytes,
+        prompt_cache_ssd_max_bytes=getattr(
+            args, "prompt_cache_ssd_max_bytes", DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
+        ),
         sampling_rank_only=args.sampling_rank_only,
         async_overlap=args.async_overlap,
         ring_connections_per_ip=args.ring_connections_per_ip,
@@ -1075,9 +1079,9 @@ def _write_cancel_request(
         root.mkdir(parents=True, exist_ok=True)
         path = root / f"{deployment_id}-cancel.json"
         epoch = int(time.time() * 1000)
-        # Reused deployment IDs can leave an old control file behind. Keep
-        # epochs strictly monotonic even if that file came from a clock jump;
-        # the new worker treats the existing epoch as its startup watermark.
+        # A reused deployment ID can leave a marker from a future-skewed
+        # clock. Keep the edge monotonically newer so the live worker cannot
+        # mistake a watchdog request for its startup watermark.
         try:
             existing = json.loads(path.read_text(encoding="utf-8"))
             previous_epoch = existing.get("epoch") if isinstance(existing, dict) else 0
@@ -1959,7 +1963,14 @@ def run_worker(args: argparse.Namespace) -> int:
             measured_weight_bytes = _measured_weight_bytes(provider.model)
             _validate_measured_weight_bytes(measured_weight_bytes, assignment)
             model_group = parallel_groups.pipeline or parallel_groups.tensor or group
+            # Installed first so the runtime optimizations wrap the RDMA-aware send.
             with (
+                install_stage_links(
+                    mx,
+                    group,
+                    decode_worker_stage_links(args.plan),
+                    rank=rank,
+                ) as stage_links,
                 install_pipeline_group_routing(
                     provider.model,
                     (parallel_groups.pipeline if parallel_groups.hybrid else None),
@@ -1990,6 +2001,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         profile.to_dict() for profile in performance_profiles
                     ],
                     optimizations=optimizations,
+                    stage_links=stage_links,
                     mtp_enabled=mtp_enabled,
                     mtp_fixed_depth=mtp_fixed_depth,
                     mtp_effective_depth=qwen_mtp_depth or mtp_fixed_depth,
@@ -2016,6 +2028,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         "capacity_bytes": assignment.capacity_bytes,
                         "reserve_bytes": assignment.reserve_bytes,
                         "headroom_bytes": assignment.headroom_bytes,
+                        "stage_links": stage_links,
                     }
                 )
                 _wait_for_serve_release(
@@ -2023,6 +2036,7 @@ def run_worker(args: argparse.Namespace) -> int:
                     args.deployment_id,
                     plan_hash,
                     world_size,
+                    timeout=args.load_timeout,
                 )
                 warmup_tokens = _planned_prefill_shape_warmup_tokens(
                     optimizations,
@@ -2091,7 +2105,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         ssd_cache_dir=_prompt_cache_ssd_dir(args, rank),
                         ssd_cache_persistent=bool(args.prompt_cache_ssd),
                         ssd_write_behind=bool(args.prompt_cache_ssd),
-                        ssd_max_bytes=args.prompt_cache_ssd_max_bytes,
+                        ssd_cache_max_bytes=execution.prompt_cache_ssd_max_bytes,
                         prefill_step_size=args.prefill_step_size,
                         prefill_guard=build_guard(
                             provider.model,
@@ -2206,6 +2220,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--control-host", default="")
     parser.add_argument("--control-port", type=int, default=0)
     parser.add_argument("--control-token", default="")
+    parser.add_argument("--load-timeout", type=float, default=1800.0)
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument(
         "--execution-profile",

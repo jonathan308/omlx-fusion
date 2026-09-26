@@ -80,7 +80,9 @@ class PeerHealth:
             return False
         if not self.heartbeat_required:
             return True
-        return self.seconds_since_heartbeat is not None and self.process_live is not False
+        return (
+            self.seconds_since_heartbeat is not None and self.process_live is not False
+        )
 
     @property
     def stale(self) -> bool:
@@ -294,7 +296,9 @@ def marker_owner_is_live(marker: dict[str, Any]) -> bool:
     return _pid_is_live(pid)
 
 
-def marker_age_seconds(marker: dict[str, Any], *, now: float | None = None) -> float | None:
+def marker_age_seconds(
+    marker: dict[str, Any], *, now: float | None = None
+) -> float | None:
     """Seconds since a rank last refreshed its marker."""
 
     from datetime import UTC, datetime
@@ -492,9 +496,7 @@ class PeerWatchdog:
         self._on_abort = on_abort
         self._abort_grace = max(0.0, float(abort_grace))
         self._failure_tolerance = max(1, int(failure_tolerance))
-        self._consecutive_failures: dict[int, int] = {
-            rank: 0 for rank in hosts_by_rank
-        }
+        self._consecutive_failures: dict[int, int] = {rank: 0 for rank in hosts_by_rank}
         self._stop = False
 
     def stop(self) -> None:
@@ -557,9 +559,7 @@ class PeerWatchdog:
                 try:
                     self._on_abort(reason)
                 except Exception:
-                    logger.warning(
-                        "Peer watchdog abort stage failed", exc_info=True
-                    )
+                    logger.warning("Peer watchdog abort stage failed", exc_info=True)
                 if self._wait_for_recovery(sleep):
                     for rank in failed_ranks:
                         self._consecutive_failures[rank] = 0

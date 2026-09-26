@@ -8,6 +8,7 @@ touches the Hugging Face hub.
 import base64
 import json
 import platform
+import shlex
 import stat
 import struct
 import subprocess
@@ -37,12 +38,14 @@ from omlx.cluster.modelsync import (
     compare_manifests,
     parse_rsync_progress,
 )
-from omlx.cluster.planner import PipelineAssignment, synthetic_model_layout, ShardPlan
+from omlx.cluster.planner import PipelineAssignment, ShardPlan, synthetic_model_layout
 from omlx.cluster.registry import ClusterRegistry
 
 
 def _write_shard(directory, name, tensors, payload=b"\x00" * 32):
-    header = {t: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]} for t in tensors}
+    header = {
+        t: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]} for t in tensors
+    }
     blob = json.dumps(header).encode()
     (directory / name).write_bytes(struct.pack("<Q", len(blob)) + blob + payload)
 
@@ -135,9 +138,7 @@ def manifest_client(tmp_path, monkeypatch):
 
     models_root = tmp_path / "models"
     _model(models_root / "alpha")
-    settings = SimpleNamespace(
-        get_effective_model_dirs=lambda: [str(models_root)]
-    )
+    settings = SimpleNamespace(get_effective_model_dirs=lambda: [str(models_root)])
     monkeypatch.setattr(modelsync, "_pool_getter", None)
     monkeypatch.setattr(modelsync, "_settings_loader", lambda: settings)
     app = FastAPI()
@@ -168,9 +169,7 @@ def test_manifest_endpoint_404_for_unknown_model(manifest_client):
     assert response.status_code == 404
 
 
-def test_manifest_endpoint_refuses_paths_outside_model_dirs(
-    manifest_client, tmp_path
-):
+def test_manifest_endpoint_refuses_paths_outside_model_dirs(manifest_client, tmp_path):
     client, _ = manifest_client
     outside = _model(tmp_path / "elsewhere")
 
@@ -199,7 +198,9 @@ def test_compare_manifests_states(tmp_path):
     assert result["state"] == "partial"
     assert result["missing"] == ["model-00002.safetensors"]
     assert result["bytes"] == local.total_bytes - sum(
-        item.size_bytes for item in local.files if item.name == "model-00002.safetensors"
+        item.size_bytes
+        for item in local.files
+        if item.name == "model-00002.safetensors"
     )
 
     (peer_root / "config.json").write_text(json.dumps({"model_type": "other"}))
@@ -258,6 +259,8 @@ def test_path_map_validation():
         _deployment(path_map={"peer": "relative/dir"})
     with pytest.raises(ValueError, match="outside the deployment"):
         _deployment(path_map={"stranger": "/models/x"})
+    with pytest.raises(ValueError, match="absolute"):
+        _deployment(path_map={"peer": "/models/x\nmalformed"})
     assert validate_model_path_map(None) == {}
     assert validate_model_path_map({"a": "/m"}, ("a",)) == {"a": "/m"}
 
@@ -367,9 +370,7 @@ def _write_legacy_registry(base: Path, deployment: ClusterDeployment) -> Path:
     del entry["path_map"]
     path = base / "cluster" / "deployments.json"
     path.parent.mkdir(parents=True)
-    path.write_text(
-        json.dumps({"schema_version": 1, "deployments": [entry]}, indent=2)
-    )
+    path.write_text(json.dumps({"schema_version": 1, "deployments": [entry]}, indent=2))
     return path
 
 
@@ -400,9 +401,7 @@ def test_legacy_deployments_json_migrates_on_load(tmp_path):
 def test_registry_round_trip_preserves_path_map(tmp_path):
     model = tmp_path / "model"
     model.mkdir()
-    deployment = _deployment(
-        str(model), path_map={"peer": "/Volumes/models/copy"}
-    )
+    deployment = _deployment(str(model), path_map={"peer": "/Volumes/models/copy"})
     registry = ClusterRegistry(tmp_path)
 
     registry.upsert(deployment)
@@ -419,15 +418,9 @@ def test_registry_round_trip_preserves_path_map(tmp_path):
 def test_auto_method_prefers_rsync_for_large_models_with_ssh_trust():
     manager = ModelSyncManager(ssh_trust=lambda target: True)
 
-    assert (
-        manager.decide_method("user@peer", AUTO_RSYNC_THRESHOLD_BYTES + 1)
-        == "rsync"
-    )
+    assert manager.decide_method("user@peer", AUTO_RSYNC_THRESHOLD_BYTES + 1) == "rsync"
     # At or below 20 GiB each node downloads its own shard files instead.
-    assert (
-        manager.decide_method("user@peer", AUTO_RSYNC_THRESHOLD_BYTES)
-        == "download"
-    )
+    assert manager.decide_method("user@peer", AUTO_RSYNC_THRESHOLD_BYTES) == "download"
     # No enrolled SSH trust: download regardless of size.
     untrusted = ModelSyncManager(ssh_trust=lambda target: False)
     assert (
@@ -543,8 +536,11 @@ def test_sync_failure_emits_error_event(tmp_path):
 
     with pytest.raises(ModelSyncError, match="status 23"):
         manager.sync(
-            "peer", str(root), "rsync",
-            ssh_target="user@peer", on_progress=events.append,
+            "peer",
+            str(root),
+            "rsync",
+            ssh_target="user@peer",
+            on_progress=events.append,
         )
 
     assert events[-1].phase == "error"
@@ -592,7 +588,9 @@ def test_sync_auto_selects_rsync_for_large_models(tmp_path):
 
 def test_build_rsync_argv_is_resumable_and_noninteractive():
     argv = build_rsync_argv(
-        "/models/src", "user@peer.local", "/Volumes/models/dst",
+        "/models/src",
+        "user@peer.local",
+        "/Volumes/models/dst",
         ssh_identity="~/.ssh/omlx_cluster",
     )
 
@@ -604,6 +602,21 @@ def test_build_rsync_argv_is_resumable_and_noninteractive():
     assert "BatchMode=yes" in ssh and "omlx_cluster" in ssh
     assert argv[-2] == "/models/src/"
     assert argv[-1] == "user@peer.local:/Volumes/models/dst"
+
+
+def test_build_rsync_argv_protects_remote_paths_and_validates_targets():
+    destination = "/Volumes/model copies/$(touch should-not-run)"
+    argv = build_rsync_argv(
+        "/models/src",
+        "user@peer.local",
+        destination,
+    )
+
+    assert argv[-1] == f"user@peer.local:{shlex.quote(destination)}"
+    with pytest.raises(ValueError, match="SSH target"):
+        build_rsync_argv("/models/src", "peer;touch-nope", "/models/dst")
+    with pytest.raises(ValueError, match="single-line"):
+        build_rsync_argv("/models/src", "peer.local", "/models/dst\nother")
 
 
 def test_parse_rsync_progress_lines():
@@ -648,7 +661,6 @@ def test_allow_patterns_reject_inverted_range(tmp_path):
 
 
 def test_preflight_uses_per_node_model_paths(monkeypatch):
-    from omlx.cluster import launch
     from omlx.cluster.launch import _local_runtime_versions, preflight_remote_hosts
     from omlx.cluster.models import CLUSTER_PROTOCOL_VERSION
 

@@ -33,6 +33,7 @@ from ..cluster.liveness import (
     check_peers,
     describe_failure,
     marker_age_seconds,
+    marker_owner_is_live,
     read_marker,
 )
 from ..exceptions import PrefillMemoryExceededError
@@ -41,6 +42,7 @@ from .base import GenerationOutput
 from .batched import BatchedEngine
 
 logger = logging.getLogger(__name__)
+_request_clock = time.monotonic
 
 # How long one per-rank marker health read stays authoritative. Every request
 # preflights the cluster, so this bounds both the added latency (one SSH read
@@ -121,13 +123,9 @@ def _reasoning_effort_retry_payloads(
     if candidate is not None and candidate != normalized:
         variants.append(_variant(candidate))
     logger.info(
-        "rank-zero rejected reasoning_effort=%r; retrying with %s, then "
-        "without it",
+        "rank-zero rejected reasoning_effort=%r; retrying with %s, then without it",
         value,
-        [
-            var["chat_template_kwargs"]["reasoning_effort"]
-            for var in variants
-        ],
+        [var["chat_template_kwargs"]["reasoning_effort"] for var in variants],
     )
 
     dropped_kwargs = {
@@ -148,7 +146,7 @@ class DistributedInferenceError(RuntimeError):
     """A bounded error surfaced when the private rank-zero backend fails."""
 
 
-class DistributedRequestAborted(DistributedInferenceError):
+class DistributedRequestAborted(DistributedInferenceError):  # noqa: N818
     """Raised into a proxied request the coordinator has aborted."""
 
 
@@ -200,7 +198,6 @@ class DistributedBatchedEngine(BatchedEngine):
         abort_drain_timeout: float = 15.0,
         orphan_reap_grace: float = 5.0,
     ) -> None:
-        # Upstream 0.6.2 (#2714) structure: env-var-configurable read timeout.
         if request_read_timeout is None:
             raw = os.environ.get("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", "300.0")
             try:
@@ -215,7 +212,6 @@ class DistributedBatchedEngine(BatchedEngine):
                 "distributed request read timeout must be a finite positive "
                 f"number, got {request_read_timeout!r}"
             )
-        # Our G3/G4 abort-drain / orphan-reap semantics kept on top.
         if abort_drain_timeout < 0 or orphan_reap_grace < 0:
             raise ValueError("distributed abort timeouts must be non-negative")
         # The deployment is the signed, rank-identical launch contract.  A
@@ -228,7 +224,11 @@ class DistributedBatchedEngine(BatchedEngine):
             and getattr(model_settings, "mtp_enabled", False)
         )
         settings_depth = (
-            getattr(model_settings, "mtp_num_draft_tokens", None)
+            # Upstream renamed the model-level draft depth to
+            # mtp_fixed_depth (explicit) / mtp_adaptive_max_depth (adaptive).
+            getattr(model_settings, "mtp_fixed_depth", None)
+            or getattr(model_settings, "mtp_adaptive_max_depth", None)
+            or getattr(model_settings, "mtp_num_draft_tokens", None)
             if settings_mtp
             else None
         )
@@ -273,20 +273,20 @@ class DistributedBatchedEngine(BatchedEngine):
         self._model_type: str | None = None
         self._active_requests = 0
         self._active_lock = asyncio.Lock()
+        self._peer_health: tuple[float, bool, str] | None = None
+        self._peer_health_lock = asyncio.Lock()
         self._abort_drain_timeout = float(abort_drain_timeout)
         self._orphan_reap_grace = float(orphan_reap_grace)
         self._request_states: dict[str, _DistributedRequestState] = {}
         self._next_request_seq = 0
         self._last_cancel_epoch = 0
-        self._peer_health: tuple[float, bool, str] | None = None
-        self._peer_health_lock = asyncio.Lock()
         self._runtime_failed_reason: str | None = None
 
     @property
     def runtime_failed_reason(self) -> str | None:
         """Terminal worker failure observed by the coordinator, if any."""
 
-        if self._runtime_failed_reason is None and self._loaded:
+        if self._runtime_failed_reason is None and getattr(self, "_supervisor", None) is not None:
             status = self._supervisor.status()
             reason = status.failure_reason
             if reason is None and status.returncode is not None:
@@ -532,8 +532,8 @@ raise SystemExit(2)
     async def start(self) -> None:
         if self._loaded:
             return
-        self._runtime_failed_reason = None
         self._validate_model_settings()
+        self._runtime_failed_reason = None
 
         # Tokenizer/config metadata stays in the oMLX process. No model weights
         # are loaded here.
@@ -1072,12 +1072,10 @@ raise SystemExit(2)
                 not _valid_transport_request_id(request_id)
                 or request_id in self._request_states
             ):
-                request_id = (
-                    f"{self.deployment.deployment_id}-{self._next_request_seq}"
-                )
+                request_id = f"{self.deployment.deployment_id}-{self._next_request_seq}"
             self._request_states[request_id] = _DistributedRequestState(
                 request_id,
-                time.monotonic(),
+                _request_clock(),
             )
             return request_id
 
@@ -1106,7 +1104,7 @@ raise SystemExit(2)
 
         state = self._request_states.get(request_id)
         if state is not None and state.finished_at is None:
-            state.finished_at = time.monotonic()
+            state.finished_at = _request_clock()
 
     def reap_orphaned_generators(
         self,
@@ -1128,13 +1126,12 @@ raise SystemExit(2)
 
         if not self._request_states:
             return 0
-        current = time.monotonic() if now is None else now
+        current = _request_clock() if now is None else now
         limit = self._orphan_reap_grace if grace is None else grace
         stale = [
             request_id
             for request_id, state in self._request_states.items()
-            if state.finished_at is not None
-            and current - state.finished_at >= limit
+            if state.finished_at is not None and current - state.finished_at >= limit
         ]
         for request_id in stale:
             self._request_states.pop(request_id, None)
@@ -1155,6 +1152,9 @@ raise SystemExit(2)
         the rank-0 marker's ``metrics.active_requests`` is the rank-side
         quiescence evidence an abort or unload should wait for (G5).
         """
+
+        if self.runtime_failed_reason is not None:
+            return 0
 
         telemetry_rank = (
             int(self.deployment.decode_rank)
@@ -1178,6 +1178,11 @@ raise SystemExit(2)
             if self.deployment.serving_mode == "disaggregated":
                 return self._active_requests
             return None
+        if not marker_owner_is_live(marker) or marker.get("error"):
+            return 0
+        age = marker_age_seconds(marker)
+        if age is not None and age > _DEFAULT_STALE_AFTER:
+            return 0
         metrics = marker.get("metrics")
         if not isinstance(metrics, dict):
             if self.deployment.serving_mode == "disaggregated":
@@ -1365,9 +1370,7 @@ raise SystemExit(2)
         if scope == "requests":
             newest = [request_id] if request_id in pending_request_ids else []
             older = sorted(pending_request_ids.difference(newest))
-            payload["request_ids"] = (newest + older)[
-                :_MAX_TARGETED_CANCEL_REQUESTS
-            ]
+            payload["request_ids"] = (newest + older)[:_MAX_TARGETED_CANCEL_REQUESTS]
         try:
             root.mkdir(parents=True, exist_ok=True)
             temporary = path.with_name(path.name + ".tmp")
@@ -1407,7 +1410,6 @@ raise SystemExit(2)
                 )
                 return False
             await asyncio.sleep(0.1)
-
 
     async def chat(
         self,
@@ -1485,6 +1487,7 @@ raise SystemExit(2)
             self._cancel_backend_after_timeout(request_id)
             raise self._read_timeout_error(stream=False) from exc
         except httpx.HTTPError as exc:
+            self._raise_if_aborted(request_id)
             raise await self._transport_failure_error(
                 exc,
                 stream=False,
@@ -1707,9 +1710,9 @@ raise SystemExit(2)
                                 if isinstance(function.get("name"), str):
                                     target["function"]["name"] += function["name"]
                                 if isinstance(function.get("arguments"), str):
-                                    target["function"]["arguments"] += (
-                                        function["arguments"]
-                                    )
+                                    target["function"]["arguments"] += function[
+                                        "arguments"
+                                    ]
 
                         new_text = ""
                         reasoning = delta.get("reasoning") or delta.get(
@@ -1869,6 +1872,7 @@ raise SystemExit(2)
             self._cancel_backend_after_timeout(request_id)
             raise self._read_timeout_error(stream=False) from exc
         except httpx.HTTPError as exc:
+            self._raise_if_aborted(request_id)
             raise await self._transport_failure_error(
                 exc,
                 stream=False,
@@ -2204,9 +2208,7 @@ raise SystemExit(2)
         if cached is None or time.monotonic() - cached[0] >= _PEER_HEALTH_TTL:
             async with self._peer_health_lock:
                 cached = self._peer_health
-                if cached is None or (
-                    time.monotonic() - cached[0] >= _PEER_HEALTH_TTL
-                ):
+                if cached is None or (time.monotonic() - cached[0] >= _PEER_HEALTH_TTL):
                     hosts_by_rank = {
                         rank: (host.node_id, host.ssh)
                         for rank, host in enumerate(self.deployment.hosts)
@@ -2234,9 +2236,7 @@ raise SystemExit(2)
                     self._peer_health = cached
         if not cached[1]:
             self._mark_runtime_failed(cached[2])
-            raise DistributedInferenceError(
-                f"cluster is not serving: {cached[2]}"
-            )
+            raise DistributedInferenceError(f"cluster is not serving: {cached[2]}")
 
     async def preflight_chat(self, *args: Any, **kwargs: Any) -> None:
         self._validate_request_features(kwargs)
@@ -2249,6 +2249,8 @@ raise SystemExit(2)
         return None
 
     def has_active_requests(self) -> bool:
+        if self.runtime_failed_reason is not None:
+            return False
         # Sweep finished-but-abandoned requests first so a leaked generator
         # cannot hold quiescence-gated unload open forever (G4).
         self.reap_orphaned_generators()

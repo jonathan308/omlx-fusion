@@ -21,10 +21,11 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +38,7 @@ def default_identity_path() -> Path:
     """Default on-disk location, honoring the OMLX_BASE_PATH override."""
 
     env_value = os.environ.get("OMLX_BASE_PATH")
-    base = (
-        Path(env_value).expanduser() if env_value else Path.home() / ".omlx"
-    )
+    base = Path(env_value).expanduser() if env_value else Path.home() / ".omlx"
     return base / "cluster" / "identity.json"
 
 
@@ -67,9 +66,7 @@ def _scutil_local_hostname() -> str | None:
 def _default_friendly_name() -> str:
     for candidate in (_scutil_local_hostname(), socket.gethostname()):
         if candidate:
-            name = _NAME_SANITIZE.sub("-", candidate.strip())[
-                :_MAX_NAME_LENGTH
-            ]
+            name = _NAME_SANITIZE.sub("-", candidate.strip())[:_MAX_NAME_LENGTH]
             if name:
                 return name
     return "omlx-node"
@@ -131,9 +128,7 @@ class NodeIdentity:
     def rename(self, new_name: str) -> None:
         """Update the display name and persist it. ``node_id`` is immutable."""
 
-        cleaned = _NAME_SANITIZE.sub("-", str(new_name).strip())[
-            :_MAX_NAME_LENGTH
-        ]
+        cleaned = _NAME_SANITIZE.sub("-", str(new_name).strip())[:_MAX_NAME_LENGTH]
         if not cleaned:
             raise ValueError("friendly name must not be empty")
         self.friendly_name = cleaned
@@ -233,9 +228,7 @@ def configure_node_identity(
 
     global _configured_identity
     path = (
-        Path(base_path) / "cluster" / "identity.json"
-        if base_path is not None
-        else None
+        Path(base_path) / "cluster" / "identity.json" if base_path is not None else None
     )
     identity = load_or_create(path, taken_names=taken_names)
     with _identity_lock:

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 import re
 from collections.abc import Callable
@@ -279,6 +280,8 @@ def progressive_sharded_load(
         # rank killed at 163 GiB against an 84 GiB plan). Drop the snapshot
         # — and the pre-shard fixed list — before any sharding begins.
         del flat, fixed
+        gc.collect()
+        mx_module.clear_cache()
         # A pipeline model keeps global layer numbering by padding layers
         # before this stage with None. Tensor strategies intentionally reject
         # such a list because pure TP must never shard an incomplete model by
@@ -336,6 +339,9 @@ def progressive_sharded_load(
             if _layer_index(path) is None
         ]
         _eval_values(mx_module, sharded_fixed)
+        mx_module.clear_cache()
+        del sharded_fixed
+        gc.collect()
         mx_module.clear_cache()
         if previous_cache_limit is not None:
             set_cache_limit(previous_cache_limit)

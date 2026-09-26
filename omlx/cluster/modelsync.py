@@ -34,6 +34,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException
 
 from ..exceptions import ModelNotFoundError
+from .deployment import validate_ssh_target
 from .ssh_policy import cluster_ssh_options
 from .staging import (
     index_shards,
@@ -143,9 +144,7 @@ class SyncProgress:
     model_id: str
     peer: str
     method: str
-    phase: Literal[
-        "checking", "transferring", "verifying", "done", "error"
-    ]
+    phase: Literal["checking", "transferring", "verifying", "done", "error"]
     bytes_done: int = 0
     bytes_total: int = 0
     bytes_per_second: float | None = None
@@ -190,8 +189,7 @@ def build_manifest(
         else None
     )
     files = [
-        ManifestFile(name=path.name, size_bytes=path.stat().st_size)
-        for path in weights
+        ManifestFile(name=path.name, size_bytes=path.stat().st_size) for path in weights
     ]
     for name in sidecar_files(root):
         path = root / name
@@ -231,7 +229,9 @@ def allow_patterns_for_shard(
     return tuple(sorted(patterns))
 
 
-def compare_manifests(local: ModelManifest, peer: ModelManifest | None) -> dict[str, Any]:
+def compare_manifests(
+    local: ModelManifest, peer: ModelManifest | None
+) -> dict[str, Any]:
     """Whether ``peer`` can serve the model ``local`` describes.
 
     * ``missing`` — the peer answered 404 or is unreachable.
@@ -261,7 +261,9 @@ def compare_manifests(local: ModelManifest, peer: ModelManifest | None) -> dict[
         }
     peer_sizes = {item.name: item.size_bytes for item in peer.files}
     missing = [
-        item.name for item in local.files if peer_sizes.get(item.name) != item.size_bytes
+        item.name
+        for item in local.files
+        if peer_sizes.get(item.name) != item.size_bytes
     ]
     matched = sum(
         item.size_bytes for item in local.files if item.name not in set(missing)
@@ -281,12 +283,15 @@ def parse_rsync_progress(line: str) -> tuple[int, float, float] | None:
     if match is None:
         return None
     done = int(match.group("bytes").replace(",", ""))
-    rate = float(match.group("rate").replace(",", "")) * _RATE_MULTIPLIERS[
-        match.group("unit")
-    ]
+    rate = (
+        float(match.group("rate").replace(",", ""))
+        * _RATE_MULTIPLIERS[match.group("unit")]
+    )
     parts = [int(part) for part in match.group("eta").split(":")]
-    eta = parts[0] * 3600 + parts[1] * 60 + parts[2] if len(parts) == 3 else (
-        parts[0] * 60 + parts[1]
+    eta = (
+        parts[0] * 3600 + parts[1] * 60 + parts[2]
+        if len(parts) == 3
+        else (parts[0] * 60 + parts[1])
     )
     return done, rate, float(eta)
 
@@ -307,11 +312,23 @@ def build_rsync_argv(
     host keys, BatchMode) — never a hand-rolled option set.
     """
 
+    ssh_target = validate_ssh_target(ssh_target)
+    target_dir = str(destination_dir)
+    if (
+        not Path(target_dir).is_absolute()
+        or "\x00" in target_dir
+        or "\n" in target_dir
+        or "\r" in target_dir
+    ):
+        raise ValueError("rsync destination must be an absolute single-line path")
     ssh_argv = ["ssh", *cluster_ssh_options()]
     if ssh_identity is not None:
         ssh_argv.extend(["-i", str(ssh_identity)])
     source = str(Path(source_dir).expanduser()).rstrip("/") + "/"
-    destination = f"{ssh_target}:{destination_dir}"
+    # macOS ships openrsync 2.6.9 without --protect-args/-s. Quote the remote
+    # path inside the host:path operand so the peer shell receives one literal
+    # filename while retaining compatibility with the system binary.
+    destination = f"{ssh_target}:{shlex.quote(target_dir)}"
     return [
         "rsync",
         "-a",
@@ -358,9 +375,7 @@ def _normalize_peer_url(peer: str) -> str:
         raise ValueError("peer must be a host:port or http(s) URL")
     if "://" not in peer:
         if ":" not in peer.rsplit("]", 1)[-1]:
-            raise ValueError(
-                f"peer {peer!r} has no port; use host:port or a full URL"
-            )
+            raise ValueError(f"peer {peer!r} has no port; use host:port or a full URL")
         peer = f"http://{peer}"
     return peer.rstrip("/")
 
@@ -411,7 +426,11 @@ class ModelSyncManager:
             for item in status.get("models", []) if isinstance(status, dict) else []:
                 if not isinstance(item, dict):
                     continue
-                if model_id in {item.get("id"), item.get("source_repo_id"), item.get("model_path")}:
+                if model_id in {
+                    item.get("id"),
+                    item.get("source_repo_id"),
+                    item.get("model_path"),
+                }:
                     path = Path(str(item["model_path"])).expanduser()
                     if path.is_dir():
                         return path.resolve()
@@ -452,7 +471,9 @@ class ModelSyncManager:
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 return None
-            raise ModelSyncError(f"peer manifest request failed: HTTP {exc.code}") from exc
+            raise ModelSyncError(
+                f"peer manifest request failed: HTTP {exc.code}"
+            ) from exc
         except (OSError, urllib.error.URLError) as exc:
             raise ModelSyncError(f"peer is unreachable: {exc}") from exc
 
@@ -495,9 +516,12 @@ class ModelSyncManager:
     ) -> Literal["rsync", "download"]:
         """auto = rsync when SSH trust exists AND the model is over 20 GB."""
 
-        if ssh_target and total_bytes > AUTO_RSYNC_THRESHOLD_BYTES:
-            if self._ssh_trust(ssh_target):
-                return "rsync"
+        if (
+            ssh_target
+            and total_bytes > AUTO_RSYNC_THRESHOLD_BYTES
+            and self._ssh_trust(ssh_target)
+        ):
+            return "rsync"
         return "download"
 
     def sync(
@@ -530,8 +554,15 @@ class ModelSyncManager:
             if method == "auto"
             else method
         )
-        self._emit(on_progress, local.model_id, peer, chosen, "checking",
-                   bytes_total=local.total_bytes, detail="comparing manifests")
+        self._emit(
+            on_progress,
+            local.model_id,
+            peer,
+            chosen,
+            "checking",
+            bytes_total=local.total_bytes,
+            detail="comparing manifests",
+        )
         try:
             if chosen == "rsync":
                 result = self._sync_rsync(
@@ -549,11 +580,25 @@ class ModelSyncManager:
                     on_progress,
                 )
         except Exception as exc:
-            self._emit(on_progress, local.model_id, peer, chosen, "error",
-                       bytes_total=local.total_bytes, detail=str(exc)[:500])
+            self._emit(
+                on_progress,
+                local.model_id,
+                peer,
+                chosen,
+                "error",
+                bytes_total=local.total_bytes,
+                detail=str(exc)[:500],
+            )
             raise
-        self._emit(on_progress, local.model_id, peer, chosen, "done",
-                   bytes_done=local.total_bytes, bytes_total=local.total_bytes)
+        self._emit(
+            on_progress,
+            local.model_id,
+            peer,
+            chosen,
+            "done",
+            bytes_done=local.total_bytes,
+            bytes_total=local.total_bytes,
+        )
         return result
 
     def _sync_rsync(
@@ -595,8 +640,15 @@ class ModelSyncManager:
         rc = self._rsync_run(argv, on_line=self._progress_line_parser(progress))
         if rc != 0:
             raise ModelSyncError(f"rsync to {ssh_target} exited with status {rc}")
-        self._emit(on_progress, local.model_id, peer, "rsync", "verifying",
-                   bytes_total=local.total_bytes, detail="verifying peer manifest")
+        self._emit(
+            on_progress,
+            local.model_id,
+            peer,
+            "rsync",
+            "verifying",
+            bytes_total=local.total_bytes,
+            detail="verifying peer manifest",
+        )
         return {
             "method": "rsync",
             "peer": peer,

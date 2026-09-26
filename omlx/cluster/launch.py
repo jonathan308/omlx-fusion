@@ -12,6 +12,7 @@ import math
 import os
 import platform
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -24,7 +25,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -340,8 +341,7 @@ _DEFAULT_LAUNCHER_LEASE_INTERVAL = 5.0
 
 def _launch_manifest_path(state_dir: str | Path, deployment_id: str) -> Path:
     return (
-        Path(state_dir).expanduser()
-        / f"{_LAUNCH_MANIFEST_PREFIX}{deployment_id}.json"
+        Path(state_dir).expanduser() / f"{_LAUNCH_MANIFEST_PREFIX}{deployment_id}.json"
     )
 
 
@@ -418,8 +418,7 @@ _REMOTE_SERVE_MARKER_SCRIPT = (
 )
 
 _REMOTE_CLEAR_SERVE_MARKER_SCRIPT = (
-    "import pathlib,sys;"
-    "pathlib.Path(sys.argv[1]).expanduser().unlink(missing_ok=True)"
+    "import pathlib,sys;pathlib.Path(sys.argv[1]).expanduser().unlink(missing_ok=True)"
 )
 
 
@@ -428,7 +427,7 @@ def _set_serve_release(
     state_dir: str | Path,
     payload: dict[str, Any] | None,
     *,
-    runner: "SSHRunner" = subprocess.run,
+    runner: SSHRunner = subprocess.run,
 ) -> None:
     """Atomically publish or clear the post-load serve gate on every rank."""
 
@@ -712,9 +711,9 @@ def _rank_marker_matches(
     if marker.get("deployment_id") != deployment_id or marker.get("rank") != rank:
         return False
     recorded = marker.get("plan_hash")
-    if plan_hash is not None and recorded is not None and recorded != plan_hash:
-        return False
-    return True
+    return not (
+        plan_hash is not None and recorded is not None and recorded != plan_hash
+    )
 
 
 def _sweep_rank_processes(
@@ -941,10 +940,9 @@ def stop_deployment_processes(
     if manifest_path.exists() and manifest is None:
         failures.append("launch manifest is unreadable; refusing unverified unload")
     elif manifest is not None:
-        if (
-            manifest.get("deployment_id") != deployment.deployment_id
-            or manifest.get("plan_hash") not in {None, deployment.plan_hash}
-        ):
+        if manifest.get("deployment_id") != deployment.deployment_id or manifest.get(
+            "plan_hash"
+        ) not in {None, deployment.plan_hash}:
             failures.append("launch manifest identity does not match deployment")
         else:
             candidate_group = int(manifest["process_group"])
@@ -1303,9 +1301,7 @@ def _python_minor(version: str) -> tuple[str, str] | None:
     return (parts[0], parts[1])
 
 
-def _interpreter_parity(
-    local: str, remote: Any
-) -> tuple[str | None, str | None]:
+def _interpreter_parity(local: str, remote: Any) -> tuple[str | None, str | None]:
     """Compare the interpreter two ranks will actually run under (#2695).
 
     Returns ``(blocking, warning)``, at most one of which is set.
@@ -1360,8 +1356,7 @@ def _rank_python_module_argv(
         for rank, executable in enumerate(executables)
     )
     script = (
-        f'case "${{MLX_RANK:-}}" in {cases} *) exit 64;; esac; '
-        'exec "$omlx_python" "$@"'
+        f'case "${{MLX_RANK:-}}" in {cases} *) exit 64;; esac; exec "$omlx_python" "$@"'
     )
     return ["/bin/sh", "-c", script, "omlx-rank-python", "-m", module]
 
@@ -1377,6 +1372,8 @@ def build_mlx_launch_argv(
     state_dir: str = "~/.omlx/cluster/runtime",
     control_host: str | None = None,
     control_port: int | None = None,
+    control_token: str | None = None,
+    load_timeout: float = 1800.0,
     launcher_lease: Path | None = None,
 ) -> list[str]:
     """Build an argument vector without a user-controlled shell fragment.
@@ -1405,8 +1402,11 @@ def build_mlx_launch_argv(
             raise ValueError(f"{label} must be between 1 and 65535")
     if api_port == collective_port:
         raise ValueError("API and collective ports must be distinct")
-    if (control_host is None) != (control_port is None):
-        raise ValueError("rank-control host and port must be provided together")
+    control_values = (control_host, control_port, control_token)
+    if any(value is not None for value in control_values) and not all(
+        value is not None for value in control_values
+    ):
+        raise ValueError("rank-control host, port, and token must be provided together")
     if control_host is not None:
         try:
             control_host = str(ipaddress.ip_address(control_host))
@@ -1414,6 +1414,12 @@ def build_mlx_launch_argv(
             raise ValueError("rank-control host must be an IP address") from exc
         if not 1 <= int(control_port) <= 65535:
             raise ValueError("rank-control port must be between 1 and 65535")
+        try:
+            encoded_control_token = str(control_token).encode("ascii", "strict")
+        except UnicodeEncodeError as exc:
+            raise ValueError("rank-control token must be ASCII") from exc
+        if len(encoded_control_token) != 64:
+            raise ValueError("rank-control token must be 64 ASCII bytes")
     if cwd is not None and not cwd.is_absolute():
         raise ValueError("distributed working directory must be absolute")
     if launcher_lease is not None and not launcher_lease.is_absolute():
@@ -1464,6 +1470,8 @@ def build_mlx_launch_argv(
             deployment.backend,
             "--port",
             str(api_port),
+            "--load-timeout",
+            str(load_timeout),
             "--deployment-id",
             deployment.deployment_id,
             "--plan-hash",
@@ -1502,7 +1510,11 @@ def build_mlx_launch_argv(
         argv.extend(["--server-host", server_host])
     if launcher_lease is not None:
         argv.extend(["--launcher-lease", str(launcher_lease)])
-    if control_host is not None and control_port is not None:
+    if (
+        control_host is not None
+        and control_port is not None
+        and control_token is not None
+    ):
         argv.extend(
             [
                 "--control-host",
@@ -1510,7 +1522,7 @@ def build_mlx_launch_argv(
                 "--control-port",
                 str(control_port),
                 "--control-token",
-                deployment.plan_hash,
+                control_token,
             ]
         )
     if deployment.execution.prompt_cache_bytes is not None:
@@ -1525,13 +1537,13 @@ def build_mlx_launch_argv(
     if deployment.execution.cache_affinity:
         argv.append("--cache-affinity")
     if deployment.execution.prompt_cache_ssd:
-        argv.extend(
-            [
-                "--prompt-cache-ssd",
-                "--prompt-cache-ssd-max-bytes",
-                str(deployment.execution.prompt_cache_ssd_max_bytes),
-            ]
-        )
+        argv.append("--prompt-cache-ssd")
+    argv.extend(
+        [
+            "--prompt-cache-ssd-max-bytes",
+            str(deployment.execution.prompt_cache_ssd_max_bytes),
+        ]
+    )
     if deployment.execution.auto_tune:
         argv.append("--auto-tune")
     if deployment.execution.sampling_rank_only:
@@ -1869,7 +1881,10 @@ def run_cuda_fabric_probe(
         raise DistributedLaunchError(
             f"CUDA fabric probe exited with code {completed.returncode}{suffix}"
         )
-    if len(completed.stdout.encode()) + len(completed.stderr.encode()) > _REMOTE_OUTPUT_LIMIT:
+    if (
+        len(completed.stdout.encode()) + len(completed.stderr.encode())
+        > _REMOTE_OUTPUT_LIMIT
+    ):
         raise DistributedLaunchError("CUDA fabric probe output exceeded the safe limit")
     records: list[dict[str, Any]] = []
     for line in completed.stdout.splitlines():
@@ -1884,7 +1899,9 @@ def run_cuda_fabric_probe(
         raise DistributedLaunchError(
             "CUDA fabric probe did not return one result from each worker"
         )
-    observed = min(float(record.get("payload_bytes_per_second") or 0) for record in records)
+    observed = min(
+        float(record.get("payload_bytes_per_second") or 0) for record in records
+    )
     verified = observed >= minimum_bytes_per_second
     identity = "\0".join(sorted(host.ssh for host in hosts)).encode()
     group_id = f"connectx-{hashlib.sha256(identity).hexdigest()[:16]}"
@@ -2032,8 +2049,7 @@ def discover_remote_python_executable(
         # bare command name (``python3``) needs ``sys.executable`` to become an
         # absolute path.
         script = (
-            "import os,omlx; print(os.path.expanduser("
-            f"{candidate!r}))"
+            f"import os,omlx; print(os.path.expanduser({candidate!r}))"
             if candidate.startswith(("~", "/"))
             else "import sys,omlx; print(sys.executable)"
         )
@@ -2375,9 +2391,7 @@ def probe_remote_system_host(
         "ssh_reachable": True,
         "status": payload,
         "runtime_compatible": False,
-        "runtime_mismatches": [
-            _RUNTIME_UNVERIFIED if evidence else _RUNTIME_MISSING
-        ],
+        "runtime_mismatches": [_RUNTIME_UNVERIFIED if evidence else _RUNTIME_MISSING],
         # Same keys as the healthy path, so a caller never has to know which
         # branch produced the result before reading it.
         "runtime_warnings": [],
@@ -2742,9 +2756,7 @@ def preflight_remote_hosts(
         from .memory_guard import ceiling_breakdown
 
         local_admission_ceiling = int(
-            ceiling_breakdown(
-                assignments[0].memory_guard_tier
-            ).get("hard_limit", 0)
+            ceiling_breakdown(assignments[0].memory_guard_tier).get("hard_limit", 0)
         )
     except Exception as exc:
         raise DistributedLaunchError(
@@ -2850,7 +2862,10 @@ def preflight_remote_hosts(
             mismatches.append(
                 f"model directory is missing on remote host: {remote_model_path}"
             )
-        if local_identity is not None and versions.get("model_identity") != local_identity:
+        if (
+            local_identity is not None
+            and versions.get("model_identity") != local_identity
+        ):
             mismatches.append(
                 "model identity differs from the coordinator "
                 "(config, tokenizer, processor, or weight index)"
@@ -2917,9 +2932,7 @@ def _validate_deployment_admission(
                 0.0,
                 min(
                     1.0,
-                    (
-                        assignment.capacity_bytes - assignment.reserve_bytes
-                    )
+                    (assignment.capacity_bytes - assignment.reserve_bytes)
                     / assignment.capacity_bytes,
                 ),
             )
@@ -2975,6 +2988,8 @@ class DistributedJobStatus:
     launcher_log_path: str | None = None
     failure_reason: str | None = None
     ranks: tuple[dict[str, Any], ...] = ()
+    # What the pre-launch RDMA check decided for this launch, and why.
+    stage_links: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -2989,7 +3004,50 @@ class DistributedJobStatus:
             "launcher_log_path": self.launcher_log_path,
             "failure_reason": self.failure_reason,
             "ranks": [dict(rank) for rank in self.ranks],
+            "stage_links": self.stage_links,
         }
+
+
+def _attach_rdma_stage_links(
+    deployment: ClusterDeployment,
+) -> tuple[ClusterDeployment, dict[str, Any]]:
+    """Re-verify RDMA stage links for one launch; any error keeps MLX's transport."""
+    try:
+        from .rdma.launch_links import attach_stage_links
+
+        return attach_stage_links(deployment)
+    except Exception as exc:
+        logger.warning(
+            "RDMA stage-link check failed; launching over MLX's transport",
+            exc_info=True,
+        )
+        _release_rdma_stage_links(deployment.deployment_id)
+        report = {
+            "active": False,
+            "reason": f"RDMA stage-link check failed: {exc}",
+            "edges": [],
+        }
+        return replace(deployment, stage_links=()), report
+
+
+def _effective_rdma_report(
+    report: dict[str, Any] | None, ranks: tuple[dict[str, Any], ...]
+) -> dict[str, Any] | None:
+    """The pre-launch RDMA report, corrected by the ranks' own vote."""
+    if not report:
+        return report
+    from .rdma.launch_links import effective_report
+
+    return effective_report(report, ranks)
+
+
+def _release_rdma_stage_links(deployment_id: str) -> None:
+    """Free the RDMA links a finished launch held."""
+    # Nothing can have been claimed if the RDMA module does not import.
+    with suppress(ImportError):
+        from .rdma.launch_links import release_links
+
+        release_links(deployment_id)
 
 
 class DistributedJobSupervisor:
@@ -3006,6 +3064,9 @@ class DistributedJobSupervisor:
         stop_timeout: float = 10.0,
         preflight: bool = True,
         launcher_lease_interval: float = _DEFAULT_LAUNCHER_LEASE_INTERVAL,
+        attach_stage_links: Callable[
+            [ClusterDeployment], tuple[ClusterDeployment, dict[str, Any]]
+        ] = _attach_rdma_stage_links,
     ) -> None:
         if (
             load_timeout <= 0
@@ -3015,6 +3076,8 @@ class DistributedJobSupervisor:
         ):
             raise ValueError("supervisor timeouts must be positive")
         self.deployment = deployment
+        self._attach_stage_links = attach_stage_links
+        self.stage_link_report: dict[str, Any] | None = None
         self.python_executable = _validate_python_executable(python_executable)
         self.cwd = cwd
         self.state_dir = state_dir
@@ -3026,6 +3089,7 @@ class DistributedJobSupervisor:
         self.port: int | None = None
         self.collective_port: int | None = None
         self.control_port: int | None = None
+        self.control_token: str | None = None
         self.ready_event: dict[str, Any] | None = None
         self.rank_ready_events: dict[int, dict[str, Any]] = {}
         self.failure_event: dict[str, Any] | None = None
@@ -3202,13 +3266,13 @@ class DistributedJobSupervisor:
                 "Could not verify prior distributed teardown; refusing to "
                 f"start new ranks: {exc}"
             ) from exc
-        if orphan_report["failures"]:
+        if orphan_report.get("failures"):
             detail = "; ".join(str(item) for item in orphan_report["failures"])
             raise DistributedTeardownError(
                 "Prior distributed teardown is unverified; refusing to start "
                 f"new ranks: {detail[:_LOG_LINE_LIMIT]}"
             )
-        if orphan_report["active"]:
+        if orphan_report.get("active"):
             active = ", ".join(str(item) for item in orphan_report["active"])
             raise DistributedTeardownError(
                 "Another distributed launch is still active "
@@ -3241,24 +3305,40 @@ class DistributedJobSupervisor:
         self.port, self.collective_port = _available_launch_ports(self.deployment)
         control_host = self.deployment.hosts[0].ips[0]
         self.control_port = _available_control_port(control_host)
+        # The plan hash is public deployment identity, not authentication.
+        # Mint a fresh launch-scoped secret so an unauthenticated peer on the
+        # fabric cannot join rank control by reading the signed plan.
+        self.control_token = secrets.token_hex(32)
         try:
             launcher_lease = self._prepare_launcher_lease()
         except OSError as exc:
             raise DistributedLaunchError(
                 f"Could not create the cluster launcher lease: {exc}"
             ) from exc
-        argv = build_mlx_launch_argv(
-            self.deployment,
-            hostfile=hostfile,
-            api_port=self.port,
-            collective_port=self.collective_port,
-            python_executable=self.python_executable,
-            cwd=self.cwd,
-            state_dir=self.state_dir,
-            control_host=control_host,
-            control_port=self.control_port,
-            launcher_lease=launcher_lease,
+        # Stage links are re-verified for every launch, never reused from a stored plan.
+        self.deployment, self.stage_link_report = self._attach_stage_links(
+            self.deployment
         )
+        try:
+            argv = build_mlx_launch_argv(
+                self.deployment,
+                hostfile=hostfile,
+                api_port=self.port,
+                collective_port=self.collective_port,
+                python_executable=self.python_executable,
+                cwd=self.cwd,
+                state_dir=self.state_dir,
+                control_host=control_host,
+                control_port=self.control_port,
+                control_token=self.control_token,
+                load_timeout=self.load_timeout,
+                launcher_lease=launcher_lease,
+            )
+        except Exception:
+            # No rank exists yet, so the links this launch claimed are free again.
+            _release_rdma_stage_links(self.deployment.deployment_id)
+            self._stop_launcher_lease_heartbeat(remove=True)
+            raise
         self._phase = "loading"
         try:
             environment = os.environ.copy()
@@ -3765,12 +3845,15 @@ class DistributedJobSupervisor:
         self.port = None
         self.collective_port = None
         self.control_port = None
+        self.control_token = None
         self.ready_event = None
         self.rank_ready_events.clear()
         self.failure_event = None
         self._phase = "stopped"
         self._remove_launch_manifest()
         self._stop_launcher_lease_heartbeat(remove=True)
+        # Every rank is proven gone, so its RDMA link may carry the next launch.
+        _release_rdma_stage_links(self.deployment.deployment_id)
         with suppress(Exception):
             _set_serve_release(self.deployment, self.state_dir, None)
         if self._temporary is not None:
@@ -3906,9 +3989,7 @@ class DistributedJobSupervisor:
                     host.ssh,
                 )
             elif action in ("terminated", "killed"):
-                logger.info(
-                    "reaped remote rank %d on %s (%s)", rank, host.ssh, action
-                )
+                logger.info("reaped remote rank %d on %s (%s)", rank, host.ssh, action)
             elif action:
                 logger.debug(
                     "remote rank reap for rank %d on %s: %s",
@@ -3918,8 +3999,7 @@ class DistributedJobSupervisor:
                 )
             else:
                 logger.warning(
-                    "remote rank reap for rank %d on %s returned no report "
-                    "(exit %s)",
+                    "remote rank reap for rank %d on %s returned no report (exit %s)",
                     rank,
                     host.ssh,
                     completed.returncode,
@@ -3950,9 +4030,7 @@ class DistributedJobSupervisor:
         for rank, host in enumerate(self.deployment.hosts):
             filename = f"{self.deployment.deployment_id}-rank-{rank}.json"
             if host.ssh in _LOOPBACK_TARGETS:
-                marker = read_marker(
-                    Path(self.state_dir).expanduser() / filename
-                )
+                marker = read_marker(Path(self.state_dir).expanduser() / filename)
             else:
                 remote_root = self.state_dir.rstrip("/") or "."
                 marker, _, _, _ = read_remote_marker(
@@ -3965,7 +4043,8 @@ class DistributedJobSupervisor:
                 marker.get("deployment_id") != self.deployment.deployment_id
                 or marker.get("plan_hash") != self.deployment.plan_hash
                 or marker.get("rank") != rank
-                or marker.get("phase") not in {
+                or marker.get("phase")
+                not in {
                     "failed",
                     "peer_lost",
                     "launcher_lost",
@@ -3974,9 +4053,7 @@ class DistributedJobSupervisor:
                 continue
             error = marker.get("error")
             if isinstance(error, str) and error.strip():
-                failures.append(
-                    f"rank {rank} ({host.node_id}): {error.strip()}"
-                )
+                failures.append(f"rank {rank} ({host.node_id}): {error.strip()}")
         return "; ".join(failures)[:_LOG_LINE_LIMIT] or None
 
     def _failure_reason(self) -> str | None:
@@ -4008,8 +4085,7 @@ class DistributedJobSupervisor:
                 # failed.  Stop/unload clears ``process`` and phase afterwards;
                 # while it remains registered this is always unexpected.
                 failure_reason = (
-                    "distributed launcher exited unexpectedly with code "
-                    f"{returncode}"
+                    f"distributed launcher exited unexpectedly with code {returncode}"
                 )
         return DistributedJobStatus(
             deployment_id=self.deployment.deployment_id,
@@ -4038,6 +4114,13 @@ class DistributedJobSupervisor:
             ranks=tuple(
                 dict(self.rank_ready_events[rank])
                 for rank in sorted(self.rank_ready_events)
+            ),
+            stage_links=_effective_rdma_report(
+                self.stage_link_report,
+                tuple(
+                    self.rank_ready_events[rank]
+                    for rank in sorted(self.rank_ready_events)
+                ),
             ),
         )
 

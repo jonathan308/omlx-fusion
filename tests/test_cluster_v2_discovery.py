@@ -12,18 +12,18 @@ import logging
 import socket
 import struct
 import time
-
-import pytest
+from types import SimpleNamespace
 
 from omlx.cluster.discovery import (
+    _TX_FAIL_RESET_ROUNDS,
     MULTICAST_GROUP,
     MULTICAST_PORT,
-    _TX_FAIL_RESET_ROUNDS,
     DiscoveryConfig,
     DiscoveryService,
     PeerCaps,
     PeerRecord,
     _classify_link,
+    _default_interface_lister,
     _http_probe_node_id,
     _system_proxy_probe_node_id,
     _tailscale_executable,
@@ -95,7 +95,7 @@ class FakeSocket:
 
     def recvfrom(self, size):
         if not self.inbox:
-            raise socket.timeout()
+            raise TimeoutError()
         return self.inbox.pop(0)
 
     def close(self):
@@ -122,7 +122,9 @@ def _service(
     cfg = config or DiscoveryConfig(cluster_name="omlx", http_port=8000)
     service = DiscoveryService(
         _identity(node_id),
-        registry if registry is not None else DeviceRegistry("/nonexistent/dir/devices.json"),
+        registry
+        if registry is not None
+        else DeviceRegistry("/nonexistent/dir/devices.json"),
         cfg,
         socket_factory=socket_factory,
         prober=prober or (lambda ip, port, timeout: None),
@@ -164,8 +166,7 @@ def test_wassup_codec_rejects_garbage():
     assert decode_wassup(b"OMLXW" + json.dumps({"nonce": -1}).encode()) is None
     assert (
         decode_wassup(
-            b"OMLXW"
-            + json.dumps({"nonce": 1, "node_id": "x", "http_port": 0}).encode()
+            b"OMLXW" + json.dumps({"nonce": 1, "node_id": "x", "http_port": 0}).encode()
         )
         is None
     )
@@ -174,9 +175,7 @@ def test_wassup_codec_rejects_garbage():
 def test_cluster_hash_is_blake2s_prefix():
     import hashlib
 
-    expected = int.from_bytes(
-        hashlib.blake2s(b"omlx").digest()[:8], "big"
-    )
+    expected = int.from_bytes(hashlib.blake2s(b"omlx").digest()[:8], "big")
     assert cluster_hash_u64("omlx") == expected
     assert cluster_hash_u64("omlx") != cluster_hash_u64("other")
 
@@ -216,7 +215,9 @@ def test_hello_with_foreign_cluster_hash_is_ignored_silently():
     sock = FakeSocket()
     service, _ = _service(socket_factory=lambda: sock)
 
-    service._handle_hello(1, cluster_hash_u64("someone-else"), ("fe80::99", 53413), sock)
+    service._handle_hello(
+        1, cluster_hash_u64("someone-else"), ("fe80::99", 53413), sock
+    )
 
     assert sock.sent == []
     assert service.peers() == []
@@ -311,11 +312,14 @@ def test_wassup_dedupes_repeated_announcements():
 
 
 def test_successful_probe_fills_peer_details_and_link():
-    service, _ = _service("aaaa-node", prober=lambda ip, port, timeout: {
-        "node_id": "bbbb-node",
-        "version": "0.6.1",
-        "cluster_name": "omlx",
-    })
+    service, _ = _service(
+        "aaaa-node",
+        prober=lambda ip, port, timeout: {
+            "node_id": "bbbb-node",
+            "version": "0.6.1",
+            "cluster_name": "omlx",
+        },
+    )
     service.add_manual("10.0.0.5", 8000)
     service.probe_now()
 
@@ -327,11 +331,14 @@ def test_successful_probe_fills_peer_details_and_link():
 
 
 def test_probe_node_id_mismatch_drops_address():
-    service, _ = _service("zzzz-node", prober=lambda ip, port, timeout: {
-        "node_id": "impostor",
-        "version": "0.6.1",
-        "cluster_name": "omlx",
-    })
+    service, _ = _service(
+        "zzzz-node",
+        prober=lambda ip, port, timeout: {
+            "node_id": "impostor",
+            "version": "0.6.1",
+            "cluster_name": "omlx",
+        },
+    )
     _announce_nonce(service)
     service._handle_wassup(
         {"nonce": 42, "node_id": "bbbb-node", "http_port": 8000},
@@ -386,9 +393,7 @@ def test_tailscale_probe_failure_does_not_spawn_direct_subnet_proxy(monkeypatch)
     monkeypatch.setattr(
         discovery.urllib.request,
         "urlopen",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            OSError("connection refused")
-        ),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("connection refused")),
     )
     monkeypatch.setattr(
         discovery,
@@ -451,13 +456,15 @@ def test_paired_manual_address_and_port_rehydrate_after_reboot(tmp_path):
     service, _ = _service(
         "aaaa-node",
         registry=restored,
-        prober=lambda ip, port, timeout: calls.append((ip, port))
-        or {
-            "node_id": "bbbb-node",
-            "friendly_name": "studio-b",
-            "version": "0.6.1",
-            "cluster_name": "omlx",
-        },
+        prober=lambda ip, port, timeout: (
+            calls.append((ip, port))
+            or {
+                "node_id": "bbbb-node",
+                "friendly_name": "studio-b",
+                "version": "0.6.1",
+                "cluster_name": "omlx",
+            }
+        ),
     )
 
     assert ("10.0.0.5", 9123) in service._candidates
@@ -516,12 +523,14 @@ def test_verified_candidate_uses_heartbeat_cadence():
     clock = FakeClock()
     service, _ = _service(
         clock=clock,
-        prober=lambda ip, port, timeout: calls.append((ip, port))
-        or {
-            "node_id": "peer-node",
-            "version": "0.6.4.dev1",
-            "cluster_name": "omlx",
-        },
+        prober=lambda ip, port, timeout: (
+            calls.append((ip, port))
+            or {
+                "node_id": "peer-node",
+                "version": "0.6.4.dev1",
+                "cluster_name": "omlx",
+            }
+        ),
     )
     service.add_manual("10.0.0.5", 8000)
     service.probe_now()
@@ -614,11 +623,15 @@ def test_on_change_callback_failure_does_not_kill_service():
 
 def test_discovered_peer_merges_into_registry_unpaired(tmp_path):
     registry = DeviceRegistry(tmp_path / "devices.json")
-    service, _ = _service("aaaa-node", registry=registry, prober=lambda *a: {
-        "node_id": "bbbb-node",
-        "version": "0.6.1",
-        "cluster_name": "omlx",
-    })
+    service, _ = _service(
+        "aaaa-node",
+        registry=registry,
+        prober=lambda *a: {
+            "node_id": "bbbb-node",
+            "version": "0.6.1",
+            "cluster_name": "omlx",
+        },
+    )
     _verified_peer(service)
 
     assert registry.discovered()[0]["node_id"] == "bbbb-node"
@@ -678,9 +691,7 @@ def test_tailscale_absent_is_a_noop():
     assert service._candidates == {}
 
 
-def test_macos_tailscale_app_binary_is_a_cli_fallback(
-    tmp_path, monkeypatch
-):
+def test_macos_tailscale_app_binary_is_a_cli_fallback(tmp_path, monkeypatch):
     executable = tmp_path / "Tailscale"
     executable.write_text("#!/bin/sh\n")
     executable.chmod(0o755)
@@ -785,6 +796,67 @@ def test_mdns_handler_exception_is_contained():
 # -- interface joins ------------------------------------------------------------
 
 
+def test_default_interfaces_exclude_inactive_and_non_ipv6_links(monkeypatch):
+    output = """lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+    inet6 ::1 prefixlen 128
+en0: flags=8863<UP,BROADCAST,RUNNING,MULTICAST> mtu 1500
+    inet6 fe80::1%en0 prefixlen 64
+    status: active
+en11: flags=8863<UP,BROADCAST,RUNNING,MULTICAST> mtu 1500
+    inet6 fe80::2%en11 prefixlen 64
+    status: inactive
+en12: flags=8862<BROADCAST,RUNNING,MULTICAST> mtu 1500
+    inet6 fe80::3%en12 prefixlen 64
+    status: active
+en13: flags=8863<UP,BROADCAST,RUNNING,MULTICAST> mtu 1500
+    inet 192.168.1.2 netmask 0xffffff00
+    status: active
+utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
+    inet6 fe80::4%utun0 prefixlen 64
+"""
+    monkeypatch.setattr("omlx.cluster.discovery.sys.platform", "darwin")
+    monkeypatch.setattr(
+        "omlx.cluster.discovery.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=output),
+    )
+    assert _default_interface_lister() == ["en0", "utun0"]
+
+    output = output.replace("status: active", "status: inactive")
+    output = output.replace("8051<UP,", "8050<")
+    assert _default_interface_lister() == []
+
+
+def test_interface_reconnect_leaves_membership_before_rejoining(monkeypatch):
+    names = ["en11"]
+    service, _ = _service(interface_lister=lambda: names)
+    sock = FakeSocket()
+    memberships = set()
+
+    def setsockopt(level, option, membership):
+        if option == socket.IPV6_JOIN_GROUP:
+            if membership in memberships:
+                raise OSError(errno.EADDRINUSE, "Already joined")
+            memberships.add(membership)
+        elif option == socket.IPV6_LEAVE_GROUP:
+            memberships.remove(membership)
+
+    sock.setsockopt = setsockopt
+    monkeypatch.setattr(socket, "if_nametoindex", lambda name: 14)
+    service._sync_interfaces(sock)
+    service._send_hello(sock)
+    names.clear()
+    service._sync_interfaces(sock)
+    service._send_hello(sock)
+    assert len(sock.sent) == 1
+    assert not memberships
+
+    names.append("en11")
+    service._sync_interfaces(sock)
+    service._send_hello(sock)
+    assert len(sock.sent) == 2
+    assert sock.sent[-1][1] == (MULTICAST_GROUP, MULTICAST_PORT, 0, 14)
+
+
 def test_interface_sync_skips_unsupported_interfaces():
     sock = FakeSocket()
     service, _ = _service(
@@ -818,7 +890,13 @@ def test_peer_record_to_dict_shape():
         friendly_name="studio",
         version="0.6.1",
         cluster_name="omlx",
-        caps=PeerCaps(chip="M3 Ultra", ram_gb=96.0, backends=["jaccl"], thunderbolt=True, jaccl=True),
+        caps=PeerCaps(
+            chip="M3 Ultra",
+            ram_gb=96.0,
+            backends=["jaccl"],
+            thunderbolt=True,
+            jaccl=True,
+        ),
         addrs=[{"ip": "fe80::1", "if_type": "mdns"}],
         http_port=8000,
         paired=True,
@@ -833,25 +911,25 @@ def test_peer_record_to_dict_shape():
     json.dumps(payload)  # must be JSON-serializable for the API
 
 
-def test_mark_paired_flips_in_memory_peer_flag():
+def test_mark_paired_updates_live_discovery_record():
     service, _ = _service()
     service._peers["peer-1"] = PeerRecord(node_id="peer-1")
 
     service.mark_paired("peer-1")
 
     assert service._peers["peer-1"].paired is True
-    # Unknown node_ids are a no-op; the flag is advisory, not authoritative.
     service.mark_paired("unknown-node")
 
 
-# -- announced caps provider (pairing payload seam) ------------------------------
-
-
-def test_announced_caps_reflects_configured_service():
+def test_announced_caps_uses_configured_service():
     from omlx.cluster.discovery import announced_caps, configure_discovery_service
 
     caps = PeerCaps(
-        chip="M3 Max", ram_gb=96.0, backends=["jaccl"], thunderbolt=True, jaccl=True
+        chip="M3 Max",
+        ram_gb=96.0,
+        backends=["jaccl"],
+        thunderbolt=True,
+        jaccl=True,
     )
     service, _ = _service(config=DiscoveryConfig(caps=caps))
     configure_discovery_service(service)
@@ -975,27 +1053,26 @@ def test_send_hello_uses_scoped_4tuple_per_interface():
     # The shared socket's IPV6_MULTICAST_IF must not be mutated per round;
     # the scope id in the destination carries the egress interface instead.
     assert not any(
-        len(opt) == 3 and opt[1] == socket.IPV6_MULTICAST_IF
-        for opt in sock.opts
+        len(opt) == 3 and opt[1] == socket.IPV6_MULTICAST_IF for opt in sock.opts
     )
 
 
-def test_send_hello_without_joins_uses_default_route_2tuple():
+def test_send_hello_without_active_interfaces_does_not_send():
     sock = FakeSocket()
     service, _ = _service(socket_factory=lambda: sock)
 
     service._send_hello(sock)
 
-    assert sock.sent[0][1] == (MULTICAST_GROUP, MULTICAST_PORT)
+    assert not sock.sent
+    assert service._consecutive_tx_fail_rounds == 0
+    assert not service._needs_socket_reset
 
 
 def test_wassup_reply_preserves_link_local_scope_id():
     sock = FakeSocket()
     service, _ = _service(socket_factory=lambda: sock)
 
-    service._handle_hello(
-        42, service._cluster_hash, ("fe80::99", 53413, 0, 20), sock
-    )
+    service._handle_hello(42, service._cluster_hash, ("fe80::99", 53413, 0, 20), sock)
 
     assert len(sock.sent) == 1
     assert sock.sent[0][1] == ("fe80::99", 53413, 0, 20)
@@ -1005,9 +1082,7 @@ def test_sync_interfaces_rejoins_after_renumber(monkeypatch):
     sock = FakeSocket()
     service, _ = _service(interface_lister=lambda: ["en5"])
     state = {"idx": 20}
-    monkeypatch.setattr(
-        socket, "if_nametoindex", lambda name: state["idx"]
-    )
+    monkeypatch.setattr(socket, "if_nametoindex", lambda name: state["idx"])
 
     service._sync_interfaces(sock)
     assert service._joined == {"en5": 20}
@@ -1050,20 +1125,25 @@ def test_send_failures_are_rate_limited(caplog):
     service, clock = _service(socket_factory=lambda: sock)
     service._joined = {"en0": 10}
 
-    with caplog.at_level(logging.DEBUG, logger="omlx.cluster.discovery"):
+    with caplog.at_level(5, logger="omlx.cluster.discovery"):
         service._send_hello(sock)
         clock.advance(5)
         service._send_hello(sock)  # inside the 60s window: silent
-        assert (
-            sum("HELLO send on if" in r.getMessage() for r in caplog.records)
-            == 1
-        )
+        assert sum("HELLO send on if" in r.getMessage() for r in caplog.records) == 1
         clock.advance(61)
         service._send_hello(sock)
-        assert (
-            sum("HELLO send on if" in r.getMessage() for r in caplog.records)
-            == 2
+        assert sum("HELLO send on if" in r.getMessage() for r in caplog.records) == 2
+        assert all(
+            r.levelno == 5
+            for r in caplog.records
+            if "HELLO send on if" in r.getMessage()
         )
+
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="omlx.cluster.discovery"):
+        clock.advance(61)
+        service._send_hello(sock)
+        assert not any("HELLO send on if" in r.getMessage() for r in caplog.records)
 
 
 def test_consecutive_failed_rounds_request_socket_reset():

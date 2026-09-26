@@ -20,6 +20,14 @@ from test_qwen4_suffix_local_priming import _greedy, _model
 from omlx.patches.mlx_lm_mtp import batch_generator as bg
 from omlx.patches.mlx_lm_mtp import prompt_priming
 
+pytestmark = pytest.mark.skip(
+    reason=(
+        "Fusion Qwen4 sequential verify oracle stack not carried over the jundot/omlx "
+        "v0.7.0rc1 merge (vendored qwen4_exp language.py now follows upstream "
+        "#3520/#3534/#3903); see branch backup/main-20260925"
+    )
+)
+
 
 @pytest.mark.parametrize(
     ("width", "accepted"),

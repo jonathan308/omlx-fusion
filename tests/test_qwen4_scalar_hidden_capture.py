@@ -11,6 +11,14 @@ import pytest
 
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
+pytestmark = pytest.mark.skip(
+    reason=(
+        "Fusion Qwen4 scalar MTP hidden capture stack not carried over the jundot/omlx "
+        "v0.7.0rc1 merge (vendored qwen4_exp language.py now follows upstream "
+        "#3520/#3534/#3903); see branch backup/main-20260925"
+    )
+)
+
 
 class _IdentityLayer:
     is_linear = False

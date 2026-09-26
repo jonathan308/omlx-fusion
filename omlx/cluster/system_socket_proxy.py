@@ -2,44 +2,51 @@
 """Carry one local TCP stream through macOS's system Python when required.
 
 Some macOS installations deny a Homebrew Python process outbound access to a
-direct Thunderbolt subnet (``ENETUNREACH``) while Apple's system Python can use
-the exact same address.  Distributed ranks still need a reliable, ordered TCP
-control channel for cancellation, cache agreement, and request steering.  A
-small system-Python child bridges a local loopback socket to that direct path;
-the parent process keeps its normal socket API and no model data crosses it.
+direct Thunderbolt subnet while Apple's system Python can use the same address.
+A bounded child bridges a loopback socket to that path; the parent retains its
+normal socket API and no model data crosses this helper.
 """
 
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
-from pathlib import Path
 import select
 import socket
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 
+logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT_SECONDS = 20.0
-_PROXY_PROGRAM = r'''
+_PROXY_PROGRAM = r"""
 import socket, sys, threading, time
 
 def connect(host, port, timeout):
     deadline = time.monotonic() + timeout
     error = None
     while time.monotonic() < deadline:
-        remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            remote.settimeout(min(1.0, max(0.05, deadline - time.monotonic())))
-            remote.connect((host, port))
-            remote.settimeout(None)
-            return remote
+            targets = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
         except OSError as exc:
             error = exc
-            remote.close()
-            time.sleep(0.05)
+            targets = []
+        for family, socktype, protocol, _, sockaddr in targets:
+            remote = socket.socket(family, socktype, protocol)
+            try:
+                remote.settimeout(min(1.0, max(0.05, deadline - time.monotonic())))
+                remote.connect(sockaddr)
+                remote.settimeout(None)
+                return remote
+            except OSError as exc:
+                error = exc
+                remote.close()
+        time.sleep(0.05)
     raise RuntimeError("could not reach control coordinator: %s" % error)
 
 def copy(source, target):
@@ -63,13 +70,13 @@ def main():
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
         print("PORT %d" % listener.getsockname()[1], flush=True)
-        remote = connect(host, port, timeout)
-        print("READY", flush=True)
         local, _ = listener.accept()
     finally:
         listener.close()
+    remote = connect(host, port, timeout)
     thread = threading.Thread(target=copy, args=(remote, local), daemon=True)
     thread.start()
+    print("READY", flush=True)
     copy(local, remote)
     thread.join(timeout=1.0)
     local.close()
@@ -81,7 +88,7 @@ if __name__ == "__main__":
     except BaseException as exc:
         print("oMLX control socket helper failed: %s" % exc, file=sys.stderr, flush=True)
         raise
-'''
+"""
 
 
 def _system_python() -> str | None:
@@ -102,16 +109,22 @@ def should_proxy_control_socket(host: str) -> bool:
             "OMLX_CLUSTER_CONTROL_TRANSPORT must be auto, direct, or system-proxy"
         )
     if mode == "direct":
+        logger.info("control transport: direct (forced by env)")
         return False
     if mode == "system-proxy":
         if _system_python() is None:
             raise RuntimeError("system Python control proxy is unavailable")
+        logger.info("control transport: system-proxy (forced by env)")
         return True
     try:
         loopback = ipaddress.ip_address(host).is_loopback
     except ValueError:
         loopback = host.strip().lower() in {"localhost", "localhost.local"}
-    return sys.platform == "darwin" and not loopback and _system_python() is not None
+    use_proxy = (
+        sys.platform == "darwin" and not loopback and _system_python() is not None
+    )
+    logger.debug("control transport: system proxy fallback available=%s", use_proxy)
+    return use_proxy
 
 
 @dataclass
@@ -122,10 +135,8 @@ class SystemSocketProxy:
     process: subprocess.Popen[bytes]
 
     def close(self) -> None:
-        try:
+        with suppress(OSError):
             self.stream.close()
-        except OSError:
-            pass
         if self.process.poll() is None:
             try:
                 self.process.wait(timeout=1.0)
@@ -148,11 +159,7 @@ def _helper_error(process: subprocess.Popen[bytes]) -> str:
     return f"control socket helper stopped (status={status}){suffix}"
 
 
-def _read_line(
-    process: subprocess.Popen[bytes],
-    *,
-    deadline: float,
-) -> bytes:
+def _read_line(process: subprocess.Popen[bytes], *, deadline: float) -> bytes:
     if process.stdout is None:
         raise RuntimeError("control socket helper has no stdout")
     while True:
@@ -175,12 +182,7 @@ def open_system_tcp_proxy(
     *,
     timeout: float = _DEFAULT_TIMEOUT_SECONDS,
 ) -> SystemSocketProxy:
-    """Open a local stream bridged to ``host:port`` by system Python.
-
-    The helper does not report ready until it established the direct remote
-    connection, so a rank-control handshake cannot be buffered against a
-    dead proxy and mistaken for a connected worker.
-    """
+    """Open a local stream bridged to ``host:port`` by system Python."""
 
     if not 1 <= int(port) <= 65535 or timeout <= 0:
         raise ValueError("control socket proxy endpoint is invalid")

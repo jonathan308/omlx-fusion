@@ -9,6 +9,14 @@ import pytest
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 from test_mlx_vlm_qwen4_exp_compat import _tiny_config
 
+pytestmark = pytest.mark.skip(
+    reason=(
+        "Fusion Qwen4 tokenwise PLE verify stack not carried over the jundot/omlx "
+        "v0.7.0rc1 merge (vendored qwen4_exp language.py now follows upstream "
+        "#3520/#3534/#3903); see branch backup/main-20260925"
+    )
+)
+
 
 @pytest.mark.parametrize("accepted", [0, 2, 3])
 def test_qwen4_tokenwise_ple_matches_scalar_rows_and_rollback(

@@ -79,8 +79,8 @@ def test_sidecar_orders_ranks_without_using_parent_network(monkeypatch):
     thread.start()
     results["client"] = second(b"bb", 2)
     thread.join(3)
-    getattr(first, "close")()
-    getattr(second, "close")()
+    first.close()
+    second.close()
 
     assert not thread.is_alive()
     assert not errors

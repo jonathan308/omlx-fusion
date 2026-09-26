@@ -390,7 +390,7 @@ def _validated_metrics(value: Any) -> dict[str, Any]:
             raise ValueError("runtime active-request metric is not running")
         request_ids = [item["request_id"] for item in requests]
         if len(set(request_ids)) != len(request_ids):
-            raise ValueError("runtime active-request IDs are not unique")
+            raise ValueError("runtime active-request identities: IDs are not unique")
         truncated = _nonnegative_int(
             value.get("active_request_metrics_truncated", 0),
             "metrics active_request_metrics_truncated",

@@ -77,6 +77,12 @@ ALLOWED_ENDPOINTS = {
     "/admin/api/cluster/runtime",
     "/admin/api/cluster/deployments",
     "/admin/api/cluster/replan",
+    "/admin/api/cluster/diagnostics",
+    "/admin/api/cluster/join-keys",
+    "/admin/api/cluster/join-status",
+    "/admin/api/cluster/cuda-fabric/verify",
+    "/admin/api/cluster/rdma-links",
+    "/admin/api/cluster/rdma-links/verify",
     "/admin/api/cluster/tp-layout-qualifications",
 }
 
@@ -161,7 +167,7 @@ def test_discovered_fixture_proves_the_two_mac_cap_is_gone():
     javascript = _read(JAVASCRIPT)
     template = _read(TEMPLATE)
     assert "length === 2" not in javascript
-    assert "slice(0, 2" not in javascript
+    assert "planNodes().slice(0, 2" not in javascript
     assert "max 2" not in javascript.lower()
     assert 'x-for="device in allDevices()"' in template
 
@@ -197,7 +203,7 @@ def test_polling_is_one_hertz_and_visibility_gated():
     assert "CLUSTER_V2_POLL_MS = 1000" in javascript
     assert "document.hidden" in javascript
     assert "this.mainTab === 'cluster'" in javascript
-    assert "this.clusterLegacyView" in javascript
+    assert "clusterLegacyView" not in javascript
     assert "setInterval(() => this.tick(), CLUSTER_V2_POLL_MS)" in javascript
 
 
@@ -218,7 +224,7 @@ def test_version_mismatch_banner_is_actionable_and_keeps_the_device():
     javascript = _read(JAVASCRIPT)
 
     assert "data-cluster-v2-version-mismatch" in template
-    assert "Version mismatch across your Macs" in template
+    assert "cluster.v2.version_mismatch.title" in template
     assert "brew upgrade omlx" in template
     assert "versionMismatches()" in javascript
     # The banner compares peer vs self versions and names both.
@@ -238,7 +244,7 @@ def test_multicast_self_test_stub_degrades_gracefully():
     assert "/api/cluster/discovery/health" in javascript
     assert "discoveryHealthUnsupported" in javascript
     assert "error?.status === 404" in javascript
-    assert "Local Network" in template
+    assert "cluster.v2.discovering.local_network" in template
     # The fixture pins the stub contract for whoever implements it.
     health = _fixtures()["discovery_health_ok.json"]
     assert "multicast_rx_within_5s" in health
@@ -315,9 +321,9 @@ def test_configured_deployment_panel_lists_devices_and_deactivates():
     assert "changeClusterModel" in javascript
     assert "unloadDeploymentWeights" in javascript
     assert "loadDeploymentWeights" in javascript
-    assert "Tailscale control" in javascript
-    assert "Inference: JACCL over Thunderbolt RDMA" in javascript
-    assert "device links below are control/discovery routes" in template
+    assert "cluster.v2.link.tailscale_control" in javascript
+    assert "cluster.v2.deploy.fabric_jaccl" in javascript
+    assert "cluster.v2.active.fabric_note" in template
     assert "planIsHybrid()" in javascript
     assert "Hybrid TP×pipeline" in javascript
     assert "pipeline stages" in javascript
@@ -406,8 +412,7 @@ component.apiFetch = async (url, options = {}) => {
 
 
 def test_active_card_load_and_unload_keep_the_signed_deployment():
-    result = _run_wizard(
-        """
+    result = _run_wizard("""
 global.setTimeout = () => 0;
 const deployment = { deployment_id: 'pool-a', model: '/models/m' };
 component.deploymentsPayload = [deployment];
@@ -437,11 +442,10 @@ component.apiFetch = async (url, options = {}) => {
     calls,
   }));
 })();
-"""
-    )
+""")
 
     assert result["armed"] == "pool-a"
-    assert result["deploymentAfterUnload"] is None
+    assert result["deploymentAfterUnload"] == "pool-a"
     assert result["lifecycleBusy"] is False
     assert {
         "url": "/admin/api/cluster/deployments/pool-a/unload",
@@ -465,8 +469,7 @@ def test_runtime_residency_separates_configuration_from_observed_workers():
             "runtime_failed.json",
         )
     }
-    result = _run_wizard(
-        f"""
+    result = _run_wizard(f"""
 component.deploymentsPayload = {json.dumps(deployment)};
 component.deploymentsLoaded = true;
 const savedDeployment = component.deploymentsPayload[0];
@@ -519,13 +522,12 @@ samples.launcherOnly = {{
   label: component.deploymentStatus(savedDeployment).label,
 }};
 process.stdout.write(JSON.stringify(samples));
-"""
-    )
+""")
 
     detached = result["runtime_detached.json"]
     assert detached["runtimeState"] == "configured"
-    assert detached["wizardState"] != "active"
-    assert detached["configured"] is None
+    assert detached["wizardState"] == "active"  # management remains accessible
+    assert detached["configured"] is not None
     assert detached["active"] is None, "a detached marker is not residency"
     assert detached["modelName"] == "minimax-m3"
     assert detached["label"] == "Not loaded"
@@ -879,9 +881,8 @@ process.stdout.write(JSON.stringify({ opened, closed }));
     }
 
 
-def test_cold_saved_setups_open_one_model_picker_instead_of_a_fake_active_card():
-    result = _run_wizard(
-        """
+def test_cold_saved_setups_keep_management_without_claiming_residency():
+    result = _run_wizard("""
 component.devicesPayload = {
   self: { node_id: 'node-a', friendly_name: 'Node A', caps: {}, addrs: [] },
   paired: [{ node_id: 'node-b', friendly_name: 'Node B', caps: {}, addrs: [], paired: true }],
@@ -902,10 +903,11 @@ process.stdout.write(JSON.stringify({
   stage: component.stage,
   wizard: component.wizardState(),
 }));
-"""
-    )
+""")
 
-    assert result == {"configured": None, "stage": "plan", "wizard": "plan"}
+    assert result["configured"]["deployment_id"] == "ds4-cold"
+    assert result["stage"] is None
+    assert result["wizard"] == "active"
 
     template = _read(TEMPLATE)
     assert 'x-for="deployment in deploymentsPayload"' not in template
@@ -990,7 +992,7 @@ process.stdout.write(JSON.stringify({
 
     assert result["active"] == {
         "ids": [41, 42],
-        "phases": ["Prefill", "Decode"],
+        "phases": ["prefill", "decode"],
         "prefill": ["812 tok/s", "905 tok/s"],
         "decode": ["—", "44.3 tok/s"],
         "count": "2 active",
@@ -998,7 +1000,7 @@ process.stdout.write(JSON.stringify({
     assert result["completed"] == {
         "id": 42,
         "history": True,
-        "phase": "Complete",
+        "phase": "complete",
         "count": "Last completed request",
     }
     assert result["cached"] == {
@@ -1014,15 +1016,14 @@ process.stdout.write(JSON.stringify({
 
 
 def test_serving_profile_drives_the_server_owned_signed_plan():
-    result = _run_wizard(
-        _WIZARD_TWO_MACS
-        + """
+    result = _run_wizard(_WIZARD_TWO_MACS + """
 component.setExecutionProfile('throughput');
 component.modelOptions = [{ model_path: '/models/m', id: 'm' }];
 component.selectedModelPath = '/models/m';
 component.targetContextTokens = 262144;
 let posted = null;
 component.apiFetch = async (url, options) => {
+  if (url.endsWith('/node-budgets')) return {nodes: component.planNodes()};
   if (url.endsWith('/autoconfigure')) {
     posted = JSON.parse(options.body);
     return {
@@ -1048,8 +1049,7 @@ component.apiFetch = async (url, options) => {
     })),
   }));
 })();
-"""
-    )
+""")
 
     assert result["selected"] == "throughput"
     assert result["posted"] == "throughput"
@@ -1065,8 +1065,8 @@ component.apiFetch = async (url, options) => {
     assert "data-cluster-v2-serving-profile" in template
     assert "data-cluster-v2-serving-profile-option" in template
     assert "data-cluster-v2-context-reservation" in template
-    assert 'aria-label="Distributed context reservation"' in template
-    assert "There is no separate batching switch" in template
+    assert "cluster.v2.plan.context_aria" in template
+    assert "cluster.v2.plan.batching_note" in template
 
 
 def test_active_serving_status_uses_resolved_runtime_limits_and_batch_evidence():
@@ -1260,17 +1260,15 @@ def test_one_hertz_tick_polls_runtime_ownership_and_not_just_deployments():
     assert "=== 'ready'" in active
 
 
-def test_legacy_view_toggle_keeps_v1_reachable_exactly_once():
+def test_cluster_v2_is_the_sole_dashboard_flow():
     dashboard = _read(DASHBOARD)
     template = _read(TEMPLATE)
 
-    assert dashboard.count('{% include "dashboard/_cluster.html" %}') == 1
+    assert '{% include "dashboard/_cluster.html" %}' not in dashboard
     assert dashboard.count('{% include "dashboard/_cluster_v2.html" %}') == 1
-    assert 'x-data="{ clusterLegacyView: false }"' in dashboard
-    assert "clusterLegacyView = true" in template
-    assert "clusterLegacyView = false" in dashboard
-    assert "Advanced (legacy)" in template
-    assert "data-cluster-legacy-view" in dashboard
+    assert "clusterLegacyView" not in dashboard + template
+    assert "Advanced (legacy)" not in dashboard + template
+    assert "data-cluster-v2-advanced-tools" in template
     # cluster_v2.js loads before dashboard.js so the factory exists when
     # Alpine initializes x-data="clusterV2Wizard()".
     scripts = dashboard.index("js/cluster_v2.js"), dashboard.index("js/dashboard.js")
@@ -1327,7 +1325,7 @@ def test_joiner_poll_drives_approval_and_survives_reloads():
     assert "joined" in approved
     assert "this.refreshDevices()" in approved
     denied = javascript.split("snapshot.state === 'denied'", 1)[1]
-    assert "denied the join request" in denied
+    assert "cluster.v2.toast.join_denied" in denied
     # Denied is terminal server-side; the UI clears it via the cancel endpoint.
     assert "/api/cluster/pair/join/cancel" in javascript
 
@@ -1385,8 +1383,17 @@ def _run_wizard(body: str) -> dict:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required to execute the wizard component")
+    # The component resolves its copy through window.t(...); give the sandbox
+    # the real English catalog so runtime assertions still read the shipped
+    # strings. A missing key falls through as the key itself, which makes a
+    # forgotten catalog entry visible rather than silently blank.
+    catalog = json.loads(
+        (ROOT / "omlx/admin/i18n/en.json").read_text(encoding="utf-8")
+    )
     script = f"""
 {_read(JAVASCRIPT)}
+const __catalog = {json.dumps(catalog, ensure_ascii=False)};
+global.window = {{ t: (key) => (key in __catalog ? __catalog[key] : key) }};
 const component = clusterV2Wizard();
 {body}
 """
@@ -1413,6 +1420,58 @@ component.devicesPayload = {
 };
 component.roleOptions = roles;
 """ % json.dumps(str(FIXTURES / "node_roles.json"))
+
+
+def test_advanced_cuda_tools_use_selected_pair_and_one_time_join_contract():
+    result = _run_wizard(
+        """
+Object.assign(global.window, {
+  location: { hostname: '192.168.1.20', protocol: 'http:', port: '8000' },
+});
+global.setTimeout = () => 0;
+const calls = [];
+const nodes = [
+  { node_id: 'cuda-a', hostname: 'CUDA A', ssh: 'cuda-a.local' },
+  { node_id: 'cuda-b', hostname: 'CUDA B', ssh: 'cuda-b.local' },
+  { node_id: 'cuda-c', hostname: 'CUDA C', ssh: 'cuda-c.local' },
+];
+component.apiFetch = async (url, options = {}) => {
+  calls.push({ url, method: options.method || 'GET', body: options.body || null });
+  if (url.endsWith('/join-status')) return { join_keys: [], nodes };
+  if (url.endsWith('/join-keys')) return {
+    command: 'curl secure | sh', join_id: 'a'.repeat(16),
+    expires_at: Date.now() / 1000 + 1800,
+  };
+  if (url.endsWith('/cuda-fabric/verify')) return { verified: true };
+  throw new Error('unexpected URL ' + url);
+};
+(async () => {
+  await component.toggleAdvancedTools();
+  component.cudaJoin.controllerIp = '192.168.1.20';
+  await component.generateCudaJoinCommand();
+  component.cudaFabricMemberA = 'cuda-a';
+  component.cudaFabricMemberB = 'cuda-c';
+  await component.verifyCudaFabric();
+  const verify = calls.find((call) => call.url.endsWith('/cuda-fabric/verify'));
+  process.stdout.write(JSON.stringify({
+    command: component.cudaJoin.command,
+    joined: component.cudaNodes().length,
+    verify: JSON.parse(verify.body),
+    methods: calls.map((call) => call.method),
+  }));
+})().catch((error) => { console.error(error); process.exit(1); });
+""",
+    )
+
+    assert result["command"] == "curl secure | sh"
+    assert result["joined"] == 3
+    assert result["verify"] == {
+        "hosts": [
+            {"node_id": "cuda-a", "ssh": "cuda-a.local"},
+            {"node_id": "cuda-c", "ssh": "cuda-c.local"},
+        ]
+    }
+    assert "POST" in result["methods"]
 
 
 def test_plan_step_has_a_per_node_role_picker_with_defaults_unchanged():
@@ -1465,7 +1524,7 @@ def test_fit_failure_banner_is_actionable_and_never_silent():
 
     assert "data-cluster-v2-fit-banner" in template
     assert "data-cluster-v2-fit-switch-headless" in template
-    assert "Switch all to Headless and retry" in template
+    assert "cluster.v2.plan.switch_headless" in template
     assert "parseFitFailure" in javascript
     assert r"at least (\d+) additional bytes" in javascript
     assert "canFixWithHeadless" in javascript
@@ -1604,14 +1663,13 @@ def test_persistent_prompt_cache_is_visible_opt_in_and_replans():
     assert "promptCacheSsdMaxGiB: 20" in javascript
     assert "prompt_cache_ssd: this.promptCacheSsd" in javascript
     assert "prompt_cache_ssd_max_bytes" in javascript
-    assert "Writes run in the background" in template
-    assert "512 MiB pending limit" in template
+    assert "cluster.v2.plan.prompt_reuse_blurb" in template
 
     result = _run_wizard(
-        _WIZARD_TWO_MACS
-        + """
+        _WIZARD_TWO_MACS + """
 const posted = [];
 component.apiFetch = async (url, options) => {
+  if (url.endsWith('/node-budgets')) return {nodes: component.planNodes()};
   const body = options && options.body ? JSON.parse(options.body) : null;
   if (url.endsWith('/autoconfigure')) {
     posted.push(body.prompt_cache_ssd);
@@ -1653,8 +1711,7 @@ component.selectedModelPath = '/models/m';
 
 def test_every_strategy_uses_server_autoconfigure_and_its_tp_choice():
     result = _run_wizard(
-        _WIZARD_TWO_MACS
-        + """
+        _WIZARD_TWO_MACS + _WIZARD_TIMER_STUBS + """
 const bodies = [];
 function proposalFor(strategy) {
   const tp = strategy === 'pipeline' ? 1 : 2;
@@ -1670,6 +1727,7 @@ function proposalFor(strategy) {
     { node_id: 'node-b', ssh: 'worker', ips: ['10.0.0.2'], rdma: [] },
   ];
   return {
+    ready_to_activate: true,
     backend: strategy === 'pipeline' ? 'ring' : 'jaccl',
     performance_probe: { ok: true, status: 'applied_before_staging' },
     plan: { assignments: [], tensor_parallel_size: tp, placement_signature: signature },
@@ -1681,6 +1739,7 @@ function proposalFor(strategy) {
   };
 }
 component.apiFetch = async (url, options) => {
+  if (url.endsWith('/node-budgets')) return {nodes: component.planNodes()};
   const body = options && options.body ? JSON.parse(options.body) : null;
   bodies.push({
     url,
@@ -1713,18 +1772,16 @@ component.selectedModelPath = '/models/m';
 """,
     )
 
-    proposals = [
-        b for b in result["bodies"] if b["url"].endswith("/autoconfigure")
-    ]
+    proposals = [b for b in result["bodies"] if b["url"].endswith("/autoconfigure")]
     deploys = [
         b
         for b in result["bodies"]
         if b["url"].endswith("/deployments") and b["marker"] is not None
     ]
     assert [item["strategy"] for item in proposals] == ["tensor", "auto", "pipeline"]
-    assert all(item.get("tp") is None for item in proposals), (
-        "the browser must not choose a TP degree"
-    )
+    assert all(
+        item.get("tp") is None for item in proposals
+    ), "the browser must not choose a TP degree"
     assert len(deploys) == 1
     assert deploys[0]["url"] == "/admin/api/cluster/deployments"
     assert deploys[0].get("strategy") is None
@@ -1767,6 +1824,7 @@ def test_phase_split_picker_posts_signed_role_ownership_and_renders_flow():
         + """
 const bodies = [];
 component.apiFetch = async (url, options) => {
+  if (url.endsWith('/node-budgets')) return {nodes: component.planNodes()};
   const body = options?.body ? JSON.parse(options.body) : null;
   bodies.push({ url, body });
   if (url.endsWith('/autoconfigure')) {
@@ -1958,8 +2016,7 @@ slow.selectedModelPath = '/models/m';
 
 def test_calibration_requires_a_real_model_and_performance_probe_success():
     result = _run_wizard(
-        _WIZARD_TWO_MACS
-        + """
+        _WIZARD_TWO_MACS + """
 const proposal = JSON.parse(
   require('fs').readFileSync(
     %s,
@@ -1969,6 +2026,7 @@ const proposal = JSON.parse(
 const bodies = [];
 let probeOk = false;
 component.apiFetch = async (url, options) => {
+  if (url.endsWith('/node-budgets')) return {nodes: component.planNodes()};
   if (url.endsWith('/autoconfigure')) {
     bodies.push(JSON.parse(options.body));
     return {
@@ -2120,6 +2178,33 @@ process.stdout.write(JSON.stringify({
     assert "row.status === 'warn'" in template
     assert "triangle-alert" in template
     assert "text-amber-800 bg-amber-50 border border-amber-200" in template
+
+
+def test_peer_runtime_warning_is_amber_and_does_not_block_planning():
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + """
+component.checks.started = true;
+component.checks.probes = {
+  'node-b': {
+    ok: true,
+    result: { runtime_warnings: ['Remote runtime uses a fallback interpreter.'] },
+  },
+};
+const row = component.checkRows().find((item) => item.key === 'ssh');
+process.stdout.write(JSON.stringify({
+  status: row.status,
+  detail: row.detail,
+  blockingPass: component.checksBlockingPass(),
+}));
+""",
+    )
+
+    assert result == {
+        "status": "warn",
+        "detail": "Remote runtime uses a fallback interpreter.",
+        "blockingPass": True,
+    }
 
 
 def test_split_bar_has_a_tensor_variant_and_width_transitions():
@@ -2351,13 +2436,11 @@ component.apiFetch = async (url, options) => {
 
 def test_stage_409_replans_like_activation_409():
     result = _run_wizard(
-        _WIZARD_TWO_MACS
-        + _WIZARD_TIMER_STUBS
-        + _WIZARD_PARTIAL_MODEL
-        + """
+        _WIZARD_TWO_MACS + _WIZARD_TIMER_STUBS + _WIZARD_PARTIAL_MODEL + """
 const calls = [];
 component.apiFetch = async (url, options) => {
   calls.push(url);
+  if (url.endsWith('/node-budgets')) return {nodes: component.planNodes()};
   if (url.endsWith('/stage')) {
     const error = new Error(
       'The staging request no longer matches the approved plan.',
@@ -2392,6 +2475,7 @@ component.apiFetch = async (url, options) => {
     # warning toast, then a fresh signed plan.
     assert result["calls"] == [
         "/admin/api/cluster/stage",
+        "/admin/api/cluster/node-budgets",
         "/admin/api/cluster/autoconfigure",
     ]
     assert result["signature"] == "c" * 16
@@ -2613,3 +2697,44 @@ component.apiFetch = async (url, options) => {
     assert result["stagingError"] == ""
     assert result["busy"] is False
     assert result["toasts"] == ["warning", "success"]
+
+
+@pytest.mark.parametrize("delayed_action", ["poll", "begin"])
+def test_cancel_ignores_older_join_response(delayed_action):
+    result = _run_wizard("""
+let resolveOld;
+const notices = [];
+component.notify = (kind, message) => notices.push({kind, message});
+component.apiFetch = (url) => url.endsWith('/cancel')
+  ? Promise.resolve({state: 'idle', cleanup_pending: true})
+  : new Promise(resolve => { resolveOld = resolve; });
+(async () => {
+  const pending = DELAYED_ACTION === 'poll'
+    ? component.refreshJoinState()
+    : component.beginJoinAddr('peer:8000', 'Peer');
+  await component.cancelJoin();
+  resolveOld({state: 'awaiting_approval', code: '123456'});
+  await pending;
+  process.stdout.write(JSON.stringify({join: component.join, notices}));
+})().catch(error => { console.error(error); process.exit(1); });
+""".replace("DELAYED_ACTION", json.dumps(delayed_action)))
+    assert result["join"]["state"] == "idle"
+    assert result["join"]["busy"] is False
+    assert result["join"]["cleanup_pending"] is True
+    assert result["notices"][0]["kind"] == "warning"
+    assert "on this Mac" in result["notices"][0]["message"]
+
+
+def test_cleanup_status_does_not_hide_new_join_controls():
+    result = _run_wizard("""
+component.join.cleanup_pending = true;
+component.devicesPayload = {
+  self: {node_id: 'self'}, paired: [],
+  discovered: [{node_id: 'other', state: 'discovered'}],
+};
+process.stdout.write(JSON.stringify({state: component.wizardState(), active: component.joinActive()}));
+""")
+    assert result == {"state": "device_card", "active": False}
+    template = _read(TEMPLATE)
+    assert "data-cluster-v2-join-cleanup" in template
+    assert 'x-show="join.cleanup_pending"' in template

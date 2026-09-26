@@ -29,6 +29,7 @@ from ..adapter.output_parser import detect_output_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..cache.observability import CacheRateTracker
+from ..exceptions import PrefillMemoryAbortedError
 from ..memory_monitor import (
     MemoryMonitor,
     raise_if_prefill_exceeds,
@@ -47,6 +48,8 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+_EXECUTOR_DRAIN_TIMEOUT = 10.0
 
 
 def _get_dflash_stop_token_ids(
@@ -123,9 +126,9 @@ def _finalize_output_parser(
 def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     """Decide whether ``model_path`` can run on the current dflash backend.
 
-    DFlash 0.1.10+omlx.4 registers QwenGdnTargetOps, Gemma4TargetOps, and
-    MuseGlimmerTargetOps; oMLX adds a
-    Laguna target/draft adapter. The top-level ``model_type`` is the canonical
+    DFlash 0.1.10+omlx.7 registers QwenGdnTargetOps, Gemma4TargetOps, and
+    MuseGlimmerTargetOps; oMLX adds Laguna and MiMo V2 target/draft adapters.
+    The top-level ``model_type`` is the canonical
     discriminator: Gemma4 multimodal
     configs use ``gemma4`` at the top, while MTP-only variants (e.g. the
     Gemma4 ``-assistant`` checkpoint) declare ``gemma4_assistant`` even
@@ -166,9 +169,11 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     is_muse = model_type in ("muse_glimmer", "muse_glimmer_text")
     if model_type == "glm5_next":
         return False, "GLM-5.3 uses the native oMLX VLM engine"
-    if not (is_qwen or is_gemma4 or is_laguna or is_muse):
+    is_mimo = model_type in ("mimo_v2", "mimo_v2_flash")
+    if not (is_qwen or is_gemma4 or is_laguna or is_muse or is_mimo):
         return False, (
-            f"DFlash supports only Qwen, Gemma4, Laguna, and Muse Glimmer "
+            f"DFlash supports only Qwen, Gemma4, Laguna, MiMo V2, and "
+            f"Muse Glimmer "
             f"models (model_type='{cfg.get('model_type', '')}')"
         )
     return True, ""
@@ -409,7 +414,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._tokenizer_obj = None
         self._executor_tokenizer = None
         self._loaded = False
-        self._active_request = False
+        # DFlash runs outside Scheduler, so memory-pressure aborts cannot use
+        # EngineCore's request registry. Keep the stop events for every
+        # submitted generation instead; the process memory enforcer calls
+        # abort_all_requests() to signal them at the next DFlash event boundary.
+        self._stop_events_lock = threading.Lock()
+        self._active_stop_events: set[threading.Event] = set()
         self._model_type_str = None
         self._fallback_engine: BaseEngine | None = None
         self._in_fallback_mode = False
@@ -704,14 +714,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         loop = asyncio.get_running_loop()
         runtime_context = self._build_runtime_context()
 
-        def _load_models_owned():
-            # Register oMLX-owned target extensions before importing the
-            # dflash loader functions below.
-            from ..patches.dflash_laguna import install_dflash_laguna_backend
-
-            install_dflash_laguna_backend()
-
-            from dflash_mlx.draft_backend import EagerDraftBackend
+        def _load_models():
             from dflash_mlx.engine.target_ops import bind_draft_to_target
             from dflash_mlx.runtime.loading import (
                 load_draft_bundle,
@@ -727,6 +730,14 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             maybe_apply_pre_load_patches(
                 self._model_name, model_settings=self._model_settings
             )
+
+            # Register oMLX's target and drafter specializations before
+            # load_target_bundle resolves either architecture.
+            from ..patches.dflash_laguna import install_dflash_laguna_backend
+            from ..patches.dflash_mimo_v2 import install_dflash_mimo_v2_backend
+
+            install_dflash_laguna_backend()
+            install_dflash_mimo_v2_backend()
 
             # Wrap dflash's hook installers so we can revert the class-level
             # __call__ patches when this engine stops. Without this, a later
@@ -780,18 +791,28 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     else None
                 ),
             )
+            from ..patches.dflash_mimo_v2 import (
+                draft_backend_for,
+                prepare_mimo_draft,
+            )
+
+            prepare_mimo_draft(
+                draft,
+                draft_meta,
+                self._draft_model_path,
+            )
             bind_draft_to_target(
                 draft,
                 target_bundle.model,
                 target_ops=target_bundle.target_ops,
             )
-            draft_backend = EagerDraftBackend()
+            draft_backend = draft_backend_for(draft)
             return target_bundle, draft, draft_backend, draft_meta
 
         result = await loop.run_in_executor(
             get_mlx_executor(),
             self._load_with_wired_limit,
-            _load_models_owned,
+            _load_models,
         )
         target_bundle, self._draft_model, self._draft_backend, draft_meta = result
         self._draft_window_size = self._resolve_draft_window_size(draft_meta)
@@ -995,7 +1016,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         await self._restore_wired_limit_async()
 
         # Release dflash model and cache references
-        shutdown_runtime_cache_manager()
+        await loop.run_in_executor(get_mlx_executor(), shutdown_runtime_cache_manager)
         self._dflash_prefix_cache = None
         self._runtime_context = None
         self._target_model = None
@@ -1076,8 +1097,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             await self._fallback_engine.stop()
             self._fallback_engine = None
         await self._restore_wired_limit_async()
+        from ..engine_core import get_mlx_executor
+
         try:
-            shutdown_runtime_cache_manager()
+            await asyncio.get_running_loop().run_in_executor(
+                get_mlx_executor(), shutdown_runtime_cache_manager
+            )
         except Exception as exc:
             logger.debug(f"shutdown_runtime_cache_manager: {exc}")
         self._dflash_prefix_cache = None
@@ -1548,6 +1573,17 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             return 0
         return max(0, int(getattr(prefix_flow, "hit_tokens", 0) or 0))
 
+    @staticmethod
+    def _summary_finish_reason(summary, stop_ids, max_tokens: int) -> str:
+        """Return "length" when generation reached max_tokens without a stop token."""
+        if summary is None:
+            return "stop"
+        stops = set(stop_ids)
+        # A committed block can hold tokens after the stop token, so scan all.
+        if any(int(token) in stops for token in summary.generated_token_ids):
+            return "stop"
+        return "length" if int(summary.generation_tokens) >= max_tokens else "stop"
+
     def _create_output_parser_session(self, tools: list[dict] | None) -> Any | None:
         """Create a request-local parser, including its tool schemas."""
         factory = self._output_parser_factory
@@ -1693,7 +1729,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 else:
                     self._update_activity(activity_id)
                 if stop_event.is_set():
-                    logger.info("DFlash generation aborted by client")
+                    logger.info("DFlash generation abort requested")
                     break
 
                 if isinstance(event, TokenEvent):
@@ -1777,6 +1813,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         "cached_tokens": self._cached_tokens_from_flow(prefix_flow),
                     }
                     tail = add_parser_final_metrics(metrics)
+                    if not metrics.get("finish_reason"):
+                        metrics["finish_reason"] = self._summary_finish_reason(
+                            event, stop_ids, max_tokens
+                        )
                     enqueue_final(metrics, new_text=tail)
                     break
 
@@ -1822,13 +1862,20 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     "aborted": stop_event.is_set(),
                 }
             )
-            self._active_request = False
 
     def _tokenize_prompt(self, prompt: str | list[int]) -> list[int]:
         """Return prompt IDs without re-tokenizing an already-tokenized prompt."""
         if isinstance(prompt, list):
             return list(prompt)
         return list(self._tokenizer_obj.encode(prompt))
+
+    def _register_stop_event(self, stop_event: threading.Event) -> None:
+        with self._stop_events_lock:
+            self._active_stop_events.add(stop_event)
+
+    def _unregister_stop_event(self, stop_event: threading.Event) -> None:
+        with self._stop_events_lock:
+            self._active_stop_events.discard(stop_event)
 
     async def generate(
         self,
@@ -1894,7 +1941,6 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
         from ..engine_core import get_mlx_executor
 
-        loop = asyncio.get_running_loop()
         stop_event = threading.Event()
         # Admin visibility: DFlash bypasses the scheduler, so the Active
         # Models card reads this activity instead of a scheduler snapshot.
@@ -1958,7 +2004,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     else:
                         self._update_activity(activity_id)
                     if stop_event.is_set():
-                        logger.info("DFlash generation aborted by client")
+                        logger.info("DFlash generation abort requested")
                         break
                     if isinstance(event, TokenEvent):
                         token_id = int(event.token_id)
@@ -2008,6 +2054,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     prefix_flow,
                     first_token_at,
                     parser_output_text,
+                    self._summary_finish_reason(summary, stop_ids, max_tokens),
                 )
             finally:
                 self._record_prefill_guard_active_memory()
@@ -2019,10 +2066,17 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         except Exception as exc:
                             logger.debug(f"event_iter.close() raised: {exc}")
                 self._end_runtime_cache_request(cache_manager)
-                self._active_request = False
 
-        self._active_request = True
-        future = loop.run_in_executor(get_mlx_executor(), _run)
+        self._register_stop_event(stop_event)
+        try:
+            future = get_mlx_executor().submit(_run)
+        except Exception:
+            self._unregister_stop_event(stop_event)
+            self._end_activity(activity_id)
+            raise
+        # Use the executor future: asyncio cancellation can precede worker exit.
+        future.add_done_callback(lambda _: self._unregister_stop_event(stop_event))
+        future = asyncio.wrap_future(future)
         try:
             try:
                 (
@@ -2033,21 +2087,30 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     prefix_flow,
                     first_token_at,
                     parser_output_text,
+                    summary_finish,
                 ) = await asyncio.shield(asyncio.wrap_future(future))
             except asyncio.CancelledError:
                 stop_event.set()
                 logger.info("DFlash generate cancelled, waiting for executor to drain")
                 try:
-                    await asyncio.wait_for(asyncio.wrap_future(future), timeout=10.0)
+                    await asyncio.wait_for(
+                        asyncio.wrap_future(future), timeout=_EXECUTOR_DRAIN_TIMEOUT
+                    )
                 except TimeoutError:
                     logger.warning(
-                        "DFlash executor did not exit within 10s after abort"
+                        "DFlash executor did not exit within %gs after abort",
+                        _EXECUTOR_DRAIN_TIMEOUT,
                     )
                 except Exception:
                     pass
                 raise
         finally:
             self._end_activity(activity_id)
+
+        if stop_event.is_set():
+            raise PrefillMemoryAbortedError(
+                "Request aborted: process memory limit exceeded"
+            )
 
         if parser_session is not None:
             # Parser already converted protocol markers to <think>...</think>
@@ -2099,7 +2162,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             finish_reason=(
                 parser_final.finish_reason
                 if parser_final is not None and parser_final.finish_reason
-                else "stop"
+                else summary_finish
             ),
             tool_calls=(
                 parser_final.tool_calls
@@ -2198,25 +2261,32 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         # Admin visibility: DFlash bypasses the scheduler, so the Active
         # Models card reads this activity instead of a scheduler snapshot.
         activity_id = self._begin_activity("generate", detail="generating")
-        self._active_request = True
-        future = loop.run_in_executor(
-            get_mlx_executor(),
-            self._run_generate_streaming,
-            prompt_tokens,
-            max_tokens,
-            temperature,
-            top_p,
-            top_k,
-            min_p,
-            repetition_penalty,
-            int(repetition_context_size),
-            seed,
-            tools,
-            queue,
-            loop,
-            stop_event,
-            activity_id,
-        )
+        self._register_stop_event(stop_event)
+        try:
+            future = get_mlx_executor().submit(
+                self._run_generate_streaming,
+                prompt_tokens,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                min_p,
+                repetition_penalty,
+                int(repetition_context_size),
+                seed,
+                tools,
+                queue,
+                loop,
+                stop_event,
+                activity_id,
+            )
+        except Exception:
+            self._unregister_stop_event(stop_event)
+            self._end_activity(activity_id)
+            raise
+        # Use the executor future: asyncio cancellation can precede worker exit.
+        future.add_done_callback(lambda _: self._unregister_stop_event(stop_event))
+        future = asyncio.wrap_future(future)
 
         total_text = ""
         total_completion = 0
@@ -2225,6 +2295,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         try:
             while True:
                 new_text, new_tokens, finished, metrics = await queue.get()
+
+                if metrics and metrics.get("aborted"):
+                    raise PrefillMemoryAbortedError(
+                        "Request aborted: process memory limit exceeded"
+                    )
 
                 if think_prefix_pending and new_text:
                     new_text = self._think_prefix_text() + new_text
@@ -2279,11 +2354,14 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 stop_event.set()
                 logger.info("DFlash stream cancelled, waiting for executor to drain")
             try:
-                await asyncio.wait_for(asyncio.wrap_future(future), timeout=10.0)
+                await asyncio.wait_for(
+                    asyncio.wrap_future(future), timeout=_EXECUTOR_DRAIN_TIMEOUT
+                )
             except TimeoutError:
                 logger.warning(
-                    "DFlash executor did not exit within 10s after abort; "
-                    "next request may still be queued"
+                    "DFlash executor did not exit within %gs after abort; "
+                    "next request may still be queued",
+                    _EXECUTOR_DRAIN_TIMEOUT,
                 )
             except Exception as exc:
                 logger.debug(f"DFlash executor future raised: {exc}")
@@ -2469,10 +2547,37 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             and self._fallback_engine.has_active_requests()
         ):
             return True
-        if self._active_request:
-            return True
+        with self._stop_events_lock:
+            if self._active_stop_events:
+                return True
         with self._active_lock:
             return self._active_count > 0
+
+    async def abort_all_requests(self) -> int:
+        """Signal every in-flight DFlash generation to stop.
+
+        The process memory enforcer relies on this method at hard pressure.
+        DFlash does not use Scheduler request objects, so its per-generation
+        threading events are the authoritative abort handles.
+        """
+        aborted = 0
+        fallback = self._fallback_engine
+        if fallback is not None:
+            abort_fallback = getattr(fallback, "abort_all_requests", None)
+            if callable(abort_fallback):
+                result = abort_fallback()
+                if hasattr(result, "__await__"):
+                    result = await result
+                if isinstance(result, (int, float)):
+                    aborted += max(0, int(result))
+
+        with self._stop_events_lock:
+            stop_events = tuple(self._active_stop_events)
+        for stop_event in stop_events:
+            if not stop_event.is_set():
+                stop_event.set()
+                aborted += 1
+        return aborted
 
     def get_stats(self) -> dict[str, Any]:
         return {

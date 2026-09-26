@@ -181,7 +181,9 @@ def capture_dns_sd(args: Sequence[str], timeout: float) -> DiscoveryOutput:
     return DiscoveryOutput(raw.decode(errors="replace"), error)
 
 
-def parse_browse_instances(output: str, service_type: str = "_ssh._tcp.") -> tuple[str, ...]:
+def parse_browse_instances(
+    output: str, service_type: str = "_ssh._tcp."
+) -> tuple[str, ...]:
     """Parse service instance names without trusting their display text."""
 
     instances: list[str] = []
@@ -249,10 +251,7 @@ def discover_ssh_peers(
         if target is None:
             return None
         hostname, port = target
-        if (
-            port != 22
-            or _bonjour_host_label(hostname) == local_hostname
-        ):
+        if port != 22 or _bonjour_host_label(hostname) == local_hostname:
             return None
         return {
             "name": instance,
@@ -305,10 +304,7 @@ def verify_pairing_token(encoded_token: str, *, shared_secret: str) -> bool:
     except (binascii.Error, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return False
 
-    if (
-        not isinstance(expires_at, (int, float))
-        or isinstance(expires_at, bool)
-    ):
+    if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool):
         return False
 
     if time.time() > expires_at:
@@ -530,7 +526,7 @@ from contextlib import suppress  # noqa: E402
 from dataclasses import dataclass, field  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-from .._version import __version__ as _OMLX_VERSION  # noqa: E402
+from .._version import __version__ as _omlx_version  # noqa: E402
 
 logger = logging.getLogger(__name__)  # noqa: E402
 _probe_diagnostics = threading.local()
@@ -603,7 +599,7 @@ def decode_wassup(data: bytes) -> dict[str, Any] | None:
     if not data.startswith(_WASSUP_MAGIC):
         return None
     try:
-        payload = json.loads(data[len(_WASSUP_MAGIC):].decode("utf-8"))
+        payload = json.loads(data[len(_WASSUP_MAGIC) :].decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):
@@ -653,7 +649,9 @@ class PeerCaps:
         )
 
 
-def _rdma_fabric_caps(caps: "PeerCaps", runner: Callable[..., Any] = subprocess.run) -> None:
+def _rdma_fabric_caps(
+    caps: PeerCaps, runner: Callable[..., Any] = subprocess.run
+) -> None:
     """Detect the Thunderbolt RDMA fabric and set ``thunderbolt``/``jaccl``.
 
     macOS-only, best-effort, never raises: ``rdma_ctl status`` reports
@@ -675,7 +673,11 @@ def _rdma_fabric_caps(caps: "PeerCaps", runner: Callable[..., Any] = subprocess.
         return
     try:
         status = runner(  # noqa: S603 - fixed system executable
-            [rdma_ctl, "status"], capture_output=True, text=True, timeout=5.0, check=False
+            [rdma_ctl, "status"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
         )
         enabled = (
             status.returncode == 0
@@ -730,7 +732,8 @@ def local_caps() -> PeerCaps:
             caps.chip = platform.machine()
             with suppress(OSError, ValueError):
                 caps.ram_gb = round(
-                    os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+                    os.sysconf("SC_PAGE_SIZE")
+                    * os.sysconf("SC_PHYS_PAGES")
                     / (1 << 30),
                     1,
                 )
@@ -778,7 +781,7 @@ class PeerRecord:
 class DiscoveryConfig:
     cluster_name: str = "omlx"
     http_port: int = 8000
-    version: str = _OMLX_VERSION
+    version: str = _omlx_version
     caps: PeerCaps = field(default_factory=local_caps)
     hello_interval: float = 1.0
     heartbeat_interval: float = 2.0
@@ -847,20 +850,32 @@ def save_cluster_name(
 
 
 def _default_interface_lister() -> list[str]:
-    """Names of multicast-capable candidate interfaces (never raises)."""
+    """Names of active IPv6 multicast interfaces (never raises)."""
 
     names: list[str] = []
     if sys.platform == "darwin":
         try:
             result = subprocess.run(  # noqa: S603 - fixed system executable
-                ["/sbin/ifconfig", "-l"],
+                ["/sbin/ifconfig", "-a"],
                 capture_output=True,
                 text=True,
                 timeout=2.0,
                 check=False,
             )
             if result.returncode == 0:
-                names = result.stdout.split()
+                for block in re.split(r"\n(?=\S)", result.stdout):
+                    header = re.match(r"^(\S+):\s+flags=[0-9a-fA-F]+<([^>]*)>", block)
+                    if header is None:
+                        continue
+                    name, flags = header.groups()
+                    if (
+                        not name.startswith("lo")
+                        and {"UP", "MULTICAST"} <= set(flags.split(","))
+                        and not re.search(r"^\s+status:\s+inactive\s*$", block, re.M)
+                        and re.search(r"^\s+inet6\s+", block, re.M) is not None
+                    ):
+                        names.append(name)
+                return names
         except (OSError, subprocess.SubprocessError):
             names = []
     if not names:
@@ -921,9 +936,7 @@ def local_addr_dicts() -> list[dict[str, str]]:
     return addrs
 
 
-def _http_probe_node_id(
-    ip: str, port: int, timeout: float
-) -> dict[str, Any] | None:
+def _http_probe_node_id(ip: str, port: int, timeout: float) -> dict[str, Any] | None:
     """GET http://ip:port/api/cluster/node_id; ``None`` on any failure."""
 
     host = f"[{ip}]" if ":" in ip else ip
@@ -971,9 +984,7 @@ def _http_probe_node_id(
             }
             return None
         _probe_diagnostics.value = {"transport": "system-proxy", "error": ""}
-    if not isinstance(payload, dict) or not isinstance(
-        payload.get("node_id"), str
-    ):
+    if not isinstance(payload, dict) or not isinstance(payload.get("node_id"), str):
         return None
     return payload
 
@@ -1055,8 +1066,10 @@ def _tailscale_executable() -> str | None:
     candidate = Path(
         os.environ.get("OMLX_TAILSCALE_CLI", _MACOS_TAILSCALE_CLI)
     ).expanduser()
-    if sys.platform == "darwin" and candidate.is_file() and os.access(
-        candidate, os.X_OK
+    if (
+        sys.platform == "darwin"
+        and candidate.is_file()
+        and os.access(candidate, os.X_OK)
     ):
         return str(candidate)
     return None
@@ -1139,9 +1152,9 @@ class DiscoveryService:
         """
 
         last = self._last_hello_at
-        return last is not None and (
-            self._clock() - last
-        ) < self.config.multicast_window
+        return (
+            last is not None and (self._clock() - last) < self.config.multicast_window
+        )
 
     @property
     def last_multicast_rx_at(self) -> float | None:
@@ -1167,9 +1180,7 @@ class DiscoveryService:
 
     def peers(self) -> list[PeerRecord]:
         with self._lock:
-            return [
-                self._peers[key] for key in sorted(self._peers)
-            ]
+            return [self._peers[key] for key in sorted(self._peers)]
 
     def mark_paired(self, node_id: str) -> None:
         """Flip the in-memory paired flag when pairing completes out-of-band.
@@ -1211,18 +1222,14 @@ class DiscoveryService:
             ]
         return {
             "multicast_loop_alive": threads.get("omlx-discovery-mcast", False),
-            "maintenance_loop_alive": threads.get(
-                "omlx-discovery-maint", False
-            ),
+            "maintenance_loop_alive": threads.get("omlx-discovery-maint", False),
             "socket_open": self._socket is not None,
             "joined_interfaces": joined,
             "last_hello_tx_ok_at": self._last_tx_ok_wall,
             "last_hello_tx_error": self._last_tx_error,
             "consecutive_tx_fail_rounds": self._consecutive_tx_fail_rounds,
             "socket_resets": self._consecutive_socket_resets,
-            "local_network_blocked_suspected": (
-                self._local_network_blocked_suspected
-            ),
+            "local_network_blocked_suspected": (self._local_network_blocked_suspected),
             "candidates": len(self._candidates),
             "candidate_states": candidate_states,
             "peers": len(self._peers),
@@ -1369,8 +1376,7 @@ class DiscoveryService:
                 # Clean return without a stop request is also a bug —
                 # discovery is always-on. Restart rather than going dark.
                 logger.warning(
-                    "discovery thread %s exited unexpectedly; "
-                    "restarting in 2s",
+                    "discovery thread %s exited unexpectedly; restarting in 2s",
                     name,
                 )
                 self._stop.wait(2.0)
@@ -1413,7 +1419,14 @@ class DiscoveryService:
         current = set(names)
         for name, ifindex in list(self._joined.items()):
             if name not in current:
-                # Interface vanished; its group membership dies with it.
+                # An inactive interface can retain membership until explicitly left.
+                membership = socket.inet_pton(
+                    socket.AF_INET6, MULTICAST_GROUP
+                ) + struct.pack("@I", ifindex)
+                with suppress(OSError):
+                    sock.setsockopt(
+                        socket.IPPROTO_IPV6, socket.IPV6_LEAVE_GROUP, membership
+                    )
                 self._joined.pop(name, None)
                 continue
             try:
@@ -1423,8 +1436,7 @@ class DiscoveryService:
                 continue
             if now_index != ifindex:
                 logger.info(
-                    "interface %s renumbered (%d -> %d); "
-                    "re-joining multicast group",
+                    "interface %s renumbered (%d -> %d); re-joining multicast group",
                     name,
                     ifindex,
                     now_index,
@@ -1441,9 +1453,7 @@ class DiscoveryService:
                 socket.AF_INET6, MULTICAST_GROUP
             ) + struct.pack("@I", ifindex)
             try:
-                sock.setsockopt(
-                    socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, membership
-                )
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, membership)
             except OSError as exc:
                 if exc.errno not in _JOIN_IGNORED_ERRNOS:
                     logger.debug("multicast join on %s failed: %s", name, exc)
@@ -1469,9 +1479,7 @@ class DiscoveryService:
                     # log and burns CPU. Back off to at most one rebuild
                     # per 60s; the first success resets the schedule.
                     now_mono = time.monotonic()
-                    backoff = min(
-                        2.0 ** self._consecutive_socket_resets, 60.0
-                    )
+                    backoff = min(2.0**self._consecutive_socket_resets, 60.0)
                     if now_mono - self._last_socket_reset_at < backoff:
                         self._stop.wait(1.0)
                         continue
@@ -1489,8 +1497,7 @@ class DiscoveryService:
                         if now_wall - last_reset_warn >= 60.0:
                             last_reset_warn = now_wall
                             logger.warning(
-                                "multicast socket rebuild failed: %s; "
-                                "retrying",
+                                "multicast socket rebuild failed: %s; retrying",
                                 exc,
                             )
                         self._needs_socket_reset = True
@@ -1519,7 +1526,7 @@ class DiscoveryService:
                     last_hello = now
                 try:
                     data, addr = sock.recvfrom(_MAX_DATAGRAM)
-                except socket.timeout:
+                except TimeoutError:
                     continue
                 except OSError:
                     if self._stop.is_set():
@@ -1540,12 +1547,13 @@ class DiscoveryService:
                 self._joined.clear()
 
     def _send_hello(self, sock: Any) -> None:
-        nonce = secrets.randbits(64)
         with self._lock:
+            joined = list(self._joined.values())
+            if not joined:
+                return
+            nonce = secrets.randbits(64)
             self._nonces.append(nonce)
         payload = encode_hello(nonce, self._cluster_hash)
-        with self._lock:
-            joined = list(self._joined.values()) or [0]
         any_ok = False
         last_error: str | None = None
         now = self._clock()
@@ -1555,11 +1563,7 @@ class DiscoveryService:
             # IPV6_MULTICAST_IF on the shared socket per round instead; that
             # state goes stale when macOS renumbers interfaces on
             # Thunderbolt hotplug and every send then fails EHOSTUNREACH.)
-            target = (
-                (MULTICAST_GROUP, MULTICAST_PORT, 0, ifindex)
-                if ifindex
-                else (MULTICAST_GROUP, MULTICAST_PORT)
-            )
+            target = (MULTICAST_GROUP, MULTICAST_PORT, 0, ifindex)
             try:
                 sock.sendto(payload, target)
                 any_ok = True
@@ -1570,9 +1574,7 @@ class DiscoveryService:
                     >= _TX_FAIL_LOG_INTERVAL
                 ):
                     self._tx_fail_logged_at[ifindex] = now
-                    logger.debug(
-                        "HELLO send on if %d failed: %s", ifindex, exc
-                    )
+                    logger.log(5, "HELLO send on if %d failed: %s", ifindex, exc)
         if any_ok:
             self._consecutive_tx_fail_rounds = 0
             self._consecutive_socket_resets = 0
@@ -1582,9 +1584,8 @@ class DiscoveryService:
         else:
             self._consecutive_tx_fail_rounds += 1
             self._last_tx_error = last_error
-            if (
-                self._consecutive_tx_fail_rounds >= _TX_FAIL_RESET_ROUNDS
-                and any(joined)
+            if self._consecutive_tx_fail_rounds >= _TX_FAIL_RESET_ROUNDS and any(
+                joined
             ):
                 if self._consecutive_tx_fail_rounds == _TX_FAIL_RESET_ROUNDS:
                     # Log once per failure streak; the loop's backoff
@@ -1636,15 +1637,11 @@ class DiscoveryService:
         # link-local HELLO source requires the ingress interface as scope id
         # in the reply destination; without it the kernel has no route and
         # the handshake silently never completes.
-        reply = encode_wassup(
-            nonce, self.identity.node_id, self.config.http_port
-        )
+        reply = encode_wassup(nonce, self.identity.node_id, self.config.http_port)
         target_sock = sock if sock is not None else self._socket
         if target_sock is not None:
             target = (
-                (peer_ip, peer_port, 0, scope_id)
-                if scope_id
-                else (peer_ip, peer_port)
+                (peer_ip, peer_port, 0, scope_id) if scope_id else (peer_ip, peer_port)
             )
             try:
                 target_sock.sendto(reply, target)
@@ -1655,9 +1652,7 @@ class DiscoveryService:
                     >= _TX_FAIL_LOG_INTERVAL
                 ):
                     self._reply_fail_logged_at[peer_ip] = now
-                    logger.debug(
-                        "WASSUP reply to %s failed: %s", peer_ip, exc
-                    )
+                    logger.debug("WASSUP reply to %s failed: %s", peer_ip, exc)
 
     def _handle_wassup(self, payload: dict[str, Any], addr: Any) -> None:
         with self._lock:
@@ -1800,9 +1795,7 @@ class DiscoveryService:
                 peer = PeerRecord(node_id=node_id)
                 self._peers[node_id] = peer
             peer.version = str(result.get("version") or peer.version)
-            peer.cluster_name = str(
-                result.get("cluster_name") or peer.cluster_name
-            )
+            peer.cluster_name = str(result.get("cluster_name") or peer.cluster_name)
             if result.get("friendly_name"):
                 peer.friendly_name = str(result["friendly_name"])
             peer.http_port = port
@@ -1932,9 +1925,7 @@ class DiscoveryService:
     def _start_mdns(self) -> None:
         zc = self._zc
         addresses = self._local_addresses()
-        caps_json = json.dumps(
-            self.config.caps.to_dict(), separators=(",", ":")
-        )
+        caps_json = json.dumps(self.config.caps.to_dict(), separators=(",", ":"))
         properties = {
             "id": self.identity.node_id,
             "name": self.identity.friendly_name,
@@ -1964,9 +1955,7 @@ class DiscoveryService:
         packed: list[bytes] = []
         with suppress(OSError):
             hostname = socket.gethostname()
-            for family, _, _, _, sockaddr in socket.getaddrinfo(
-                hostname, None
-            ):
+            for family, _, _, _, sockaddr in socket.getaddrinfo(hostname, None):
                 if family == socket.AF_INET:
                     packed.append(socket.inet_pton(family, sockaddr[0]))
                 elif family == socket.AF_INET6 and not sockaddr[0].startswith(
@@ -1982,8 +1971,9 @@ class DiscoveryService:
 
         try:
             props = {
-                (k.decode("utf-8", "replace") if isinstance(k, bytes) else k):
-                (v.decode("utf-8", "replace") if isinstance(v, bytes) else v)
+                (k.decode("utf-8", "replace") if isinstance(k, bytes) else k): (
+                    v.decode("utf-8", "replace") if isinstance(v, bytes) else v
+                )
                 for k, v in (info.properties or {}).items()
             }
             node_id = str(props.get("id") or "")
@@ -1994,8 +1984,7 @@ class DiscoveryService:
                 if not self._hash_mismatch_logged:
                     self._hash_mismatch_logged = True
                     logger.info(
-                        "Ignoring mDNS service for a different oMLX cluster "
-                        "(%r != %r)",
+                        "Ignoring mDNS service for a different oMLX cluster (%r != %r)",
                         cluster,
                         self.config.cluster_name,
                     )
@@ -2030,9 +2019,7 @@ class DiscoveryService:
             self._merge_registry(peer)
             if port:
                 for ip in addresses:
-                    self._add_candidate(
-                        ip, port, node_id=node_id, if_type="mdns"
-                    )
+                    self._add_candidate(ip, port, node_id=node_id, if_type="mdns")
             if is_new:
                 self._fire_change(peer)
         except Exception:
@@ -2118,3 +2105,13 @@ def announced_caps() -> dict[str, Any]:
         return local_caps().to_dict()
     except Exception:  # pragma: no cover - defensive
         return {}
+
+
+def announced_addrs() -> list[str]:
+    """Validated local addresses included in an approved pairing record."""
+
+    return [
+        str(address["ip"])
+        for address in local_addr_dicts()
+        if isinstance(address, dict) and address.get("ip")
+    ][:8]

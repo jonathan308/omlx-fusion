@@ -17,7 +17,7 @@ pinned mlx-lm v0.31.3 (`ed1fca4`) without modifying the upstream package.
 | `hyper_connection.py` | PR 1192 `mlx_lm/models/hyper_connection.py` | 1:1 copy — do not edit |
 | `cache_extras.py` | PR 1192 `mlx_lm/models/cache.py` lines 903-1447 | PoolingCache + BatchPoolingCache, 1:1 |
 | `utils_patch.py` | adapted from PR 1192 `mlx_lm/utils.py` | replacement `load_model` + `_load_safetensors` |
-| `generate_patch.py` | adapted from PR 1192 `mlx_lm/generate.py` | replacement `_make_cache` |
+| `__init__.py::_preserve_singleton_rotating_offset` | Fusion ("Preserve absolute DS4 offsets across cache restore") | keeps the absolute host `_offset` on a singleton `BatchRotatingKVCache.merge` (formerly in the retired `generate_patch.py`) |
 | `cache_handlers.py` | omlx-side, new | PoolingCache / BatchPoolingCache handlers for omlx CacheTypeRegistry |
 | `__init__.py` | omlx-side, new | `apply_deepseek_v4_patch()` orchestration |
 

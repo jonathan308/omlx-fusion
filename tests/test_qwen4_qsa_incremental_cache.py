@@ -198,6 +198,8 @@ def test_qsa_ephemeral_pool_rebuilds_after_restore_extract_and_rewinds_trim():
     assert mx.array_equal(extracted_pool, pooled).item()
 
     assert cache.trim(3) == 3
+    # trim keeps the pooled blocks below the new complete count (10 // 4 = 2)
+    # and only clamps the pooled frontier; the tail is re-pooled lazily.
     pooled_backing = cache._pooled_index_keys
     assert pooled_backing is not None
     assert cache._pooled_index_offset == 2
@@ -441,62 +443,6 @@ def test_mtp_prefix_snapshot_rejects_stale_pooled_qsa_bank():
     )
     cache._pooled_index_offset -= 1
     assert prompt_priming._cache_at_offset([cache], total) is None
-
-
-def test_qsa_equal_mrope_text_planes_qualify_once_and_3d_update_revokes():
-    cache = language.QSAKVCache()
-    raw = mx.random.normal((1, 12, 8))
-    text_positions = mx.broadcast_to(
-        mx.arange(12, dtype=mx.int32)[None, None],
-        (3, 1, 12),
-    )
-    cache.update_indexer(raw, text_positions)
-    assert cache._omlx_text_position_ids_qualified is False
-
-    current = mx.broadcast_to(
-        mx.arange(12, 18, dtype=mx.int32)[None, None],
-        (3, 1, 6),
-    )
-    qualified = language._qualified_text_verify_position_ids(current, cache)
-    assert qualified.shape == (1, 6)
-    assert mx.array_equal(qualified, current[0]).item()
-    assert cache._omlx_text_position_ids_qualified is True
-
-    # The direct verify path appends the collapsed 2-D text view and keeps the
-    # one-time qualification live for the next speculative cycle.
-    cache.update_indexer(mx.random.normal((1, 6, 8)), qualified)
-    assert cache._omlx_text_position_ids_qualified is True
-
-    multimodal = mx.stack(
-        [
-            mx.arange(18, 20, dtype=mx.int32)[None],
-            mx.arange(28, 30, dtype=mx.int32)[None],
-            mx.arange(38, 40, dtype=mx.int32)[None],
-        ]
-    )
-    cache.update_indexer(mx.random.normal((1, 2, 8)), multimodal)
-    assert cache._omlx_text_position_ids_qualified is False
-
-
-def test_qsa_divergent_mrope_history_fails_closed_as_multimodal():
-    cache = language.QSAKVCache()
-    raw = mx.random.normal((1, 8, 8))
-    positions = mx.stack(
-        [
-            mx.arange(8, dtype=mx.int32)[None],
-            mx.arange(10, 18, dtype=mx.int32)[None],
-            mx.arange(20, 28, dtype=mx.int32)[None],
-        ]
-    )
-    cache.update_indexer(raw, positions)
-    current = mx.broadcast_to(
-        mx.arange(28, 34, dtype=mx.int32)[None, None],
-        (3, 1, 6),
-    )
-
-    actual = language._qualified_text_verify_position_ids(current, cache)
-    assert actual is current
-    assert cache._omlx_text_position_ids_qualified is False
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])

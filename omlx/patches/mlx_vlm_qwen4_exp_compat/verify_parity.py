@@ -267,18 +267,27 @@ def _text_forward(
             hidden_sink=hidden_sink,
             gdn_sink=gdn_sink,
         )
+        # mlx-vlm ea79808 moved the verify projections to
+        # ``mlx_vlm.speculative.ops.linear`` with a two-argument ABI; the
+        # ordinary projection is used when the probe is not in verify mode.
+        embedding = language_model.model.embed_tokens
         if language_model.args.tie_word_embeddings:
-            logits = module._target_verify_embedding_as_linear(
-                language_model.model.embed_tokens,
-                hidden,
-                target_verify,
-            )
+            if target_verify:
+                verify_embedding = getattr(
+                    module, "_target_verify_embedding_as_linear", None
+                )
+                if verify_embedding is None:
+                    from mlx_vlm.speculative.ops.linear import (
+                        _target_verify_embedding_as_linear as verify_embedding,
+                    )
+                logits = verify_embedding(embedding, hidden)
+            else:
+                logits = embedding.as_linear(hidden)
         else:
-            logits = module._target_verify_linear(
-                language_model.lm_head,
-                hidden,
-                target_verify,
-            )
+            if target_verify:
+                logits = module._target_verify_linear(language_model.lm_head, hidden)
+            else:
+                logits = language_model.lm_head(hidden)
     return logits, list(hidden_sink or ())
 
 

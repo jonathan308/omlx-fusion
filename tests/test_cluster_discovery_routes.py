@@ -108,9 +108,7 @@ def test_devices_paired_rows_carry_paired_flag(_configured_stores):
     assert payload["paired"][0]["paired"] is True
 
 
-def test_devices_reflects_live_discovery_service(
-    _configured_stores, tmp_path
-):
+def test_devices_reflects_live_discovery_service(_configured_stores, tmp_path):
     identity, registry, client = _configured_stores
 
     service = DiscoveryService(
@@ -129,7 +127,6 @@ def test_devices_reflects_live_discovery_service(
 
     payload = client.get("/api/cluster/devices").json()
 
-    assert payload["cluster_name"] if "cluster_name" in payload else True
     assert payload["self"]["cluster_name"] == "home"
     assert payload["self"]["http_port"] == 8000
     assert payload["multicast_ok"] is True
@@ -139,9 +136,7 @@ def test_devices_reflects_live_discovery_service(
     configure_discovery_service(None)
 
 
-def test_devices_excludes_paired_peers_from_discovered(
-    _configured_stores, tmp_path
-):
+def test_devices_excludes_paired_peers_from_discovered(_configured_stores, tmp_path):
     identity, registry, client = _configured_stores
     registry.mark_paired("peer-1", friendly_name="studio-b")
 
@@ -201,9 +196,7 @@ def test_discovery_health_reflects_live_service(_configured_stores):
     configure_discovery_service(None)
 
 
-def test_devices_merges_pending_pairing_requests(
-    _configured_stores, monkeypatch
-):
+def test_devices_merges_pending_pairing_requests(_configured_stores, monkeypatch):
     identity, registry, client = _configured_stores
 
     class _FakePairingManager:
@@ -226,36 +219,26 @@ def test_devices_merges_pending_pairing_requests(
 
     from omlx.cluster import pairing
 
-    monkeypatch.setattr(
-        pairing, "get_pairing_manager", lambda: _FakePairingManager()
-    )
+    monkeypatch.setattr(pairing, "get_pairing_manager", lambda: _FakePairingManager())
 
     payload = client.get("/api/cluster/devices").json()
 
-    pending = [
-        d for d in payload["discovered"] if d["node_id"] == "peer-pending"
-    ]
+    pending = [d for d in payload["discovered"] if d["node_id"] == "peer-pending"]
     assert len(pending) == 1
     assert pending[0]["state"] == "awaiting_approval"
     assert pending[0]["friendly_name"] == "studio-2"
 
 
-def test_devices_paired_rows_carry_enrolled_ssh_target(
-    _configured_stores, monkeypatch
-):
+def test_devices_paired_rows_carry_enrolled_ssh_target(_configured_stores, monkeypatch):
     from types import SimpleNamespace
 
     from omlx.cluster import enrollment
 
     _, registry, client = _configured_stores
     registry.mark_paired("peer-1", friendly_name="studio-b")
-    enrolled = SimpleNamespace(
-        node_id="peer-1", ssh="omlx@studio-b.local"
-    )
+    enrolled = SimpleNamespace(node_id="peer-1", ssh="omlx@studio-b.local")
     fake_store = SimpleNamespace(list_nodes=lambda: (enrolled,))
-    monkeypatch.setattr(
-        enrollment, "get_cluster_enrollment", lambda: fake_store
-    )
+    monkeypatch.setattr(enrollment, "get_cluster_enrollment", lambda: fake_store)
 
     payload = client.get("/api/cluster/devices").json()
 
@@ -263,13 +246,15 @@ def test_devices_paired_rows_carry_enrolled_ssh_target(
 
 
 def test_cluster_name_persisted_config(tmp_path, monkeypatch):
-    from omlx.cluster.discovery import load_cluster_name, save_cluster_name
+    from omlx.cluster.discovery import default_cluster_config_path, load_cluster_name
 
     assert load_cluster_name(tmp_path) == "omlx"  # no file yet
-    save_cluster_name("studio-lan", tmp_path)
+    path = default_cluster_config_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"cluster_name": "studio-lan"}')
     assert load_cluster_name(tmp_path) == "studio-lan"
     # Malformed JSON falls back to the default instead of raising.
-    (tmp_path / "cluster" / "cluster.json").write_text("{not json")
+    path.write_text("{not json")
     assert load_cluster_name(tmp_path) == "omlx"
 
 
@@ -326,9 +311,7 @@ def test_manual_peer_add_verifies_and_returns_peer(_configured_stores):
 
     service = _live_service(registry, prober)
 
-    response = client.post(
-        "/api/cluster/devices/manual", json={"ip": "10.0.0.2"}
-    )
+    response = client.post("/api/cluster/devices/manual", json={"ip": "10.0.0.2"})
 
     assert response.status_code == 200
     payload = response.json()
@@ -336,9 +319,7 @@ def test_manual_peer_add_verifies_and_returns_peer(_configured_stores):
     assert payload["verified"] is True
     assert payload["peer"]["node_id"] == "tb-peer"
     assert payload["peer"]["friendly_name"] == "m5-max"
-    assert payload["peer"]["addrs"] == [
-        {"ip": "10.0.0.2", "if_type": "manual"}
-    ]
+    assert payload["peer"]["addrs"] == [{"ip": "10.0.0.2", "if_type": "manual"}]
     service.stop()
 
 
@@ -363,9 +344,7 @@ def test_manual_peer_add_rejects_bad_input(_configured_stores):
     _live_service(registry)
 
     assert (
-        client.post(
-            "/api/cluster/devices/manual", json={"ip": "not-an-ip"}
-        ).status_code
+        client.post("/api/cluster/devices/manual", json={"ip": "not-an-ip"}).status_code
         == 400
     )
     assert (
@@ -375,25 +354,20 @@ def test_manual_peer_add_rejects_bad_input(_configured_stores):
         ).status_code
         == 400
     )
-    assert (
-        client.post("/api/cluster/devices/manual", json={}).status_code
-        == 400
-    )
+    assert client.post("/api/cluster/devices/manual", json={}).status_code == 400
 
 
 def test_manual_peer_add_503_when_discovery_disabled(_configured_stores):
     _, _, client = _configured_stores  # fixture leaves service unset
 
-    response = client.post(
-        "/api/cluster/devices/manual", json={"ip": "10.0.0.2"}
-    )
+    response = client.post("/api/cluster/devices/manual", json={"ip": "10.0.0.2"})
 
     assert response.status_code == 503
 
 
 def test_health_detail_reports_loop_state(_configured_stores):
     _, registry, client = _configured_stores
-    service = _live_service(registry)
+    _live_service(registry)
 
     response = client.get("/api/cluster/discovery/health/detail")
 
@@ -493,15 +467,11 @@ def test_devices_pending_request_wins_over_stale_discovered_record(
 
     from omlx.cluster import pairing
 
-    monkeypatch.setattr(
-        pairing, "get_pairing_manager", lambda: _FakePairingManager()
-    )
+    monkeypatch.setattr(pairing, "get_pairing_manager", lambda: _FakePairingManager())
 
     payload = client.get("/api/cluster/devices").json()
 
-    pending = [
-        d for d in payload["discovered"] if d["node_id"] == "peer-pending"
-    ]
+    pending = [d for d in payload["discovered"] if d["node_id"] == "peer-pending"]
     assert len(pending) == 1
     assert pending[0]["state"] == "awaiting_approval"
     assert pending[0]["friendly_name"] == "studio-2"
@@ -593,9 +563,7 @@ def test_devices_paired_row_normalizes_last_addrs_and_keeps_ssh_target(
     )
     enrolled = SimpleNamespace(node_id="peer-1", ssh="omlx@studio-b.local")
     fake_store = SimpleNamespace(list_nodes=lambda: (enrolled,))
-    monkeypatch.setattr(
-        enrollment, "get_cluster_enrollment", lambda: fake_store
-    )
+    monkeypatch.setattr(enrollment, "get_cluster_enrollment", lambda: fake_store)
 
     payload = client.get("/api/cluster/devices").json()
 

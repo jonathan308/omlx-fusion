@@ -117,9 +117,7 @@ class ModelFit:
         """Does memory, not the model, set the usable context?"""
 
         declared = self.declared_context_tokens
-        return bool(
-            self.fits and declared and self.max_context_tokens < declared
-        )
+        return bool(self.fits and declared and self.max_context_tokens < declared)
 
     def describe(self) -> str:
         """One line a person can act on."""
@@ -385,9 +383,7 @@ def assess_model(
         # them, which is where the fast links were placed. Ranks are positional
         # to the planner and must be contiguous from zero, so a subset — or a
         # caller's single node that happened to be rank 1 — is renumbered.
-        subset = [
-            replace(node, rank=index) for index, node in enumerate(nodes[:used])
-        ]
+        subset = [replace(node, rank=index) for index, node in enumerate(nodes[:used])]
         plan, reason = _plan_or_none(
             layout,
             subset,
@@ -483,9 +479,7 @@ def assess_model(
         if standalone_node_id:
             failure_kind = "single_node_only"
             context = (
-                f" at up to {standalone_context:,} tokens"
-                if standalone_context
-                else ""
+                f" at up to {standalone_context:,} tokens" if standalone_context else ""
             )
             last_reason = (
                 "This model cannot combine Macs because mlx-lm supports neither "

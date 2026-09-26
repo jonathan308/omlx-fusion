@@ -13,7 +13,6 @@ data path used after initialization.
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import socket
 import struct
 import subprocess
@@ -21,7 +20,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-
+from pathlib import Path
 
 _RANK_BYTES = struct.Struct("!I")
 _DEFAULT_BOOTSTRAP_TIMEOUT_SECONDS = 20.0
@@ -32,7 +31,7 @@ _MAX_METADATA_BYTES = 8 * 1024 * 1024
 # Apple's system Python is allowed to use the same direct Thunderbolt IP.  This
 # tiny, standard-library-only helper owns only the one-time JACCL metadata
 # socket.  The parent still owns every RDMA queue pair and collective.
-_SIDECAR_PROGRAM = r'''
+_SIDECAR_PROGRAM = r"""
 import socket, struct, sys, time
 
 RANK = struct.Struct("!I")
@@ -140,7 +139,7 @@ if __name__ == "__main__":
     except BaseException as exc:
         print("oMLX JACCL side-channel helper failed: %s" % exc, file=sys.stderr, flush=True)
         raise
-'''
+"""
 
 
 def _positive_float(name: str, default: float) -> float:
@@ -161,7 +160,9 @@ def _enabled() -> bool:
     upstream comparison and incident recovery.
     """
 
-    return os.environ.get("OMLX_JACCL_PYTHON_SIDE_CHANNEL", "1").strip().lower() not in {
+    return os.environ.get(
+        "OMLX_JACCL_PYTHON_SIDE_CHANNEL", "1"
+    ).strip().lower() not in {
         "0",
         "false",
         "no",
@@ -205,7 +206,7 @@ def _read_exact_stream(stream: object, n_bytes: int) -> bytes:
 
     chunks: list[bytes] = []
     remaining = n_bytes
-    read = getattr(stream, "read")
+    read = stream.read
     while remaining:
         chunk = read(remaining)
         if not chunk:
@@ -269,9 +270,13 @@ class _SocketAllGather:
                 peer, _address = server.accept()
                 try:
                     peer.settimeout(self.timeout)
-                    peer_rank = _RANK_BYTES.unpack(_recv_exact(peer, _RANK_BYTES.size))[0]
+                    peer_rank = _RANK_BYTES.unpack(_recv_exact(peer, _RANK_BYTES.size))[
+                        0
+                    ]
                     if not 1 <= peer_rank < self.size or peers[peer_rank] is not None:
-                        raise RuntimeError("JACCL side channel received an invalid peer rank")
+                        raise RuntimeError(
+                            "JACCL side channel received an invalid peer rank"
+                        )
                 except BaseException:
                     peer.close()
                     raise
@@ -383,9 +388,7 @@ class _SidecarAllGather:
             stderr=subprocess.PIPE,
             bufsize=0,
         )
-        _trace(
-            f"sidecar started rank={rank} size={size} coordinator={host}:{port}"
-        )
+        _trace(f"sidecar started rank={rank} size={size} coordinator={host}:{port}")
 
     def _failure(self) -> RuntimeError:
         status = self._process.poll()
@@ -440,7 +443,7 @@ def _mlx_supports_all_gather_factory(distributed: object) -> bool:
     JACCL load from looking like a fabric failure.
     """
 
-    init = getattr(distributed, "init")
+    init = distributed.init
     return "all_gather_factory" in (getattr(init, "__doc__", "") or "")
 
 
@@ -457,7 +460,7 @@ def init_cluster_group(
     control channel; collectives immediately thereafter remain RDMA/JACCL.
     """
 
-    distributed = getattr(mx, "distributed")
+    distributed = mx.distributed
     selected = backend
     if selected is None and os.environ.get("MLX_JACCL_COORDINATOR"):
         selected = "jaccl"

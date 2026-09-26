@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
+from omlx.cluster import runtime_optimizations
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
 from omlx.cluster.launch import DistributedLaunchError, run_cluster_performance_probe
 from omlx.cluster.performance import (
@@ -27,6 +28,7 @@ from omlx.cluster.planner import (
     plan_unequal_pipeline,
 )
 from omlx.cluster.runtime_optimizations import (
+    _agree_across_ranks,
     _deepseek_v4_fused_decode_capability,
     _deepseek_v4_outer_prefill_step,
     _indexer_row_parallel_capability,
@@ -83,6 +85,17 @@ def test_sparse_indexer_row_parallel_capability_reports_tp_contract(monkeypatch)
     assert enabled is True
     assert active is True
     assert "2048 pooled entries" in reason
+
+
+@pytest.fixture(autouse=True)
+def _ranks_agree(monkeypatch):
+    """The fake two-rank groups below cannot run a real collective, so model a
+    cluster whose other ranks validated exactly what this rank did."""
+    monkeypatch.setattr(
+        runtime_optimizations,
+        "_agree_across_ranks",
+        lambda group, local: dict(local),
+    )
 
 
 def _profile(node_id: str, rank: int, rate: float) -> NodePerformanceProfile:
@@ -158,7 +171,9 @@ def test_partial_measurements_fall_back_to_original_memory_objective():
 
 def test_execution_tuner_reduces_concurrency_and_synchronizes_prompt_cache():
     settings = execution_profile("throughput")
-    assert settings.prompt_cache_ssd is False
+    # Upstream's ExecutionSettings default (SSD boundary snapshots on); the
+    # one-click activation request keeps Fusion's opt-in default separately.
+    assert settings.prompt_cache_ssd is True
     assert settings.prompt_cache_ssd_max_bytes == 20 * 1024**3
     assignments = [
         SimpleNamespace(headroom_bytes=3 * 1024**3),
@@ -592,6 +607,66 @@ def test_sampling_rank_optimization_is_capability_gated_and_restored():
     assert _ValidatedPipeline.__call__ is original_call
     assert mlx_generate.GenerationBatch._step is original_step
     assert mlx_generate.PromptProcessingBatch.prompt is original_prompt
+
+
+def test_capability_vote_keeps_only_what_every_rank_supports(monkeypatch):
+    class Group:
+        @staticmethod
+        def size():
+            return 3
+
+    local = {"prompt": True, "rank_zero_logits": False, "sampling": True}
+    # The other two ranks support prompt overlap and sampling, but one of them
+    # rejects sampling, so only prompt overlap survives. Votes are sorted by name.
+    others = mx.array([2, 0, 1], dtype=mx.int32)
+    monkeypatch.setattr(
+        mx.distributed,
+        "all_sum",
+        lambda votes, group=None: votes + others,
+    )
+
+    assert _agree_across_ranks(Group(), local) == {
+        "prompt": True,
+        "rank_zero_logits": False,
+        "sampling": False,
+    }
+
+
+def test_rank_zero_sampling_stays_off_when_another_rank_cannot_use_it(monkeypatch):
+    """#3521: a rank that takes the token all-sum path while its peer runs
+    MLX-LM's hidden-state gather deadlocks both, so no rank may enable it alone."""
+    settings = replace(
+        execution_profile("balanced"),
+        sampling_rank_only=True,
+    )
+    model = SimpleNamespace(model=_ValidatedPipeline())
+    original_gather = mx.distributed.all_gather
+    original_send = mx.distributed.send
+    original_step = mlx_generate.GenerationBatch._step
+    votes = []
+
+    def peer_rejects_sampling(group, local):
+        votes.append(dict(local))
+        return {**local, "sampling": False}
+
+    monkeypatch.setattr(
+        runtime_optimizations, "_agree_across_ranks", peer_rejects_sampling
+    )
+
+    with install_runtime_optimizations(
+        model,
+        _WorkerGroup(),
+        settings,
+        batchable=True,
+    ) as capabilities:
+        assert votes == [{"prompt": True, "rank_zero_logits": False, "sampling": True}]
+        sampling = capabilities["sampling_rank_only"]
+        assert sampling["active"] is False
+        assert "another rank" in sampling["reason"]
+        assert capabilities["pipeline_prefill_overlap"]["active"] is False
+        assert mx.distributed.all_gather is original_gather
+        assert mx.distributed.send is original_send
+        assert mlx_generate.GenerationBatch._step is original_step
 
 
 def test_worker_rank_skips_vocab_projection_when_adapter_declares_contract(
@@ -1300,6 +1375,8 @@ def _outer_prefill_batch(
         _currently_processing=staged_current,
         _unprocessed_sequences=staged_pending,
         _omlx_tokens=tokens,
+        # mlx-lm 0.32 BatchGenerator._next accounts decode work here.
+        _counters=mlx_generate.BatchCounters(),
     )
 
 
@@ -1724,6 +1801,7 @@ def test_ds4_pinned_next_admits_no_extra_prompt_behind_ready_rows():
             self.uids.extend(rows.uids)
 
     batch = mlx_generate.BatchGenerator.__new__(mlx_generate.BatchGenerator)
+    batch._counters = mlx_generate.BatchCounters()  # mlx-lm 0.32 decode accounting
     batch.model = DS4Model()
     batch.prefill_step_size = 2048
     batch.prefill_batch_size = 4
@@ -1813,6 +1891,7 @@ def test_ds4_pinned_next_limits_pending_rows_during_decode(
         None,
     )
     batch = mlx_generate.BatchGenerator.__new__(mlx_generate.BatchGenerator)
+    batch._counters = mlx_generate.BatchCounters()  # mlx-lm 0.32 decode accounting
     batch.model = DS4Model()
     batch.prefill_step_size = 2048
     batch.prefill_batch_size = 4
@@ -1884,6 +1963,7 @@ def test_ds4_pinned_next_withholds_prompt_when_boundaries_fill_decode_budget():
 
     long = (11, [list(range(6000))], 1, None, [], None, None, None)
     batch = mlx_generate.BatchGenerator.__new__(mlx_generate.BatchGenerator)
+    batch._counters = mlx_generate.BatchCounters()  # mlx-lm 0.32 decode accounting
     batch.model = DS4Model()
     batch.prefill_step_size = 2048
     batch.prefill_batch_size = 4

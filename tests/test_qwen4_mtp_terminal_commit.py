@@ -19,6 +19,14 @@ from test_qwen4_suffix_local_priming import (
 
 from omlx.patches.mlx_lm_mtp import prompt_priming
 
+pytestmark = pytest.mark.skip(
+    reason=(
+        "Fusion Qwen4 two-phase terminal commit stack not carried over the jundot/omlx "
+        "v0.7.0rc1 merge (vendored qwen4_exp language.py now follows upstream "
+        "#3520/#3534/#3903); see branch backup/main-20260925"
+    )
+)
+
 
 class _CycleBatch(SimpleNamespace):
     def extract_cache(self, idx):

@@ -6,9 +6,11 @@ import json
 import socket
 
 import pytest
+from fastapi import HTTPException
 
 from omlx.server import (
     ClientDisconnectTrackingMiddleware,
+    _with_json_keepalive,
     _with_request_disconnect_abort,
     _with_sse_keepalive,
 )
@@ -192,9 +194,7 @@ async def test_real_uvicorn_socket_disconnect_aborts_only_its_request():
             await asyncio.sleep(0.01)
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(
-            b"GET /stream HTTP/1.1\r\n"
-            b"Host: localhost\r\n"
-            b"Connection: close\r\n\r\n"
+            b"GET /stream HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
         )
         await writer.drain()
         await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=2.0)
@@ -348,7 +348,9 @@ class TestChatKeepaliveCarriesRole:
     def test_id_sharing_frame_carries_assistant_role(self):
         from omlx.server import _chat_keepalive_chunk
 
-        assert self._first_chunk_role(_chat_keepalive_chunk("chatcmpl-x")) == "assistant"
+        assert (
+            self._first_chunk_role(_chat_keepalive_chunk("chatcmpl-x")) == "assistant"
+        )
 
 
 class TestResolveKeepalive:
@@ -376,7 +378,9 @@ class TestResolveKeepalive:
         try:
             self._set_mode("chunk")
             assert _resolve_keepalive("openai_chat") == _KEEPALIVE_CHAT_CHUNK
-            assert _resolve_keepalive("openai_completion") == _KEEPALIVE_COMPLETION_CHUNK
+            assert (
+                _resolve_keepalive("openai_completion") == _KEEPALIVE_COMPLETION_CHUNK
+            )
             assert _resolve_keepalive("anthropic") == _KEEPALIVE_ANTHROPIC_PING
             # Responses API has no official ping; chunk mode disables keepalive
             assert _resolve_keepalive("openai_responses") is None
@@ -391,7 +395,12 @@ class TestResolveKeepalive:
         original = _server_state.global_settings.server.sse_keepalive_mode
         try:
             self._set_mode("comment")
-            for protocol in ("openai_chat", "openai_completion", "anthropic", "openai_responses"):
+            for protocol in (
+                "openai_chat",
+                "openai_completion",
+                "anthropic",
+                "openai_responses",
+            ):
                 assert _resolve_keepalive(protocol) == _KEEPALIVE_COMMENT
         finally:
             _server_state.global_settings.server.sse_keepalive_mode = original
@@ -404,7 +413,37 @@ class TestResolveKeepalive:
         original = _server_state.global_settings.server.sse_keepalive_mode
         try:
             self._set_mode("off")
-            for protocol in ("openai_chat", "openai_completion", "anthropic", "openai_responses"):
+            for protocol in (
+                "openai_chat",
+                "openai_completion",
+                "anthropic",
+                "openai_responses",
+            ):
                 assert _resolve_keepalive(protocol) is None
         finally:
             _server_state.global_settings.server.sse_keepalive_mode = original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status_code,error_type", [(400, "invalid_request_error"), (500, "server_error")]
+)
+async def test_json_keepalive_preserves_http_error_after_first_byte(
+    status_code, error_type
+):
+    result = asyncio.get_running_loop().create_future()
+    stream = _with_json_keepalive(None, result)
+    assert await anext(stream) == " "
+    result.set_exception(
+        HTTPException(status_code=status_code, detail="Request failed")
+    )
+
+    chunks = [chunk async for chunk in stream]
+    assert json.loads("".join(chunks)) == {
+        "error": {
+            "message": "Request failed",
+            "type": error_type,
+            "param": None,
+            "code": None,
+        }
+    }

@@ -142,7 +142,7 @@ def prompt_opens_thinking(
     return True, think_tag
 
 
-def extract_thinking(text: str) -> Tuple[str, str]:
+def extract_thinking(text: str, *, truncated: bool = False) -> Tuple[str, str]:
     """Extract thinking and content from complete text.
 
     Handles:
@@ -155,6 +155,10 @@ def extract_thinking(text: str) -> Tuple[str, str]:
       ``("everything…", "")`` — unfinished private reasoning is never
       reclassified as a visible answer.
 
+    Unfinished thinking always stays in the thinking channel; ``truncated=True``
+    (length termination) additionally keeps an unterminated block that follows
+    complete blocks out of the content channel before the block scan below.
+
     Tag-free text is always classified as content because this non-streaming
     helper has no prompt-open-state information. Streaming callers use
     :class:`ThinkingParser`, which preserves unfinished prompt-opened text as
@@ -162,6 +166,7 @@ def extract_thinking(text: str) -> Tuple[str, str]:
 
     Args:
         text: Complete model output text.
+        truncated: Keep unfinished thinking in its channel on length termination.
 
     Returns:
         Tuple of (thinking_content, regular_content).
@@ -186,6 +191,11 @@ def extract_thinking(text: str) -> Tuple[str, str]:
             break
         thinking_parts.append(match.group(1))
         remaining = remaining[:match.start()] + remaining[match.end():]
+
+    if truncated and _OPEN_TAG in remaining:
+        before, after = remaining.split(_OPEN_TAG, 1)
+        thinking_parts.append(after)
+        remaining = before
 
     if thinking_parts:
         # A later malformed block can follow one or more complete blocks, for
@@ -324,14 +334,17 @@ class ThinkingParser:
             self._content_emitted = True
         return (thinking_delta, content_delta)
 
-    def finish(self) -> Tuple[str, str]:
+    def finish(self, *, truncated: bool = False) -> Tuple[str, str]:
         """Flush any remaining buffered content.
 
         Should be called when the stream is complete to emit any
         buffered characters that were waiting for potential tag completion.
-        Unfinished reasoning remains reasoning. Callers can inspect
-        :attr:`unfinished_thinking` and surface an incomplete finish reason;
-        they must not leak accumulated chain-of-thought into answer content.
+        Unfinished reasoning remains reasoning, whether or not the stream was
+        truncated (``truncated`` is accepted for API parity with the length
+        termination path and never widens what reaches content). Callers can
+        inspect :attr:`unfinished_thinking` and surface an incomplete finish
+        reason; they must not leak accumulated chain-of-thought into answer
+        content.
 
         Returns:
             Tuple of (thinking_text, content_text) from remaining buffer

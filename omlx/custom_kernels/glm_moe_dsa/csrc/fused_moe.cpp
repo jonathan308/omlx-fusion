@@ -70,6 +70,8 @@ int affine_pack_factor(int bits) {
       return 8;
     case 4:
       return 2;
+    case 6:
+      return 4;
     case 8:
       return 1;
     default:
@@ -85,6 +87,8 @@ int affine_bytes_per_pack(int bits) {
       return 3;
     case 4:
       return 1;
+    case 6:
+      return 3;
     case 8:
       return 1;
     default:
@@ -93,7 +97,8 @@ int affine_bytes_per_pack(int bits) {
 }
 
 bool supported_deepseek_affine(int group_size, int bits) {
-  return group_size == 64 && (bits == 2 || bits == 3);
+  return group_size == 64 &&
+      (bits == 2 || bits == 3 || bits == 4 || bits == 6 || bits == 8);
 }
 
 int affine_packed_row_bytes(int K, int bits) {

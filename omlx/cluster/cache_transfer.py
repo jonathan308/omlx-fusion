@@ -119,7 +119,13 @@ def prepare_cache_transfer(
     if prompt_tokens < 1:
         raise ValueError("cache transfer requires a positive prompt length")
 
-    state_items = list(tree_flatten([entry.state for entry in cache]))
+    # mlx-lm 0.32 folds the former ``meta_state`` (offsets, indices, ...) into
+    # ``state``; the wire helpers split arrays from scalar metadata again so
+    # the safetensors contract (arrays + string metadata) is unchanged.
+    from .prompt_snapshot_cache import _wire_state
+
+    wire = [_wire_state(entry) for entry in cache]
+    state_items = list(tree_flatten([state for state, _meta in wire]))
     if not state_items or len(state_items) > MAX_CACHE_ARRAYS:
         raise ValueError("cache transfer has an invalid tensor-leaf count")
 
@@ -147,7 +153,7 @@ def prepare_cache_transfer(
     metadata_items = list(
         tree_flatten(
             [
-                [entry.meta_state for entry in cache],
+                [meta for _state, meta in wire],
                 {},
                 [type(entry).__name__ for entry in cache],
             ]
@@ -271,6 +277,8 @@ def restore_cache_transfer(
     ):
         raise ValueError("cache transfer metadata does not describe one cache list")
 
+    from .prompt_snapshot_cache import _from_wire_state
+
     restored = []
     for class_name, state, meta_state in zip(classes, states, cache_info):
         cache_class = getattr(cache_module, class_name, None)
@@ -280,7 +288,7 @@ def restore_cache_transfer(
             or not callable(getattr(cache_class, "from_state", None))
         ):
             raise ValueError(f"cache transfer does not admit class {class_name!r}")
-        restored.append(cache_class.from_state(state, meta_state))
+        restored.append(_from_wire_state(class_name, state, meta_state))
     return restored
 
 

@@ -42,9 +42,7 @@ class ProbeRateLimiter:
         now = time.monotonic() if now is None else now
         with self._lock:
             tokens, updated = self._buckets.get(key, (float(self._burst), now))
-            tokens = min(
-                float(self._burst), tokens + (now - updated) * self._rate
-            )
+            tokens = min(float(self._burst), tokens + (now - updated) * self._rate)
             if tokens < 1.0:
                 self._buckets[key] = (tokens, now)
                 return False
@@ -52,9 +50,7 @@ class ProbeRateLimiter:
             # Bound the map: drop idle buckets once it grows past 4096 keys.
             if len(self._buckets) > 4096:
                 self._buckets = {
-                    k: v
-                    for k, v in self._buckets.items()
-                    if now - v[1] < 600.0
+                    k: v for k, v in self._buckets.items() if now - v[1] < 600.0
                 }
             return True
 
@@ -182,32 +178,26 @@ async def cluster_add_manual_peer(
         )
     try:
         body = await request.json()
-    except ValueError:
-        raise HTTPException(status_code=400, detail="invalid JSON body")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON body") from exc
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="invalid JSON body")
     raw_ip = body.get("ip")
     try:
         ip = str(ipaddress.ip_address(str(raw_ip)))
-    except ValueError:
+    except ValueError as exc:
         raise HTTPException(
             status_code=400, detail=f"invalid IP address: {raw_ip!r}"
-        )
+        ) from exc
     port = body.get("port", 8000)
-    if not isinstance(port, int) or isinstance(port, bool) or not (
-        1 <= port <= 65535
-    ):
+    if not isinstance(port, int) or isinstance(port, bool) or not (1 <= port <= 65535):
         raise HTTPException(status_code=400, detail="invalid port")
     service.add_manual(ip, port)
     # Probe synchronously (bounded by the configured probe timeout) so the
     # caller learns immediately whether the address answers as an oMLX node.
     await asyncio.to_thread(service.probe_candidate_now, ip, port)
     peer = next(
-        (
-            p
-            for p in service.peers()
-            if any(a["ip"] == ip for a in p.addrs)
-        ),
+        (p for p in service.peers() if any(a["ip"] == ip for a in p.addrs)),
         None,
     )
     return {
@@ -219,9 +209,7 @@ async def cluster_add_manual_peer(
     }
 
 
-def _enrich_paired_row(
-    row: dict[str, Any], record: dict[str, Any] | None
-) -> None:
+def _enrich_paired_row(row: dict[str, Any], record: dict[str, Any] | None) -> None:
     """Fill gaps on a paired row from the matching discovery record.
 
     Pairings completed before capabilities were exchanged persisted empty
@@ -241,9 +229,7 @@ def _enrich_paired_row(
         for addr in record.get("addrs") or []:
             if not isinstance(addr, dict) or not addr.get("ip"):
                 continue
-            existing = next(
-                (a for a in addrs if a["ip"] == addr["ip"]), None
-            )
+            existing = next((a for a in addrs if a["ip"] == addr["ip"]), None)
             if existing is not None:
                 # The discovered entry knows the real interface type.
                 existing["if_type"] = addr.get("if_type") or existing["if_type"]
@@ -273,9 +259,7 @@ def _enrich_paired_row(
         if record.get(key):
             row[key] = record[key]
     state = record.get("state")
-    row["state"] = (
-        state if state in {"discovered", "suspect", "dead"} else "suspect"
-    )
+    row["state"] = state if state in {"discovered", "suspect", "dead"} else "suspect"
     last_seen = record.get("last_seen")
     row["last_seen"] = (
         float(last_seen)

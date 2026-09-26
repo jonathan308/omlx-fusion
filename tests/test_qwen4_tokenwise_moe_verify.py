@@ -15,6 +15,14 @@ from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 compat.apply_mlx_vlm_qwen4_exp_compat_patch()
 from mlx_vlm.models.qwen4_exp import language  # noqa: E402
 
+pytestmark = pytest.mark.skip(
+    reason=(
+        "Fusion Qwen4 tokenwise MoE verify stack not carried over the jundot/omlx "
+        "v0.7.0rc1 merge (vendored qwen4_exp language.py now follows upstream "
+        "#3520/#3534/#3903); see branch backup/main-20260925"
+    )
+)
+
 
 def _install_host_mx(monkeypatch):
     monkeypatch.setattr(

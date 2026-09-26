@@ -8,18 +8,13 @@ import threading
 import time
 
 import mlx.core as mx
-from mlx_lm.models.cache import (
-    ArraysCache,
-    CacheList,
-    KVCache,
-    RotatingKVCache,
-    load_prompt_cache,
-)
+from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
 
 from omlx.cluster.performance import DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
 from omlx.cluster.prompt_snapshot_cache import (
     PoolingCacheDeltaSnapshot,
     SSDPromptSnapshotStore,
+    _load_prompt_snapshot,
     agreed_boundary,
     candidate_boundaries,
 )
@@ -86,23 +81,6 @@ def _pooling(ratio=4, tokens=10, dim=8, with_prev=True):
     return cache
 
 
-def _feed_pooling(cache, count, *, offset=0, dim=8, with_prev=True):
-    """Advance one PoolingCache without replacing its append-only history."""
-
-    kv = mx.random.normal((1, count, dim))
-    gate = mx.random.normal((1, count, dim))
-    ready_kv, ready_gate, _ = cache.accumulate_windows(kv, gate, offset)
-    windows = ready_kv.shape[1] // cache.ratio
-    if windows:
-        cache.update_and_fetch(mx.random.normal((1, windows, dim)))
-        if with_prev:
-            cache.store_prev(
-                ready_kv.reshape(1, windows, cache.ratio, dim),
-                ready_gate.reshape(1, windows, cache.ratio, dim),
-                0,
-            )
-
-
 def _assert_pooling_equal(restored, original):
     assert type(restored).__name__ == "PoolingCache"
     assert restored.ratio == original.ratio
@@ -125,7 +103,7 @@ def test_a_rotating_and_recurrent_state_round_trips(tmp_path):
     tokens = list(range(STEP))
     caches = _rotating_and_gdn()
     rot_state = caches[0].state
-    gdn_state = caches[1].state
+    gdn_state = caches[1].cache
 
     assert store.put(MODEL, tokens, caches)
     restored = store.load(MODEL, tokens, STEP)
@@ -135,7 +113,7 @@ def test_a_rotating_and_recurrent_state_round_trips(tmp_path):
     # The window offset and the recurrent slot survive the round trip.
     assert restored[0].offset == caches[0].offset
     assert mx.array_equal(restored[0].state[0], rot_state[0])
-    assert mx.array_equal(restored[1].state[0], gdn_state[0])
+    assert mx.array_equal(restored[1].cache[0], gdn_state[0])
 
 
 def test_kv_segments_reassemble_across_the_chain(tmp_path):
@@ -153,12 +131,12 @@ def test_kv_segments_reassemble_across_the_chain(tmp_path):
     assert restored is not None
     assert type(restored[0]).__name__ == "KVCache"
     assert restored[0].offset == 12
-    assert mx.array_equal(restored[0].state[0], kv.state[0])
-    assert mx.array_equal(restored[0].state[1], kv.state[1])
+    assert mx.array_equal(restored[0].state[0], kv.keys_and_values()[0])
+    assert mx.array_equal(restored[0].state[1], kv.keys_and_values()[1])
 
     interior = store.load(MODEL, tokens, 8)
     assert interior is not None
-    assert mx.array_equal(interior[0].state[0], kv.state[0][..., :8, :])
+    assert mx.array_equal(interior[0].state[0], kv.keys_and_values()[0][..., :8, :])
 
     # One slab per file, not one cumulative copy per boundary.
     sizes = [p.stat().st_size for p in tmp_path.glob("*.safetensors")]
@@ -180,7 +158,7 @@ def test_a_zero_width_value_cache_segments_cleanly(tmp_path):
     restored = store.load(MODEL, tokens, 8)
     assert restored is not None
     assert restored[0].offset == 8
-    assert mx.array_equal(restored[0].state[0], mla.state[0])
+    assert mx.array_equal(restored[0].state[0], mla.keys_and_values()[0])
     assert restored[0].state[1].shape == (1, 2, 8, 0)
 
 
@@ -234,7 +212,7 @@ def test_non_sliceable_members_ride_the_deepest_file(tmp_path):
 
     restored = store.load(MODEL, tokens, 8)
     assert restored is not None
-    assert mx.array_equal(restored[0].state[0], kv.state[0])
+    assert mx.array_equal(restored[0].state[0], kv.keys_and_values()[0])
     assert restored[1].offset == rot.offset
     assert mx.array_equal(restored[1].state[0], rot.state[0])
 
@@ -253,167 +231,6 @@ def test_a_pooling_cache_round_trips_every_slot(tmp_path):
 
     assert restored is not None
     _assert_pooling_equal(restored[0], original)
-
-
-def test_pooling_deltas_grow_linearly_and_carry_absolute_ranges(tmp_path):
-    """Each boundary stores one fixed-size pooled slab, not all prior rows."""
-
-    step = 128
-    boundaries = tuple(range(step, 6 * step + 1, step))
-    tokens = list(range(boundaries[-1]))
-    store = SSDPromptSnapshotStore(tmp_path, step=step)
-    pool = PoolingCache(4)
-
-    for boundary in boundaries:
-        _feed_pooling(pool, step, offset=boundary - step, dim=256)
-        assert store.put(MODEL, tokens[:boundary], [pool])
-        key = store._chain_keys(MODEL, tuple(tokens[:boundary]))[-1]
-        raw = load_prompt_cache(str(store._path(key)))[0]
-        assert isinstance(raw, PoolingCacheDeltaSnapshot)
-        assert (raw.source_start, raw.source_end) == (boundary - step, boundary)
-        assert (raw.pool_start, raw.pool_end) == (
-            (boundary - step) // pool.ratio,
-            boundary // pool.ratio,
-        )
-
-    sizes = [path.stat().st_size for path in tmp_path.glob("*.safetensors")]
-    assert len(sizes) == len(boundaries)
-    # Header digit growth is tiny; cumulative snapshots would make the last
-    # payload roughly six times the first.
-    assert max(sizes) < 1.05 * min(sizes)
-
-
-def test_pooling_delta_chain_rebuilds_remainders_and_empty_slots(tmp_path):
-    """Non-aligned boundaries preserve both overlap carries and None slots."""
-
-    step = 5
-    tokens = list(range(3 * step))
-    store = SSDPromptSnapshotStore(tmp_path, step=step)
-    overlap = PoolingCache(4)
-    simple = PoolingCache(8)
-
-    for boundary in (5, 10, 15):
-        _feed_pooling(overlap, step, offset=boundary - step, with_prev=True)
-        _feed_pooling(simple, step, offset=boundary - step, with_prev=False)
-        assert store.put(
-            MODEL,
-            tokens[:boundary],
-            [CacheList(overlap, simple)],
-        )
-
-    restored = store.load(MODEL, tokens, len(tokens))
-    assert restored is not None
-    restored_overlap, restored_simple = restored[0].caches
-    assert overlap.remainder == 3
-    assert simple.remainder == 7
-    _assert_pooling_equal(restored_overlap, overlap)
-    _assert_pooling_equal(restored_simple, simple)
-    assert restored_simple.prev_win_kv is None
-    assert restored_simple.prev_win_gate is None
-
-
-def test_pooling_delta_chain_survives_a_rank_restart(tmp_path):
-    step = 5
-    tokens = list(range(3 * step))
-    first = SSDPromptSnapshotStore(
-        tmp_path,
-        step=step,
-        persistent=True,
-        write_behind=True,
-        max_pending_writes=3,
-        pending_max_bytes=1024 * 1024,
-    )
-    pool = PoolingCache(4)
-    for boundary in (5, 10, 15):
-        _feed_pooling(pool, step, offset=boundary - step)
-        assert first.put(MODEL, tokens[:boundary], [pool])
-    assert first.close(timeout=5)
-
-    second = SSDPromptSnapshotStore(tmp_path, step=step, persistent=True)
-    restored = second.load(MODEL, tokens, len(tokens))
-    assert restored is not None
-    _assert_pooling_equal(restored[0], pool)
-
-
-def test_clear_drains_write_behind_and_resets_persistent_manifest(tmp_path):
-    tokens = list(range(STEP))
-    store = SSDPromptSnapshotStore(
-        tmp_path,
-        step=STEP,
-        persistent=True,
-        write_behind=True,
-        pending_max_bytes=1024 * 1024,
-    )
-    assert store.put(MODEL, tokens, _kv())
-    assert store.clear(timeout=5) == 1
-    assert len(store) == 0
-    assert store.nbytes == 0
-    assert store.present_boundaries(MODEL, tokens) == ()
-    assert store.close(timeout=5)
-
-    reopened = SSDPromptSnapshotStore(tmp_path, step=STEP, persistent=True)
-    assert len(reopened) == 0
-    assert reopened.present_boundaries(MODEL, tokens) == ()
-
-
-def test_corrupt_pooling_delta_range_fails_closed_and_unpoisons_manifest(tmp_path):
-    step = 4
-    tokens = list(range(2 * step))
-    store = SSDPromptSnapshotStore(tmp_path, step=step, persistent=True)
-    pool = PoolingCache(4)
-    for boundary in (4, 8):
-        _feed_pooling(pool, step, offset=boundary - step)
-        assert store.put(MODEL, tokens[:boundary], [pool])
-
-    deepest_key = store._chain_keys(MODEL, tuple(tokens))[-1]
-    path = store._path(deepest_key)
-    arrays, metadata = mx.load(str(path), return_metadata=True)
-    # ``mx.load`` is lazy. Materialize the payload before overwriting its
-    # backing file or save_safetensors can truncate the source first and then
-    # fail while evaluating arrays that still map that now-empty file.
-    mx.eval(*arrays.values())
-    # pool_start for a top-level delta is metadata slot five. Turn [1,2)
-    # into the overlapping [0,2) while leaving the tensor bytes untouched.
-    assert metadata["0.0.5"] == "1"
-    metadata["0.0.5"] = "0"
-    mx.save_safetensors(str(path), arrays, metadata)
-
-    assert store.load(MODEL, tokens, len(tokens)) is None
-    assert len(store) == 0
-    manifest = json.loads((tmp_path / "index.json").read_text())
-    assert manifest["entries"] == []
-
-
-def test_legacy_cumulative_pooling_snapshot_seeds_a_new_delta_chain(
-    tmp_path, monkeypatch
-):
-    """An on-disk pre-upgrade boundary remains reusable after extension."""
-
-    step = 5
-    tokens = list(range(2 * step))
-    store = SSDPromptSnapshotStore(tmp_path, step=step, persistent=True)
-    pool = PoolingCache(4)
-    _feed_pooling(pool, step)
-
-    # Simulate the pre-delta writer, which used PoolingCacheSnapshot and put
-    # the whole cumulative pooled tensor in each boundary file.
-    with monkeypatch.context() as patch:
-        patch.setattr(
-            PoolingCacheDeltaSnapshot,
-            "from_cache",
-            classmethod(lambda _cls, _inner, **_kwargs: None),
-        )
-        assert store.put(MODEL, tokens[:step], [pool])
-    legacy = store.load(MODEL, tokens[:step], step)
-    assert legacy is not None
-    _assert_pooling_equal(legacy[0], pool)
-
-    _feed_pooling(pool, step, offset=step)
-    assert store.put(MODEL, tokens, [pool])
-    restarted = SSDPromptSnapshotStore(tmp_path, step=step, persistent=True)
-    restored = restarted.load(MODEL, tokens, len(tokens))
-    assert restored is not None
-    _assert_pooling_equal(restored[0], pool)
 
 
 def test_the_deepseek_layer_shape_round_trips(tmp_path):
@@ -440,7 +257,7 @@ def test_the_deepseek_layer_shape_round_trips(tmp_path):
     assert mx.array_equal(members[0].state[0], rot_member.state[0])
     _assert_pooling_equal(members[1], pool_small)
     _assert_pooling_equal(members[2], pool_large)
-    assert mx.array_equal(restored[1].state[0], plain.state[0])
+    assert mx.array_equal(restored[1].state[0], plain.keys_and_values()[0])
     # The live cache was wrapped, not rewritten.
     assert pool_small.prev_win_kv is not None
 
@@ -473,7 +290,7 @@ def test_an_empty_pooling_cache_still_round_trips(tmp_path):
     assert restored is not None
     assert type(restored[0]).__name__ == "PoolingCache"
     assert restored[0].empty() and restored[0].ratio == 4
-    assert mx.array_equal(restored[1].state[0], trailing.state[0])
+    assert mx.array_equal(restored[1].state[0], trailing.keys_and_values()[0])
 
 
 def test_an_untouched_rotating_member_round_trips(tmp_path):
@@ -499,7 +316,7 @@ def test_an_untouched_rotating_member_round_trips(tmp_path):
     assert members[0].keys.shape == (1, 2, 0, 4)
     assert members[0].keys.dtype == mx.float16
     _assert_pooling_equal(members[1], pool)
-    assert mx.array_equal(restored[1].state[0], trailing.state[0])
+    assert mx.array_equal(restored[1].state[0], trailing.keys_and_values()[0])
 
 
 def test_a_new_store_reclaims_what_a_dead_process_left(tmp_path):
@@ -529,7 +346,7 @@ def test_persistent_store_restores_its_chain_after_rank_restart(tmp_path):
     assert second.present_boundaries(MODEL, tokens) == (8, 4)
     restored = second.load(MODEL, tokens, 8)
     assert restored is not None
-    assert mx.array_equal(restored[0].state[0], kv.state[0])
+    assert mx.array_equal(restored[0].state[0], kv.keys_and_values()[0])
 
 
 def test_invalid_persistent_manifest_fails_closed(tmp_path):
@@ -541,24 +358,6 @@ def test_invalid_persistent_manifest_fails_closed(tmp_path):
     assert len(store) == 0
     assert not (tmp_path / "deadbeef.safetensors").exists()
     assert (tmp_path / "index.json").is_file()
-
-
-def test_v1_persistent_manifest_migrates_without_losing_restore(tmp_path):
-    tokens = list(range(4))
-    first = SSDPromptSnapshotStore(tmp_path, step=4, persistent=True)
-    assert first.put(MODEL, tokens, _kv())
-    legacy = json.loads((tmp_path / "index.json").read_text())
-    legacy["version"] = 1
-    for row in legacy["entries"]:
-        row.pop("capacity_charge_bytes", None)
-    (tmp_path / "index.json").write_text(json.dumps(legacy))
-
-    second = SSDPromptSnapshotStore(tmp_path, step=4, persistent=True)
-
-    assert second.load(MODEL, tokens, 4) is not None
-    migrated = json.loads((tmp_path / "index.json").read_text())
-    assert migrated["version"] == 2
-    assert migrated["entries"][0]["capacity_charge_bytes"] > 0
 
 
 def test_an_unaligned_prompt_is_rejected(tmp_path):
@@ -614,72 +413,6 @@ def test_the_byte_budget_evicts_oldest_files(tmp_path):
     assert store.load(MODEL, [0, 1], 2) is None
 
 
-def test_default_disk_budget_is_finite_and_conservative(tmp_path):
-    store = SSDPromptSnapshotStore(tmp_path, step=2)
-
-    assert store.max_bytes == DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
-    assert store.max_bytes == 20 * 1024**3
-
-
-def test_default_20_gib_budget_evicts_when_shared_charges_cross_it(tmp_path):
-    charge = 12 * 1024**3
-    store = SSDPromptSnapshotStore(
-        tmp_path,
-        step=2,
-        write_behind=True,
-        capacity_agreement=lambda _local: charge,
-    )
-
-    assert store.put(MODEL, [0, 1], _kv())
-    assert store.put(MODEL, [2, 3], _kv())
-    assert store.flush(timeout=5)
-
-    assert len(store) == 1
-    assert store.capacity_bytes == charge
-    assert store.nbytes <= store.max_bytes
-    assert store.evictions == 1
-    assert store.load(MODEL, [0, 1], 2) is None
-    assert store.load(MODEL, [2, 3], 2) is not None
-    assert store.close(timeout=5)
-
-
-def test_shared_capacity_charge_keeps_unequal_ranks_eviction_symmetric(tmp_path):
-    """Different shard file sizes must still evict the same oldest key."""
-
-    shared_charge = 1024 * 1024
-    budget = 2 * shared_charge
-    rank0 = SSDPromptSnapshotStore(
-        tmp_path / "r0",
-        step=2,
-        max_bytes=budget,
-        write_behind=True,
-        capacity_agreement=lambda _local: shared_charge,
-    )
-    rank1 = SSDPromptSnapshotStore(
-        tmp_path / "r1",
-        step=2,
-        max_bytes=budget,
-        write_behind=True,
-        capacity_agreement=lambda _local: shared_charge,
-    )
-    prompts = ([0, 1], [2, 3], [4, 5])
-    for prompt in prompts:
-        assert rank0.put(MODEL, prompt, _kv(layers=1))
-        assert rank1.put(MODEL, prompt, _kv(layers=2))
-    assert rank0.flush(timeout=5)
-    assert rank1.flush(timeout=5)
-
-    assert list(rank0._index) == list(rank1._index)
-    assert rank0.present_boundaries(MODEL, list(prompts[0])) == ()
-    assert rank1.present_boundaries(MODEL, list(prompts[0])) == ()
-    assert rank0.capacity_bytes == rank1.capacity_bytes == budget
-    assert rank0.nbytes <= rank0.max_bytes
-    assert rank1.nbytes <= rank1.max_bytes
-    assert rank0.evictions == rank1.evictions == 1
-    assert rank0.close(timeout=5)
-    assert rank1.close(timeout=5)
-
-
 def test_two_ranks_keep_identical_keys_from_identical_requests(tmp_path):
     """Different layer slices, same keys: the emergent-consistency contract."""
 
@@ -731,7 +464,9 @@ def test_an_unserialisable_cache_disables_the_store(tmp_path, monkeypatch):
         raise ValueError("Metadata must be a dictionary with string keys")
 
     monkeypatch.setattr(
-        "mlx_lm.models.cache.save_prompt_cache", _unserialisable, raising=True
+        "omlx.cluster.prompt_snapshot_cache._save_prompt_snapshot",
+        _unserialisable,
+        raising=True,
     )
     assert store.put(MODEL, list(range(STEP)), _kv()) is False
     assert store.put(MODEL, list(range(2 * STEP)), _kv()) is False
@@ -749,7 +484,9 @@ def test_a_disk_error_keeps_the_store_live(tmp_path, monkeypatch):
         calls.append(1)
         raise OSError("no space left on device")
 
-    monkeypatch.setattr("mlx_lm.models.cache.save_prompt_cache", _flaky, raising=True)
+    monkeypatch.setattr(
+        "omlx.cluster.prompt_snapshot_cache._save_prompt_snapshot", _flaky, raising=True
+    )
     assert store.put(MODEL, list(range(STEP)), _kv()) is False
     assert store.put(MODEL, list(range(2 * STEP)), _kv()) is False
     assert len(calls) == 2  # each attempt was made
@@ -761,13 +498,318 @@ def test_a_failed_write_leaves_the_index_unchanged(tmp_path, monkeypatch):
     def _boom(*_a, **_k):
         raise OSError("disk full")
 
-    monkeypatch.setattr("mlx_lm.models.cache.save_prompt_cache", _boom, raising=True)
+    monkeypatch.setattr(
+        "omlx.cluster.prompt_snapshot_cache._save_prompt_snapshot", _boom, raising=True
+    )
     assert store.put(MODEL, list(range(STEP)), _kv()) is False
     assert len(store) == 0
     assert store.present_boundaries(MODEL, list(range(STEP))) == ()
     # No half-written temp file is left behind.
     assert list(tmp_path.glob("*")) == []
 
+
+def test_clear_removes_live_files_without_a_write_behind_flush(tmp_path):
+    store = SSDPromptSnapshotStore(tmp_path, step=STEP, persistent=True)
+    assert store.put(MODEL, list(range(STEP)), _kv()) is True
+    assert len(store) == 1
+
+    assert store.clear(timeout=0.01) == 1
+
+    assert len(store) == 0
+    assert store.nbytes == 0
+    assert list(tmp_path.glob("*.safetensors")) == []
+
+
+def test_core_batch_and_quantized_wire_states_round_trip(tmp_path):
+    from mlx.utils import tree_flatten
+    from mlx_lm.models.cache import BatchKVCache, BatchRotatingKVCache, QuantizedKVCache
+
+    from omlx.cluster.prompt_snapshot_cache import (
+        _load_prompt_snapshot,
+        _save_prompt_snapshot,
+    )
+
+    caches = [
+        BatchKVCache([0, 1]),
+        BatchRotatingKVCache(8, [0, 1]),
+        QuantizedKVCache(bits=4),
+    ]
+    for cache in caches:
+        rows = 1 if isinstance(cache, QuantizedKVCache) else 2
+        cache.update_and_fetch(
+            mx.ones((rows, 1, 3, 64)), mx.full((rows, 1, 3, 64), 2.0)
+        )
+    path = str(tmp_path / "core.safetensors")
+    _save_prompt_snapshot(path, caches)
+    restored = _load_prompt_snapshot(path)
+    for before, after in zip(caches, restored):
+        assert type(before) is type(after)
+        assert mx.array_equal(mx.array(before.offset), mx.array(after.offset))
+        for (_, a), (_, b) in zip(
+            tree_flatten(before.keys_and_values()),
+            tree_flatten(after.keys_and_values()),
+        ):
+            assert mx.array_equal(a, b)
+        if hasattr(before, "left_padding"):
+            assert mx.array_equal(before.left_padding, after.left_padding)
+
+
+# ---------------------------------------------------------------------------
+# Fusion: exact pooling deltas, write-behind snapshots and the signed shared
+# disk-capacity charge.
+# ---------------------------------------------------------------------------
+
+
+def _feed_pooling(cache, count, *, offset=0, dim=8, with_prev=True):
+    """Advance one PoolingCache without replacing its append-only history."""
+
+    kv = mx.random.normal((1, count, dim))
+    gate = mx.random.normal((1, count, dim))
+    ready_kv, ready_gate, _ = cache.accumulate_windows(kv, gate, offset)
+    windows = ready_kv.shape[1] // cache.ratio
+    if windows:
+        cache.update_and_fetch(mx.random.normal((1, windows, dim)))
+        if with_prev:
+            cache.store_prev(
+                ready_kv.reshape(1, windows, cache.ratio, dim),
+                ready_gate.reshape(1, windows, cache.ratio, dim),
+                0,
+            )
+
+def test_pooling_deltas_grow_linearly_and_carry_absolute_ranges(tmp_path):
+    """Each boundary stores one fixed-size pooled slab, not all prior rows."""
+
+    step = 128
+    boundaries = tuple(range(step, 6 * step + 1, step))
+    tokens = list(range(boundaries[-1]))
+    store = SSDPromptSnapshotStore(tmp_path, step=step)
+    pool = PoolingCache(4)
+
+    for boundary in boundaries:
+        _feed_pooling(pool, step, offset=boundary - step, dim=256)
+        assert store.put(MODEL, tokens[:boundary], [pool])
+        key = store._chain_keys(MODEL, tuple(tokens[:boundary]))[-1]
+        raw = _load_prompt_snapshot(str(store._path(key)))[0]
+        assert isinstance(raw, PoolingCacheDeltaSnapshot)
+        assert (raw.source_start, raw.source_end) == (boundary - step, boundary)
+        assert (raw.pool_start, raw.pool_end) == (
+            (boundary - step) // pool.ratio,
+            boundary // pool.ratio,
+        )
+
+    sizes = [path.stat().st_size for path in tmp_path.glob("*.safetensors")]
+    assert len(sizes) == len(boundaries)
+    # Header digit growth is tiny; cumulative snapshots would make the last
+    # payload roughly six times the first.
+    assert max(sizes) < 1.05 * min(sizes)
+
+def test_pooling_delta_chain_rebuilds_remainders_and_empty_slots(tmp_path):
+    """Non-aligned boundaries preserve both overlap carries and None slots."""
+
+    step = 5
+    tokens = list(range(3 * step))
+    store = SSDPromptSnapshotStore(tmp_path, step=step)
+    overlap = PoolingCache(4)
+    simple = PoolingCache(8)
+
+    for boundary in (5, 10, 15):
+        _feed_pooling(overlap, step, offset=boundary - step, with_prev=True)
+        _feed_pooling(simple, step, offset=boundary - step, with_prev=False)
+        assert store.put(
+            MODEL,
+            tokens[:boundary],
+            [CacheList(overlap, simple)],
+        )
+
+    restored = store.load(MODEL, tokens, len(tokens))
+    assert restored is not None
+    restored_overlap, restored_simple = restored[0].caches
+    assert overlap.remainder == 3
+    assert simple.remainder == 7
+    _assert_pooling_equal(restored_overlap, overlap)
+    _assert_pooling_equal(restored_simple, simple)
+    assert restored_simple.prev_win_kv is None
+    assert restored_simple.prev_win_gate is None
+
+def test_pooling_delta_chain_survives_a_rank_restart(tmp_path):
+    step = 5
+    tokens = list(range(3 * step))
+    first = SSDPromptSnapshotStore(
+        tmp_path,
+        step=step,
+        persistent=True,
+        write_behind=True,
+        max_pending_writes=3,
+        pending_max_bytes=1024 * 1024,
+    )
+    pool = PoolingCache(4)
+    for boundary in (5, 10, 15):
+        _feed_pooling(pool, step, offset=boundary - step)
+        assert first.put(MODEL, tokens[:boundary], [pool])
+    assert first.close(timeout=5)
+
+    second = SSDPromptSnapshotStore(tmp_path, step=step, persistent=True)
+    restored = second.load(MODEL, tokens, len(tokens))
+    assert restored is not None
+    _assert_pooling_equal(restored[0], pool)
+
+def test_clear_drains_write_behind_and_resets_persistent_manifest(tmp_path):
+    tokens = list(range(STEP))
+    store = SSDPromptSnapshotStore(
+        tmp_path,
+        step=STEP,
+        persistent=True,
+        write_behind=True,
+        pending_max_bytes=1024 * 1024,
+    )
+    assert store.put(MODEL, tokens, _kv())
+    assert store.clear(timeout=5) == 1
+    assert len(store) == 0
+    assert store.nbytes == 0
+    assert store.present_boundaries(MODEL, tokens) == ()
+    assert store.close(timeout=5)
+
+    reopened = SSDPromptSnapshotStore(tmp_path, step=STEP, persistent=True)
+    assert len(reopened) == 0
+    assert reopened.present_boundaries(MODEL, tokens) == ()
+
+def test_corrupt_pooling_delta_range_fails_closed_and_unpoisons_manifest(tmp_path):
+    step = 4
+    tokens = list(range(2 * step))
+    store = SSDPromptSnapshotStore(tmp_path, step=step, persistent=True)
+    pool = PoolingCache(4)
+    for boundary in (4, 8):
+        _feed_pooling(pool, step, offset=boundary - step)
+        assert store.put(MODEL, tokens[:boundary], [pool])
+
+    deepest_key = store._chain_keys(MODEL, tuple(tokens))[-1]
+    path = store._path(deepest_key)
+    arrays, metadata = mx.load(str(path), return_metadata=True)
+    # ``mx.load`` is lazy. Materialize the payload before overwriting its
+    # backing file or save_safetensors can truncate the source first and then
+    # fail while evaluating arrays that still map that now-empty file.
+    mx.eval(*arrays.values())
+    # pool_start for a top-level delta is metadata slot five. Turn [1,2)
+    # into the overlapping [0,2) while leaving the tensor bytes untouched.
+    assert metadata["0.0.5"] == "1"
+    metadata["0.0.5"] = "0"
+    mx.save_safetensors(str(path), arrays, metadata)
+
+    assert store.load(MODEL, tokens, len(tokens)) is None
+    assert len(store) == 0
+    manifest = json.loads((tmp_path / "index.json").read_text())
+    assert manifest["entries"] == []
+
+def test_legacy_cumulative_pooling_snapshot_seeds_a_new_delta_chain(
+    tmp_path, monkeypatch
+):
+    """An on-disk pre-upgrade boundary remains reusable after extension."""
+
+    step = 5
+    tokens = list(range(2 * step))
+    store = SSDPromptSnapshotStore(tmp_path, step=step, persistent=True)
+    pool = PoolingCache(4)
+    _feed_pooling(pool, step)
+
+    # Simulate the pre-delta writer, which used PoolingCacheSnapshot and put
+    # the whole cumulative pooled tensor in each boundary file.
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            PoolingCacheDeltaSnapshot,
+            "from_cache",
+            classmethod(lambda _cls, _inner, **_kwargs: None),
+        )
+        assert store.put(MODEL, tokens[:step], [pool])
+    legacy = store.load(MODEL, tokens[:step], step)
+    assert legacy is not None
+    _assert_pooling_equal(legacy[0], pool)
+
+    _feed_pooling(pool, step, offset=step)
+    assert store.put(MODEL, tokens, [pool])
+    restarted = SSDPromptSnapshotStore(tmp_path, step=step, persistent=True)
+    restored = restarted.load(MODEL, tokens, len(tokens))
+    assert restored is not None
+    _assert_pooling_equal(restored[0], pool)
+
+def test_v1_persistent_manifest_migrates_without_losing_restore(tmp_path):
+    tokens = list(range(4))
+    first = SSDPromptSnapshotStore(tmp_path, step=4, persistent=True)
+    assert first.put(MODEL, tokens, _kv())
+    legacy = json.loads((tmp_path / "index.json").read_text())
+    legacy["version"] = 1
+    for row in legacy["entries"]:
+        row.pop("capacity_charge_bytes", None)
+    (tmp_path / "index.json").write_text(json.dumps(legacy))
+
+    second = SSDPromptSnapshotStore(tmp_path, step=4, persistent=True)
+
+    assert second.load(MODEL, tokens, 4) is not None
+    migrated = json.loads((tmp_path / "index.json").read_text())
+    assert migrated["version"] == 2
+    assert migrated["entries"][0]["capacity_charge_bytes"] > 0
+
+def test_default_disk_budget_is_finite_and_conservative(tmp_path):
+    store = SSDPromptSnapshotStore(tmp_path, step=2)
+
+    assert store.max_bytes == DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
+    assert store.max_bytes == 20 * 1024**3
+
+def test_default_20_gib_budget_evicts_when_shared_charges_cross_it(tmp_path):
+    charge = 12 * 1024**3
+    store = SSDPromptSnapshotStore(
+        tmp_path,
+        step=2,
+        write_behind=True,
+        capacity_agreement=lambda _local: charge,
+    )
+
+    assert store.put(MODEL, [0, 1], _kv())
+    assert store.put(MODEL, [2, 3], _kv())
+    assert store.flush(timeout=5)
+
+    assert len(store) == 1
+    assert store.capacity_bytes == charge
+    assert store.nbytes <= store.max_bytes
+    assert store.evictions == 1
+    assert store.load(MODEL, [0, 1], 2) is None
+    assert store.load(MODEL, [2, 3], 2) is not None
+    assert store.close(timeout=5)
+
+def test_shared_capacity_charge_keeps_unequal_ranks_eviction_symmetric(tmp_path):
+    """Different shard file sizes must still evict the same oldest key."""
+
+    shared_charge = 1024 * 1024
+    budget = 2 * shared_charge
+    rank0 = SSDPromptSnapshotStore(
+        tmp_path / "r0",
+        step=2,
+        max_bytes=budget,
+        write_behind=True,
+        capacity_agreement=lambda _local: shared_charge,
+    )
+    rank1 = SSDPromptSnapshotStore(
+        tmp_path / "r1",
+        step=2,
+        max_bytes=budget,
+        write_behind=True,
+        capacity_agreement=lambda _local: shared_charge,
+    )
+    prompts = ([0, 1], [2, 3], [4, 5])
+    for prompt in prompts:
+        assert rank0.put(MODEL, prompt, _kv(layers=1))
+        assert rank1.put(MODEL, prompt, _kv(layers=2))
+    assert rank0.flush(timeout=5)
+    assert rank1.flush(timeout=5)
+
+    assert list(rank0._index) == list(rank1._index)
+    assert rank0.present_boundaries(MODEL, list(prompts[0])) == ()
+    assert rank1.present_boundaries(MODEL, list(prompts[0])) == ()
+    assert rank0.capacity_bytes == rank1.capacity_bytes == budget
+    assert rank0.nbytes <= rank0.max_bytes
+    assert rank1.nbytes <= rank1.max_bytes
+    assert rank0.evictions == rank1.evictions == 1
+    assert rank0.close(timeout=5)
+    assert rank1.close(timeout=5)
 
 def test_write_behind_freezes_mutable_rotating_state_at_the_boundary(
     tmp_path, monkeypatch
@@ -793,22 +835,24 @@ def test_write_behind_freezes_mutable_rotating_state_at_the_boundary(
     )
     cache = RotatingKVCache(max_size=4)
     _advance([cache], 4)
-    expected_state = [value.tolist() for value in cache.state]
-    expected_meta = cache.meta_state
+    def _plain(state):
+        # mlx-lm 0.32 folds the former meta_state (offset, idx, ...) into
+        # ``state`` next to the arrays.
+        return [v.tolist() if hasattr(v, "tolist") else v for v in state]
+
+    expected_state = _plain(cache.state)
 
     assert store.put(MODEL, [0, 1, 2, 3], [cache])
     assert started.wait(timeout=5)
     _advance([cache], 1)  # overwrites the live full rotating buffer in place
-    assert cache.meta_state != expected_meta
+    assert _plain(cache.state) != expected_state
     release.set()
     assert store.flush(timeout=5)
 
     restored = store.load(MODEL, [0, 1, 2, 3], 4)
     assert restored is not None
-    assert restored[0].meta_state == expected_meta
-    assert [value.tolist() for value in restored[0].state] == expected_state
+    assert _plain(restored[0].state) == expected_state
     assert store.close(timeout=5)
-
 
 def test_write_behind_strictly_rejects_one_oversized_payload(tmp_path):
     store = SSDPromptSnapshotStore(
@@ -823,7 +867,6 @@ def test_write_behind_strictly_rejects_one_oversized_payload(tmp_path):
     assert store.pending_bytes == 0
     assert store.pending_peak_bytes == 0
     assert store.close(timeout=5)
-
 
 def test_write_behind_count_saturation_drops_instead_of_blocking_prefill(
     tmp_path, monkeypatch
@@ -856,7 +899,6 @@ def test_write_behind_count_saturation_drops_instead_of_blocking_prefill(
     release.set()
     assert store.close(timeout=5)
 
-
 def test_write_behind_close_is_bounded_when_the_writer_stalls(tmp_path, monkeypatch):
     started = threading.Event()
     release = threading.Event()
@@ -886,7 +928,6 @@ def test_write_behind_close_is_bounded_when_the_writer_stalls(tmp_path, monkeypa
     assert tmp_path.is_dir()
     release.set()
     assert store.close(timeout=5)
-
 
 def test_write_behind_fifo_keeps_successful_rank_key_order_symmetric(tmp_path):
     rank0 = SSDPromptSnapshotStore(

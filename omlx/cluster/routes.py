@@ -111,6 +111,7 @@ from .planner import (
     synthetic_model_layout,
 )
 from .probe import collect_cluster_status, detect_low_power_mode
+from .rdma.link_routes import cluster_rdma_link_verify, cluster_rdma_links
 from .registry import get_cluster_registry, get_device_registry
 from .identity import get_node_identity
 from .replan import (
@@ -541,6 +542,8 @@ class ClusterDeploymentRequest(BaseModel):
     sampling_rank_only: bool = True
     async_overlap: bool = True
     cache_affinity: bool = True
+    prompt_cache_ssd: bool = True
+    prompt_cache_ssd_max_bytes: int = Field(default=20 * 1024**3, gt=0)
     max_kv_size: int | None = Field(default=None, gt=0)
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
@@ -1351,6 +1354,16 @@ def _create_cluster_plan(
             ),
             context_tokens=request.target_context_tokens,
         )
+    elif request.allocation == "proportional":
+        plan = plan_proportional_pipeline(
+            model,
+            nodes,
+            workload_profile=request.execution_profile,
+            microbatch_size=(
+                request.pipeline_microbatch_size or defaults.pipeline_microbatch_size
+            ),
+            context_tokens=request.target_context_tokens,
+        )
     else:
         plan = plan_unequal_pipeline(
             model,
@@ -1369,10 +1382,13 @@ def _create_cluster_plan(
 class ClusterAutoconfigureRequest(BaseModel):
     """Everything one-click activation needs; the server decides the rest."""
 
+    model_config = ConfigDict(extra="forbid")
+
     # Active-cluster membership changes keep the durable deployment identity
     # while recomputing every rank/host/transport field. First-time setup omits
     # this and receives the normal model+plan-derived ID.
     deployment_id: str | None = Field(default=None, max_length=128)
+    path_map: dict[str, str] | None = Field(default=None, max_length=64)
     model_path: str | None = Field(default=None, max_length=4096)
     model_source: str | None = Field(default=None, max_length=255)
     model_source_python: str | None = Field(default=None, max_length=4096)
@@ -1468,6 +1484,7 @@ def _staging_for(
                 else validate_ssh_target(source_host)
             ),
             source_python_executable=request.model_source_python,
+            path_map=getattr(request, "path_map", None),
         )
     except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
         return {"error": str(exc), "ready": False}
@@ -1693,6 +1710,13 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     """
 
     _validate_cluster_hosts(request.hosts)
+    try:
+        path_map = validate_model_path_map(
+            request.path_map, tuple(node.node_id for node in request.nodes)
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    request = request.model_copy(update={"path_map": path_map})
 
     plan_request = ClusterPlanRequest(
         model_path=request.model_path,
@@ -1743,9 +1767,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         except (OSError, RuntimeError, ValueError) as exc:
             fabric_error = str(exc)
     provisional_backend = (
-        str(fabric["backend"])
-        if fabric is not None
-        else choose_backend(transports)[0]
+        str(fabric["backend"]) if fabric is not None else choose_backend(transports)[0]
     )
     strategy_transports = transports
     if provisional_backend == "ring" and transports:
@@ -2162,9 +2184,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 for profile in performance_probe.get("profiles", ())
             )
             if len(profiles) != len(profiled_request_nodes):
-                raise ValueError(
-                    "performance probe did not return every cluster rank"
-                )
+                raise ValueError("performance probe did not return every cluster rank")
             profile_by_node = {profile.node_id: profile for profile in profiles}
             profiled_request_nodes = [
                 node.model_copy(
@@ -2230,6 +2250,11 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 "Performance measurement was unavailable; using the safe "
                 f"memory-balanced split. {exc}"
             )
+
+    # Destination paths participate in the same placement signature checked
+    # by staging and activation; adding them only to activation yields 409.
+    if path_map:
+        choice = replace(choice, plan=replace(choice.plan, path_map=path_map))
 
     # stage_manifest probes peers with blocking SSH. Keep it off the FastAPI
     # event loop just like transport detection and preflight above.
@@ -2312,12 +2337,18 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             and staging_ready
             and fabric_ready
         ),
+        "ready_to_stage": (
+            not any(issue.blocking for issue in issues)
+            and fabric_ready
+            and not bool((staging or {}).get("error"))
+        ),
         "warnings": _redact_diagnostic(warnings),
         "transports": [transport.__dict__ for transport in transports],
         "plan": plan_payload,
         # Ready to POST straight to /deployments once the user approves.
         "activation": {
             "deployment_id": request.deployment_id,
+            "path_map": request.path_map,
             "model_path": request.model_path,
             "model_source": request.model_source,
             "model_source_python": request.model_source_python,
@@ -2745,7 +2776,15 @@ def _reconcile_runtime_ownership(payload: dict[str, Any], pool: Any) -> None:
                 deployment = registry.get_for_model(entry.model_path)
                 if deployment is not None:
                     loading_deployments.add(deployment.deployment_id)
-        except (OSError, RuntimeError, ValueError):
+                    if deployment.deployment_id not in loaded_deployments:
+                        launchers.append(
+                            {
+                                "deployment_id": deployment.deployment_id,
+                                "model_id": model_id,
+                                "phase": "loading",
+                            }
+                        )
+        except (AttributeError, OSError, RuntimeError, ValueError):
             # Ownership remains fail-closed: an unresolvable loading entry does
             # not grant a marker permission to advertise a live model.
             pass
@@ -2778,10 +2817,12 @@ async def cluster_runtime():
 
     payload = await asyncio.to_thread(read_runtime_markers)
     if _get_engine_pool is None:
+        _reconcile_runtime_ownership(payload, None)
         return payload
     try:
         pool = _engine_pool()
     except HTTPException:
+        _reconcile_runtime_ownership(payload, None)
         return payload
     _reconcile_runtime_ownership(payload, pool)
     return payload
@@ -4985,17 +5026,11 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
     if request.deployment_id:
         current = await asyncio.to_thread(registry.get, request.deployment_id)
         if current is None:
-            raise HTTPException(
-                status_code=404, detail="cluster deployment not found"
-            )
+            raise HTTPException(status_code=404, detail="cluster deployment not found")
     elif request.model_path:
-        current = await asyncio.to_thread(
-            registry.get_for_model, request.model_path
-        )
+        current = await asyncio.to_thread(registry.get_for_model, request.model_path)
 
-    if current is None and not (
-        request.model_path and request.nodes and request.hosts
-    ):
+    if current is None and not (request.model_path and request.nodes and request.hosts):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -5025,8 +5060,7 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
         if current is None:
             raise HTTPException(status_code=400, detail="hosts are required")
         hosts = [
-            ClusterHostRequest(**payload)
-            for payload in hosts_from_deployment(current)
+            ClusterHostRequest(**payload) for payload in hosts_from_deployment(current)
         ]
         derived["hosts"] = True
     backend = request.backend
@@ -5064,7 +5098,8 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
     try:
         _validate_cluster_hosts(hosts)
         effective = ClusterDeploymentRequest(
-            deployment_id=request.deployment_id,
+            deployment_id=request.deployment_id
+            or (current.deployment_id if current else None),
             model_path=(request.model_path or (current.model if current else "")),
             model_source=request.model_source,
             model_source_python=request.model_source_python,
@@ -5167,9 +5202,7 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
 
     signed_plan = _plan_with_signature(plan)
     changes = (
-        _plan_changes(placement_view(current), plan)
-        if current is not None
-        else None
+        _plan_changes(placement_view(current), plan) if current is not None else None
     )
 
     if request.approved_placement is None:
@@ -5178,9 +5211,7 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
             "mode": "preview",
             "steps": list(_REPLAN_STEPS),
             "derived": derived,
-            "current": (
-                summarize_deployment(current) if current is not None else None
-            ),
+            "current": (summarize_deployment(current) if current is not None else None),
             "changes": changes,
             "deployment_id": deployment.deployment_id,
             "backend": deployment.backend,
@@ -5324,8 +5355,9 @@ async def load_cluster_deployment(deployment_id: str):
             )
         entry = pool.get_entry(model_id)
         resident = getattr(entry, "engine", None) if entry is not None else None
-        if resident is not None and getattr(
-            resident, "runtime_failed_reason", None
+        if resident is not None and (
+            getattr(resident, "runtime_failed_reason", None)
+            or getattr(entry, "pending_unload_reason", None)
         ):
             await pool.prepare_cluster_reload(model_id)
         engine = await pool.get_engine(model_id)
@@ -5359,3 +5391,8 @@ async def load_cluster_deployment(deployment_id: str):
         "canary_completion_tokens": canary.completion_tokens,
         "ranks": status.get("ranks", []),
     }
+
+
+# RDMA links over MCDMA: inventory with live evidence, and on-demand verification.
+router.add_api_route("/rdma-links", cluster_rdma_links, methods=["GET"])
+router.add_api_route("/rdma-links/verify", cluster_rdma_link_verify, methods=["POST"])

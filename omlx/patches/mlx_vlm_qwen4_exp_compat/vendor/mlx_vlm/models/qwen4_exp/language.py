@@ -6,29 +6,32 @@ import math
 import mmap
 import os
 import struct
-import threading
 import time
 import weakref
 from bisect import bisect_right
-from contextvars import ContextVar
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
-from types import SimpleNamespace
+from threading import Lock, RLock
 from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from .cache import ArraysCache, BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
+from omlx.patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import register_ple_resource
+
+from .cache import BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
+from mlx_vlm.models.cache import ArraysCache
+from mlx_vlm.speculative.cache_state import start_speculative_cache
+from mlx_vlm.speculative.ops.linear import _target_verify_linear, _target_verify_linears
+from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
 from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
 from ..qwen3_5.language import (
     Qwen3_5Attention,
     Qwen3_5GatedDeltaNet,
     _create_qwen3_5_attention_mask,
     _create_qwen3_5_ssm_mask,
-    _target_verify_linear,
-    _target_verify_linears,
 )
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from .config import ModelConfig, TextConfig
@@ -37,612 +40,92 @@ from .qsa_fast import (
     contiguous_causal_gathered_qsa_decode,
     pool_completed_index_keys,
 )
+from . import hc_fused
+
+logger = logging.getLogger(__name__)
 
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
 _HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
-_HC_FUSED_VERIFY_WIDTHS = frozenset({2, 3, 4, 5, 6, 7, 8, 9})
-_QSA_DIRECT_VERIFY_MIN_TOKENS = 32_768
-_QSA_VERIFY_MATCH_DECODE_ENV = "OMLX_QWEN4_VERIFY_MATCH_DECODE_QSA"
-_QSA_VERIFY_MATCH_DECODE_LOGGED = False
-_TOKENWISE_QSA_VERIFY_ENV = "OMLX_QWEN4_TOKENWISE_QSA_VERIFY"
-_TOKENWISE_QSA_VERIFY_LOGGED = False
-_DECODE_PROFILE_LOCAL = threading.local()
-_DECODE_PROFILE_LOCK = threading.Lock()
-_DECODE_PROFILE_CALLS = 0
-_COARSE_PROFILE_LOCK = threading.Lock()
-_COARSE_PROFILE_CALLS = 0
-_SCALAR_MTP_HIDDEN_SINK: ContextVar[list | None] = ContextVar(
-    "qwen4_scalar_mtp_hidden_sink",
-    default=None,
-)
-_TOKENWISE_LM_HEAD_HIDDEN_SINK: ContextVar[list | None] = ContextVar(
-    "qwen4_tokenwise_lm_head_hidden_sink",
-    default=None,
-)
-_PLE_WINDOW_PREFETCH: ContextVar["_PLEWindowPrefetch | None"] = ContextVar(
-    "qwen4_ple_window_prefetch",
-    default=None,
-)
-_EXACT_HC_VERIFY_ENV = "OMLX_QWEN4_EXACT_HC_VERIFY"
-_EXACT_HC_VERIFY_LOGGED = False
-_TOKENWISE_GDN_VERIFY_ENV = "OMLX_QWEN4_TOKENWISE_GDN_VERIFY"
-_TOKENWISE_GDN_VERIFY_LOGGED = False
-_TOKENWISE_LM_HEAD_VERIFY_ENV = "OMLX_QWEN4_TOKENWISE_LM_HEAD_VERIFY"
-_TOKENWISE_LM_HEAD_VERIFY_LOGGED = False
-
-logger = logging.getLogger(__name__)
-_TOKENWISE_PLE_VERIFY_LOGGED = False
-_TOKENWISE_MOE_VERIFY_ENV = "OMLX_QWEN4_TOKENWISE_MOE_VERIFY"
-_TOKENWISE_MOE_VERIFY_WIDTHS = frozenset(range(2, 10))
-_TOKENWISE_MOE_VERIFY_LOGGED = False
+# Identity cache: keep the array alive so CPython cannot recycle id().
+_TEXT_MROPE_EQUAL_PLANES: list[tuple[Any, int, bool]] = []
 
 
-@dataclass
-class _PLEPrefetchEntry:
-    module: Any
-    cache: Any
-    ngram_ids: mx.array
-    embeddings: mx.array
-    expected_history: Any
-    next_row: int = 0
-
-
-@dataclass
-class _PLEWindowPrefetch:
-    token_ids: tuple[int, ...]
-    entries: dict[tuple[int, int], _PLEPrefetchEntry]
-    active_row: int = -1
-    active_token: int | None = None
-    active_input: Any = None
-    consumed: set[tuple[int, int]] | None = None
-    disabled: bool = False
-
-
-def _begin_ple_window_prefetch(payload: _PLEWindowPrefetch):
-    return _PLE_WINDOW_PREFETCH.set(payload)
-
-
-def _activate_ple_prefetch_row(
-    payload: _PLEWindowPrefetch,
-    row: int,
-    token_id: int,
-    input_ids: mx.array,
+def _broadcast_text_mrope_position_ids(
+    position_ids: Optional[mx.array],
+    length: int,
 ) -> bool:
-    if (
-        _PLE_WINDOW_PREFETCH.get() is not payload
-        or payload.disabled
-        or payload.active_row != -1
-        or row < 0
-        or row >= len(payload.token_ids)
-        or int(token_id) != payload.token_ids[row]
-        or input_ids.shape != (1, 1)
-    ):
-        payload.disabled = True
-        return False
-    payload.active_row = int(row)
-    payload.active_token = int(token_id)
-    payload.active_input = input_ids
-    payload.consumed = set()
-    return True
+    """True for missing/2-D text ids, or 3-D MRoPE that is a text broadcast.
 
-
-def _finish_ple_prefetch_row(payload: _PLEWindowPrefetch) -> bool:
-    if _PLE_WINDOW_PREFETCH.get() is not payload or payload.active_row < 0:
-        payload.disabled = True
-        return False
-    complete = bool(
-        not payload.disabled
-        and payload.consumed is not None
-        and len(payload.consumed) == len(payload.entries)
-    )
-    if not complete:
-        payload.disabled = True
-    payload.active_row = -1
-    payload.active_token = None
-    payload.active_input = None
-    payload.consumed = None
-    return complete
-
-
-def _end_ple_window_prefetch(token) -> None:
-    _PLE_WINDOW_PREFETCH.reset(token)
-
-
-def _consume_ple_prefetched_embedding(
-    module,
-    cache,
-    input_ids: mx.array,
-    previous_context: mx.array,
-) -> mx.array | None:
-    payload = _PLE_WINDOW_PREFETCH.get()
-    if payload is None or payload.disabled:
-        return None
-    key = (id(module), id(cache))
-    entry = payload.entries.get(key)
-    row = payload.active_row
-    if (
-        entry is None
-        or entry.module is not module
-        or entry.cache is not cache
-        or row < 0
-        or row >= len(payload.token_ids)
-        or payload.active_token != payload.token_ids[row]
-        or input_ids is not payload.active_input
-        or input_ids.shape != (1, 1)
-        or previous_context is not entry.expected_history
-        or entry.next_row != row
-        or payload.consumed is None
-        or key in payload.consumed
-    ):
-        payload.disabled = True
-        return None
-    payload.consumed.add(key)
-    entry.next_row += 1
-    entry.expected_history = cache[3]
-    return mx.contiguous(entry.embeddings[:, row : row + 1])
-
-
-def _tokenwise_ple_verify_enabled() -> bool:
-    """Diagnostic: preserve scalar PLE math inside a target verify window."""
-
-    return os.environ.get("OMLX_QWEN4_TOKENWISE_PLE_VERIFY", "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
-def _qsa_verify_match_decode_enabled() -> bool:
-    """Whether target verification may use scalar decode's QSA crossover."""
-
-    return os.environ.get(_QSA_VERIFY_MATCH_DECODE_ENV, "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _tokenwise_qsa_verify_enabled() -> bool:
-    """Diagnostic gate for ordinary scalar QSA target verification."""
-
-    return os.environ.get(_TOKENWISE_QSA_VERIFY_ENV, "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _qsa_verify_sparse_threshold_met(
-    prospective_tokens: int,
-    prospective_blocks: int,
-    block_topk: int,
-) -> bool:
-    """Preserve the sparse-block proof and optionally remove only the 32K floor."""
-
-    if prospective_blocks <= block_topk:
-        return False
-    if prospective_tokens >= _QSA_DIRECT_VERIFY_MIN_TOKENS:
+    Parent LanguageModel tiles identical ``(1, L)`` positions to ``(3, 1, L)``
+    for text-only mRoPE. Real image grids differ across the three planes and
+    must stay on the official mask+SDPA path.
+    """
+    if position_ids is None:
         return True
-    if not _qsa_verify_match_decode_enabled():
+    if not isinstance(position_ids, mx.array):
         return False
-
-    global _QSA_VERIFY_MATCH_DECODE_LOGGED
-    if not _QSA_VERIFY_MATCH_DECODE_LOGGED:
-        _QSA_VERIFY_MATCH_DECODE_LOGGED = True
-        logger.info(
-            "Qwen4 target verify matching scalar decode QSA crossover "
-            "(tokens=%d blocks=%d)",
-            prospective_tokens,
-            prospective_blocks,
-        )
-    return True
-
-
-def _tokenwise_moe_verify_enabled() -> bool:
-    """Diagnostic gate for scalar router/expert target verification."""
-
-    return os.environ.get(_TOKENWISE_MOE_VERIFY_ENV, "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _tokenwise_moe_verify(
-    module,
-    mixed: mx.array,
-    target_verify: bool,
-) -> mx.array | None:
-    """Replay each B1 M=2..9 MoE row through the scalar module path."""
-
-    if not (
-        target_verify
-        and _tokenwise_moe_verify_enabled()
-        and mixed.ndim == 3
-        and mixed.shape[0] == 1
-        and mixed.shape[1] in _TOKENWISE_MOE_VERIFY_WIDTHS
-    ):
-        return None
-
-    try:
-        rows = [
-            module(mixed[:, row : row + 1], target_verify=False)
-            for row in range(mixed.shape[1])
-        ]
-        output = mx.concatenate(rows, axis=1)
-    except Exception as exc:
-        logger.debug(
-            "Qwen4 tokenwise MoE target-verify diagnostic failed closed: %s",
-            exc,
-        )
-        return None
-
-    global _TOKENWISE_MOE_VERIFY_LOGGED
-    if not _TOKENWISE_MOE_VERIFY_LOGGED:
-        _TOKENWISE_MOE_VERIFY_LOGGED = True
-        logger.info(
-            "Qwen4 tokenwise MoE target-verify diagnostic active (M=%d)",
-            mixed.shape[1],
-        )
-    return output
-
-
-def _qwen4_moe_forward(module, mixed: mx.array, target_verify: bool) -> mx.array:
-    tokenwise = _tokenwise_moe_verify(module, mixed, target_verify)
-    if tokenwise is not None:
-        return tokenwise
-    return module(mixed, target_verify=target_verify)
-
-
-def _exact_hc_verify_enabled() -> bool:
-    """Diagnostic gate for scalar-reduction HC target verification."""
-
-    return os.environ.get(_EXACT_HC_VERIFY_ENV, "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _tokenwise_gdn_verify_enabled() -> bool:
-    """Diagnostic gate for canonical scalar-row GDN verification."""
-
-    return os.environ.get(_TOKENWISE_GDN_VERIFY_ENV, "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _tokenwise_lm_head_verify_enabled() -> bool:
-    """Diagnostic gate for canonical scalar-row output projection."""
-
-    return os.environ.get(_TOKENWISE_LM_HEAD_VERIFY_ENV, "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _capture_tokenwise_lm_head_hidden(
-    hidden: mx.array,
-    target_verify: bool,
-) -> mx.array:
-    """Publish one Qwen4 final hidden tensor to the scoped output-head sink."""
-
-    sink = _TOKENWISE_LM_HEAD_HIDDEN_SINK.get()
-    if sink is not None and target_verify:
-        sink.append(hidden)
-    return hidden
-
-
-def _tokenwise_lm_head_projection(
-    model,
-    hidden: mx.array,
-) -> mx.array | None:
-    """Project each B1 M=2..9 row through the exact scalar decode head.
-
-    The ordinary target-verification projection is already available as the
-    fail-closed result.  Any scalar capability/runtime failure therefore
-    returns ``None`` and leaves those logits untouched.
-    """
-
-    if not (
-        hidden.ndim == 3
-        and hidden.shape[0] == 1
-        and hidden.shape[1] in _HC_FUSED_VERIFY_WIDTHS
-    ):
-        return None
-    projection = (
-        model.model.embed_tokens.as_linear
-        if model.args.tie_word_embeddings
-        else model.lm_head
+    if position_ids.ndim == 2:
+        return tuple(position_ids.shape) == (1, length)
+    if position_ids.ndim != 3 or tuple(position_ids.shape) != (3, 1, length):
+        return False
+    for cached_ids, cached_len, cached_same in _TEXT_MROPE_EQUAL_PLANES:
+        if cached_ids is position_ids and cached_len == length:
+            return cached_same
+    same = bool(
+        mx.array_equal(position_ids[0], position_ids[1]).item()
+        and mx.array_equal(position_ids[1], position_ids[2]).item()
     )
-    try:
-        rows = [
-            projection(hidden[:, row : row + 1])
-            for row in range(hidden.shape[1])
-        ]
-        logits = mx.concatenate(rows, axis=1)
-        # Resolve the diagnostic graph here so a capability/runtime failure
-        # can retain the already-computed ordinary target-verify logits.
-        mx.eval(logits)
-    except Exception as exc:
-        logger.debug(
-            "Qwen4 tokenwise LM-head target-verify diagnostic failed closed: %s",
-            exc,
-        )
-        return None
-
-    global _TOKENWISE_LM_HEAD_VERIFY_LOGGED
-    if not _TOKENWISE_LM_HEAD_VERIFY_LOGGED:
-        _TOKENWISE_LM_HEAD_VERIFY_LOGGED = True
-        logger.info(
-            "Qwen4 tokenwise LM-head target-verify diagnostic active (M=%d, %s)",
-            hidden.shape[1],
-            "tied" if model.args.tie_word_embeddings else "untied",
-        )
-    return logits
+    _TEXT_MROPE_EQUAL_PLANES.append((position_ids, length, same))
+    if len(_TEXT_MROPE_EQUAL_PLANES) > 8:
+        del _TEXT_MROPE_EQUAL_PLANES[:-8]
+    return same
 
 
-def _exact_hc_verify_projection(
-    module,
-    normed: mx.array,
-    target_verify: bool,
-) -> mx.array | None:
-    """Replay each M=2..9 HC row through the scalar hybrid projection.
-
-    This diagnostic isolates the first multi-row target-verification branch.
-    It deliberately reuses the already-qualified scalar ``hybrid_projection``
-    for every row, preserving row order when the results are concatenated.  A
-    capability miss or native failure returns ``None`` so the existing exact
-    fused-verify/canonical fallback remains authoritative.
-    """
-
-    if not (
-        target_verify
-        and _exact_hc_verify_enabled()
-        and getattr(module, "_omlx_exact_hybrid_projection", False)
-        and normed.ndim == 3
-        and normed.shape[0] == 1
-        and normed.shape[1] in _HC_FUSED_VERIFY_WIDTHS
-        and normed.shape[-1] == 10240
-        and normed.dtype == mx.bfloat16
-    ):
-        return None
-
-    from .hc_projection import hybrid_projection
-
-    rows = []
-    for row in range(normed.shape[1]):
-        projected = hybrid_projection(
-            normed[:, row : row + 1],
-            module.input_mix_weight_down,
-            module.block_inject_weight,
-        )
-        if projected is None:
-            return None
-        rows.append(projected)
-
-    global _EXACT_HC_VERIFY_LOGGED
-    if not _EXACT_HC_VERIFY_LOGGED:
-        _EXACT_HC_VERIFY_LOGGED = True
-        logger.info(
-            "Qwen4 exact HC target-verify diagnostic active (M=%d)",
-            normed.shape[1],
-        )
-    return mx.concatenate(rows, axis=1)
-
-
-class _Qwen4DecodeProfileSample:
-    """One synchronized, diagnostic-only Qwen4 decode sample.
-
-    The profiler deliberately puts an evaluation boundary after every major
-    model stage.  That makes the category attribution trustworthy, but also
-    means the sampled token is not a production-throughput measurement.  The
-    feature is disabled unless ``OMLX_QWEN4_DECODE_PROFILE=1`` and samples only
-    one token per configured interval so ordinary decode stays representative.
-    """
-
-    def __init__(self, call_index: int, context_tokens: int):
-        self.call_index = call_index
-        self.context_tokens = context_tokens
-        self.stage_ns: dict[str, int] = {}
-        self.model_ns = 0
-
-    def add(self, stage: str, elapsed_ns: int) -> None:
-        self.stage_ns[stage] = self.stage_ns.get(stage, 0) + max(0, elapsed_ns)
-
-    def milliseconds(self, stage: str) -> float:
-        return self.stage_ns.get(stage, 0) / 1_000_000.0
-
-
-class _Qwen4CoarseProfileSample:
-    def __init__(self, call_index: int, context_tokens: int):
-        self.call_index = call_index
-        self.context_tokens = context_tokens
-
-
-def _decode_profile_int(name: str, default: int, minimum: int) -> int:
-    try:
-        return max(minimum, int(os.environ.get(name, str(default))))
-    except (TypeError, ValueError):
-        return default
-
-
-def _decode_profile_enabled() -> bool:
-    return os.environ.get("OMLX_QWEN4_DECODE_PROFILE", "0") == "1"
-
-
-def _decode_profile_context_tokens(model, cache) -> int | None:
-    if not cache:
-        return None
-    try:
-        entry = cache[model.fa_idx]
-        offset = entry._idx if hasattr(entry, "_idx") else entry.offset
-    except (AttributeError, IndexError, TypeError):
-        return None
-    if not isinstance(offset, int) or offset <= 0:
-        return None
-    return offset
-
-
-def _new_decode_profile_sample(model, inputs, inputs_embeds, mask, cache, kwargs):
-    """Return a sparse profile sample only for ordinary B1/T1 text decode."""
-
-    if not _decode_profile_enabled() or get_mtp_runtime().enabled:
-        return None
-    if not (
-        isinstance(inputs, mx.array)
-        and inputs.ndim == 2
-        and inputs.shape == (1, 1)
-        and inputs_embeds is None
-        and (mask is None or (isinstance(mask, str) and mask == "causal"))
-        and not kwargs.get("return_hidden", False)
-        and kwargs.get("capture_layer_ids") is None
-        and not kwargs.get("skip_logits", False)
-    ):
-        return None
-    context_tokens = _decode_profile_context_tokens(model, cache)
-    if context_tokens is None:
-        return None
-
-    global _DECODE_PROFILE_CALLS
-    with _DECODE_PROFILE_LOCK:
-        _DECODE_PROFILE_CALLS += 1
-        call_index = _DECODE_PROFILE_CALLS
-    warmup = _decode_profile_int("OMLX_QWEN4_DECODE_PROFILE_WARMUP", 8, 0)
-    interval = _decode_profile_int("OMLX_QWEN4_DECODE_PROFILE_INTERVAL", 16, 1)
-    if call_index <= warmup or (call_index - warmup - 1) % interval:
-        return None
-    return _Qwen4DecodeProfileSample(call_index, context_tokens)
-
-
-def _new_coarse_profile_sample(model, inputs, inputs_embeds, mask, cache, kwargs):
-    """Sample normal lazy graph construction separately from its final eval."""
-
-    if (
-        os.environ.get("OMLX_QWEN4_DECODE_COARSE_PROFILE", "0") != "1"
-        or _decode_profile_enabled()
-        or get_mtp_runtime().enabled
-    ):
-        return None
-    if not (
-        isinstance(inputs, mx.array)
-        and inputs.ndim == 2
-        and inputs.shape == (1, 1)
-        and inputs_embeds is None
-        and (mask is None or (isinstance(mask, str) and mask == "causal"))
-        and not kwargs.get("return_hidden", False)
-        and kwargs.get("capture_layer_ids") is None
-        and not kwargs.get("skip_logits", False)
-    ):
-        return None
-    context_tokens = _decode_profile_context_tokens(model, cache)
-    if context_tokens is None:
-        return None
-
-    global _COARSE_PROFILE_CALLS
-    with _COARSE_PROFILE_LOCK:
-        _COARSE_PROFILE_CALLS += 1
-        call_index = _COARSE_PROFILE_CALLS
-    warmup = _decode_profile_int(
-        "OMLX_QWEN4_DECODE_COARSE_PROFILE_WARMUP", 8, 0
-    )
-    interval = _decode_profile_int(
-        "OMLX_QWEN4_DECODE_COARSE_PROFILE_INTERVAL", 16, 1
-    )
-    if call_index <= warmup or (call_index - warmup - 1) % interval:
-        return None
-    return _Qwen4CoarseProfileSample(call_index, context_tokens)
-
-
-def _profile_eval(value) -> None:
-    """Evaluate a stage result before timing its synchronized boundary."""
-
-    arrays = []
-
-    def collect(current):
-        if isinstance(current, mx.array):
-            arrays.append(current)
-        elif isinstance(current, dict):
-            for child in current.values():
-                collect(child)
-        elif isinstance(current, (list, tuple)):
-            for child in current:
-                collect(child)
-
-    collect(value)
-    if arrays:
-        mx.eval(*arrays)
-    mx.synchronize()
-
-
-def _profile_stage(sample, stage: str, function):
-    started = time.perf_counter_ns()
-    result = function()
-    _profile_eval(result)
-    sample.add(stage, time.perf_counter_ns() - started)
-    return result
-
-
-def _current_decode_profile():
-    return getattr(_DECODE_PROFILE_LOCAL, "sample", None)
-
-
-def _log_decode_profile(sample: _Qwen4DecodeProfileSample, total_ns: int) -> None:
-    total_ms = total_ns / 1_000_000.0
-    model_ms = sample.model_ns / 1_000_000.0
-    outer_ms = max(0.0, total_ms - model_ms)
-    accounted_ms = sum(sample.stage_ns.values()) / 1_000_000.0
-    model_unaccounted_ms = max(0.0, model_ms - accounted_ms)
-    logger.info(
-        "[qwen4-decode-profile] synchronized diagnostic call=%d context=%d "
-        "total=%.3fms model=%.3fms outer+logits=%.3fms "
-        "embed+mask=%.3fms ple=%.3fms attn_hc=%.3fms gdn=%.3fms "
-        "qsa=%.3fms attn_residual=%.3fms mlp_hc=%.3fms moe=%.3fms "
-        "mlp_residual=%.3fms final_hc=%.3fms model_other=%.3fms",
-        sample.call_index,
-        sample.context_tokens,
-        total_ms,
-        model_ms,
-        outer_ms,
-        sample.milliseconds("embed+mask"),
-        sample.milliseconds("ple"),
-        sample.milliseconds("attn_hc"),
-        sample.milliseconds("gdn"),
-        sample.milliseconds("qsa"),
-        sample.milliseconds("attn_residual"),
-        sample.milliseconds("mlp_hc"),
-        sample.milliseconds("moe"),
-        sample.milliseconds("mlp_residual"),
-        sample.milliseconds("final_hc"),
-        model_unaccounted_ms,
+def _rank_two_text_position_ids(
+    position_ids: Optional[mx.array],
+    length: int,
+) -> bool:
+    """True for missing or ``(1, length)`` text ids only; no plane comparison."""
+    if position_ids is None:
+        return True
+    return (
+        isinstance(position_ids, mx.array)
+        and position_ids.ndim == 2
+        and tuple(position_ids.shape) == (1, length)
     )
 
 
-def _log_coarse_profile(
-    sample: _Qwen4CoarseProfileSample,
-    build_ns: int,
-    eval_ns: int,
-) -> None:
-    logger.info(
-        "[qwen4-decode-coarse] ordinary lazy path call=%d context=%d "
-        "graph_build=%.3fms final_eval=%.3fms total=%.3fms",
-        sample.call_index,
-        sample.context_tokens,
-        build_ns / 1_000_000.0,
-        eval_ns / 1_000_000.0,
-        (build_ns + eval_ns) / 1_000_000.0,
-    )
+def _gathered_min_query_tokens() -> int:
+    """Keep narrow Lightning MTP windows on masked SDPA (M5 crossover)."""
+    raw = os.environ.get("OMLX_QWEN4_GATHERED_MIN_QUERY", "").strip()
+    if raw:
+        try:
+            return max(2, int(raw))
+        except ValueError:
+            pass
+    return 16
+
+
+def _split_text_mrope_positions(
+    position_ids: Optional[mx.array],
+    batch: int,
+    length: int,
+    past_len: int,
+) -> tuple[mx.array, mx.array]:
+    """Indexer text ids vs rotary ids for the gathered QSA arms."""
+    if position_ids is None:
+        text_position_ids = mx.arange(
+            past_len, past_len + length, dtype=mx.int32
+        )[None]
+        rotary_position_ids = mx.broadcast_to(
+            text_position_ids,
+            (3, batch, length),
+        )
+        return text_position_ids, rotary_position_ids
+    if position_ids.ndim == 3:
+        return position_ids[0], position_ids
+    return position_ids, position_ids
 
 
 @dataclass(frozen=True)
@@ -656,25 +139,14 @@ class Qwen4ExpMTPRuntime:
 _MTP_RUNTIME = Qwen4ExpMTPRuntime()
 
 
-@dataclass
+@dataclass(frozen=True)
 class _PLESpeculativeState:
-    """PLE inputs needed to restore a partially accepted verify window.
-
-    The state is armed by the n-gram lookup and completed only after the
-    paired short-convolution capture from the same target-verify forward.
-    Rollback refuses half-written or shape-inconsistent snapshots before it
-    mutates QSA/GDN state, so PLE can never be committed from another epoch.
-    """
+    """PLE inputs needed to restore a partially accepted verify window."""
 
     history: mx.array
     input_ids: mx.array
-    conv_state: mx.array | None = None
-    conv_inputs: mx.array | None = None
-    complete: bool = False
-
-
-class _PLESpeculativeRollbackError(RuntimeError):
-    """A PLE verify snapshot cannot be restored transactionally."""
+    conv_state: mx.array
+    conv_inputs: mx.array
 
 
 def configure_mtp_runtime(
@@ -716,32 +188,16 @@ def resolve_ple_runtime_mode(
 
 
 def configure_ple_runtime(model_path: str | Path, mode: str | None = None) -> str:
-    """Bind the external PLE artifact before Qwen4 model construction."""
+    """Bind same-directory PLE storage before Qwen4 model construction."""
     global _PLE_RUNTIME_MODEL_PATH, _PLE_RUNTIME_MODE
 
     compute_path = Path(model_path).expanduser().resolve()
-    ple_path = compute_path
-    artifact = {}
-    config_path = compute_path / "config.json"
-    if config_path.is_file():
-        artifact = json.loads(config_path.read_text()).get("qwen4_exp_artifact") or {}
-        relative_ple = artifact.get("ple_artifact")
-        if relative_ple is not None:
-            relative_ple = Path(relative_ple)
-            if relative_ple.is_absolute():
-                raise ValueError("Qwen4-Exp PLE artifact path must be relative")
-            ple_path = (compute_path / relative_ple).resolve()
-            artifact_root = compute_path.parent.resolve()
-            if ple_path != artifact_root and artifact_root not in ple_path.parents:
-                raise ValueError("Qwen4-Exp PLE artifact escapes its artifact root")
-
     requested = mode or os.environ.get("OMLX_QWEN4_PLE_MODE")
     if requested is None:
-        requested = artifact.get("ple_residency", "auto")
+        requested = "auto"
     checkpoint_bytes = sum(
         path.stat().st_size
-        for root in {compute_path, ple_path}
-        for path in root.glob("*.safetensors")
+        for path in compute_path.glob("*.safetensors")
     )
     physical_memory = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     _PLE_RUNTIME_MODE = resolve_ple_runtime_mode(
@@ -749,7 +205,7 @@ def configure_ple_runtime(model_path: str | Path, mode: str | None = None) -> st
         checkpoint_bytes=checkpoint_bytes,
         physical_memory=physical_memory,
     )
-    _PLE_RUNTIME_MODEL_PATH = ple_path
+    _PLE_RUNTIME_MODEL_PATH = compute_path
     return _PLE_RUNTIME_MODE
 
 
@@ -793,8 +249,13 @@ class _QSAIndexerCache:
         self._index_position_ids = None
         self._index_offset = 0
         self._index_capacity_managed = True
-        self._omlx_text_position_ids_qualified = False
+        self._index_reserved_tokens = 0
         self._invalidate_pooled_indexer()
+
+    def reserve_index_capacity(self, tokens: int) -> None:
+        """Reserve a stepped prefill horizon; later growth uses plain steps."""
+
+        self._index_reserved_tokens = max(0, int(tokens))
 
     @property
     def index_keys(self):
@@ -833,13 +294,23 @@ class _QSAIndexerCache:
         self._index_position_ids = position_ids
         self._index_offset = 0 if keys is None else int(keys.shape[1])
         self._index_capacity_managed = False
-        self._omlx_text_position_ids_qualified = False
         self._invalidate_pooled_indexer()
 
     @staticmethod
     def _growth_capacity(current: int, needed: int, step: int) -> int:
         stepped = ((needed + step - 1) // step) * step
         return max(stepped, 2 * current if current else step)
+
+    def _next_capacity(
+        self, current: int, needed: int, step: int, reserve: Optional[int] = None
+    ) -> int:
+        """Use reserved capacity when known, otherwise amortize growth."""
+        if reserve is None:
+            reserve = getattr(self, "_index_reserved_tokens", 0)
+        if not reserve:
+            return self._growth_capacity(current, needed, step)
+        target = needed if current >= reserve else max(needed, reserve)
+        return ((target + step - 1) // step) * step
 
     def _ensure_indexer_capacity(
         self,
@@ -856,9 +327,14 @@ class _QSAIndexerCache:
             )
         if needed <= current:
             return
-        capacity = ((needed + self.index_step - 1) // self.index_step) * self.index_step
-        if current and self._index_capacity_managed:
-            capacity = max(capacity, 2 * current)
+        if self._index_capacity_managed or self._index_reserved_tokens:
+            capacity = self._next_capacity(current, needed, self.index_step)
+        else:
+            # The backing buffers belong to a restore/reconstruction caller, so
+            # only round up to the step; never second-guess its sizing.
+            capacity = (
+                (needed + self.index_step - 1) // self.index_step
+            ) * self.index_step
         new_keys = mx.zeros(
             (sample_keys.shape[0], capacity, sample_keys.shape[-1]),
             dtype=sample_keys.dtype,
@@ -889,11 +365,6 @@ class _QSAIndexerCache:
         length = int(keys.shape[1])
         if position_ids.shape[-1] != length:
             raise ValueError("QSA index update keys and positions are misaligned")
-        # A general 3-D update may carry genuine image/video MRoPE.  Revoke a
-        # prior text qualification; the target-verify route deliberately
-        # collapses its already-qualified equal planes to 2-D before append.
-        if position_ids.ndim == 3:
-            self._omlx_text_position_ids_qualified = False
 
         if self._index_position_ids is not None:
             if self._index_position_ids.ndim == 3 and position_ids.ndim == 2:
@@ -969,10 +440,12 @@ class _QSAIndexerCache:
             )
             if complete_blocks > current_capacity:
                 block_step = max(1, self.index_step // compress_ratio)
-                capacity = self._growth_capacity(
+                reserved = getattr(self, "_index_reserved_tokens", 0)
+                capacity = self._next_capacity(
                     current_capacity,
                     complete_blocks,
                     block_step,
+                    reserve=(reserved // compress_ratio if reserved else 0),
                 )
                 new_buffer = mx.zeros(
                     (new_pooled.shape[0], capacity, new_pooled.shape[-1]),
@@ -995,23 +468,14 @@ class _QSAIndexerCache:
 
     def _trim_indexer(self, length: int):
         self._index_offset = min(self._index_offset, max(0, int(length)))
-        # Speculative rollback changes only a suffix of the raw index state.
-        # Completed blocks strictly before the new logical end are immutable,
-        # so retain their normalized/RoPE-rotated rows.  Rewind to the last
-        # complete block: a partially retained block may contain rejected
-        # verify tokens and must be recomputed on the next append.
-        if (
-            self._pooled_index_keys is None
-            or self._pooled_index_ratio is None
-            or self._pooled_index_ratio <= 0
-        ):
+        # Trim leaves completed prefix blocks intact; only re-pool the new tail.
+        if self._pooled_index_keys is not None and self._pooled_index_ratio:
+            self._pooled_index_offset = min(
+                self._pooled_index_offset,
+                self._index_offset // self._pooled_index_ratio,
+            )
+        else:
             self._invalidate_pooled_indexer()
-            return
-        complete_blocks = self._index_offset // self._pooled_index_ratio
-        self._pooled_index_offset = min(
-            self._pooled_index_offset,
-            complete_blocks,
-        )
 
     @property
     def indexer_nbytes(self):
@@ -1028,6 +492,9 @@ class _QSAIndexerCache:
 
 class QSAKVCache(_QSAIndexerCache, KVCache):
     """KV cache with the raw indexer keys and multimodal positions used by QSA."""
+
+    _omlx_mtp_verify_attention_cache = True
+    _omlx_mtp_batched_head_cache = True
 
     # Hybrid/TurboQuant caches do not currently expose a way to carry the
     # indexer's unprojected keys. Uniform quantization uses the specialized
@@ -1160,53 +627,11 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
         return super().nbytes + self.indexer_nbytes
 
 
-def _qualified_text_verify_position_ids(
-    position_ids: Optional[mx.array],
-    cache: Optional[Any],
-) -> Optional[mx.array]:
-    """Collapse equal 3-plane text MRoPE only after exact history proof.
-
-    mlx-vlm can carry ordinary text positions in the VLM-shaped
-    ``[3, 1, L]`` container.  Qwen4's direct verify path is text-only, so a
-    rank check alone rejects that valid case.  Qualify the current positions
-    and the complete cached QSA position history once; genuine multimodal
-    planes remain divergent and fail closed.  The cache marker survives normal
-    verify appends and is revoked by any later general 3-D index update.
-    """
-
-    if not (
-        isinstance(position_ids, mx.array)
-        and position_ids.ndim == 3
-        and position_ids.shape[0] == 3
-        and position_ids.shape[1] == 1
-        and type(cache) is QSAKVCache
-    ):
-        return position_ids
-    if getattr(cache, "_omlx_text_position_ids_qualified", False):
-        return position_ids[0]
-
-    cached = cache.index_position_ids
-    if cached is None:
-        return position_ids
-    current_equal = mx.all(position_ids[0] == position_ids[1]) & mx.all(
-        position_ids[0] == position_ids[2]
-    )
-    if cached.ndim == 2:
-        history_equal = mx.array(True)
-    elif cached.ndim == 3 and cached.shape[0] == 3 and cached.shape[1] == 1:
-        history_equal = mx.all(cached[0] == cached[1]) & mx.all(
-            cached[0] == cached[2]
-        )
-    else:
-        return position_ids
-    if not bool((current_equal & history_equal).item()):
-        return position_ids
-    cache._omlx_text_position_ids_qualified = True
-    return position_ids[0]
-
-
 class BatchQSAKVCache:
     """Batch KV cache that keeps QSA raw keys and text/MRoPE positions aligned."""
+
+    _omlx_mtp_batch_rollback_cache = True
+    _omlx_mtp_verify_attention_cache = True
 
     def __init__(self, left_padding):
         self.kv_cache = BatchKVCache(left_padding)
@@ -1215,33 +640,27 @@ class BatchQSAKVCache:
         self.index_offset = 0
 
     @property
-    def offset(self):
-        return self.kv_cache.offset
-
-    @property
-    def left_padding(self):
-        return self.kv_cache.left_padding
-
-    # mlx-vlm's vector speculative rollback probes ``keys``/``values`` on
-    # every trimmable cache before it invokes prepare(right_padding=...) and
-    # finalize().  Keep BatchQSA's storage encapsulated in BatchKVCache while
-    # exposing that established cache protocol; without these views a mixed
-    # accepted-count rollback raises before either QSA or PLE can be restored.
-    @property
     def keys(self):
+        # Parent vector rollback uses this to select prepare/finalize, which
+        # restore both the KV rows and their raw QSA indexer positions.
         return self.kv_cache.keys
-
-    @keys.setter
-    def keys(self, value):
-        self.kv_cache.keys = value
 
     @property
     def values(self):
         return self.kv_cache.values
 
-    @values.setter
-    def values(self, value):
-        self.kv_cache.values = value
+    @property
+    def offset(self):
+        return self.kv_cache.offset
+
+    @property
+    def _idx(self):
+        # Parent attention/position code needs the physical padded cache width.
+        return self.kv_cache._idx
+
+    @property
+    def left_padding(self):
+        return self.kv_cache.left_padding
 
     def update_and_fetch(self, keys, values):
         return self.kv_cache.update_and_fetch(keys, values)
@@ -1296,25 +715,49 @@ class BatchQSAKVCache:
 
     @staticmethod
     def _pad_index(cache, target, sample_keys, sample_positions):
-        length = 0 if cache.index_keys is None else cache.index_offset
+        length = (
+            0
+            if cache.index_keys is None
+            else getattr(cache, "index_offset", cache.index_keys.shape[1])
+        )
+        if isinstance(length, mx.array):
+            if length.size != 1:
+                raise ValueError(
+                    "QSA index length must be scalar after row normalization"
+                )
+            length = int(length.item())
+        else:
+            length = int(length)
         left = target - length
         if cache.index_keys is None:
+            offset = cache.offset
+            batch_size = offset.shape[0] if isinstance(offset, mx.array) else 1
             keys = mx.zeros(
-                (cache.offset.shape[0], 0, sample_keys.shape[-1]),
+                (batch_size, 0, sample_keys.shape[-1]),
                 dtype=sample_keys.dtype,
             )
             if sample_positions.ndim == 3:
                 positions = mx.zeros(
-                    (sample_positions.shape[0], cache.offset.shape[0], 0),
+                    (sample_positions.shape[0], batch_size, 0),
                     dtype=sample_positions.dtype,
                 )
             else:
                 positions = mx.zeros(
-                    (cache.offset.shape[0], 0), dtype=sample_positions.dtype
+                    (batch_size, 0), dtype=sample_positions.dtype
                 )
         else:
             keys = cache.index_keys[:, :length]
             positions = cache.index_position_ids[..., :length]
+            # Widen 2-D text positions to the join's widest rank before
+            # padding (#3294 item 2): the runtime update path already
+            # broadcasts text up to MRoPE in _append_indexer_positions; joins
+            # must apply the same rule or the concatenate below sees ranks 2
+            # and 3. Replicating across MRoPE channels matches runtime.
+            if sample_positions.ndim == 3 and positions.ndim == 2:
+                positions = mx.broadcast_to(
+                    positions[None],
+                    (sample_positions.shape[0], *positions.shape),
+                )
         if left:
             keys = mx.pad(keys, [(0, 0), (left, 0), (0, 0)])
             positions = mx.pad(
@@ -1330,25 +773,55 @@ class BatchQSAKVCache:
     def extend(self, other):
         if not isinstance(other, BatchQSAKVCache):
             raise TypeError(f"Cannot extend BatchQSAKVCache with {type(other)}")
-        self.kv_cache.extend(other.kv_cache)
+
+        for cache in (self, other):
+            if (cache.index_keys is None) != (cache.index_position_ids is None):
+                raise ValueError("QSA raw keys and positions must be extended together")
+            if cache.index_keys is None:
+                if cache.kv_cache.size():
+                    raise ValueError("Cannot extend QSA KV state without indexer state")
+            elif cache.index_offset != cache.kv_cache.size():
+                raise ValueError(
+                    "QSA extend requires aligned KV and indexer widths, got "
+                    f"kv={cache.kv_cache.size()} and indexer={cache.index_offset}"
+                )
+
         sample_keys = (
             self.index_keys if self.index_keys is not None else other.index_keys
         )
-        sample_positions = (
-            self.index_position_ids
-            if self.index_position_ids is not None
-            else other.index_position_ids
-        )
-        if sample_keys is None:
+        # Prefer the WIDEST position rank over "first non-None" (#3294 item
+        # 2): promotion only widens, so a 2-D sample would strand a 3-D row
+        # with nothing to promote to, and position_axis would be picked from
+        # the wrong rank. Order-sensitive defect, so pick from both sides.
+        self_positions = self.index_position_ids
+        other_positions = other.index_position_ids
+        if (
+            self_positions is not None
+            and other_positions is not None
+            and self_positions.ndim != other_positions.ndim
+        ):
+            sample_positions = (
+                other_positions if self_positions.ndim == 2 else self_positions
+            )
+        elif self_positions is not None:
+            sample_positions = self_positions
+        else:
+            sample_positions = other_positions
+        if sample_keys is None or sample_positions is None:
+            self.kv_cache.extend(other.kv_cache)
             return
         target = max(self.index_offset, other.index_offset)
         left = self._pad_index(self, target, sample_keys, sample_positions)
         right = self._pad_index(other, target, sample_keys, sample_positions)
-        self.index_keys = mx.concatenate([left[0], right[0]], axis=0)
+        index_keys = mx.concatenate([left[0], right[0]], axis=0)
         position_axis = 1 if sample_positions.ndim == 3 else 0
-        self.index_position_ids = mx.concatenate(
+        index_position_ids = mx.concatenate(
             [left[1], right[1]], axis=position_axis
         )
+
+        self.kv_cache.extend(other.kv_cache)
+        self.index_keys = index_keys
+        self.index_position_ids = index_position_ids
         self.index_offset = target
 
     def extract(self, idx):
@@ -1374,33 +847,82 @@ class BatchQSAKVCache:
 
     @classmethod
     def merge(cls, caches):
-        caches = list(caches)
-        out = cls([0] * len(caches))
-        if not caches:
+        rows = []
+        for cache in caches:
+            if isinstance(cache, cls):
+                batch_size = int(cache.offset.shape[0])
+                if cache.kv_cache.keys is None:
+                    if cache.index_keys is not None:
+                        raise ValueError(
+                            "Cannot merge a QSA batch with indexer state but no KV state"
+                        )
+                    rows.extend(QSAKVCache() for _ in range(batch_size))
+                else:
+                    rows.extend(cache.extract(idx) for idx in range(batch_size))
+            elif isinstance(cache, QSAKVCache):
+                rows.append(cache)
+            else:
+                raise TypeError(f"Cannot merge QSA cache with {type(cache)}")
+
+        out = cls([0] * len(rows))
+        if not rows:
             return out
-        out.kv_cache = BatchKVCache.merge(caches)
-        sample = next((cache for cache in caches if cache.index_keys is not None), None)
+
+        lengths = []
+        for row in rows:
+            kv_length = int(row.offset)
+            if row.keys is None:
+                if kv_length:
+                    raise ValueError("QSA cache has a non-zero offset without KV state")
+            elif kv_length > row.keys.shape[2]:
+                raise ValueError("QSA cache offset exceeds its KV storage")
+
+            if (row.index_keys is None) != (row.index_position_ids is None):
+                raise ValueError("QSA raw keys and positions must be merged together")
+            index_length = 0 if row.index_keys is None else row.index_keys.shape[1]
+            if row.index_position_ids is not None and (
+                row.index_position_ids.ndim not in {2, 3}
+                or row.index_position_ids.shape[-1] != index_length
+            ):
+                raise ValueError("QSA raw keys and positions are misaligned")
+            if index_length != kv_length:
+                raise ValueError(
+                    "QSA merge requires aligned KV and indexer lengths, got "
+                    f"kv={kv_length} and indexer={index_length}"
+                )
+            lengths.append(index_length)
+
+        out.kv_cache = BatchKVCache.merge(rows)
+        sample = next((row for row in rows if row.index_keys is not None), None)
         if sample is None:
             return out
-        target = max(cache.offset for cache in caches)
-        rows = [
+        # Pick the widest position rank across every cache, not the first
+        # non-None sample (#3294 item 2): promotion only widens, so a 2-D
+        # first sample would strand a 3-D row at concatenate time.
+        widest_positions = sample.index_position_ids
+        for row in rows:
+            pos = row.index_position_ids
+            if pos is not None and pos.ndim > widest_positions.ndim:
+                widest_positions = pos
+        target = out.kv_cache.size()
+        if target != max(lengths):
+            raise ValueError(
+                "QSA merge produced different KV and indexer widths, got "
+                f"kv={target} and indexer={max(lengths)}"
+            )
+        padded_rows = [
             cls._pad_index(
-                SimpleNamespace(
-                    index_keys=cache.index_keys,
-                    index_position_ids=cache.index_position_ids,
-                    index_offset=cache.offset,
-                    offset=mx.array([cache.offset]),
-                ),
+                row,
                 target,
                 sample.index_keys,
-                sample.index_position_ids,
+                widest_positions,
             )
-            for cache in caches
+            for row in rows
         ]
-        out.index_keys = mx.concatenate([row[0] for row in rows], axis=0)
-        position_axis = 1 if sample.index_position_ids.ndim == 3 else 0
+        out.index_keys = mx.concatenate([row[0] for row in padded_rows], axis=0)
+        position_axis = 1 if widest_positions.ndim == 3 else 0
         out.index_position_ids = mx.concatenate(
-            [row[1] for row in rows], axis=position_axis
+            [row[1] for row in padded_rows], axis=position_axis
         )
         out.index_offset = target
         return out
@@ -1417,11 +939,10 @@ class BatchQSAKVCache:
     def trim(self, n):
         trimmed = self.kv_cache.trim(n)
         self.index_offset = max(0, self.index_offset - trimmed)
-        # Keep the physical auxiliary arrays at the committed extent.  The
-        # next update_indexer() concatenates onto these arrays and derives its
-        # new extent from shape[1]; retaining rejected verify columns here
-        # would therefore resurrect them and desynchronize QSA selection from
-        # the trimmed K/V cache (issue #3245 / PR #3246).
+        # Slice the physical arrays like the singleton trim does:
+        # update_indexer concatenates onto them and re-derives index_offset
+        # from shape[1], so stale draft columns would otherwise fossilize
+        # and desync the indexer from the KV by the trimmed amount.
         if trimmed and self.index_keys is not None:
             self.index_keys = self.index_keys[:, : self.index_offset]
             self.index_position_ids = self.index_position_ids[
@@ -1534,6 +1055,22 @@ class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
         return size + self.indexer_nbytes
 
 
+# Dispatch each decoder layer's graph to the GPU as soon as it is built (decode and
+# verify rows only) so the GPU executes layer i while the host builds layer i+1.
+# Scheduling only: outputs are bit-identical. Disable with OMLX_QWEN4_EAGER_DISPATCH=0.
+_EAGER_DISPATCH = os.environ.get("OMLX_QWEN4_EAGER_DISPATCH", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+_EAGER_DISPATCH_MAX_ROWS = 64
+# Lightning MTP verify rows through the gathered QSA arm (OMLX_QWEN4_QSA_GATHERED_VERIFY=0 disables).
+_GATHERED_VERIFY_DISABLED = os.environ.get(
+    "OMLX_QWEN4_QSA_GATHERED_VERIFY", "1"
+).strip().lower() in {"0", "false", "no", "off"}
+
+
 class Qwen4ExpRMSNorm(nn.Module):
     """Qwen4 RMSNorm, whose checkpoint weights are centered at zero."""
 
@@ -1547,14 +1084,14 @@ class Qwen4ExpRMSNorm(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         dtype = x.dtype
-        y = x.astype(mx.float32)
-        if self.group_size is not None:
-            y = y.reshape(*y.shape[:-1], -1, self.group_size)
-            weight = self.weight.reshape(-1, self.group_size)
-        else:
-            weight = self.weight
-        y = y * mx.rsqrt(mx.mean(mx.square(y), axis=-1, keepdims=True) + self.eps)
-        y = y * (1.0 + weight.astype(mx.float32))
+        scale = 1.0 + self.weight.astype(mx.float32)
+        if self.group_size is None:
+            return mx.fast.rms_norm(x, scale, self.eps).astype(dtype)
+        # rms_norm takes a 1-D weight, so a grouped norm cannot hand it the
+        # per-group scale; normalise over the group axis and scale afterwards.
+        # The scale stays fp32 -- rounding (1 + w) to bf16 costs half a ULP.
+        y = x.astype(mx.float32).reshape(*x.shape[:-1], -1, self.group_size)
+        y = mx.fast.rms_norm(y, None, self.eps) * scale.reshape(-1, self.group_size)
         return y.reshape(x.shape).astype(dtype)
 
 
@@ -1576,6 +1113,15 @@ class Qwen4ExpRMSNormGated(nn.Module):
         return (y * gate).astype(dtype)
 
 
+class _Qwen4Verifier(Qwen3_5BatchInvariantForward):
+    @staticmethod
+    def _normalize_gated_delta_qk(layer, q, k):
+        return layer._normalize_qk(q, k)
+
+
+_VERIFIER = _Qwen4Verifier()
+
+
 class Qwen4ExpGatedDeltaNet(Qwen3_5GatedDeltaNet):
     def __init__(self, config: TextConfig):
         super().__init__(config)
@@ -1592,127 +1138,6 @@ class Qwen4ExpGatedDeltaNet(Qwen3_5GatedDeltaNet):
         q = q * mx.rsqrt(mx.sum(mx.square(q), axis=-1, keepdims=True) + 1e-6)
         k = k * mx.rsqrt(mx.sum(mx.square(k), axis=-1, keepdims=True) + 1e-6)
         return q * scale, k
-
-    @staticmethod
-    def _row_mask(mask: Optional[mx.array], row: int) -> Optional[mx.array]:
-        if isinstance(mask, mx.array) and mask.ndim == 2:
-            return mask[:, row : row + 1]
-        return mask
-
-    def _tokenwise_verify(
-        self,
-        inputs: mx.array,
-        mask: Optional[mx.array],
-        cache: Any,
-        gdn_sink: list,
-    ) -> mx.array:
-        """Run one full target window through the canonical scalar GDN path.
-
-        Each row calls the official Qwen3.5 scalar implementation with
-        ``target_verify=False`` and advances the live cache chronologically.
-        The synthetic sink record keeps the existing 12-field rollback ABI:
-        post-row SSM states form ``intermediate_states`` and the chronological
-        convolution input is reconstructed from the pre-window state plus the
-        newest scalar cache slot after every row.  The inherited Qwen3.5/Qwen4
-        rollback therefore selects an accepted prefix without a second or
-        approximate recurrent replay.
-        """
-
-        batch, width, _ = inputs.shape
-        existing_conv = cache[0]
-        if existing_conv is not None and existing_conv.shape[0] == batch:
-            initial_conv = existing_conv + mx.zeros((), dtype=existing_conv.dtype)
-        else:
-            initial_conv = mx.zeros(
-                (batch, self.conv_kernel_size - 1, self.conv_dim),
-                dtype=inputs.dtype,
-            )
-
-        existing_state = cache[1]
-        if existing_state is not None and existing_state.shape[0] == batch:
-            initial_state = existing_state + mx.zeros((), dtype=existing_state.dtype)
-        else:
-            initial_state = None
-
-        outputs = []
-        conv_tokens = []
-        intermediate_states = []
-        for row in range(width):
-            output = super().__call__(
-                inputs[:, row : row + 1],
-                mask=self._row_mask(mask, row),
-                cache=cache,
-                gdn_sink=None,
-                target_verify=False,
-            )
-            if cache[0] is None or cache[1] is None:
-                raise RuntimeError(
-                    "Qwen4 scalar GDN verification did not publish both cache states"
-                )
-            outputs.append(output)
-            conv_tokens.append(
-                cache[0][:, -1:, :] + mx.zeros((), dtype=cache[0].dtype)
-            )
-            intermediate_states.append(
-                cache[1] + mx.zeros((), dtype=cache[1].dtype)
-            )
-
-        conv_input = mx.concatenate([initial_conv, *conv_tokens], axis=1)
-        states = mx.stack(intermediate_states, axis=1)
-        # The inherited rollback fast path consumes fields 7, 9, 10 and 11.
-        # Keep every legacy slot in place so no caller or model ABI changes.
-        gdn_sink.append(
-            (
-                None,  # q: unused when intermediate states are present
-                None,  # k
-                None,  # v
-                None,  # a
-                None,  # b
-                self.A_log,
-                self.dt_bias,
-                initial_state,
-                mask,
-                conv_input,
-                self.conv_kernel_size,
-                states,
-            )
-        )
-        return mx.concatenate(outputs, axis=1)
-
-    def __call__(
-        self,
-        inputs: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-        gdn_sink: Optional[list] = None,
-        target_verify: bool = False,
-    ) -> mx.array:
-        verify = target_verify or gdn_sink is not None
-        if (
-            verify
-            and _tokenwise_gdn_verify_enabled()
-            and inputs.ndim == 3
-            and inputs.shape[0] == 1
-            and inputs.shape[1] in _HC_FUSED_VERIFY_WIDTHS
-            and cache is not None
-            and gdn_sink is not None
-        ):
-            output = self._tokenwise_verify(inputs, mask, cache, gdn_sink)
-            global _TOKENWISE_GDN_VERIFY_LOGGED
-            if not _TOKENWISE_GDN_VERIFY_LOGGED:
-                _TOKENWISE_GDN_VERIFY_LOGGED = True
-                logger.info(
-                    "Qwen4 tokenwise GDN target-verify diagnostic active (M=%d)",
-                    inputs.shape[1],
-                )
-            return output
-        return super().__call__(
-            inputs,
-            mask=mask,
-            cache=cache,
-            gdn_sink=gdn_sink,
-            target_verify=target_verify,
-        )
 
 
 class Qwen4ExpQSAIndexer(nn.Module):
@@ -1737,16 +1162,12 @@ class Qwen4ExpQSAIndexer(nn.Module):
 
     @staticmethod
     def _default_position_ids(batch: int, start: int, length: int):
-        steps = mx.arange(length, dtype=mx.int32)
-        if isinstance(start, mx.array):
-            starts = start.astype(mx.int32)
-        else:
-            starts = mx.array(start, dtype=mx.int32)
-        if starts.ndim == 0:
-            starts = mx.broadcast_to(starts, (batch,))
-        else:
-            starts = starts.reshape(-1)[:batch]
-        return starts[:, None] + steps[None, :]
+        if isinstance(start, mx.array) and start.ndim == 1:
+            return mx.maximum(start[:batch], 0)[:, None] + mx.arange(
+                length, dtype=mx.int32
+            )[None, :]
+        positions = mx.arange(start, start + length, dtype=mx.int32)
+        return mx.broadcast_to(positions[None], (batch, length))
 
     def _apply_rope(self, x: mx.array, position_ids: mx.array) -> mx.array:
         # MRoPE's helper applies the same partial rotary transform to both
@@ -1761,8 +1182,10 @@ class Qwen4ExpQSAIndexer(nn.Module):
         position_ids: Optional[mx.array],
         target_verify: bool = False,
     ) -> Optional[mx.array]:
-        projected = _target_verify_linear(
-            self.index_qk_proj, hidden_states, target_verify
+        projected = (
+            _target_verify_linear(self.index_qk_proj, hidden_states)
+            if target_verify
+            else self.index_qk_proj(hidden_states)
         )
         return self.from_projected(projected, cache, position_ids)
 
@@ -1774,9 +1197,63 @@ class Qwen4ExpQSAIndexer(nn.Module):
     ) -> Optional[mx.array]:
         batch, seq_len, _ = qk.shape
         past_len = cache.offset if cache is not None else 0
-        batched_offsets = isinstance(past_len, mx.array) and past_len.ndim > 0
         if position_ids is None:
             position_ids = self._default_position_ids(batch, past_len, seq_len)
+
+        if (
+            isinstance(cache, BatchQSAKVCache)
+            and (cache.index_offset + seq_len) // self.compress_ratio > self.block_topk
+        ):
+            # Block pooling is anchored at each request's first real token,
+            # not at column zero of the left-padded batch.
+            row_masks = []
+            key_length = cache.index_offset + seq_len
+            for i, padding in enumerate(cache.left_padding.tolist()):
+                input_padding = min(seq_len, max(0, padding - cache.index_offset))
+                width = max(0, key_length - padding)
+                if input_padding == seq_len:
+                    row_masks.append(
+                        mx.zeros((1, 1, seq_len, key_length), dtype=mx.bool_)
+                    )
+                    continue
+                row_cache = QSAKVCache()
+                row_cache.offset = max(0, cache.index_offset - padding)
+                if cache.index_keys is not None:
+                    row_cache.index_keys = cache.index_keys[
+                        i : i + 1, padding : cache.index_offset
+                    ]
+                    positions = cache.index_position_ids
+                    row_cache.index_position_ids = (
+                        positions[:, i : i + 1, padding : cache.index_offset]
+                        if positions.ndim == 3
+                        else positions[i : i + 1, padding : cache.index_offset]
+                    )
+                row_positions = (
+                    position_ids[:, i : i + 1, input_padding:]
+                    if position_ids.ndim == 3
+                    else position_ids[i : i + 1, input_padding:]
+                )
+                row_mask = self.from_projected(
+                    qk[i : i + 1, input_padding:], row_cache, row_positions
+                )
+                if row_mask is None:
+                    ends = (
+                        width
+                        - (seq_len - input_padding)
+                        + mx.arange(seq_len - input_padding)
+                        + 1
+                    )
+                    row_mask = (mx.arange(width)[None, :] < ends[:, None])[None, None]
+                row_masks.append(
+                    mx.pad(row_mask, [(0, 0), (0, 0), (input_padding, 0), (padding, 0)])
+                )
+            raw_keys = qk.reshape(
+                batch, seq_len, self.n_heads + self.kv_heads, self.head_dim
+            )
+            cache.update_indexer(
+                raw_keys[:, :, self.n_heads :].squeeze(2), position_ids
+            )
+            return mx.concatenate(row_masks, axis=0)
 
         qk = qk.reshape(batch, seq_len, self.n_heads + self.kv_heads, self.head_dim)
         query = qk[:, :, : self.n_heads]
@@ -1789,53 +1266,11 @@ class Qwen4ExpQSAIndexer(nn.Module):
             full_position_ids = position_ids
 
         key_len = raw_keys.shape[1]
-        left_padding = None
-        pooled_raw_keys = raw_keys
-        pooled_position_ids = full_position_ids
-        if batched_offsets:
-            # BatchKVCache stores unequal histories right-aligned.  QSA block
-            # boundaries, however, are defined from each sequence's logical
-            # token zero, not from physical column zero.  Compact each row
-            # virtually before four-token pooling so a left pad of 1..3 does
-            # not shift every micro-block or let padding participate in top-k.
-            left_padding = getattr(cache, "left_padding", None)
-            if not (
-                isinstance(left_padding, mx.array)
-                and left_padding.ndim > 0
-                and left_padding.size >= batch
-            ):
-                # The auxiliary selector cannot prove row alignment.  The
-                # caller will retain the ordinary dense attention mask.
-                return None
-            left_padding = left_padding.reshape(-1)[:batch].astype(mx.int32)
-            logical_indices = mx.arange(key_len, dtype=mx.int32)[None, :]
-            physical_indices = left_padding[:, None] + logical_indices
-            physical_indices = mx.minimum(physical_indices, key_len - 1)
-            key_gather = mx.broadcast_to(
-                physical_indices[..., None],
-                (batch, key_len, raw_keys.shape[-1]),
-            )
-            pooled_raw_keys = mx.take_along_axis(
-                raw_keys,
-                key_gather,
-                axis=1,
-            )
-            if full_position_ids.ndim == 3:
-                position_gather = mx.broadcast_to(
-                    physical_indices[None],
-                    (full_position_ids.shape[0], batch, key_len),
-                )
-                pooled_position_ids = mx.take_along_axis(
-                    full_position_ids,
-                    position_gather,
-                    axis=2,
-                )
-            else:
-                pooled_position_ids = mx.take_along_axis(
-                    full_position_ids,
-                    physical_indices,
-                    axis=1,
-                )
+        if isinstance(past_len, mx.array):
+            # Batched rows carry per-row KV offsets, but the indexer cache is
+            # left-padded to one width; the masks below need aligned-column
+            # scalars or the (batch,) offsets broadcast into the seq axis.
+            past_len = key_len - seq_len
         max_complete_blocks = key_len // self.compress_ratio
         if max_complete_blocks <= self.block_topk:
             return None
@@ -1851,8 +1286,8 @@ class Qwen4ExpQSAIndexer(nn.Module):
             )
         else:
             pooled_keys = pool_completed_index_keys(
-                pooled_raw_keys,
-                pooled_position_ids,
+                raw_keys,
+                full_position_ids,
                 compress_ratio=self.compress_ratio,
                 index_key_norm=self.k_layernorm,
                 apply_index_rope=self._apply_rope,
@@ -1867,22 +1302,11 @@ class Qwen4ExpQSAIndexer(nn.Module):
         scores = mx.sum(mx.maximum(scores, 0), axis=1)
         scores = scores / math.sqrt(self.head_dim)
 
-        query_steps = mx.arange(seq_len, dtype=mx.int32)
-        if batched_offsets:
-            query_ends = (
-                past_len.reshape(-1)[:batch, None].astype(mx.int32)
-                + query_steps[None, :]
-                + 1
-            )
-        else:
-            query_ends = mx.broadcast_to(
-                (past_len + query_steps + 1)[None],
-                (batch, seq_len),
-            )
+        query_ends = past_len + mx.arange(seq_len) + 1
         complete_counts = query_ends // self.compress_ratio
         valid_blocks = (
             mx.arange(max_complete_blocks)[None, None, :]
-            < complete_counts[..., None]
+            < complete_counts[None, :, None]
         )
         scores = mx.where(valid_blocks, scores, -mx.inf)
         selected_blocks = mx.argpartition(scores, kth=-self.block_topk, axis=-1)[
@@ -1913,31 +1337,14 @@ class Qwen4ExpQSAIndexer(nn.Module):
 
         token_indices = mx.arange(key_len)
         tail_starts = complete_counts * self.compress_ratio
-        tail = (token_indices[None, None, :] >= tail_starts[..., None]) & (
-            token_indices[None, None, :] < query_ends[..., None]
+        tail = (token_indices[None, None, :] >= tail_starts[None, :, None]) & (
+            token_indices[None, None, :] < query_ends[None, :, None]
         )
-        causal = token_indices[None, None, :] < query_ends[..., None]
+        causal = token_indices[None, None, :] < query_ends[None, :, None]
         use_sparse = complete_counts > self.block_topk
         selected_tokens = mx.where(
-            use_sparse[..., None], selected_tokens | tail, causal
+            use_sparse[None, :, None], selected_tokens | tail, causal
         )
-        if left_padding is not None:
-            # Convert the logical selector mask back to the physical,
-            # right-aligned BatchKVCache columns consumed by attention.
-            physical_indices = mx.arange(key_len, dtype=mx.int32)[None, :]
-            logical_indices = physical_indices - left_padding[:, None]
-            valid_physical = logical_indices >= 0
-            logical_indices = mx.maximum(logical_indices, 0)
-            token_gather = mx.broadcast_to(
-                logical_indices[:, None, :],
-                (batch, seq_len, key_len),
-            )
-            selected_tokens = mx.take_along_axis(
-                selected_tokens,
-                token_gather,
-                axis=-1,
-            )
-            selected_tokens = selected_tokens & valid_physical[:, None, :]
         return selected_tokens[:, None]
 
 
@@ -1953,159 +1360,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         position_ids: Optional[mx.array],
         length: int,
     ) -> bool:
-        """Accept absent or shape-matched 2-D text positions, never MRoPE."""
+        """Accept absent, 2-D text, or broadcast-identical 3-D text mRoPE."""
 
-        return position_ids is None or bool(
-            isinstance(position_ids, mx.array)
-            and position_ids.ndim == 2
-            and position_ids.shape == (1, length)
-        )
-
-    def _tokenwise_text_verify_eligible(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array],
-        cache: Optional[Any],
-        position_ids: Optional[mx.array],
-        position_embeddings: Optional[tuple[mx.array, mx.array]],
-        target_verify: bool,
-    ) -> bool:
-        """Admit only a restorable B1 text verifier with aligned QSA state."""
-
-        supported_mask = (
-            mask is None
-            or (isinstance(mask, str) and mask == "causal")
-            or isinstance(mask, mx.array)
-        )
-        if not (
-            target_verify
-            and _tokenwise_qsa_verify_enabled()
-            and x.ndim == 3
-            and x.shape[0] == 1
-            and 2 <= x.shape[1] <= 9
-            and supported_mask
-            and type(cache) is QSAKVCache
-            and isinstance(cache.offset, int)
-            and position_embeddings is None
-            and self._batch_one_text_position_ids(position_ids, x.shape[1])
-        ):
-            return False
-
-        if cache.offset:
-            if cache.index_keys is None or cache.index_position_ids is None:
-                return False
-            if (
-                cache.index_keys.shape[1] != cache.offset
-                or cache.index_position_ids.shape[-1] != cache.offset
-            ):
-                return False
-        return True
-
-    @staticmethod
-    def _slice_tokenwise_verify_mask(
-        mask,
-        *,
-        row: int,
-        width: int,
-        visible_tokens: int,
-    ):
-        if mask is None or isinstance(mask, str):
-            return mask
-        if not isinstance(mask, mx.array):
-            raise ValueError("Qwen4 tokenwise QSA received an unsupported mask")
-        if mask.ndim == 2:
-            if mask.shape == (1, width):
-                return mask[:, row : row + 1]
-            if mask.shape[0] == width and mask.shape[1] >= visible_tokens:
-                return mask[row : row + 1, :visible_tokens]
-            raise ValueError("Qwen4 tokenwise QSA rank-two mask is not row aligned")
-        if mask.ndim not in {3, 4} or mask.shape[-2] not in {1, width}:
-            raise ValueError("Qwen4 tokenwise QSA attention mask is not row aligned")
-        if mask.shape[-1] < visible_tokens:
-            raise ValueError("Qwen4 tokenwise QSA attention mask has a short key axis")
-        row_mask = mask if mask.shape[-2] == 1 else mask[..., row : row + 1, :]
-        return row_mask[..., :visible_tokens]
-
-    @staticmethod
-    def _restore_tokenwise_qsa_offset(cache: QSAKVCache, start_offset: int) -> None:
-        if cache.offset < start_offset:
-            raise RuntimeError("Qwen4 tokenwise QSA cache rewound below its start")
-        advanced = cache.offset - start_offset
-        if advanced:
-            trimmed = cache.trim(advanced)
-            if trimmed != advanced:
-                raise RuntimeError("Qwen4 tokenwise QSA cache trim was incomplete")
-        elif getattr(cache, "_index_offset", start_offset) > start_offset:
-            cache._trim_indexer(start_offset)
-        if cache.offset != start_offset or getattr(
-            cache, "_index_offset", start_offset
-        ) != start_offset:
-            raise RuntimeError("Qwen4 tokenwise QSA cache failed to restore")
-
-    def _tokenwise_text_verify(
-        self,
-        x: mx.array,
-        mask,
-        cache: QSAKVCache,
-        position_ids: Optional[mx.array],
-    ) -> mx.array | None:
-        """Run one ordinary scalar QSA call per verifier row transactionally."""
-
-        width = x.shape[1]
-        start_offset = cache.offset
-        try:
-            row_positions = [
-                None
-                if position_ids is None
-                else position_ids[:, row : row + 1]
-                for row in range(width)
-            ]
-            row_masks = [
-                self._slice_tokenwise_verify_mask(
-                    mask,
-                    row=row,
-                    width=width,
-                    visible_tokens=start_offset + row + 1,
-                )
-                for row in range(width)
-            ]
-            outputs = [
-                self(
-                    x[:, row : row + 1],
-                    mask=row_masks[row],
-                    cache=cache,
-                    position_ids=row_positions[row],
-                    position_embeddings=None,
-                    target_verify=False,
-                )
-                for row in range(width)
-            ]
-            expected_offset = start_offset + width
-            if (
-                cache.offset != expected_offset
-                or cache.index_keys is None
-                or cache.index_position_ids is None
-                or cache.index_keys.shape[1] != expected_offset
-                or cache.index_position_ids.shape[-1] != expected_offset
-            ):
-                raise RuntimeError("Qwen4 tokenwise QSA rows advanced unevenly")
-            output = mx.concatenate(outputs, axis=1)
-        except Exception as exc:
-            self._restore_tokenwise_qsa_offset(cache, start_offset)
-            logger.debug(
-                "Qwen4 tokenwise QSA target-verify diagnostic failed closed: %s",
-                exc,
-            )
-            return None
-
-        global _TOKENWISE_QSA_VERIFY_LOGGED
-        if not _TOKENWISE_QSA_VERIFY_LOGGED:
-            _TOKENWISE_QSA_VERIFY_LOGGED = True
-            logger.info(
-                "Qwen4 tokenwise QSA target-verify diagnostic active (M=%d)",
-                width,
-            )
-        return output
+        return _broadcast_text_mrope_position_ids(position_ids, length)
 
     def _gathered_text_prefill_eligible(
         self,
@@ -2122,7 +1379,10 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         if not (
             x.ndim == 3
             and x.shape[0] == 1
-            and x.shape[1] > 1
+            # Narrow multi-row windows (Lightning MTP history/verify passes)
+            # are cheaper on the official masked path; see
+            # _gathered_min_query_tokens.
+            and x.shape[1] >= _gathered_min_query_tokens()
             and causal_mask
             and type(cache) is QSAKVCache
             and isinstance(cache.offset, int)
@@ -2147,7 +1407,12 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         position_embeddings: Optional[tuple[mx.array, mx.array]],
         target_verify: bool,
     ) -> bool:
-        """Fail closed outside scalar-offset batch-one text decode."""
+        """Fail closed outside scalar-offset batch-one text decode.
+
+        Prefill may accept broadcast-identical 3-D text mRoPE. Decode keeps
+        the 2-D / absent predicate until that arm has its own numerical
+        parity coverage.
+        """
 
         causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
         if not (
@@ -2158,7 +1423,13 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             and isinstance(cache.offset, int)
             and position_embeddings is None
             and not target_verify
-            and self._batch_one_text_position_ids(position_ids, 1)
+            and (
+                position_ids is None
+                or (
+                    position_ids.ndim == 2
+                    and tuple(position_ids.shape) == (1, 1)
+                )
+            )
         ):
             return False
 
@@ -2186,32 +1457,23 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         position_embeddings: Optional[tuple[mx.array, mx.array]],
         target_verify: bool,
     ) -> bool:
-        """Admit only the exact batch-one Lightning-MTP verify geometry.
+        """Lightning MTP verify rows (batch-one text, rank-two positions, aligned
+        indexer) attend only the selected blocks; rollback is unaffected."""
 
-        The general target-verify implementation evaluates each row against
-        the full K/V cache.  QSA selection is still exact, but the boolean mask
-        does not make dense SDPA sparse.  This route preserves each verify
-        position's selector and causal boundary while sending the whole window
-        through the same direct selected-block implementation as prefill.
-        """
-
+        if _GATHERED_VERIFY_DISABLED or not target_verify:
+            return False
         causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
         if not (
-            target_verify
-            and x.ndim == 3
+            x.ndim == 3
             and x.shape[0] == 1
-            and 2 <= x.shape[1] <= 9
+            and x.shape[1] > 1
             and causal_mask
             and type(cache) is QSAKVCache
             and isinstance(cache.offset, int)
             and position_embeddings is None
-            and self._batch_one_text_position_ids(position_ids, x.shape[1])
+            and _rank_two_text_position_ids(position_ids, x.shape[1])
         ):
             return False
-
-        # A speculative rollback must restore all four QSA cache components.
-        # Never enter the direct route if a restored/foreign cache omitted or
-        # misaligned the auxiliary indexer state.
         if cache.offset:
             if cache.index_keys is None or cache.index_position_ids is None:
                 return False
@@ -2220,35 +1482,24 @@ class Qwen4ExpAttention(Qwen3_5Attention):
                 or cache.index_position_ids.shape[-1] != cache.offset
             ):
                 return False
-
-        prospective_tokens = cache.offset + x.shape[1]
-        prospective_blocks = prospective_tokens // self.indexer.compress_ratio
-        return _qsa_verify_sparse_threshold_met(
-            prospective_tokens,
-            prospective_blocks,
-            self.indexer.block_topk,
-        )
+        return cache.offset + x.shape[1] > self.indexer.token_budget
 
     def _gathered_text_prefill(
         self,
         x: mx.array,
         cache: QSAKVCache,
         position_ids: Optional[mx.array] = None,
-        *,
         target_verify: bool = False,
     ) -> mx.array:
-        """Project once, append both caches, and attend only to selected K/V.
-
-        ``target_verify`` retains the canonical verify-shaped projection
-        routing while the direct QSA kernel evaluates every verify row's own
-        exact selected block set and causal tail.
-        """
+        """Project once, append both caches, and attend only to selected K/V."""
 
         batch, length, _ = x.shape
-        q_proj_output, keys, values = _target_verify_linears(
-            (self.q_proj, self.k_proj, self.v_proj),
-            x,
-            target_verify,
+        q_proj_output, keys, values = (
+            _target_verify_linears((self.q_proj, self.k_proj, self.v_proj), x)
+            if target_verify
+            else tuple(
+                projection(x) for projection in (self.q_proj, self.k_proj, self.v_proj)
+            )
         )
         queries, gate = mx.split(
             q_proj_output.reshape(batch, length, self.num_attention_heads, -1),
@@ -2265,17 +1516,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         ).transpose(0, 2, 1, 3)
 
         past_len = cache.offset
-        if position_ids is None:
-            text_position_ids = mx.arange(
-                past_len, past_len + length, dtype=mx.int32
-            )[None]
-            rotary_position_ids = mx.broadcast_to(
-                text_position_ids,
-                (3, batch, length),
-            )
-        else:
-            text_position_ids = position_ids
-            rotary_position_ids = position_ids
+        text_position_ids, rotary_position_ids = _split_text_mrope_positions(
+            position_ids, batch, length, past_len
+        )
         queries, keys = self.rotary_emb.apply_rotary(
             queries,
             keys,
@@ -2284,10 +1527,10 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         )
         keys, values = cache.update_and_fetch(keys, values)
 
-        projected = _target_verify_linear(
-            self.indexer.index_qk_proj,
-            x,
-            target_verify,
+        projected = (
+            _target_verify_linear(self.indexer.index_qk_proj, x)
+            if target_verify
+            else self.indexer.index_qk_proj(x)
         ).reshape(
             batch,
             length,
@@ -2313,28 +1556,49 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             text_position_ids,
         ).transpose(0, 2, 1, 3)
 
-        output = contiguous_causal_gathered_qsa(
-            queries,
-            keys,
-            values,
-            index_queries,
-            raw_index_keys,
-            full_position_ids,
-            num_query_heads=self.num_attention_heads,
-            num_key_value_heads=self.num_key_value_heads,
-            head_dim=self.head_dim,
-            indexer_head_dim=self.indexer.head_dim,
-            compress_ratio=self.indexer.compress_ratio,
-            token_budget=self.indexer.token_budget,
-            index_key_norm=self.indexer.k_layernorm,
-            apply_index_rope=self.indexer._apply_rope,
-            pooled_index_keys=pooled_index_keys,
-        )
+        # Rows that see at most the QSA block budget select every visible
+        # block, so they are plain causal attention over the cached prefix.
+        dense_rows = self.indexer.token_budget + self.indexer.compress_ratio - 1
+        dense_rows = min(length, max(0, dense_rows - past_len))
+        if length - dense_rows == 1:
+            dense_rows -= 1  # Gathered QSA needs at least two query rows.
+        outputs = []
+        if dense_rows:
+            outputs.append(
+                mx.fast.scaled_dot_product_attention(
+                    queries[:, :, :dense_rows],
+                    keys[:, :, : past_len + dense_rows],
+                    values[:, :, : past_len + dense_rows],
+                    scale=self.scale,
+                    mask="causal",
+                ).transpose(0, 2, 1, 3)
+            )
+        if dense_rows < length:
+            outputs.append(
+                contiguous_causal_gathered_qsa(
+                    queries[:, :, dense_rows:],
+                    keys,
+                    values,
+                    index_queries[:, dense_rows:],
+                    raw_index_keys,
+                    full_position_ids,
+                    num_query_heads=self.num_attention_heads,
+                    num_key_value_heads=self.num_key_value_heads,
+                    head_dim=self.head_dim,
+                    indexer_head_dim=self.indexer.head_dim,
+                    compress_ratio=self.indexer.compress_ratio,
+                    token_budget=self.indexer.token_budget,
+                    index_key_norm=self.indexer.k_layernorm,
+                    apply_index_rope=self.indexer._apply_rope,
+                    pooled_index_keys=pooled_index_keys,
+                )
+            )
+        output = outputs[0] if len(outputs) == 1 else mx.concatenate(outputs, axis=1)
         output = output.reshape(batch, length, -1)
-        return _target_verify_linear(
-            self.o_proj,
-            output * mx.sigmoid(gate),
-            target_verify,
+        return (
+            _target_verify_linear(self.o_proj, output * mx.sigmoid(gate))
+            if target_verify
+            else self.o_proj(output * mx.sigmoid(gate))
         )
 
     def _gathered_text_decode(
@@ -2346,10 +1610,10 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         """Append one token and attend only to QSA-selected cached K/V rows."""
 
         batch, length, _ = x.shape
-        q_proj_output, new_keys, new_values = _target_verify_linears(
-            (self.q_proj, self.k_proj, self.v_proj),
-            x,
-            False,
+        q_proj_output, new_keys, new_values = (
+            self.q_proj(x),
+            self.k_proj(x),
+            self.v_proj(x),
         )
         queries, gate = mx.split(
             q_proj_output.reshape(batch, length, self.num_attention_heads, -1),
@@ -2374,19 +1638,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         ).transpose(0, 2, 1, 3)
 
         past_len = cache.offset
-        if position_ids is None:
-            text_position_ids = mx.arange(
-                past_len,
-                past_len + 1,
-                dtype=mx.int32,
-            )[None]
-            rotary_position_ids = mx.broadcast_to(
-                text_position_ids,
-                (3, batch, length),
-            )
-        else:
-            text_position_ids = position_ids
-            rotary_position_ids = position_ids
+        text_position_ids, rotary_position_ids = _split_text_mrope_positions(
+            position_ids, batch, length, past_len
+        )
         queries, new_keys = self.rotary_emb.apply_rotary(
             queries,
             new_keys,
@@ -2442,38 +1696,6 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
         target_verify: bool = False,
     ) -> mx.array:
-        if self._tokenwise_text_verify_eligible(
-            x,
-            mask,
-            cache,
-            position_ids,
-            position_embeddings,
-            target_verify,
-        ):
-            tokenwise = self._tokenwise_text_verify(
-                x,
-                mask,
-                cache,
-                position_ids,
-            )
-            if tokenwise is not None:
-                return tokenwise
-
-        if self._gathered_text_verify_eligible(
-            x,
-            mask,
-            cache,
-            position_ids,
-            position_embeddings,
-            target_verify,
-        ):
-            return self._gathered_text_prefill(
-                x,
-                cache,
-                position_ids,
-                target_verify=True,
-            )
-
         if self._gathered_text_decode_eligible(
             x,
             mask,
@@ -2492,8 +1714,24 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             position_embeddings,
             target_verify,
         ):
+            cache._omlx_last_prefill_gathered = True
             return self._gathered_text_prefill(x, cache, position_ids)
 
+        if self._gathered_text_verify_eligible(
+            x,
+            mask,
+            cache,
+            position_ids,
+            position_embeddings,
+            target_verify,
+        ):
+            cache._omlx_last_prefill_gathered = True
+            return self._gathered_text_prefill(
+                x, cache, position_ids, target_verify=True
+            )
+
+        if cache is not None and x.ndim == 3 and x.shape[1] > 1:
+            cache._omlx_last_prefill_gathered = False
         qsa_mask = self.indexer(
             x,
             cache,
@@ -2509,16 +1747,19 @@ class Qwen4ExpAttention(Qwen3_5Attention):
                 else:
                     sparse_bias = mx.where(qsa_mask, 0.0, -mx.inf).astype(mask.dtype)
                     mask = mask + sparse_bias
-            # The specialized left-padded decode path remains dense. It is
-            # uncommon, and preserving its row-specific cache semantics is
-            # preferable to applying an incorrectly aligned sparse mask.
+            elif isinstance(mask, str) and mask == "left_padded_decode":
+                # The indexer mask already includes each row's left padding.
+                mask = qsa_mask
+        if target_verify:
+            return _VERIFIER._attention(
+                self, x, mask, cache, position_ids, position_embeddings
+            )
         return super().__call__(
             x,
             mask=mask,
             cache=cache,
             position_ids=position_ids,
             position_embeddings=position_embeddings,
-            target_verify=target_verify,
         )
 
 
@@ -2545,7 +1786,24 @@ class Qwen4ExpGatedResidual(nn.Module):
                 hc_hidden_size, self.hc_count, bias=False
             )
 
-    def __call__(self, hyper_input: mx.array, target_verify: bool = False):
+    def __call__(
+        self, hyper_input: mx.array, target_verify: bool = False, write=None
+    ):
+        # ``write`` is a pending (branch, gate) residual write onto hyper_input.
+        if write is not None:
+            if not target_verify and hc_fused.prefill_compatible(self, hyper_input):
+                fused = hc_fused.prefill_forward(self, hyper_input, write)
+                if fused is not None:
+                    return fused
+            hyper_input = _hc_write(hyper_input, *write)
+        if hc_fused.compatible(self, hyper_input):
+            fused = hc_fused.fused_forward(self, hyper_input)
+            if fused is not None:
+                return fused
+        if not target_verify and hc_fused.prefill_compatible(self, hyper_input):
+            fused = hc_fused.prefill_forward(self, hyper_input)
+            if fused is not None:
+                return fused
         compiled_forward = getattr(self, "_compiled_forward", None)
         if (
             compiled_forward is not None
@@ -2553,43 +1811,20 @@ class Qwen4ExpGatedResidual(nn.Module):
             and hyper_input.ndim == 3
             and hyper_input.shape[:2] == (1, 1)
             and hyper_input.dtype == mx.bfloat16
+            and not get_mtp_runtime().enabled
         ):
             return compiled_forward(hyper_input)
         return self._forward(hyper_input, target_verify=target_verify)
 
     def _forward(self, hyper_input: mx.array, target_verify: bool = False):
         normed = self.hc_norm(hyper_input)
-        verified_fused = _exact_hc_verify_projection(
-            self,
-            normed,
-            target_verify,
-        )
-        fused_projection = getattr(
-            self,
-            "_omlx_exact_verify_fused_projection",
-            None,
-        )
-        if (
-            verified_fused is None
-            and fused_projection is not None
-            and hyper_input.ndim == 3
-            and hyper_input.shape[0] == 1
-            and hyper_input.shape[-1] == 10240
-            and hyper_input.shape[1] in _HC_FUSED_VERIFY_WIDTHS
-            and hyper_input.dtype == mx.bfloat16
-        ):
-            # Actual q4/q5/q6/q8 banks are raw-array equal to the canonical
-            # split projections only for the explicitly qualified MTP widths.
-            # Width one belongs to the hybrid kernel; every other width keeps
-            # the raw two-bank fallback (long prefill included).
-            verified_fused = fused_projection(normed)
         hybrid = None
         if (
-            verified_fused is None
-            and getattr(self, "_omlx_exact_hybrid_projection", False)
+            getattr(self, "_omlx_exact_hybrid_projection", False)
             and not target_verify
             and hyper_input.shape == (1, 1, 10240)
             and hyper_input.dtype == mx.bfloat16
+            and not get_mtp_runtime().enabled
         ):
             from .hc_projection import hybrid_projection
 
@@ -2599,32 +1834,31 @@ class Qwen4ExpGatedResidual(nn.Module):
                 self.block_inject_weight,
             )
         input_inject_weight = getattr(self, "input_inject_weight", None)
-        if verified_fused is not None:
-            mix = verified_fused[..., : self.hc_lowrank]
-            block_injection = verified_fused[
-                ..., self.hc_lowrank : self.hc_lowrank + self.hc_count
-            ]
-        elif hybrid is not None:
+        if hybrid is not None:
             mix = hybrid[..., : self.hc_lowrank]
             block_injection = hybrid[
                 ..., self.hc_lowrank : self.hc_lowrank + self.hc_count
             ]
         elif input_inject_weight is None:
-            mix = _target_verify_linear(
-                self.input_mix_weight_down, normed, target_verify
+            mix = (
+                _target_verify_linear(self.input_mix_weight_down, normed)
+                if target_verify
+                else self.input_mix_weight_down(normed)
             )
             block_injection = (
-                _target_verify_linear(
-                    self.block_inject_weight, normed, target_verify
+                (
+                    _target_verify_linear(self.block_inject_weight, normed)
+                    if target_verify
+                    else self.block_inject_weight(normed)
                 )
                 if "block_inject_weight" in self
                 else None
             )
         else:
-            combined = _target_verify_linear(
-                input_inject_weight,
-                normed,
-                target_verify,
+            combined = (
+                _target_verify_linear(input_inject_weight, normed)
+                if target_verify
+                else input_inject_weight(normed)
             )
             indices = _HYPER_SPLIT_INDICES.get((self.hc_lowrank, self.hc_count))
             if indices is None:
@@ -2642,10 +1876,10 @@ class Qwen4ExpGatedResidual(nn.Module):
 
         mix = nn.silu(mix / self.hc_count)
         mix = mx.sigmoid(
-            _target_verify_linear(
-                self.input_mix_weight_up,
-                mix,
-                target_verify,
+            (
+                _target_verify_linear(self.input_mix_weight_up, mix)
+                if target_verify
+                else self.input_mix_weight_up(mix)
             )
         )
         mix = mix.reshape(*mix.shape[:-1], self.hc_count, self.hidden_size)
@@ -2729,41 +1963,6 @@ def _can_prepare_exact_hybrid(module: Qwen4ExpGatedResidual) -> bool:
     )
 
 
-def _build_exact_verify_fused_projection(module: Qwen4ExpGatedResidual):
-    """Create a separate N=324 bank while retaining both checkpoint banks."""
-
-    down = module.input_mix_weight_down
-    injection = module.block_inject_weight
-    fused = nn.QuantizedLinear.__new__(nn.QuantizedLinear)
-    nn.Module.__init__(fused)
-    fused.group_size = down.group_size
-    fused.bits = down.bits
-    fused.mode = down.mode
-    fused.weight = mx.concatenate([down.weight, injection.weight], axis=0)
-    fused.scales = mx.concatenate([down.scales, injection.scales], axis=0)
-    fused.biases = mx.concatenate([down.biases, injection.biases], axis=0)
-    fused.freeze()
-    mx.eval(fused.weight, fused.scales, fused.biases)
-    return fused
-
-
-def hyper_connection_fused_copy_nbytes(model: nn.Module) -> int:
-    """Return retained verify-copy bytes without double-counting modules."""
-
-    total = 0
-    seen = set()
-    for module in _unique_hyper_connections(model):
-        fused = getattr(module, "_omlx_exact_verify_fused_projection", None)
-        if fused is None or id(fused) in seen:
-            continue
-        seen.add(id(fused))
-        total += sum(
-            value.nbytes
-            for value in (fused.weight, fused.scales, fused.biases)
-        )
-    return int(total)
-
-
 def _unique_hyper_connections(model: nn.Module):
     modules = [model]
     modules.extend(module for _, module in model.named_modules() if module is not model)
@@ -2777,12 +1976,12 @@ def _unique_hyper_connections(model: nn.Module):
 
 
 def fuse_hyper_connection_projections(model: nn.Module) -> int:
-    """Prepare exact scalar-decode and bounded MTP-verify projections.
+    """Prepare the lossless one-dispatch Qwen4 decode projection.
 
-    The raw 320-row low-rank and four-row injection banks remain authoritative.
-    Scalar decode uses their exact hybrid kernel. A separate concatenated copy
-    is retained only for raw-array-qualified sequence widths 2..9; all other
-    widths, including long prefill, execute the canonical split banks.
+    The tempting 324-row concatenation was rejected because MLX changes its
+    QMV traversal at that width and can change raw BF16 outputs.  The raw
+    320-row low-rank and four-row injection banks deliberately remain separate
+    so every fallback retains the checkpoint's canonical two projections.
     """
     targets = [
         module
@@ -2792,9 +1991,6 @@ def fuse_hyper_connection_projections(model: nn.Module) -> int:
     ]
     for module in targets:
         module._omlx_exact_hybrid_projection = True
-        module._omlx_exact_verify_fused_projection = (
-            _build_exact_verify_fused_projection(module)
-        )
     return len(targets)
 
 
@@ -2857,28 +2053,107 @@ def _find_nth_prime_after(start: int, count: int) -> int:
     return prime
 
 
+# Prefetch unseen pages concurrently to overlap SSD reads; keep mmap as the
+# data path. Remembering pages avoids repeating thread-pool work on warm reads.
+# os.pread releases the GIL and does not change the shared file position.
+_PLE_OWNER_PID = os.getpid()
+# Serialize descriptor publication/cleanup across fork, not row reads. These
+# module callbacks retain no readers; child cleanup never takes inherited locks.
+_PLE_RESOURCE_LOCK = RLock()
+
+
+def _ple_before_fork():
+    _PLE_RESOURCE_LOCK.acquire()
+
+
+def _ple_after_fork_parent():
+    _PLE_RESOURCE_LOCK.release()
+
+
+def _ple_after_fork_child():
+    global _PLE_RESOURCE_LOCK
+    _PLE_RESOURCE_LOCK = RLock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        before=_ple_before_fork,
+        after_in_parent=_ple_after_fork_parent,
+        after_in_child=_ple_after_fork_child,
+    )
+
+
+def _ple_require_owner(owner_pid=None):
+    if os.getpid() != _PLE_OWNER_PID or (
+        owner_pid is not None and os.getpid() != owner_pid
+    ):
+        raise RuntimeError(
+            "SSD-backed Qwen4 PLE cannot be used after fork; "
+            "start a fresh process (spawn) and load the model there"
+        )
+
+
+_PLE_IO_POOL = ThreadPoolExecutor(max_workers=48, thread_name_prefix="ple-io")
+_PLE_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+# Slow gathers may indicate page eviction. Allow normal gather overhead and
+# rate-limit retries; elapsed time is a heuristic, not a residency check.
+_PLE_REARM_FLOOR_SECONDS = 0.0005
+_PLE_REARM_PER_ROW_SECONDS = 2e-6
+_PLE_REARM_MIN_INTERVAL_SECONDS = 60.0
+
+
 class _SafeTensorMMap:
     """Read selected dense or affine-packed rows without resident weights."""
 
     def __init__(self, path: Path):
+        _ple_require_owner()
+        self._owner_pid = os.getpid()
+        self._resource_lock = Lock()
         self.path = path
-        self._file = path.open("rb")
-        header_size = struct.unpack("<Q", self._file.read(8))[0]
-        self._header = json.loads(self._file.read(header_size))
-        self._data_start = 8 + header_size
-        self._mapping = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
-        try:
-            self._mapping.madvise(mmap.MADV_RANDOM)
-        except (AttributeError, OSError):
-            pass
+        self._file = None
+        self._mapping = None
+        with _PLE_RESOURCE_LOCK:
+            try:
+                # FileIO has no buffered-reader mutex inherited from another thread.
+                self._file = path.open("rb", buffering=0)
+                header_size = struct.unpack("<Q", self._file.read(8))[0]
+                self._header = json.loads(self._file.read(header_size))
+                self._data_start = 8 + header_size
+                self._mapping = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+                self._seen_pages = bytearray(
+                    1 + (max(path.stat().st_size, 1) - 1) // _PLE_PAGE_SIZE
+                )
+                self._last_rearm = 0.0
+                self._rearm_count = 0
+                try:
+                    self._mapping.madvise(mmap.MADV_RANDOM)
+                except (AttributeError, OSError):
+                    pass
+            except BaseException:
+                self._close_resources()
+                raise
+        register_ple_resource(self)
+
+    def _require_owner(self):
+        _ple_require_owner(self._owner_pid)
 
     def tensor_shape(self, key: str) -> tuple[int, ...]:
+        self._require_owner()
         return tuple(self._header[key]["shape"])
 
     def tensor_dtype(self, key: str) -> str:
+        self._require_owner()
         return str(self._header[key]["dtype"])
 
-    def rows(self, key: str, rows: list[int]) -> mx.array:
+    def rows_np(self, key: str, rows) -> tuple[np.ndarray, str]:
+        """Copy the requested rows out of the mapping; returns the raw array and the safetensors dtype."""
+        self._require_owner()
+        with self._resource_lock:
+            if self._mapping is None or self._file is None:
+                raise RuntimeError("SSD-backed Qwen4 PLE reader is closed")
+            return self._rows_np_owned(key, rows)
+
+    def _rows_np_owned(self, key, rows):
         entry = self._header[key]
         shape = tuple(entry["shape"])
         start, end = entry["data_offsets"]
@@ -2895,13 +2170,30 @@ class _SafeTensorMMap:
         np_dtype, item_size = dtype_info
         if len(shape) != 2 or end - start != math.prod(shape) * item_size:
             raise ValueError(f"Invalid sparse PLE tensor layout for {key}")
+        row_indices = np.asarray(rows, dtype=np.intp)
+        if row_indices.size == 0:
+            return np.empty((0, shape[1]), dtype=np_dtype), dtype
+        gather_start = None
+        if row_indices.size > 8:
+            fully_seen = self._prefetch_missing_pages(
+                row_indices,
+                self._data_start + start,
+                shape[1] * item_size,
+            )
+            gather_start = time.perf_counter() if fully_seen else None
         view = np.ndarray(
             shape,
             dtype=np_dtype,
             buffer=self._mapping,
             offset=self._data_start + start,
         )
-        copied = np.array(view[np.asarray(rows, dtype=np.intp)], copy=True)
+        copied = np.array(view[row_indices], copy=True)
+        if gather_start is not None:
+            self._rearm_if_slow(time.perf_counter() - gather_start, row_indices.size)
+        return copied, dtype
+
+    @staticmethod
+    def to_mx(copied: np.ndarray, dtype: str) -> mx.array:
         if dtype == "BF16":
             values = (copied.astype(np.uint32) << np.uint32(16)).view(np.float32)
             return mx.array(values).astype(mx.bfloat16)
@@ -2909,13 +2201,89 @@ class _SafeTensorMMap:
             return mx.from_fp8(mx.array(copied), dtype=mx.bfloat16)
         return mx.array(copied)
 
+    def rows(self, key: str, rows: list[int]) -> mx.array:
+        return self.to_mx(*self.rows_np(key, rows))
+
+    def _prefetch_missing_pages(self, row_indices, base_offset, row_bytes) -> bool:
+        """Prefetch unmarked pages; return whether all were already marked."""
+        self._require_owner()
+        offsets = base_offset + row_indices * row_bytes
+        needed_pages = np.unique(
+            np.concatenate(
+                (offsets // _PLE_PAGE_SIZE, (offsets + row_bytes - 1) // _PLE_PAGE_SIZE)
+            )
+        )
+        seen = np.frombuffer(self._seen_pages, dtype=np.uint8)
+        fresh = needed_pages[seen[needed_pages] == 0]
+        if fresh.size == 0:
+            return True
+        fd = self._file.fileno()
+
+        def touch(page: int) -> None:
+            offset = int(page) * _PLE_PAGE_SIZE
+            remaining = _PLE_PAGE_SIZE
+            while remaining > 0:
+                chunk = os.pread(fd, remaining, offset + (_PLE_PAGE_SIZE - remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+
+        # #3602 (Matt Barnson) uses submit/wait to drain failed page batches.
+        # Also drain partial submission here before releasing the reader mutex;
+        # otherwise close could recycle an FD still used by another page read.
+        futures = []
+        try:
+            for page in fresh.tolist():
+                futures.append(_PLE_IO_POOL.submit(touch, int(page)))
+            for future in futures:
+                future.result()
+        finally:
+            wait(futures)
+        for page in fresh.tolist():
+            self._seen_pages[page] = 1
+        return False
+
+    def _rearm_if_slow(self, elapsed: float, row_count: int) -> None:
+        """Allow another prefetch after a slow gather, at most once per interval."""
+        budget = _PLE_REARM_FLOOR_SECONDS + row_count * _PLE_REARM_PER_ROW_SECONDS
+        if elapsed < budget:
+            return
+        now = time.monotonic()
+        if now - self._last_rearm < _PLE_REARM_MIN_INTERVAL_SECONDS:
+            return
+        self._last_rearm = now
+        self._seen_pages = bytearray(len(self._seen_pages))
+        self._rearm_count += 1
+        logger.info(
+            "PLE: warm gather of %d rows took %.1f ms (memcpy budget %.1f ms); "
+            "eviction suspected, re-armed seen-page bitmap for %s (#%d)",
+            row_count,
+            elapsed * 1e3,
+            budget * 1e3,
+            self.path.name,
+            self._rearm_count,
+        )
+
+    def _close_resources(self):
+        # Caller owns the module resource lock. On exported views leave the mmap
+        # attached for a later retry, but release the file descriptor exactly once.
+        try:
+            if self._mapping is not None:
+                self._mapping.close()
+                self._mapping = None
+        finally:
+            if self._file is not None:
+                self._file.close()
+                self._file = None
+
     def close(self):
-        if self._mapping is not None:
-            self._mapping.close()
-            self._mapping = None
-        if self._file is not None:
-            self._file.close()
-            self._file = None
+        if os.getpid() != self._owner_pid:
+            with _PLE_RESOURCE_LOCK:
+                self._close_resources()
+            return
+        with self._resource_lock:
+            with _PLE_RESOURCE_LOCK:
+                self._close_resources()
 
 
 class DiskBackedShardedEmbedding(nn.Module):
@@ -2929,7 +2297,9 @@ class DiskBackedShardedEmbedding(nn.Module):
         dims: int,
         num_shards: int,
     ):
+        _ple_require_owner()
         super().__init__()
+        self._owner_pid = os.getpid()
         base, remainder = divmod(num_embeddings, num_shards)
         self.shard_sizes = tuple(
             base + (1 if index < remainder else 0) for index in range(num_shards)
@@ -2942,6 +2312,14 @@ class DiskBackedShardedEmbedding(nn.Module):
         self.weight_scale = mx.ones((1,), dtype=mx.bfloat16)
         self._prefix = prefix
         self.rows_read = 0
+        self.last_uploads = 0
+        self.last_prefetch_hit = False
+        self._pending: dict[bytes, tuple] = {}
+        self._prefetch_lock = Lock()
+        self._prefetch_closed = False
+        self._prefetch_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="ple-prefetch"
+        )
         self.last_touched_shards: tuple[int, ...] = ()
         self._readers: dict[str, _SafeTensorMMap] = {}
         self._tensor_readers: dict[str, _SafeTensorMMap] = {}
@@ -2949,6 +2327,7 @@ class DiskBackedShardedEmbedding(nn.Module):
             int, tuple[str, str | None, str | None, int | None, int | None]
         ] = {}
 
+        register_ple_resource(self, priority=1)
         model_path = Path(model_path)
         index_path = model_path / "model.safetensors.index.json"
         weight_map = json.loads(index_path.read_text()).get("weight_map", {})
@@ -3071,13 +2450,122 @@ class DiskBackedShardedEmbedding(nn.Module):
                 group_size,
             )
 
-    def __call__(self, indices: mx.array) -> mx.array:
-        shape = indices.shape
+    def _plan(self, host: np.ndarray):
+        """Shards, local rows and tensor families for a chunk; None when the touched shards differ."""
+        offsets = np.asarray(self.shard_offsets, dtype=np.int64)
+        shard = np.searchsorted(offsets, host, side="right") - 1
+        local = host - offsets[shard]
+        touched = [int(index) for index in np.unique(shard)]
+        specs = [self._shard_specs[index] for index in touched]
+        bits, group_size = specs[0][3], specs[0][4]
+        families = [0] if bits is None else [0, 1, 2]
+        dtypes = {
+            family: self._tensor_readers[specs[0][family]].tensor_dtype(specs[0][family])
+            for family in families
+        }
+        if any(spec[3:] != (bits, group_size) for spec in specs) or any(
+            self._tensor_readers[spec[family]].tensor_dtype(spec[family]) != dtypes[family]
+            for spec in specs
+            for family in families
+        ):
+            return None
+        return shard, local, touched, specs, families, dtypes, bits, group_size
+
+    def _assemble(self, host: np.ndarray, plan) -> dict[int, np.ndarray]:
+        """Copy every family's rows into one host buffer in index order (runs off the main thread on prefetch)."""
+        shard, local, touched, specs, families, _, _, _ = plan
+        buffers: dict[int, np.ndarray] = {}
+        for shard_index, spec in zip(touched, specs):
+            positions = np.flatnonzero(shard == shard_index)
+            rows = local[positions]
+            for family in families:
+                key = spec[family]
+                copied, _ = self._tensor_readers[key].rows_np(key, rows)
+                buffer = buffers.get(family)
+                if buffer is None:
+                    buffer = np.empty((host.size, copied.shape[1]), dtype=copied.dtype)
+                    buffers[family] = buffer
+                buffer[positions] = copied
+        return buffers
+
+    def _require_owner(self):
+        _ple_require_owner(self._owner_pid)
+
+    def _host_indices(self, indices: mx.array) -> np.ndarray:
+        self._require_owner()
         flat = indices.reshape(-1)
         mx.eval(flat)
-        host_indices = [int(index) for index in flat.tolist()]
-        if any(index < 0 or index >= self.shard_offsets[-1] for index in host_indices):
+        host = np.asarray(flat.astype(mx.int64)).reshape(-1)
+        if host.size and (int(host.min()) < 0 or int(host.max()) >= self.shard_offsets[-1]):
             raise IndexError("embedding index is outside the sharded vocabulary")
+        return host
+
+    def prefetch(self, indices: mx.array) -> None:
+        """Assemble a chunk's rows on the prefetch worker; a later call with the same indices consumes them."""
+        host = self._host_indices(indices)
+        if host.size == 0:
+            return
+        with self._prefetch_lock:
+            if self._prefetch_closed:
+                return
+            plan = self._plan(host)
+            if plan is None:
+                return
+            key = host.tobytes()
+            if key in self._pending:
+                return
+            # Keep two upcoming chunks; obsolete queued reads need not run.
+            while len(self._pending) >= 2:
+                _, future = self._pending.pop(next(iter(self._pending)))
+                future.cancel()
+            self._pending[key] = (
+                plan,
+                self._prefetch_executor.submit(self._assemble, host, plan),
+            )
+
+    def __call__(self, indices: mx.array) -> mx.array:
+        self._require_owner()
+        with self._prefetch_lock:
+            if self._prefetch_closed:
+                raise RuntimeError("SSD-backed Qwen4 PLE embedding is closed")
+            return self._call_owned(indices)
+
+    def _call_owned(self, indices):
+        shape = indices.shape
+        host = self._host_indices(indices)
+        if host.size == 0:
+            return mx.zeros((*shape, self.dims), dtype=mx.bfloat16)
+        pending = self._pending.pop(host.tobytes(), None)
+        if pending is not None:
+            plan, buffers = pending[0], pending[1].result()
+            self.last_prefetch_hit = True
+        else:
+            self.last_prefetch_hit = False
+            plan = self._plan(host)
+            if plan is None:
+                return self._gather_per_shard([int(index) for index in host], shape)
+            buffers = self._assemble(host, plan)
+        _, _, touched, _, families, dtypes, bits, group_size = plan
+        self.last_touched_shards = tuple(touched)
+        self.rows_read = int(host.size)
+        arrays = [_SafeTensorMMap.to_mx(buffers[family], dtypes[family]) for family in families]
+        self.last_uploads = len(arrays)
+        values = arrays[0]
+        if bits is not None:
+            values = mx.dequantize(
+                values,
+                arrays[1],
+                arrays[2],
+                group_size=group_size,
+                bits=bits,
+                mode="affine",
+            )
+        values = values.astype(mx.bfloat16) * self.weight_scale
+        return values.reshape(*shape, self.dims)
+
+    def _gather_per_shard(self, host_indices: list[int], shape) -> mx.array:
+        """Fallback for tables whose touched shards differ in dtype or quantization."""
+        self._require_owner()
         shard_indices = [
             bisect_right(self.shard_offsets, index) - 1 for index in host_indices
         ]
@@ -3118,11 +2606,30 @@ class DiskBackedShardedEmbedding(nn.Module):
         return result.reshape(*shape, self.dims)
 
     def close(self):
-        for reader in self._readers.values():
-            reader.close()
-        self._readers.clear()
-        self._tensor_readers.clear()
-        self._shard_specs.clear()
+        if os.getpid() != self._owner_pid:
+            # No inherited Future.cancel/result, executor shutdown, or instance
+            # lock. The module lock was replaced in the child at fork.
+            with _PLE_RESOURCE_LOCK:
+                self._prefetch_closed = True
+                self._pending.clear()
+                for reader in self._readers.values():
+                    reader._close_resources()
+                self._readers.clear()
+                self._tensor_readers.clear()
+                self._shard_specs.clear()
+            return
+        with self._prefetch_lock:
+            if not self._prefetch_closed:
+                self._prefetch_closed = True
+                # Drain workers before closing their mmap views. Never hold the
+                # module resource lock while waiting for a worker or row read.
+                self._prefetch_executor.shutdown(wait=True, cancel_futures=True)
+                self._pending.clear()
+            for reader in self._readers.values():
+                reader.close()
+            self._readers.clear()
+            self._tensor_readers.clear()
+            self._shard_specs.clear()
 
     @property
     def _prefix(self):
@@ -3163,35 +2670,31 @@ class ShardedEmbedding(nn.Module):
         # One tiny host sync avoids scheduling gathers against all 128 giant
         # PLE shards for every token.
         mx.eval(flat)
-        host_indices = [int(index) for index in flat.tolist()]
-        if not host_indices:
+        host = np.array(flat).astype(np.int64, copy=False)
+        if not host.size:
             return self.shards[0](flat).reshape(*indices.shape, self.dims)
-        if any(index < 0 or index >= self.shard_offsets[-1] for index in host_indices):
+        offsets = np.asarray(self.shard_offsets, dtype=np.int64)
+        if int(host.min()) < 0 or int(host.max()) >= int(offsets[-1]):
             raise IndexError("embedding index is outside the sharded vocabulary")
 
-        shard_indices = [
-            bisect_right(self.shard_offsets, index) - 1 for index in host_indices
-        ]
-        result = None
-        for shard_index in sorted(set(shard_indices)):
-            positions_list = [
-                position
-                for position, current_shard in enumerate(shard_indices)
-                if current_shard == shard_index
-            ]
-            local_indices = [
-                host_indices[position] - self.shard_offsets[shard_index]
-                for position in positions_list
-            ]
-            positions = mx.array(positions_list, dtype=mx.int32)
-            values = self.shards[shard_index](mx.array(local_indices, dtype=mx.int32))
+        # Group rows by shard on the host, gather each touched shard once, and
+        # restore token order with one inverse permutation.
+        shard = np.searchsorted(offsets, host, side="right") - 1
+        order = np.argsort(shard, kind="stable")
+        touched, starts = np.unique(shard[order], return_index=True)
+        ends = np.append(starts[1:], order.size)
+        parts = []
+        for shard_index, start, end in zip(touched, starts, ends):
+            local = host[order[start:end]] - offsets[shard_index]
+            values = self.shards[int(shard_index)](mx.array(local.astype(np.int32)))
             if values.dtype == mx.uint8:
                 values = mx.from_fp8(values, dtype=mx.bfloat16)
-            values = values * self.weight_scale
-            if result is None:
-                result = mx.zeros((len(host_indices), self.dims), dtype=values.dtype)
-            result = result.at[positions].add(values)
-        return result.reshape(*indices.shape, self.dims)
+            parts.append(values)
+        values = parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=0)
+        inverse = np.empty_like(order)
+        inverse[order] = np.arange(order.size)
+        values = mx.take(values, mx.array(inverse.astype(np.int32)), axis=0)
+        return (values * self.weight_scale).reshape(*indices.shape, self.dims)
 
     def fuse_quantized_shards(self) -> bool:
         """Join compatible packed shards without dequantizing the PLE table.
@@ -3364,24 +2867,17 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         return mx.where(valid, shifted, self.eos_token_id)
 
     def _previous_context(
-        self,
-        input_ids: mx.array,
-        cache: Optional[ArraysCache],
+        self, input_ids: mx.array, cache: ArraysCache | None
     ) -> mx.array:
         batch = input_ids.shape[0]
         if cache is not None and cache[3] is not None:
             return cache[3]
         return mx.full(
-            (batch, self.context_len),
-            self.eos_token_id,
-            dtype=mx.int64,
+            (batch, self.context_len), self.eos_token_id, dtype=mx.int64
         )
 
-    def _ngram_ids_from_history(
-        self,
-        token_history: mx.array,
-        input_width: int,
-    ) -> mx.array:
+    def _ngram_indices(self, token_history: mx.array, length: int) -> mx.array:
+        """Hashed table rows for the last ``length`` tokens of ``token_history``."""
         shifted_tokens = [
             self._shift_right_ignore_eos(token_history, shift)
             for shift in range(self.ngram_size)
@@ -3400,127 +2896,29 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             offsets = self.ngram_heads_offsets[start:end]
             ngram_ids = mixed_ids[..., None] % sizes[None, None]
             blocks.append(ngram_ids + offsets[None, None])
-        return mx.concatenate(blocks, axis=-1)[:, -int(input_width) :]
 
-    def prefetch_window(
-        self,
-        input_ids: mx.array,
-        cache: Optional[ArraysCache],
-    ) -> tuple[mx.array, mx.array]:
-        """Read a complete immutable PLE window without advancing ``cache``."""
+        return mx.concatenate(blocks, axis=-1)[:, -length:]
 
-        input_ids = input_ids.astype(mx.int64)
-        previous_context = self._previous_context(input_ids, cache)
-        token_history = mx.concatenate([previous_context, input_ids], axis=-1)
-        ngram_ids = self._ngram_ids_from_history(
-            token_history,
-            input_ids.shape[1],
-        )
-        embeddings = self.ngram_embedding(ngram_ids)
-        embeddings = embeddings.reshape(*embeddings.shape[:-2], -1)
-        mx.eval(ngram_ids, embeddings)
-        return ngram_ids, embeddings
+    def prefetch(self, next_ids: mx.array, previous_context: mx.array) -> None:
+        """Gather the rows of an upcoming chunk ahead of time (SSD-backed tables only)."""
+        prefetch = getattr(self.ngram_embedding, "prefetch", None)
+        if prefetch is None:
+            return
+        next_ids = next_ids.astype(mx.int64)
+        history = mx.concatenate([previous_context.astype(mx.int64), next_ids], axis=-1)
+        prefetch(self._ngram_indices(history, next_ids.shape[1]))
 
-    def __call__(
-        self,
-        input_ids: mx.array,
-        cache: Optional[ArraysCache],
-        *,
-        capture_speculative_state: bool = False,
-    ):
-        raw_input_ids = input_ids
+    def __call__(self, input_ids: mx.array, cache: Optional[ArraysCache]):
         input_ids = input_ids.astype(mx.int64)
         previous_context = self._previous_context(input_ids, cache)
 
-        if cache is not None:
-            if capture_speculative_state:
-                # Start a new transaction for this target-verify window.  The
-                # paired PLE convolution capture marks it complete below.
-                cache._qwen4_exp_ple_speculative_state = _PLESpeculativeState(
-                    history=previous_context,
-                    input_ids=input_ids,
-                )
-            elif getattr(cache, "_qwen4_exp_ple_speculative_state", None) is not None:
-                # A fully accepted verifier does not call rollback.  Its old
-                # snapshot cannot describe this ordinary committed forward.
-                cache._qwen4_exp_ple_speculative_state = None
-
         token_history = mx.concatenate([previous_context, input_ids], axis=-1)
         if cache is not None:
-            cache[3] = mx.contiguous(token_history[:, -self.context_len :])
+            cache.update_window(3, token_history, self.context_len)
 
-        prefetched = _consume_ple_prefetched_embedding(
-            self,
-            cache,
-            raw_input_ids,
-            previous_context,
-        )
-        if prefetched is not None:
-            return prefetched
-        ngram_ids = self._ngram_ids_from_history(
-            token_history,
-            input_ids.shape[1],
-        )
+        ngram_ids = self._ngram_indices(token_history, input_ids.shape[1])
         embeddings = self.ngram_embedding(ngram_ids)
         return embeddings.reshape(*embeddings.shape[:-2], -1)
-
-
-def _prepare_ple_window_prefetch(
-    language_model,
-    cache,
-    token_ids: tuple[int, ...],
-) -> _PLEWindowPrefetch | None:
-    """Build one immutable PLE lookup window for the scalar target oracle."""
-
-    if (
-        len(token_ids) < 2
-        or len(token_ids) > 6
-        or cache is None
-        or len(cache) != len(language_model.model.layers)
-    ):
-        return None
-    tokens = mx.array([list(map(int, token_ids))], dtype=mx.int64)
-    entries: dict[tuple[int, int], _PLEPrefetchEntry] = {}
-    try:
-        for layer, layer_cache in zip(language_model.model.layers, cache):
-            if "ple" not in layer:
-                continue
-            module = layer.ple.ple_embedding
-            layer_state = getattr(layer_cache, "state", None)
-            if (
-                layer_cache is None
-                or not isinstance(layer_state, (list, tuple))
-                or len(layer_state) < 4
-            ):
-                return None
-            history = layer_cache[3]
-            if not isinstance(history, mx.array) or history.shape != (
-                1,
-                module.context_len,
-            ):
-                return None
-            ngram_ids, embeddings = module.prefetch_window(tokens, layer_cache)
-            if layer_cache[3] is not history:
-                raise RuntimeError("Qwen4 PLE prefetch mutated live history")
-            key = (id(module), id(layer_cache))
-            if key in entries:
-                raise RuntimeError("Qwen4 PLE prefetch key is duplicated")
-            entries[key] = _PLEPrefetchEntry(
-                module=module,
-                cache=layer_cache,
-                ngram_ids=ngram_ids,
-                embeddings=embeddings,
-                expected_history=history,
-            )
-    except Exception as exc:
-        logger.debug("Qwen4 PLE window prefetch failed closed: %s", exc)
-        return None
-    if not entries:
-        return None
-    return _PLEWindowPrefetch(
-        token_ids=tuple(map(int, token_ids)),
-        entries=entries,
-    )
 
 
 class Qwen4ExpPLELayer(nn.Module):
@@ -3562,13 +2960,7 @@ class Qwen4ExpPLELayer(nn.Module):
             bias=False,
         )
 
-    def _short_conv(
-        self,
-        x: mx.array,
-        cache: Optional[ArraysCache],
-        *,
-        capture_speculative_state: bool = False,
-    ):
+    def _short_conv(self, x: mx.array, cache: Optional[ArraysCache]):
         batch = x.shape[0]
         if cache is not None and cache[2] is not None:
             state = cache[2]
@@ -3577,104 +2969,9 @@ class Qwen4ExpPLELayer(nn.Module):
                 (batch, self.short_conv_state_len, x.shape[-1]), dtype=x.dtype
             )
         conv_input = mx.concatenate([state, x], axis=1)
-        if capture_speculative_state and cache is not None:
-            snapshot = getattr(cache, "_qwen4_exp_ple_speculative_state", None)
-            if snapshot is not None:
-                snapshot.conv_state = state
-                snapshot.conv_inputs = x
-                snapshot.complete = True
         if cache is not None:
-            cache[2] = mx.contiguous(conv_input[:, -self.short_conv_state_len :])
-        return nn.silu(self.conv1d(conv_input))
-
-    def _tokenwise_verify(
-        self,
-        hidden_states: mx.array,
-        input_ids: mx.array,
-        cache: Optional[ArraysCache],
-        mask: Optional[mx.array],
-    ) -> mx.array:
-        """Evaluate PLE exactly as consecutive scalar target calls.
-
-        This is a diagnostic route for locating Qwen4's first M-width versus
-        scalar divergence.  It preserves the existing full-window rollback
-        ABI by installing one equivalent snapshot after all scalar rows have
-        advanced the live PLE slots.
-        """
-
-        batch = input_ids.shape[0]
-        input_ids_i64 = input_ids.astype(mx.int64)
-        if cache is not None and cache[3] is not None:
-            previous_history = cache[3]
-        else:
-            previous_history = mx.full(
-                (batch, self.ple_embedding.context_len),
-                self.ple_embedding.eos_token_id,
-                dtype=mx.int64,
-            )
-        if cache is not None and cache[2] is not None:
-            previous_conv = cache[2]
-        else:
-            previous_conv = mx.zeros(
-                (batch, self.short_conv_state_len, hidden_states.shape[-1]),
-                dtype=hidden_states.dtype,
-            )
-
-        outputs = []
-        conv_inputs = []
-        for row in range(input_ids.shape[1]):
-            row_hidden = hidden_states[:, row : row + 1]
-            row_ids = input_ids[:, row : row + 1]
-            embeddings = self.ple_embedding(
-                row_ids,
-                cache,
-                capture_speculative_state=False,
-            )
-            keys = self.norm_key(
-                _target_verify_linear(self.key_proj, embeddings, False)
-            ).reshape(*row_hidden.shape[:-1], self.hc_count, self.hidden_size)
-            values = _target_verify_linear(self.value_proj, embeddings, False)
-            queries = self.norm_query(row_hidden).reshape(
-                *row_hidden.shape[:-1], self.hc_count, self.hidden_size
-            )
-            gate = mx.sum(keys * queries, axis=-1, keepdims=True) / math.sqrt(
-                self.hidden_size
-            )
-            gate = mx.sign(gate) * mx.sqrt(mx.maximum(mx.abs(gate), 1e-6))
-            gated_values = mx.sigmoid(gate) * values[..., None, :]
-            gated_values = gated_values.reshape(*row_hidden.shape)
-            normed = self.norm_conv(gated_values)
-            row_mask = (
-                mask[:, row : row + 1]
-                if isinstance(mask, mx.array) and mask.ndim == 2
-                else mask
-            )
-            if (
-                row_mask is not None
-                and isinstance(row_mask, mx.array)
-                and row_mask.ndim == 2
-            ):
-                gated_values = mx.where(row_mask[..., None], gated_values, 0)
-                normed = mx.where(row_mask[..., None], normed, 0)
-            conv_inputs.append(normed)
-            outputs.append(
-                gated_values
-                + self._short_conv(
-                    normed,
-                    cache,
-                    capture_speculative_state=False,
-                )
-            )
-
-        if cache is not None:
-            cache._qwen4_exp_ple_speculative_state = _PLESpeculativeState(
-                history=previous_history,
-                input_ids=input_ids_i64,
-                conv_state=previous_conv,
-                conv_inputs=mx.concatenate(conv_inputs, axis=1),
-                complete=True,
-            )
-        return mx.concatenate(outputs, axis=1)
+            cache.update_window(2, conv_input, self.short_conv_state_len)
+        return nn.silu(self.conv1d(conv_input)), state
 
     def __call__(
         self,
@@ -3684,29 +2981,27 @@ class Qwen4ExpPLELayer(nn.Module):
         mask: Optional[mx.array],
         target_verify: bool = False,
     ):
-        if (
-            target_verify
-            and input_ids.shape[1] > 1
-            and _tokenwise_ple_verify_enabled()
-        ):
-            global _TOKENWISE_PLE_VERIFY_LOGGED
-            if not _TOKENWISE_PLE_VERIFY_LOGGED:
-                _TOKENWISE_PLE_VERIFY_LOGGED = True
-                logger.info(
-                    "Qwen4 tokenwise PLE target-verify diagnostic active (S=%d)",
-                    input_ids.shape[1],
-                )
-            return self._tokenwise_verify(hidden_states, input_ids, cache, mask)
         capture_speculative_state = target_verify and input_ids.shape[1] > 1
-        embeddings = self.ple_embedding(
-            input_ids,
-            cache,
-            capture_speculative_state=capture_speculative_state,
-        )
+        if cache is not None:
+            cache._qwen4_exp_ple_speculative_state = None
+        history = None
+        if capture_speculative_state and cache is not None:
+            history = self.ple_embedding._previous_context(
+                input_ids.astype(mx.int64), cache
+            )
+        embeddings = self.ple_embedding(input_ids, cache)
         keys = self.norm_key(
-            _target_verify_linear(self.key_proj, embeddings, target_verify)
+            (
+                _target_verify_linear(self.key_proj, embeddings)
+                if target_verify
+                else self.key_proj(embeddings)
+            )
         ).reshape(*hidden_states.shape[:-1], self.hc_count, self.hidden_size)
-        values = _target_verify_linear(self.value_proj, embeddings, target_verify)
+        values = (
+            _target_verify_linear(self.value_proj, embeddings)
+            if target_verify
+            else self.value_proj(embeddings)
+        )
         queries = self.norm_query(hidden_states).reshape(
             *hidden_states.shape[:-1], self.hc_count, self.hidden_size
         )
@@ -3720,17 +3015,25 @@ class Qwen4ExpPLELayer(nn.Module):
         if mask is not None and isinstance(mask, mx.array) and mask.ndim == 2:
             gated_values = mx.where(mask[..., None], gated_values, 0)
             normed = mx.where(mask[..., None], normed, 0)
-        return gated_values + self._short_conv(
-            normed,
-            cache,
-            capture_speculative_state=capture_speculative_state,
-        )
+        conv_output, conv_state = self._short_conv(normed, cache)
+        if history is not None and cache is not None:
+            cache._qwen4_exp_ple_speculative_state = _PLESpeculativeState(
+                history=history,
+                input_ids=input_ids.astype(mx.int64),
+                conv_state=conv_state,
+                conv_inputs=normed,
+            )
+        return gated_values + conv_output
+
+
+def _hc_write(hyper_input, branch, weights):
+    injection = branch[..., None, :] * weights[..., None]
+    return hyper_input + injection.reshape(*hyper_input.shape)
 
 
 class Qwen4ExpDecoderLayer(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
-        self.layer_idx = layer_idx
         self.is_linear = config.layer_types[layer_idx] == "linear_attention"
         if self.is_linear:
             self.linear_attn = Qwen4ExpGatedDeltaNet(config)
@@ -3757,19 +3060,6 @@ class Qwen4ExpDecoderLayer(nn.Module):
         gdn_sink=None,
         target_verify: bool = False,
     ):
-        profile = _current_decode_profile()
-        if profile is not None:
-            return self._profiled_call(
-                profile,
-                hidden_states,
-                input_ids,
-                mask,
-                cache,
-                position_ids,
-                gdn_sink,
-                target_verify,
-            )
-
         if "ple" in self:
             hidden_states = hidden_states + self.ple(
                 hidden_states,
@@ -3784,12 +3074,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
             target_verify=target_verify,
         )
         if self.is_linear:
-            branch = self.linear_attn(
-                mixed,
-                mask=mask,
-                cache=cache,
-                gdn_sink=gdn_sink,
-                target_verify=target_verify,
+            branch = (
+                _VERIFIER._gated_delta(self.linear_attn, mixed, mask, cache)
+                if target_verify
+                else self.linear_attn(mixed, mask=mask, cache=cache)
             )
         else:
             branch = self.self_attn(
@@ -3799,101 +3087,17 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 position_ids=position_ids,
                 target_verify=target_verify,
             )
-        injection = branch[..., None, :] * injection_weights[..., None]
-        hidden_states = hyper_input + injection.reshape(*hyper_input.shape)
-
         mixed, hyper_input, injection_weights = self.mlp_hyper_connection(
-            hidden_states,
+            hyper_input,
             target_verify=target_verify,
+            write=(branch, injection_weights),
         )
-        branch = _qwen4_moe_forward(self.mlp, mixed, target_verify)
-        injection = branch[..., None, :] * injection_weights[..., None]
-        return hyper_input + injection.reshape(*hyper_input.shape)
-
-    def _profiled_call(
-        self,
-        profile,
-        hidden_states,
-        input_ids,
-        mask,
-        cache,
-        position_ids,
-        gdn_sink,
-        target_verify,
-    ):
-        if "ple" in self:
-            def apply_ple():
-                return hidden_states + self.ple(
-                    hidden_states,
-                    input_ids,
-                    cache,
-                    mask,
-                    target_verify=target_verify,
-                )
-
-            hidden_states = _profile_stage(profile, "ple", apply_ple)
-
-        def apply_attn_hyper_connection():
-            return self.attn_hyper_connection(
-                hidden_states,
-                target_verify=target_verify,
-            )
-
-        mixed, hyper_input, injection_weights = _profile_stage(
-            profile, "attn_hc", apply_attn_hyper_connection
+        branch = (
+            _VERIFIER._feed_forward(self.mlp, mixed)
+            if target_verify
+            else self.mlp(mixed)
         )
-
-        def apply_attention():
-            if self.is_linear:
-                return self.linear_attn(
-                    mixed,
-                    mask=mask,
-                    cache=cache,
-                    gdn_sink=gdn_sink,
-                    target_verify=target_verify,
-                )
-            return self.self_attn(
-                mixed,
-                mask=mask,
-                cache=cache,
-                position_ids=position_ids,
-                target_verify=target_verify,
-            )
-
-        branch = _profile_stage(
-            profile,
-            "gdn" if self.is_linear else "qsa",
-            apply_attention,
-        )
-
-        def apply_attn_residual():
-            injection = branch[..., None, :] * injection_weights[..., None]
-            return hyper_input + injection.reshape(*hyper_input.shape)
-
-        hidden_states = _profile_stage(
-            profile, "attn_residual", apply_attn_residual
-        )
-
-        def apply_mlp_hyper_connection():
-            return self.mlp_hyper_connection(
-                hidden_states,
-                target_verify=target_verify,
-            )
-
-        mixed, hyper_input, injection_weights = _profile_stage(
-            profile, "mlp_hc", apply_mlp_hyper_connection
-        )
-
-        def apply_moe():
-            return _qwen4_moe_forward(self.mlp, mixed, target_verify)
-
-        branch = _profile_stage(profile, "moe", apply_moe)
-
-        def apply_mlp_residual():
-            injection = branch[..., None, :] * injection_weights[..., None]
-            return hyper_input + injection.reshape(*hyper_input.shape)
-
-        return _profile_stage(profile, "mlp_residual", apply_mlp_residual)
+        return _hc_write(hyper_input, branch, injection_weights)
 
 
 class Qwen4ExpModel(nn.Module):
@@ -3926,62 +3130,21 @@ class Qwen4ExpModel(nn.Module):
         **kwargs,
     ):
         del kwargs
-        # Qwen4 Lightning MTP consumes the raw residual streams before the
-        # final hyper-connection mixer.  A scalar activation/depth-0/tail
-        # forward still needs that tensor, but it has no speculative suffix
-        # and therefore must not create GDN/PLE rollback state.  The outer
-        # LanguageModel scopes this sink only around its implicit scalar
-        # ``return_hidden`` contract, leaving explicit capture requests alone.
-        scalar_mtp_hidden_sink = _SCALAR_MTP_HIDDEN_SINK.get()
-        if scalar_mtp_hidden_sink is not None:
-            hidden_sink = scalar_mtp_hidden_sink
-            capture_layer_ids = []
-        profile = _current_decode_profile()
-        model_started = time.perf_counter_ns() if profile is not None else 0
-        if profile is None:
-            hidden_states = (
-                self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
-            )
-            hidden_states = mx.tile(hidden_states, (1, 1, self.args.hc_count))
-        else:
-            def embed_and_tile():
-                embedded = (
-                    self.embed_tokens(inputs)
-                    if inputs_embeds is None
-                    else inputs_embeds
-                )
-                return mx.tile(embedded, (1, 1, self.args.hc_count))
-
-            hidden_states = _profile_stage(profile, "embed+mask", embed_and_tile)
+        if cache is not None and any(
+            getattr(c, "_speculation", None) is not None for c in cache
+        ):
+            gdn_sink = []
+        hidden_states = (
+            self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
+        )
+        hidden_states = mx.tile(hidden_states, (1, 1, self.args.hc_count))
         if cache is None:
             cache = [None] * len(self.layers)
 
-        if gdn_sink is not None and cache:
-            position_ids = _qualified_text_verify_position_ids(
-                position_ids,
-                cache[self.fa_idx],
-            )
-
-        if profile is None:
-            fa_mask = _create_qwen3_5_attention_mask(
-                hidden_states, cache[self.fa_idx]
-            )
-            ssm_mask = _create_qwen3_5_ssm_mask(
-                hidden_states, cache[self.ssm_idx]
-            )
-            if mask is not None and isinstance(mask, mx.array) and mask.ndim == 2:
-                ssm_mask = mask
-        else:
-            def make_masks():
-                fa = _create_qwen3_5_attention_mask(hidden_states, cache[self.fa_idx])
-                ssm = _create_qwen3_5_ssm_mask(hidden_states, cache[self.ssm_idx])
-                if mask is not None and isinstance(mask, mx.array) and mask.ndim == 2:
-                    ssm = mask
-                return fa, ssm
-
-            fa_mask, ssm_mask = _profile_stage(
-                profile, "embed+mask", make_masks
-            )
+        fa_mask = _create_qwen3_5_attention_mask(hidden_states, cache[self.fa_idx])
+        ssm_mask = _create_qwen3_5_ssm_mask(hidden_states, cache[self.ssm_idx])
+        if mask is not None and isinstance(mask, mx.array) and mask.ndim == 2:
+            ssm_mask = mask
 
         capture = set(capture_layer_ids or [])
         for index, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
@@ -3995,6 +3158,12 @@ class Qwen4ExpModel(nn.Module):
                 gdn_sink=gdn_sink,
                 target_verify=gdn_sink is not None,
             )
+            if (
+                _EAGER_DISPATCH
+                and hidden_states.shape[0] * hidden_states.shape[1]
+                <= _EAGER_DISPATCH_MAX_ROWS
+            ):
+                mx.async_eval(hidden_states)
             if hidden_sink is not None and index in capture:
                 hidden_sink.append(
                     self.hyper_connection_mixer(
@@ -4003,7 +3172,7 @@ class Qwen4ExpModel(nn.Module):
                     )
                 )
 
-        if inputs_embeds is None and hidden_sink is None and gdn_sink is None:
+        if inputs_embeds is None and gdn_sink is None:
             host_ref = getattr(self, "_omlx_mtp_prime_host", None)
             host = host_ref() if host_ref is not None else None
             if host is not None:
@@ -4022,27 +3191,9 @@ class Qwen4ExpModel(nn.Module):
             # mixer. Ordinary layer captures retain their mixed representation.
             hidden_sink.append(hidden_states)
 
-        if profile is None:
-            output = self.hyper_connection_mixer(
-                hidden_states,
-                target_verify=gdn_sink is not None,
-            )
-            return _capture_tokenwise_lm_head_hidden(
-                output,
-                gdn_sink is not None,
-            )
-
-        def apply_final_hyper_connection():
-            return self.hyper_connection_mixer(
-                hidden_states,
-                target_verify=gdn_sink is not None,
-            )
-
-        output = _profile_stage(profile, "final_hc", apply_final_hyper_connection)
-        profile.model_ns = time.perf_counter_ns() - model_started
-        return _capture_tokenwise_lm_head_hidden(
-            output,
-            gdn_sink is not None,
+        return self.hyper_connection_mixer(
+            hidden_states,
+            target_verify=gdn_sink is not None,
         )
 
 
@@ -4076,6 +3227,16 @@ class Qwen4ExpMTPModule(nn.Module):
         layer_config = replace(
             args,
             num_hidden_layers=1,
+            num_experts=(
+                args.mtp_num_experts
+                if args.mtp_num_experts is not None
+                else args.num_experts
+            ),
+            num_experts_per_tok=(
+                args.mtp_num_experts_per_tok
+                if args.mtp_num_experts_per_tok is not None
+                else args.num_experts_per_tok
+            ),
             layer_types=["qwen_sparse_attention"],
             full_attention_interval=1,
             ple_layer_ids=[],
@@ -4129,22 +3290,35 @@ class Qwen4ExpMTPModule(nn.Module):
         )
         if cache is None:
             cache = [None] * len(self.layers)
-        mask = _create_qwen3_5_attention_mask(
-            hidden_states,
-            cache[0] if cache else None,
-        )
+        if cache and isinstance(cache[0], BatchQSAKVCache):
+            # Head history can have different left padding after every fold.
+            # Keep the full mask through sparse selection and chained decode.
+            mask = cache[0].make_mask(hidden_states.shape[1], return_array=True)
+        else:
+            mask = _create_qwen3_5_attention_mask(
+                hidden_states,
+                cache[0] if cache else None,
+            )
+        # Fused mRoPE indexes position IDs per batch row.
+        offset = cache[0].offset if cache and cache[0] is not None else 0
+        positions = mx.maximum(mx.array(offset), 0).reshape(-1, 1)
+        positions = positions + mx.arange(hidden_states.shape[1])[None]
+        position_ids = mx.broadcast_to(positions, hidden_states.shape[:2])
         for layer, layer_cache in zip(self.layers, cache):
             hidden_states = layer(
                 hidden_states,
                 next_token_ids,
                 mask=mask,
                 cache=layer_cache,
-                position_ids=None,
+                position_ids=position_ids,
             )
         return self.hyper_connection_mixer(hidden_states), hidden_states
 
 
 class LanguageModel(Qwen3_5LanguageModel):
+    _omlx_mtp_multi_request = True
+    _omlx_mtp_batch_rollback = True
+
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         nn.Module.__init__(self)
         self.args = args
@@ -4163,22 +3337,18 @@ class LanguageModel(Qwen3_5LanguageModel):
         self._enable_mtp_decode_markers()
 
     def _enable_mtp_decode_markers(self) -> None:
-        from omlx.patches.mlx_lm_mtp import get_mtp_depth
+        from omlx.patches.mlx_lm_mtp import get_mtp_depth, is_mtp_depth_fixed
 
         self._omlx_mtp_decode_enabled = True
         self._omlx_mtp_chain = True
         self._omlx_mtp_depth = get_mtp_depth()
+        self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
         self._omlx_mtp_head_prenorm = True
         # The target backbone verifies every draft, so a restart may prime the
         # drafter from only the exact uncached TEXT suffix when the durable
         # backbone prefix has no matching in-memory MTP sidecar. Generic/DS4
         # hosts never receive this narrow capability marker.
         self._omlx_mtp_suffix_local_capability = "qwen4-verified-text-v1"
-        # The oMLX scheduler may defer a verifier window's cache commit until
-        # parser/text-stop resolution, then export an exact target-only
-        # resident prefix.  This explicit marker keeps that transaction seam
-        # fail-closed for every other MTP architecture.
-        self._omlx_mtp_terminal_commit_v1 = True
 
     def get_mtp_module(self):
         module = getattr(self, "mtp", None)
@@ -4188,147 +3358,46 @@ class LanguageModel(Qwen3_5LanguageModel):
         owner = owner_ref() if owner_ref is not None else None
         return getattr(owner, "mtp", None) if owner is not None else None
 
-    def prepare_ple_window_prefetch(self, cache, token_ids):
-        return _prepare_ple_window_prefetch(
-            self,
-            cache,
-            tuple(map(int, token_ids)),
-        )
-
-    @staticmethod
-    def begin_ple_window_prefetch(payload):
-        return _begin_ple_window_prefetch(payload)
-
-    @staticmethod
-    def activate_ple_prefetch_row(
-        payload,
-        row: int,
-        token_id: int,
-        input_ids: mx.array,
-    ) -> bool:
-        return _activate_ple_prefetch_row(payload, row, token_id, input_ids)
-
-    @staticmethod
-    def finish_ple_prefetch_row(payload) -> bool:
-        return _finish_ple_prefetch_row(payload)
-
-    @staticmethod
-    def end_ple_window_prefetch(token) -> None:
-        _end_ple_window_prefetch(token)
-
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
         return_hidden = bool(kwargs.get("return_hidden", False))
-        automatic_mtp_capture = bool(
-            return_hidden and kwargs.get("capture_layer_ids") is None
-        )
-        scalar_mtp_capture = bool(
-            automatic_mtp_capture
-            and inputs.ndim == 2
-            and inputs.shape[1] == 1
-        )
-        mtp_capture = automatic_mtp_capture and not scalar_mtp_capture
+        mtp_capture = return_hidden and kwargs.get("capture_layer_ids") is None
         if mtp_capture:
             kwargs["capture_layer_ids"] = []
-        tokenwise_lm_head_capture = bool(
-            _tokenwise_lm_head_verify_enabled()
-            and kwargs.get("capture_layer_ids") is not None
-            and not kwargs.get("skip_logits", False)
-            and inputs.ndim == 2
-            and inputs.shape[0] == 1
-            and inputs.shape[1] in _HC_FUSED_VERIFY_WIDTHS
-        )
-        profile = _new_decode_profile_sample(
-            self.model,
-            inputs,
-            inputs_embeds,
-            mask,
-            cache,
-            kwargs,
-        )
-        coarse_profile = _new_coarse_profile_sample(
-            self.model,
-            inputs,
-            inputs_embeds,
-            mask,
-            cache,
-            kwargs,
-        )
-        previous_profile = _current_decode_profile()
-        if profile is not None:
-            mx.synchronize()
-            outer_started = time.perf_counter_ns()
-            _DECODE_PROFILE_LOCAL.sample = profile
-        elif coarse_profile is not None:
-            mx.synchronize()
-            build_started = time.perf_counter_ns()
-        scalar_hidden_sink = [] if scalar_mtp_capture else None
-        scalar_capture_token = (
-            _SCALAR_MTP_HIDDEN_SINK.set(scalar_hidden_sink)
-            if scalar_hidden_sink is not None
-            else None
-        )
-        lm_head_hidden_sink = [] if tokenwise_lm_head_capture else None
-        lm_head_capture_token = (
-            _TOKENWISE_LM_HEAD_HIDDEN_SINK.set(lm_head_hidden_sink)
-            if lm_head_hidden_sink is not None
+        transaction = (
+            start_speculative_cache(cache or [], inputs.shape[1])
+            if mtp_capture
             else None
         )
         try:
             output = super().__call__(inputs, inputs_embeds, mask, cache, **kwargs)
-            if profile is not None:
-                _profile_eval(output.logits)
-                total_ns = time.perf_counter_ns() - outer_started
-            elif coarse_profile is not None:
-                build_ns = time.perf_counter_ns() - build_started
-                eval_started = time.perf_counter_ns()
-                mx.eval(output.logits)
-                mx.synchronize()
-                eval_ns = time.perf_counter_ns() - eval_started
-        finally:
-            if profile is not None:
-                if previous_profile is None:
-                    del _DECODE_PROFILE_LOCAL.sample
-                else:
-                    _DECODE_PROFILE_LOCAL.sample = previous_profile
-            if scalar_capture_token is not None:
-                _SCALAR_MTP_HIDDEN_SINK.reset(scalar_capture_token)
-            if lm_head_capture_token is not None:
-                _TOKENWISE_LM_HEAD_HIDDEN_SINK.reset(lm_head_capture_token)
-        if lm_head_hidden_sink is not None:
-            if len(lm_head_hidden_sink) == 1:
-                try:
-                    scalar_logits = _tokenwise_lm_head_projection(
-                        self,
-                        lm_head_hidden_sink[0],
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        "Qwen4 tokenwise LM-head replacement failed closed: %s",
-                        exc,
-                    )
-                    scalar_logits = None
-                if scalar_logits is not None:
-                    output.logits = scalar_logits
-            else:
-                logger.debug(
-                    "Qwen4 tokenwise LM-head target-verify capture failed closed: "
-                    "expected one hidden tensor, got %d",
-                    len(lm_head_hidden_sink),
-                )
-        if scalar_hidden_sink is not None:
-            if len(scalar_hidden_sink) != 1:
-                raise RuntimeError(
-                    "Qwen4 scalar MTP hidden capture did not produce exactly "
-                    "one raw residual tensor."
-                )
-            output.hidden_states = scalar_hidden_sink
-        if mtp_capture and output.hidden_states:
-            output.hidden_states = [output.hidden_states[0]]
-        if profile is not None:
-            _log_decode_profile(profile, total_ns)
-        elif coarse_profile is not None:
-            _log_coarse_profile(coarse_profile, build_ns, eval_ns)
-        return output
+            if mtp_capture and output.hidden_states:
+                output.hidden_states = [output.hidden_states[0]]
+            output.gdn_states = transaction
+            return output
+        except BaseException:
+            if transaction is not None:
+                transaction.abort()
+            raise
+
+    def prefetch_ple(self, next_ids: mx.array, current_ids: mx.array) -> None:
+        """Start gathering the next prefill chunk's PLE rows while ``current_ids`` runs."""
+        for layer in self.model.layers:
+            ple = getattr(layer, "ple", None)
+            if ple is None:
+                continue
+            embedding = ple.ple_embedding
+            if getattr(embedding.ngram_embedding, "prefetch", None) is None:
+                continue
+            fill = mx.full(
+                (current_ids.shape[0], embedding.context_len),
+                embedding.eos_token_id,
+                dtype=mx.int64,
+            )
+            history = mx.concatenate([fill, current_ids.astype(mx.int64)], axis=-1)
+            embedding.prefetch(next_ids, history[:, -embedding.context_len :])
+            if not getattr(self, "_ple_lookahead_logged", False):
+                self._ple_lookahead_logged = True
+                logger.info("PLE gather-ahead active: next prefill chunk rows are gathered during the current chunk")
 
     def mtp_forward(
         self,
@@ -4374,7 +3443,7 @@ class LanguageModel(Qwen3_5LanguageModel):
         return caches
 
     @staticmethod
-    def _normalize_accepted_counts(accepted) -> list[int]:
+    def _normalize_accepted_counts(accepted):
         if isinstance(accepted, int):
             return [accepted]
         if isinstance(accepted, mx.array):
@@ -4382,86 +3451,36 @@ class LanguageModel(Qwen3_5LanguageModel):
         return [int(value) for value in accepted]
 
     @staticmethod
-    def _discard_ple_snapshots(caches) -> None:
+    def _discard_ple_snapshots(caches):
         for cache in caches:
             if getattr(cache, "_qwen4_exp_ple_speculative_state", None) is not None:
                 cache._qwen4_exp_ple_speculative_state = None
 
     @staticmethod
-    def _validate_ple_snapshot(
-        snapshot: _PLESpeculativeState,
-        accepted_values: list[int],
-        block_size: int,
-    ) -> None:
-        """Preflight one PLE restore without changing any cache tensor."""
-
-        if not snapshot.complete:
-            raise _PLESpeculativeRollbackError(
-                "PLE speculative snapshot is incomplete "
-                "(target-verify forward did not finish both captures)"
-            )
-        if snapshot.history.ndim != 2 or snapshot.input_ids.ndim != 2:
-            raise _PLESpeculativeRollbackError(
-                "PLE speculative snapshot history/input_ids are not rank-2"
-            )
+    def _validate_ple_snapshot(snapshot, accepted_values):
         batch, window = snapshot.input_ids.shape
-        if window < 1:
-            raise _PLESpeculativeRollbackError(
-                "PLE speculative snapshot has an empty verify window"
-            )
-        if int(block_size) != int(window):
-            raise _PLESpeculativeRollbackError(
-                "PLE speculative snapshot window does not match rollback block size"
-            )
-        if snapshot.history.shape[0] != batch:
-            raise _PLESpeculativeRollbackError(
-                "PLE speculative snapshot batch mismatch (history vs input_ids)"
-            )
         if len(accepted_values) not in (1, batch):
-            raise _PLESpeculativeRollbackError(
+            raise ValueError(
                 "PLE speculative rollback accepted count does not match batch size"
             )
         if any(value < 0 or value >= window for value in accepted_values):
-            raise _PLESpeculativeRollbackError(
+            raise ValueError(
                 "PLE speculative rollback accepted count is outside the verify window"
-            )
-        if snapshot.conv_state is None or snapshot.conv_inputs is None:
-            raise _PLESpeculativeRollbackError(
-                "PLE speculative snapshot short-conv capture is incomplete"
-            )
-        if (
-            snapshot.conv_state.ndim != 3
-            or snapshot.conv_inputs.ndim != 3
-            or snapshot.conv_state.shape[0] != batch
-            or snapshot.conv_inputs.shape[0] != batch
-            or snapshot.conv_inputs.shape[1] != window
-            or snapshot.conv_state.shape[-1] != snapshot.conv_inputs.shape[-1]
-        ):
-            raise _PLESpeculativeRollbackError(
-                "PLE speculative snapshot short-conv capture is malformed"
             )
 
     @staticmethod
-    def _prepare_ple_restore(
-        snapshot: _PLESpeculativeState,
-        accepted_values: list[int],
-    ) -> tuple[mx.array, mx.array]:
-        """Build the two committed PLE slots without mutating their cache."""
-
+    def _restore_ple_state(cache, snapshot, accepted_values):
         batch = snapshot.input_ids.shape[0]
-        values = (
-            accepted_values * batch
-            if len(accepted_values) == 1
-            else accepted_values
-        )
-        retained = mx.array(values, dtype=mx.int32) + 1
+        values = accepted_values * batch if len(accepted_values) == 1 else accepted_values
+        accepted_array = mx.array(values, dtype=mx.int32)
+        retained = accepted_array + 1
 
         history_len = snapshot.history.shape[1]
         history = mx.concatenate([snapshot.history, snapshot.input_ids], axis=1)
         history_positions = retained[:, None] + mx.arange(
             history_len, dtype=mx.int32
         )[None, :]
-        restored_history = mx.contiguous(
+        cache[3] = mx.contiguous(
             mx.take_along_axis(history, history_positions, axis=1)
         )
 
@@ -4477,76 +3496,27 @@ class LanguageModel(Qwen3_5LanguageModel):
                 conv_positions[..., None],
                 (batch, state_len, snapshot.conv_state.shape[-1]),
             )
-            restored_conv = mx.contiguous(
+            cache[2] = mx.contiguous(
                 mx.take_along_axis(conv_input, conv_positions, axis=1)
             )
-        else:
-            restored_conv = snapshot.conv_state
-        return restored_conv, restored_history
 
     def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
-        """Transactionally restore PLE alongside inherited QSA/GDN rollback.
+        """Restore PLE state to the accepted prefix after inherited rollback."""
+        accepted_values = self._normalize_accepted_counts(accepted)
 
-        Qwen4 PLE owns two recurrent slots beyond Qwen3.5's GDN state: the
-        n-gram token history (slot 3) and the dilated short-convolution state
-        (slot 2).  A target verifier advances both through every draft.  On a
-        rejection, this override selects the state after the confirmed token
-        plus each row's accepted draft prefix.
-
-        Every PLE snapshot is validated and both replacement tensors are built
-        before the inherited rollback mutates QSA/GDN.  Malformed or mixed-
-        epoch snapshots therefore fail closed, letting the caller rebuild from
-        the committed token stream rather than exposing a partially restored
-        model state.
-        """
-
-        try:
-            accepted_values = self._normalize_accepted_counts(accepted)
-        except (TypeError, ValueError) as exc:
-            self._discard_ple_snapshots(caches)
-            raise _PLESpeculativeRollbackError(
-                f"PLE speculative accepted counts are malformed: {exc}"
-            ) from exc
-        pending: list[tuple[Any, mx.array, mx.array]] = []
+        pending = []
         try:
             for cache in caches:
                 snapshot = getattr(cache, "_qwen4_exp_ple_speculative_state", None)
                 if snapshot is None:
                     continue
-                self._validate_ple_snapshot(snapshot, accepted_values, block_size)
-                restored_conv, restored_history = self._prepare_ple_restore(
-                    snapshot,
-                    accepted_values,
-                )
-                pending.append((cache, restored_conv, restored_history))
-        except (
-            AttributeError,
-            TypeError,
-            ValueError,
-            _PLESpeculativeRollbackError,
-        ) as exc:
-            self._discard_ple_snapshots(caches)
-            if isinstance(exc, _PLESpeculativeRollbackError):
-                raise
-            raise _PLESpeculativeRollbackError(
-                f"PLE speculative snapshot preflight failed: {exc}"
-            ) from exc
-
-        try:
+                self._validate_ple_snapshot(snapshot, accepted_values)
+                pending.append((cache, snapshot))
             result = super().rollback_speculative_cache(
-                caches,
-                gdn_states,
-                accepted,
-                block_size,
+                caches, gdn_states, accepted, block_size
             )
-        except Exception:
-            self._discard_ple_snapshots(caches)
-            raise
-
-        try:
-            for cache, restored_conv, restored_history in pending:
-                cache[2] = restored_conv
-                cache[3] = restored_history
+            for cache, snapshot in pending:
+                self._restore_ple_state(cache, snapshot, accepted_values)
+            return result
         finally:
             self._discard_ple_snapshots(caches)
-        return result

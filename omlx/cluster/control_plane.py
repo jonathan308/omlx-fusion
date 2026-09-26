@@ -3,14 +3,18 @@
 
 from __future__ import annotations
 
-import pickle
+import hashlib
+import hmac
+import logging
 import os
+import pickle
+import secrets
 import socket
 import struct
 import threading
 import time
 import zlib
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, suppress
 from typing import Any
 
 from .system_socket_proxy import (
@@ -19,16 +23,30 @@ from .system_socket_proxy import (
     should_proxy_control_socket,
 )
 
+logger = logging.getLogger(__name__)
+
 _HANDSHAKE_MAGIC = b"OC2H"
+_HANDSHAKE_CHALLENGE_MAGIC = b"OC2C"
+_HANDSHAKE_ACK_MAGIC = b"OC2A"
 _MESSAGE_MAGIC = b"OC2M"
 _OWNED_BYTES_MAGIC = b"OC2B"
 _BARRIER_MAGIC = b"OC2R"
 _VERSION = 1
-_HANDSHAKE = struct.Struct("!4sII64s")
-_HEADER = struct.Struct("!4sIIII")
-_OWNED_BYTES_HEADER = struct.Struct("!4sIIIII")
-_BARRIER_PACKET = struct.Struct("!4sIII")
+_HANDSHAKE_CHALLENGE = struct.Struct("!4sI32s")
+_HANDSHAKE = struct.Struct("!4sII32s")
+_HANDSHAKE_ACK = struct.Struct("!4sI32s")
+_HEADER_PREFIX = struct.Struct("!4sIIII")
+_HEADER = struct.Struct("!4sIIII32s")
+_OWNED_BYTES_PREFIX = struct.Struct("!4sIIIII")
+_OWNED_BYTES_HEADER = struct.Struct("!4sIIIII32s")
+_BARRIER_PREFIX = struct.Struct("!4sIII")
+_BARRIER_PACKET = struct.Struct("!4sIII32s")
 _MAX_OBJECT_BYTES = 256 * 1024 * 1024
+_WORKER_AUTH_DOMAIN = b"omlx-rank-control-worker-v1"
+_COORDINATOR_AUTH_DOMAIN = b"omlx-rank-control-coordinator-v1"
+_MESSAGE_AUTH_DOMAIN = b"omlx-rank-control-message-v1"
+_OWNED_BYTES_AUTH_DOMAIN = b"omlx-rank-control-owned-bytes-v1"
+_BARRIER_AUTH_DOMAIN = b"omlx-rank-control-barrier-v1"
 
 _ACTIVE_LOCK = threading.Lock()
 _ACTIVE_CONTROL_PLANE: "RankControlPlane | None" = None
@@ -119,12 +137,16 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
         # the shared sequence twice.
         self._operation_lock = threading.RLock()
 
-    def __enter__(self) -> "RankControlPlane":
+    def __enter__(self) -> RankControlPlane:
         global _ACTIVE_CONTROL_PLANE
-        if self.rank == 0:
-            self._accept_workers()
-        else:
-            self._connect_to_coordinator()
+        try:
+            if self.rank == 0:
+                self._accept_workers()
+            else:
+                self._connect_to_coordinator()
+        except BaseException:
+            self.close()
+            raise
         with _ACTIVE_LOCK:
             _ACTIVE_CONTROL_PLANE = self
         return self
@@ -134,6 +156,14 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
         stream.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         stream.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
+    def _handshake_tag(self, domain: bytes, challenge: bytes, rank: int) -> bytes:
+        identity = struct.pack("!II", _VERSION, int(rank))
+        return hmac.new(
+            self._token,
+            domain + challenge + identity,
+            hashlib.sha256,
+        ).digest()
+
     def _accept_workers(self) -> None:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -141,6 +171,10 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
         listener.listen(self.world_size - 1)
         listener.settimeout(min(1.0, self._connect_timeout))
         self._listener = listener
+        logger.info(
+            "[ControlPlane R0] listening on %s:%d (world_size=%d)",
+            self.host, self.port, self.world_size,
+        )
         deadline = time.monotonic() + self._connect_timeout
         while len(self._peers) < self.world_size - 1:
             if time.monotonic() >= deadline:
@@ -149,73 +183,190 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
                 stream, _address = listener.accept()
             except TimeoutError:
                 continue
-            self._configure(stream)
+            remaining = max(0.1, deadline - time.monotonic())
+            stream.settimeout(min(30.0, remaining))
             try:
-                magic, version, rank, token = _HANDSHAKE.unpack(
+                logger.debug(
+                    "[ControlPlane R0] accepted connection from %s", _address,
+                )
+                challenge = secrets.token_bytes(32)
+                stream.sendall(
+                    _HANDSHAKE_CHALLENGE.pack(
+                        _HANDSHAKE_CHALLENGE_MAGIC,
+                        _VERSION,
+                        challenge,
+                    )
+                )
+                logger.debug("[ControlPlane R0] sent challenge, waiting for response")
+                magic, version, rank, observed_tag = _HANDSHAKE.unpack(
                     _recv_exact(stream, _HANDSHAKE.size)
+                )
+                expected_tag = self._handshake_tag(
+                    _WORKER_AUTH_DOMAIN,
+                    challenge,
+                    rank,
                 )
                 if (
                     magic != _HANDSHAKE_MAGIC
                     or version != _VERSION
                     or not 0 < rank < self.world_size
                     or rank in self._peers
-                    or token != self._token
+                    or not hmac.compare_digest(observed_tag, expected_tag)
                 ):
-                    raise RuntimeError("rank-control handshake is invalid")
-                self._peers[rank] = stream
-            except Exception:
-                stream.close()
-                raise
-
-    def _connect_to_coordinator(self) -> None:
-        if should_proxy_control_socket(self.host):
-            proxy = open_system_tcp_proxy(
-                self.host,
-                self.port,
-                timeout=self._connect_timeout,
-            )
-            stream = proxy.stream
-            try:
+                    logger.warning(
+                        "[ControlPlane R0] handshake rejected from %s"
+                        " (magic=%r version=%d rank=%d dup=%s hmac_ok=%s)",
+                        _address, magic, version, rank,
+                        rank in self._peers,
+                        hmac.compare_digest(observed_tag, expected_tag),
+                    )
+                    stream.close()
+                    continue
                 self._configure(stream)
                 stream.sendall(
-                    _HANDSHAKE.pack(
-                        _HANDSHAKE_MAGIC,
+                    _HANDSHAKE_ACK.pack(
+                        _HANDSHAKE_ACK_MAGIC,
                         _VERSION,
-                        self.rank,
-                        self._token,
+                        self._handshake_tag(
+                            _COORDINATOR_AUTH_DOMAIN,
+                            challenge,
+                            rank,
+                        ),
                     )
                 )
-            except BaseException:
-                proxy.close()
-                raise
-            self._stream_proxy = proxy
-            self._stream = stream
-            return
-        deadline = time.monotonic() + self._connect_timeout
+                self._peers[rank] = stream
+                logger.info(
+                    "[ControlPlane R0] rank %d authenticated (%d/%d peers)",
+                    rank, len(self._peers), self.world_size - 1,
+                )
+            except (OSError, TimeoutError, ConnectionError, struct.error) as exc:
+                logger.debug(
+                    "[ControlPlane R0] handshake failed from %s: %s",
+                    _address, exc,
+                )
+                stream.close()
+                continue
+
+    def _authenticate_worker_stream(self, stream: socket.socket) -> None:
+        challenge_magic, challenge_version, challenge = _HANDSHAKE_CHALLENGE.unpack(
+            _recv_exact(stream, _HANDSHAKE_CHALLENGE.size)
+        )
+        if (
+            challenge_magic != _HANDSHAKE_CHALLENGE_MAGIC
+            or challenge_version != _VERSION
+        ):
+            raise RuntimeError("rank-control challenge is invalid")
+        logger.debug(
+            "[ControlPlane R%d] received challenge, sending response", self.rank,
+        )
+        stream.sendall(
+            _HANDSHAKE.pack(
+                _HANDSHAKE_MAGIC,
+                _VERSION,
+                self.rank,
+                self._handshake_tag(
+                    _WORKER_AUTH_DOMAIN,
+                    challenge,
+                    self.rank,
+                ),
+            )
+        )
+        ack_magic, ack_version, ack_tag = _HANDSHAKE_ACK.unpack(
+            _recv_exact(stream, _HANDSHAKE_ACK.size)
+        )
+        expected_ack = self._handshake_tag(
+            _COORDINATOR_AUTH_DOMAIN,
+            challenge,
+            self.rank,
+        )
+        if (
+            ack_magic != _HANDSHAKE_ACK_MAGIC
+            or ack_version != _VERSION
+            or not hmac.compare_digest(ack_tag, expected_ack)
+        ):
+            raise RuntimeError("rank-control handshake was not acknowledged")
+        logger.info("[ControlPlane R%d] handshake complete", self.rank)
+
+    def _connect_via_proxy(self, *, deadline: float) -> None:
+        logger.info(
+            "[ControlPlane R%d] transport=system-proxy -> %s:%d",
+            self.rank,
+            self.host,
+            self.port,
+        )
+        proxy = open_system_tcp_proxy(
+            self.host,
+            self.port,
+            timeout=max(0.001, deadline - time.monotonic()),
+        )
+        stream = proxy.stream
+        try:
+            stream.settimeout(max(0.001, deadline - time.monotonic()))
+            self._authenticate_worker_stream(stream)
+            self._configure(stream)
+        except BaseException:
+            proxy.close()
+            raise
+        self._stream_proxy = proxy
+        self._stream = stream
+
+    def _connect_direct(self, *, deadline: float, allow_proxy: bool) -> None:
+        logger.info(
+            "[ControlPlane R%d] transport=direct -> %s:%d",
+            self.rank,
+            self.host,
+            self.port,
+        )
         last_error: OSError | None = None
         while time.monotonic() < deadline:
             stream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
-                stream.settimeout(min(1.0, self._connect_timeout))
+                remaining = max(0.001, deadline - time.monotonic())
+                probe_timeout = min(1.0, self._connect_timeout / 2)
+                stream.settimeout(min(probe_timeout, remaining))
                 stream.connect((self.host, self.port))
-                self._configure(stream)
-                stream.sendall(
-                    _HANDSHAKE.pack(
-                        _HANDSHAKE_MAGIC,
-                        _VERSION,
-                        self.rank,
-                        self._token,
-                    )
+                remaining = max(0.001, deadline - time.monotonic())
+                stream.settimeout(
+                    min(5.0, self._connect_timeout / 2, remaining)
+                    if allow_proxy
+                    else remaining
                 )
+                self._authenticate_worker_stream(stream)
+                self._configure(stream)
                 self._stream = stream
                 return
+            except (RuntimeError, PermissionError):
+                stream.close()
+                raise
             except OSError as exc:
                 last_error = exc
                 stream.close()
-                time.sleep(0.05)
-        raise TimeoutError(
-            f"rank-control coordinator was unreachable: {last_error}"
-        )
+                # A refused connection means rank zero has not started listening.
+                if allow_proxy and not isinstance(exc, ConnectionRefusedError):
+                    raise
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        raise TimeoutError(f"rank-control coordinator was unreachable: {last_error}")
+
+    def _connect_to_coordinator(self) -> None:
+        mode = os.environ.get("OMLX_CLUSTER_CONTROL_TRANSPORT", "auto").strip().lower()
+        proxy_available = should_proxy_control_socket(self.host)
+        deadline = time.monotonic() + self._connect_timeout
+        if mode == "system-proxy":
+            self._connect_via_proxy(deadline=deadline)
+            return
+
+        try:
+            self._connect_direct(deadline=deadline, allow_proxy=proxy_available)
+        except OSError as exc:
+            if not proxy_available or time.monotonic() >= deadline:
+                raise
+            logger.warning(
+                "[ControlPlane R%d] direct connection failed (%s); "
+                "falling back to system-proxy",
+                self.rank,
+                exc,
+            )
+            self._connect_via_proxy(deadline=deadline)
 
     def broadcast_object(self, obj: Any) -> Any:
         """Broadcast one rank-zero-owned Python object in strict sequence."""
@@ -226,12 +377,26 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
                 payload = pickle.dumps(obj) if obj is not None else b""
                 if len(payload) > _MAX_OBJECT_BYTES:
                     raise RuntimeError("rank-control object exceeds 256 MiB")
+                checksum = zlib.crc32(payload)
+                prefix = _HEADER_PREFIX.pack(
+                    _MESSAGE_MAGIC,
+                    _VERSION,
+                    self._sequence,
+                    len(payload),
+                    checksum,
+                )
+                tag = hmac.new(
+                    self._token,
+                    _MESSAGE_AUTH_DOMAIN + prefix + payload,
+                    hashlib.sha256,
+                ).digest()
                 header = _HEADER.pack(
                     _MESSAGE_MAGIC,
                     _VERSION,
                     self._sequence,
                     len(payload),
-                    zlib.crc32(payload),
+                    checksum,
+                    tag,
                 )
                 packet = header + payload
                 _trace_control(
@@ -247,7 +412,7 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
             stream = self._stream
             if stream is None:
                 raise RuntimeError("rank-control worker is not connected")
-            magic, version, sequence, size, checksum = _HEADER.unpack(
+            magic, version, sequence, size, checksum, observed_tag = _HEADER.unpack(
                 _recv_exact(stream, _HEADER.size)
             )
             if magic != _MESSAGE_MAGIC or version != _VERSION:
@@ -262,6 +427,14 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
             payload = _recv_exact(stream, size) if size else b""
             if zlib.crc32(payload) != checksum:
                 raise RuntimeError("rank-control object failed CRC32")
+            prefix = _HEADER_PREFIX.pack(magic, version, sequence, size, checksum)
+            expected_tag = hmac.new(
+                self._token,
+                _MESSAGE_AUTH_DOMAIN + prefix + payload,
+                hashlib.sha256,
+            ).digest()
+            if not hmac.compare_digest(observed_tag, expected_tag):
+                raise RuntimeError("rank-control object failed authentication")
             result = pickle.loads(payload) if payload else None
             _trace_control(
                 self.rank,
@@ -280,7 +453,7 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
         expected_size: int,
     ) -> tuple[bytes, bytes]:
         header = _recv_exact(stream, _OWNED_BYTES_HEADER.size)
-        magic, version, received_sequence, source, size, checksum = (
+        magic, version, received_sequence, source, size, checksum, observed_tag = (
             _OWNED_BYTES_HEADER.unpack(header)
         )
         if magic != _OWNED_BYTES_MAGIC or version != _VERSION:
@@ -303,6 +476,16 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
         payload = _recv_exact(stream, size) if size else b""
         if zlib.crc32(payload) != checksum:
             raise RuntimeError("rank-control owned bytes failed CRC32")
+        prefix = _OWNED_BYTES_PREFIX.pack(
+            magic, version, received_sequence, source, size, checksum
+        )
+        expected_tag = hmac.new(
+            self._token,
+            _OWNED_BYTES_AUTH_DOMAIN + prefix + payload,
+            hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(observed_tag, expected_tag):
+            raise RuntimeError("rank-control owned bytes failed authentication")
         return header + payload, payload
 
     def broadcast_owned_bytes(
@@ -341,15 +524,32 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
             sequence = self._sequence
             _trace_control(self.rank, sequence, "owned-bytes-enter")
             if self.rank == source_rank:
-                header = _OWNED_BYTES_HEADER.pack(
+                checksum = zlib.crc32(payload)
+                prefix = _OWNED_BYTES_PREFIX.pack(
                     _OWNED_BYTES_MAGIC,
                     _VERSION,
                     sequence,
                     source_rank,
                     expected_size,
-                    zlib.crc32(payload),
+                    checksum,
                 )
-                packet = header + payload
+                tag = hmac.new(
+                    self._token,
+                    _OWNED_BYTES_AUTH_DOMAIN + prefix + payload,
+                    hashlib.sha256,
+                ).digest()
+                packet = (
+                    _OWNED_BYTES_HEADER.pack(
+                        _OWNED_BYTES_MAGIC,
+                        _VERSION,
+                        sequence,
+                        source_rank,
+                        expected_size,
+                        checksum,
+                        tag,
+                    )
+                    + payload
+                )
             else:
                 packet = b""
 
@@ -385,6 +585,50 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
             )
             return owned
 
+    def _barrier_packet(self, *, sequence: int, rank: int) -> bytes:
+        prefix = _BARRIER_PREFIX.pack(_BARRIER_MAGIC, _VERSION, sequence, rank)
+        tag = hmac.new(
+            self._token,
+            _BARRIER_AUTH_DOMAIN + prefix,
+            hashlib.sha256,
+        ).digest()
+        return _BARRIER_PACKET.pack(_BARRIER_MAGIC, _VERSION, sequence, rank, tag)
+
+    def _recv_barrier_packet(
+        self,
+        stream: socket.socket,
+        *,
+        sequence: int,
+        rank: int,
+    ) -> None:
+        magic, version, received_sequence, received_rank, observed_tag = (
+            _BARRIER_PACKET.unpack(_recv_exact(stream, _BARRIER_PACKET.size))
+        )
+        prefix = _BARRIER_PREFIX.pack(magic, version, received_sequence, received_rank)
+        expected_tag = hmac.new(
+            self._token,
+            _BARRIER_AUTH_DOMAIN + prefix,
+            hashlib.sha256,
+        ).digest()
+        authenticated = hmac.compare_digest(observed_tag, expected_tag)
+        if (
+            magic != _BARRIER_MAGIC
+            or version != _VERSION
+            or received_sequence != sequence
+            or received_rank != rank
+            or not authenticated
+        ):
+            # Name every mismatched field: a diverged boundary sequence is the
+            # one clue that separates rank-state drift from a transport loss.
+            raise RuntimeError(
+                "rank-control barrier packet is invalid: "
+                f"expected magic={_BARRIER_MAGIC!r} version={_VERSION} "
+                f"sequence={sequence} rank={rank}; received "
+                f"magic={magic!r} version={version} "
+                f"sequence={received_sequence} rank={received_rank} "
+                f"authenticated={authenticated}"
+            )
+
     def barrier(self) -> None:
         """Wait until every rank reaches one ordered control boundary.
 
@@ -404,28 +648,12 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
                     stream = self._peers.get(rank)
                     if stream is None:
                         raise RuntimeError("rank-control barrier peer is not connected")
-                    magic, version, received_sequence, received_rank = (
-                        _BARRIER_PACKET.unpack(_recv_exact(stream, _BARRIER_PACKET.size))
+                    self._recv_barrier_packet(
+                        stream,
+                        sequence=sequence,
+                        rank=rank,
                     )
-                    if (
-                        magic != _BARRIER_MAGIC
-                        or version != _VERSION
-                        or received_sequence != sequence
-                        or received_rank != rank
-                    ):
-                        raise RuntimeError(
-                            "rank-control barrier arrival is invalid: "
-                            f"expected magic={_BARRIER_MAGIC!r} version={_VERSION} "
-                            f"sequence={sequence} rank={rank}; received "
-                            f"magic={magic!r} version={version} "
-                            f"sequence={received_sequence} rank={received_rank}"
-                        )
-                release = _BARRIER_PACKET.pack(
-                    _BARRIER_MAGIC,
-                    _VERSION,
-                    sequence,
-                    0,
-                )
+                release = self._barrier_packet(sequence=sequence, rank=0)
                 for rank in range(1, self.world_size):
                     self._peers[rank].sendall(release)
                 _trace_control(self.rank, sequence, "barrier-release")
@@ -434,30 +662,8 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
             stream = self._stream
             if stream is None:
                 raise RuntimeError("rank-control worker is not connected")
-            stream.sendall(
-                _BARRIER_PACKET.pack(
-                    _BARRIER_MAGIC,
-                    _VERSION,
-                    sequence,
-                    self.rank,
-                )
-            )
-            magic, version, received_sequence, coordinator = _BARRIER_PACKET.unpack(
-                _recv_exact(stream, _BARRIER_PACKET.size)
-            )
-            if (
-                magic != _BARRIER_MAGIC
-                or version != _VERSION
-                or received_sequence != sequence
-                or coordinator != 0
-            ):
-                raise RuntimeError(
-                    "rank-control barrier release is invalid: "
-                    f"expected magic={_BARRIER_MAGIC!r} version={_VERSION} "
-                    f"sequence={sequence} coordinator=0; received "
-                    f"magic={magic!r} version={version} "
-                    f"sequence={received_sequence} coordinator={coordinator}"
-                )
+            stream.sendall(self._barrier_packet(sequence=sequence, rank=self.rank))
+            self._recv_barrier_packet(stream, sequence=sequence, rank=0)
             _trace_control(self.rank, sequence, "barrier-exit")
 
     def close(self) -> None:
@@ -466,25 +672,19 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
             if _ACTIVE_CONTROL_PLANE is self:
                 _ACTIVE_CONTROL_PLANE = None
         for stream in self._peers.values():
-            try:
+            with suppress(OSError):
                 stream.close()
-            except OSError:
-                pass
         self._peers.clear()
         if self._stream is not None:
-            try:
+            with suppress(OSError):
                 self._stream.close()
-            except OSError:
-                pass
             self._stream = None
         if self._stream_proxy is not None:
             self._stream_proxy.close()
             self._stream_proxy = None
         if self._listener is not None:
-            try:
+            with suppress(OSError):
                 self._listener.close()
-            except OSError:
-                pass
             self._listener = None
 
     def __exit__(self, *_exc: Any) -> None:

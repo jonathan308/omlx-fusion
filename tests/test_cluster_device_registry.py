@@ -273,7 +273,13 @@ def test_merge_on_discovered_device_also_merges_without_downgrade(tmp_path):
     registry.merge(
         {
             "node_id": "node-c",
-            "caps": {"chip": "", "ram_gb": 0.0, "backends": [], "thunderbolt": False, "jaccl": False},
+            "caps": {
+                "chip": "",
+                "ram_gb": 0.0,
+                "backends": [],
+                "thunderbolt": False,
+                "jaccl": False,
+            },
             "addrs": [{"ip": "fe80::7", "if_type": "unknown"}],
         }
     )

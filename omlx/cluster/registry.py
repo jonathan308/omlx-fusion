@@ -67,8 +67,7 @@ class ClusterRegistry:
                 ClusterDeployment.from_dict(item) for item in raw_deployments
             ]
             self._deployments = {
-                _model_key(deployment.model): deployment
-                for deployment in deployments
+                _model_key(deployment.model): deployment for deployment in deployments
             }
             if len(self._deployments) != len(deployments):
                 raise ValueError("cluster deployment registry has duplicate models")
@@ -78,10 +77,8 @@ class ClusterRegistry:
                 # file described. Persist the upgrade so the migration happens
                 # once, but never let an unwritable file block server startup.
                 self.migrated_from = int(payload.get("schema_version", 1))
-                try:
+                with suppress(OSError):
                     self._save()
-                except OSError:
-                    pass
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -113,8 +110,7 @@ class ClusterRegistry:
     def list(self) -> tuple[ClusterDeployment, ...]:
         with self._lock:
             return tuple(
-                deployment
-                for _, deployment in sorted(self._deployments.items())
+                deployment for _, deployment in sorted(self._deployments.items())
             )
 
     def get_for_model(self, model: str) -> ClusterDeployment | None:
@@ -209,9 +205,7 @@ def default_devices_path() -> Path:
     """Default on-disk location, honoring the OMLX_BASE_PATH override."""
 
     env_value = os.environ.get("OMLX_BASE_PATH")
-    base = (
-        Path(env_value).expanduser() if env_value else Path.home() / ".omlx"
-    )
+    base = Path(env_value).expanduser() if env_value else Path.home() / ".omlx"
     return base / "cluster" / "devices.json"
 
 
@@ -230,9 +224,7 @@ class DeviceRegistry:
     """
 
     def __init__(self, path: Path | str | None = None) -> None:
-        self.path = (
-            Path(path) if path is not None else default_devices_path()
-        )
+        self.path = Path(path) if path is not None else default_devices_path()
         self._lock = threading.RLock()
         self._paired: dict[str, dict[str, Any]] = {}
         self._discovered: dict[str, dict[str, Any]] = {}
@@ -289,9 +281,7 @@ class DeviceRegistry:
             "friendly_name": friendly_name,
             "caps": dict(caps) if isinstance(caps, dict) else {},
             "paired_at": float(paired_at),
-            "last_addrs": [
-                str(a) for a in last_addrs if isinstance(a, str)
-            ][:16]
+            "last_addrs": [str(a) for a in last_addrs if isinstance(a, str)][:16]
             if isinstance(last_addrs, list)
             else [],
         }
@@ -310,9 +300,7 @@ class DeviceRegistry:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "schema_version": 1,
-            "devices": [
-                self._paired[key] for key in sorted(self._paired)
-            ],
+            "devices": [self._paired[key] for key in sorted(self._paired)],
         }
         descriptor, temporary = tempfile.mkstemp(
             prefix=".devices.", suffix=".tmp", dir=self.path.parent
@@ -333,7 +321,9 @@ class DeviceRegistry:
     # -- merge API (discovery + pairing) ------------------------------------
 
     @staticmethod
-    def _merge_caps(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    def _merge_caps(
+        existing: dict[str, Any], incoming: dict[str, Any]
+    ) -> dict[str, Any]:
         """Field-wise non-downgrading caps merge.
 
         A discovery HELLO carries a structurally complete but value-empty
@@ -454,8 +444,7 @@ class DeviceRegistry:
             raise ValueError("device record is missing a node_id")
         if "last_addrs" not in record and isinstance(record.get("addrs"), list):
             record["last_addrs"] = [
-                a.get("ip") if isinstance(a, dict) else a
-                for a in record["addrs"]
+                a.get("ip") if isinstance(a, dict) else a for a in record["addrs"]
             ]
         caps = record.get("caps")
         if caps is not None and not isinstance(caps, dict):
@@ -467,9 +456,9 @@ class DeviceRegistry:
             normalized["caps"] = dict(caps)
         addrs = record.get("last_addrs")
         if isinstance(addrs, list):
-            normalized["last_addrs"] = [
-                str(a) for a in addrs if isinstance(a, str)
-            ][:16]
+            normalized["last_addrs"] = [str(a) for a in addrs if isinstance(a, str)][
+                :16
+            ]
         http_port = record.get("http_port")
         if http_port is not None and http_port != 0 and http_port != "":
             if (
@@ -494,9 +483,7 @@ class DeviceRegistry:
         """Promote a device to trusted/paired and persist it."""
 
         with self._lock:
-            existing = self._paired.get(node_id) or self._discovered.get(
-                node_id, {}
-            )
+            existing = self._paired.get(node_id) or self._discovered.get(node_id, {})
             if http_port is not None and (
                 not isinstance(http_port, int)
                 or isinstance(http_port, bool)
@@ -511,9 +498,7 @@ class DeviceRegistry:
                 "caps": dict(caps)
                 if caps is not None
                 else dict(existing.get("caps") or {}),
-                "paired_at": float(
-                    paired_at if paired_at is not None else time.time()
-                ),
+                "paired_at": float(paired_at if paired_at is not None else time.time()),
                 "last_addrs": list(addrs)
                 if addrs is not None
                 else list(existing.get("last_addrs") or []),

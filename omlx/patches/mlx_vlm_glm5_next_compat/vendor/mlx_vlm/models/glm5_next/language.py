@@ -673,11 +673,18 @@ class Glm5NextSparseAttention(nn.Module):
                 return self._gathered_attention(q, kv_latent, topk_indices)
             else:
                 q_latent = self.embed_q(q)
+                # Native DSA requires FP16/BF16 inputs; quantized projections can yield FP32.
+                # Cast at the kernel boundary and preserve the residual stream dtype.
+                native_dtype = (
+                    mx.float16 if q_latent.dtype == mx.float32 else q_latent.dtype
+                )
+                q_latent = q_latent.astype(native_dtype)
+                kv_latent_native = kv_latent.astype(native_dtype)
                 output = None
                 if Kv >= 4096:
                     output = sparse_mla_attention_nope(
                         q_latent,
-                        kv_latent,
+                        kv_latent_native,
                         topk_indices,
                         self.scale,
                     )
@@ -685,16 +692,12 @@ class Glm5NextSparseAttention(nn.Module):
                     # the exact historical path until the dedicated NoPE ABI
                     # is present, rather than silently demoting to dense MLA.
                     if output is None:
-                        q_pe = mx.zeros(
-                            q_latent.shape[:-1] + (64,), dtype=q_latent.dtype
-                        )
-                        k_pe = mx.zeros(
-                            kv_latent.shape[:-1] + (64,), dtype=kv_latent.dtype
-                        )
+                        q_pe = mx.zeros(q_latent.shape[:-1] + (64,), dtype=native_dtype)
+                        k_pe = mx.zeros(kv_latent.shape[:-1] + (64,), dtype=native_dtype)
                         output = sparse_mla_attention(
                             q_latent,
                             q_pe,
-                            kv_latent,
+                            kv_latent_native,
                             k_pe,
                             topk_indices,
                             self.scale,
@@ -711,10 +714,10 @@ class Glm5NextSparseAttention(nn.Module):
                         output_flat = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
                     return linear_forward(self.o_proj, output_flat)
 
-                k = self.embed_q(kv_latent, transpose=False)
-                v = self.unembed_out(kv_latent)
+                k = self.embed_q(kv_latent, transpose=False).astype(native_dtype)
+                v = self.unembed_out(kv_latent).astype(native_dtype)
                 output = exact_block_token_attention(
-                    q,
+                    q.astype(native_dtype),
                     k,
                     v,
                     topk_indices,
@@ -747,7 +750,10 @@ class Glm5NextSparseAttention(nn.Module):
             if deps:
                 cache[0].keys = mx.depends(cache[0].keys, deps)
 
-        if L == 1:
+        # Short verification blocks use the same latent-space attention as
+        # decode. Expanding every cached key and value into all heads makes
+        # verification cost grow with the complete context length.
+        if L <= 8:
             q = self.embed_q(q)
             k = v = kv_latent
         else:
@@ -757,7 +763,7 @@ class Glm5NextSparseAttention(nn.Module):
         output = scaled_dot_product_attention(
             q, k, v, cache=cache, scale=self.scale, mask=attn_mask
         )
-        if L == 1:
+        if L <= 8:
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
@@ -964,9 +970,16 @@ class Glm5NextModel(nn.Module):
         )
         h = mx.contiguous(h)
 
+        # Evaluate each layer and release cached buffers to bound prefill memory.
+        # Keep decode lazy; the MTP replacement loop must use the same policy.
+        prefill = h.shape[1] >= 256
+
         for layer, c in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
             h = layer(h, mask=mask, cache=c)
+            if prefill:
+                mx.eval(h)
+                mx.clear_cache()
 
         h = h.mean(axis=2)
         return self.norm(h)
@@ -1014,6 +1027,16 @@ class LanguageModel(nn.Module):
 
         remapped = {}
         conv_parts = {}
+        fg_parts = (
+            "A_log",
+            "dt_bias",
+            "f_a_proj.weight",
+            "f_a_proj.scales",
+            "f_a_proj.biases",
+            "f_b_proj.weight",
+            "f_b_proj.scales",
+            "f_b_proj.biases",
+        )
         for k, v in weights.items():
             nk = k.replace(".hc_attn_", ".attn_hc.").replace(".hc_ffn_", ".ffn_hc.")
 
@@ -1028,19 +1051,10 @@ class LanguageModel(nn.Module):
             if fused:
                 continue
 
-            for projection in ("f_a_proj", "f_b_proj"):
-                marker = f".self_attn.{projection}."
-                if marker in nk:
-                    nk = nk.replace(
-                        marker,
-                        f".self_attn.forget_gate.{projection}.",
-                        1,
-                    )
-                    break
-            for state_name in ("A_log", "dt_bias"):
-                suffix = ".self_attn." + state_name
+            for p in fg_parts:
+                suffix = ".self_attn." + p
                 if nk.endswith(suffix):
-                    nk = nk[: -len(state_name)] + "forget_gate." + state_name
+                    nk = nk[: -len(p)] + "forget_gate." + p
                     break
 
             remapped[nk] = v

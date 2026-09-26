@@ -55,6 +55,7 @@ from typing import Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi import Request as FastAPIRequest
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
@@ -94,6 +95,7 @@ from .api.embedding_models import (
 )
 from .api.embedding_utils import (
     encode_embedding_base64,
+    find_non_finite_embeddings,
     normalize_embedding_items,
     normalize_input,
     truncate_embedding,
@@ -144,6 +146,7 @@ from .api.responses_utils import (
     ResponseStateCorruptError,
     ResponseStateNotFoundError,
     ResponseStore,
+    apply_namespace_tool_aliases,
     build_function_call_output_item,
     build_message_output_item,
     build_reasoning_output_item,
@@ -153,9 +156,11 @@ from .api.responses_utils import (
     convert_responses_tools,
     format_sse_event,
     normalize_response_output_to_messages,
+    split_namespace_tool_name,
 )
 from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
 from .api.tool_calling import (
+    ToolCallExtraction,
     ToolCallStreamSegment,
     ToolCallStreamFilter,
     build_json_system_prompt,
@@ -164,6 +169,7 @@ from .api.tool_calling import (
     extract_tool_calls_with_thinking,
     parse_tool_calls,
     parse_json_output,
+    parse_qwen_tool_calls,
     restore_gemma4_param_names,
     sanitize_tool_call_markup,
 )
@@ -175,6 +181,7 @@ from .api.utils import (
     has_nonleading_system_message,
     merge_reasoning_effort_chat_template_kwargs,
     prepare_system_messages_for_template,
+    cache_reasoning_output,
     uses_native_reasoning_content,
 )
 from .engine import BaseEngine, VLMBatchedEngine
@@ -312,6 +319,9 @@ class ServerState:
     mcp_executor: Optional[object] = None
     sampling: SamplingDefaults = field(default_factory=SamplingDefaults)
     api_key: Optional[str] = None
+    # Bind address snapshot for security checks. Unlike GlobalSettings.server.host,
+    # this remains unchanged until the process restarts on the new address.
+    bind_host: str | None = None
     settings_manager: Optional[object] = None  # ModelSettingsManager
     global_settings: Optional[object] = None  # GlobalSettings
     hf_downloader: Optional[object] = None  # HFDownloader
@@ -368,21 +378,35 @@ async def verify_api_key(
     request: FastAPIRequest,
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> bool:
-    """Verify API key if configured.
+    """Verify API key unless an explicitly loopback-only server allows no auth.
 
     Checks the provided Bearer token against the main API key and all sub keys.
     Also accepts the x-api-key header as a fallback (Anthropic SDK compatibility).
     """
     from .admin.auth import fingerprint_key, verify_any_api_key
+    from .utils.network import is_loopback_bind
 
-    # No auth required if no API key is configured
+    global_settings = _server_state.global_settings
+    configured_host = getattr(
+        getattr(global_settings, "server", None), "host", None
+    )
+    if not isinstance(configured_host, str):
+        configured_host = None
+    bind_host = getattr(_server_state, "bind_host", None)
+    active_host = bind_host if isinstance(bind_host, str) else configured_host
+    loopback_only = active_host is None or is_loopback_bind(active_host)
+
+    # A missing key is accepted only when the configured bind is loopback-only.
     if _server_state.api_key is None:
-        return True
+        if loopback_only:
+            return True
+        raise HTTPException(status_code=401, detail="API key required")
 
     # Skip verification if enabled
     if (
-        _server_state.global_settings is not None
-        and _server_state.global_settings.auth.skip_api_key_verification
+        global_settings is not None
+        and global_settings.auth.skip_api_key_verification
+        and loopback_only
     ):
         return True
 
@@ -397,8 +421,8 @@ async def verify_api_key(
 
     # Check main key and sub keys
     sub_keys = (
-        _server_state.global_settings.auth.sub_keys
-        if _server_state.global_settings is not None
+        global_settings.auth.sub_keys
+        if global_settings is not None
         else []
     )
     if not verify_any_api_key(api_key_value, _server_state.api_key, sub_keys):
@@ -406,6 +430,24 @@ async def verify_api_key(
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     return True
+
+
+def allows_unauthenticated_inference() -> bool:
+    settings = _server_state.global_settings
+    return (
+        settings is not None
+        and settings.auth.allow_unauthenticated_inference is True
+    )
+
+
+async def verify_inference_api_key(
+    request: FastAPIRequest,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> bool:
+    """Allow the manual inference opt-in without changing management auth."""
+    if allows_unauthenticated_inference():
+        return True
+    return await verify_api_key(request, credentials)
 
 
 def distributed_inference_enabled() -> bool:
@@ -481,20 +523,12 @@ async def lifespan(app: FastAPI):
     # (G8): all teardown used to live in-process, so a SIGKILL/panic of
     # omlx-server stranded loaded ranks with no owner. The launch manifest
     # written at spawn lets this new coordinator finish the teardown.
-    # The HTTP control plane may still start so the operator can read the
-    # failure, but DistributedJobSupervisor.start treats any retained
-    # manifest/failure as an admission barrier for new ranks.
+    # Best effort: a reaping failure must never block server startup.
     try:
         from .cluster.launch import reap_orphaned_launches
 
         orphan_report = await asyncio.to_thread(reap_orphaned_launches)
-        if orphan_report["failures"]:
-            logger.warning(
-                "Orphaned distributed launch recovery report from a previous "
-                "coordinator (failures remain blocked): %s",
-                orphan_report,
-            )
-        elif orphan_report["reaped"]:
+        if orphan_report["reaped"] or orphan_report["failures"]:
             logger.warning(
                 "Reaped orphaned distributed launches from a previous "
                 "coordinator: %s",
@@ -622,6 +656,11 @@ async def lifespan(app: FastAPI):
         _server_state.engine_pool._get_admission_soft_target = (
             enforcer.get_admission_soft_target
         )
+        # Resident-vs-mmap is a throughput call and must not read the
+        # instantaneous ceiling, which dips right after a model swap.
+        _server_state.engine_pool._get_residency_ceiling = (
+            enforcer.get_residency_ceiling
+        )
         enforcer.start()
 
     # Startup: Preload pinned models in the background so uvicorn binds the
@@ -703,7 +742,7 @@ async def lifespan(app: FastAPI):
         preload_task.cancel()
         with suppress(asyncio.CancelledError):
             await preload_task
-    get_server_metrics().save_alltime()
+    get_server_metrics().close()
     if ttl_task is not None:
         ttl_task.cancel()
         try:
@@ -742,14 +781,14 @@ from .api.mcp_routes import router as mcp_router
 from .api.mcp_routes import set_mcp_manager_getter
 
 set_mcp_manager_getter(get_mcp_manager)
-app.include_router(mcp_router, dependencies=[Depends(verify_api_key)])
+app.include_router(mcp_router, dependencies=[Depends(verify_inference_api_key)])
 
 # Include web search routes (chat UI built-in web_search / fetch_url tools)
 from .api.websearch_routes import router as websearch_router
 from .api.websearch_routes import set_global_settings_getter as _set_websearch_settings
 
 _set_websearch_settings(lambda: _server_state.global_settings)
-app.include_router(websearch_router, dependencies=[Depends(verify_api_key)])
+app.include_router(websearch_router, dependencies=[Depends(verify_inference_api_key)])
 
 # Include audio routes only when mlx-audio is installed.
 # audio_routes.py itself only imports fastapi/stdlib at module level, so it
@@ -760,9 +799,9 @@ try:
     from .api.audio_routes import realtime_router as audio_realtime_router
     from .api.audio_routes import router as audio_router
 
-    app.include_router(audio_router, dependencies=[Depends(verify_api_key)])
+    app.include_router(audio_router, dependencies=[Depends(verify_inference_api_key)])
     # The realtime WebSocket router authenticates in-band (first message):
-    # verify_api_key is an HTTP-only dependency and browsers cannot set an
+    # HTTP auth dependencies cannot resolve WebSocket scopes, and browsers cannot set an
     # Authorization header on WebSocket connections.
     app.include_router(audio_realtime_router)
     del _
@@ -832,10 +871,10 @@ def _register_cluster_routes() -> None:
         discovery_router,
         dependencies=[Depends(require_distributed_inference_enabled)],
     )
-    # Cluster v2 pairing (Module B): the joiner's pair/request + pair/status
-    # are public but carry only blake2s(code + node_id) and a code-encrypted
-    # cluster key — the admin's approve step is the trust decision. Approve,
-    # deny, and unpair are admin-only like every other cluster mutation.
+    # Cluster v2 pairing (Module B): pair/request carries only a salted PBKDF2
+    # verifier bound to the node and SSH identities; pair/status returns a
+    # code-encrypted cluster key only after admin approval. Approve, deny, and
+    # unpair are admin-only like every other cluster mutation.
     from .cluster.pairing_routes import pair_admin_router, pair_router
 
     app.include_router(
@@ -849,7 +888,6 @@ def _register_cluster_routes() -> None:
             Depends(require_distributed_inference_enabled),
         ],
     )
-
     _cluster_routes_registered = True
 
 
@@ -886,6 +924,7 @@ def _is_api_route(request: FastAPIRequest) -> bool:
     classified as non-API. Switch to ``request.scope.get("route")``
     matching at that point.
     """
+
     return request.url.path.startswith("/v1/")
 
 
@@ -920,7 +959,9 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
             exc.detail,
         )
     if _is_api_route(request):
-        content = _openai_error_body(exc.detail, exc.status_code)
+        content = _openai_error_body(
+            exc.detail, exc.status_code, code=getattr(exc, "code", None)
+        )
     else:
         content = {"detail": exc.detail}
     return JSONResponse(status_code=exc.status_code, content=content)
@@ -948,7 +989,7 @@ async def validation_exception_handler(
         param = errors[0].get("loc", [None])[-1] if errors else None
         content = _openai_error_body(detail_str, 422, param=param)
     else:
-        content = {"detail": exc.errors()}
+        content = {"detail": jsonable_encoder(exc.errors())}
     return JSONResponse(status_code=422, content=content)
 
 
@@ -2135,11 +2176,25 @@ def init_server(
         - Sampling parameters (max_tokens, temperature, etc.) are per-model settings
 
     Raises:
-        ValueError: If model directory doesn't exist or no models found
+        ValueError: If network authentication is unsafe, the model directory
+            doesn't exist, or no models are found.
     """
     from pathlib import Path
 
     from .model_settings import ModelSettingsManager
+    from .utils.network import network_auth_error
+
+    if global_settings is not None:
+        auth_error = network_auth_error(
+            global_settings.server.host,
+            api_key,
+            global_settings.auth.skip_api_key_verification,
+        )
+        if auth_error:
+            raise ValueError(auth_error)
+
+    if global_settings is not None:
+        global_settings.ensure_inference_auth_setting()
 
     # Store API key
     _server_state.api_key = api_key
@@ -2151,6 +2206,17 @@ def init_server(
             getattr(global_settings.server, "latent_metal_keepwarm_enabled", False)
         ).items():
             os.environ[env_name] = env_value
+    _server_state.bind_host = (
+        global_settings.server.host if global_settings is not None else None
+    )
+    if allows_unauthenticated_inference():
+        logger.warning(
+            "Unauthenticated inference is enabled on %s. Anyone who can connect "
+            "can use inference, stored Responses, audio, MCP tools, and web "
+            "search/fetch. Management endpoints still require authentication "
+            "on non-loopback binds.",
+            _server_state.bind_host,
+        )
     from .cluster.exposure import distributed_inference_enabled as is_enabled
 
     _server_state.distributed_inference_enabled = is_enabled(global_settings)
@@ -2257,6 +2323,7 @@ def init_server(
     from .cluster.enrollment import configure_cluster_enrollment, get_cluster_enrollment
     from .cluster.incidents import configure_cluster_incidents
     from .cluster.pairing import configure_pairing_manager
+    from .cluster.rdma.store import configure_rdma_link_store
     from .cluster.registry import (
         configure_cluster_registry,
         configure_device_registry,
@@ -2269,6 +2336,7 @@ def init_server(
 
     _server_state.engine_pool._cluster_registry = configure_cluster_registry(base_path)
     configure_cluster_enrollment(base_path)
+    configure_rdma_link_store(base_path)
     configure_cluster_incidents(base_path)
     configure_strategy_benchmark_store(base_path)
     configure_tp_layout_qualification_store(base_path)
@@ -2289,16 +2357,17 @@ def init_server(
         device_registry = None
     # Cluster v2 pairing manager, bridged onto Module A's DeviceRegistry when
     # available (DeviceRegistryBridge adapts the API and fails loudly on
-    # drift); otherwise the schema-compatible fallback store is used. The
-    # caps provider resolves at call time — discovery is configured later in
-    # startup — so join requests carry the same caps discovery announces.
-    from .cluster.discovery import announced_caps
+    # drift); otherwise the schema-compatible fallback store is used. Resolve
+    # capabilities lazily because the discovery service starts later.
+    from .cluster.discovery import announced_addrs, announced_caps
 
     configure_pairing_manager(
         base_path,
         registry=device_registry,
         enrollment_store=get_cluster_enrollment(),
         caps_provider=announced_caps,
+        address_provider=announced_addrs,
+        http_port=global_settings.server.port if global_settings else 8000,
     )
 
     # Discover models (use pinned models from settings file)
@@ -2329,7 +2398,12 @@ def init_server(
 
     # Reset server metrics for fresh start (with all-time persistence)
     stats_path = base_path / "stats.json"
-    reset_server_metrics(stats_path=stats_path)
+    reset_server_metrics(
+        stats_path=stats_path,
+        usage_history_enabled=getattr(
+            getattr(global_settings, "usage", None), "usage_history", True
+        ),
+    )
 
     logger.info(
         f"Server initialized with {_server_state.engine_pool.model_count} models"
@@ -2506,16 +2580,7 @@ async def _safe_anext(ait):
 
 
 async def _aclose_async_iterator(iterator: object) -> None:
-    """Deterministically unwind a nested async stream, when it supports it.
-
-    ``async for`` does not await ``aclose()`` on the iterator when the *outer*
-    async generator is closed at one of its own yield points. The runtime may
-    eventually finalize that iterator, but a client disconnect must release an
-    inference request now: local engines abort their scheduler request in that
-    close path and the distributed engine closes its private rank-zero HTTP
-    response there. The compatibility check keeps this safe for custom async
-    iterators used by integrations and tests.
-    """
+    """Close an async generator when the response transport ends."""
 
     close = getattr(iterator, "aclose", None)
     if callable(close):
@@ -2539,12 +2604,7 @@ async def _with_request_disconnect_abort(
     engine: BaseEngine,
     request_id: str | None,
 ) -> AsyncIterator[str]:
-    """Bind one public response transport to one inference request.
-
-    The ASGI middleware invokes ``abort_request`` as soon as either Starlette
-    or our keepalive poll consumes ``http.disconnect``.  The ordinary nested
-    iterator close remains in ``finally`` as a second, local-engine-safe path.
-    """
+    """Bind one public response transport to one inference request."""
 
     signal = http_request.scope.get(_DISCONNECT_SIGNAL_SCOPE_KEY)
     token: int | None = None
@@ -2773,6 +2833,17 @@ async def _with_json_keepalive(
         except PrefillMemoryExceededError as e:
             logger.warning(f"JSON keepalive prefill rejected: {e}")
             yield json.dumps(_prefill_memory_openai_error_body(e))
+            return
+        except HTTPException as e:
+            # Headers are already sent; preserve the API error in the body.
+            logger.warning(
+                "JSON keepalive request failed (%d): %s", e.status_code, e.detail
+            )
+            yield json.dumps(
+                _openai_error_body(
+                    e.detail, e.status_code, code=getattr(e, "code", None)
+                )
+            )
             return
         if result is not None:
             yield result
@@ -3285,7 +3356,7 @@ async def _create_markitdown_chat_completion(
 
 
 @app.get("/v1/models")
-async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
+async def list_models(_: bool = Depends(verify_inference_api_key)) -> ModelsResponse:
     """List all available models with load status."""
     models = []
     favorite_ids: set[str] = set()
@@ -3490,7 +3561,7 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
 async def create_embeddings(
     request: EmbeddingRequest,
     http_request: FastAPIRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """
     Create embeddings for input text(s).
@@ -3552,6 +3623,26 @@ async def create_embeddings(
 
         elapsed = time.perf_counter() - start_time
         resolved_model = resolve_model_id(request.model) or request.model
+
+        # A NaN/Inf vector has no JSON representation: FastAPI would ship it
+        # as null-filled arrays inside a 200, and a RAG pipeline stores the
+        # corrupt vectors without noticing. Fail the request instead.
+        non_finite = find_non_finite_embeddings(output.embeddings)
+        if non_finite:
+            logger.error(
+                f"Embedding: model={resolved_model} returned non-finite values "
+                f"for input item(s) {non_finite} of {len(embedding_inputs)}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Embedding model returned non-finite (NaN/Inf) values for "
+                    f"input item(s) {non_finite}. The response was rejected "
+                    "instead of returning null vectors; try sending the affected "
+                    "inputs one per request or batching inputs of equal length."
+                ),
+            )
+
         logger.info(
             f"Embedding: model={resolved_model}, "
             f"{len(embedding_inputs)} inputs, {output.dimensions} dims, "
@@ -3564,6 +3655,7 @@ async def create_embeddings(
             cached_tokens=0,
             prefill_duration=elapsed,
             model_id=resolved_model,
+            request_duration=elapsed,
         )
 
         data = []
@@ -3616,7 +3708,7 @@ def normalize_documents(documents: list[str] | list[dict]) -> list[str]:
 @app.post("/v1/rerank")
 async def create_rerank(
     request: RerankRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ) -> RerankResponse:
     """
     Rerank documents by relevance to a query.
@@ -3686,6 +3778,7 @@ async def create_rerank(
         cached_tokens=0,
         prefill_duration=elapsed,
         model_id=resolved_model,
+        request_duration=elapsed,
     )
 
     # Format response - results sorted by score (descending). Strings wrap
@@ -3721,7 +3814,7 @@ async def create_rerank(
 async def create_completion(
     request: CompletionRequest,
     http_request: FastAPIRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """Create a text completion."""
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
@@ -3830,7 +3923,11 @@ async def create_completion(
             thinking_budget = _resolve_thinking_budget(request, request.model)
             if thinking_budget is not None:
                 gen_kwargs["thinking_budget"] = thinking_budget
-            repetition_context_size = getattr(request, "repetition_context_size", None)
+            # Widen the repetition-penalty look-back window when the client
+            # asks for it (mlx-lm default window is 20 tokens).
+            repetition_context_size = getattr(
+                request, "repetition_context_size", None
+            )
             if repetition_context_size is not None:
                 gen_kwargs["repetition_context_size"] = repetition_context_size
             if inference_request_id is not None:
@@ -3892,6 +3989,7 @@ async def create_completion(
                 prefill_duration=prefill_duration,
                 generation_duration=gen_duration,
                 model_id=resolved_model,
+                request_duration=elapsed,
             )
 
             return CompletionResponse(
@@ -3929,7 +4027,7 @@ async def create_completion(
 async def create_chat_completion(
     request: ChatCompletionRequest,
     http_request: FastAPIRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """
     Create a chat completion.
@@ -4229,11 +4327,15 @@ async def create_chat_completion(
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
 
-        # Auto-set enable_thinking in chat template kwargs when a thinking
+        # Auto-set enable_thinking in chat template kwargs when a positive thinking
         # budget is active (from request or model settings).  Some chat
         # templates (e.g. Gemma 4) explicitly suppress thinking unless this
         # kwarg is True.
-        if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
+        if (
+            thinking_budget is not None
+            and thinking_budget > 0
+            and "enable_thinking" not in merged_ct_kwargs
+        ):
             merged_ct_kwargs["enable_thinking"] = True
 
         # Auto-set preserve_thinking only when the template advertises support
@@ -4272,6 +4374,9 @@ async def create_chat_completion(
 
         # Forward partial-mode decision to the engine explicitly
         chat_kwargs["is_partial"] = is_partial
+        chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
+            ms, native_reasoning=native_reasoning, chat_template_kwargs=merged_ct_kwargs
+        )
 
         # SpecPrefill: per-request overrides (fall back to model_settings)
         if request.specprefill is not None:
@@ -4386,11 +4491,14 @@ async def create_chat_completion(
                 prefill_duration=metric_prefill_duration,
                 generation_duration=metric_gen_duration,
                 model_id=resolved_model,
+                request_duration=elapsed,
             )
 
             # Separate thinking from content
             raw_text = clean_special_tokens(output.text) if output.text else ""
-            thinking_content, regular_content = extract_thinking(raw_text)
+            thinking_content, regular_content = extract_thinking(
+                raw_text, truncated=output.finish_reason == "length"
+            )
             cleaned_thinking = sanitize_tool_call_markup(
                 thinking_content, engine.tokenizer
             )
@@ -4405,9 +4513,12 @@ async def create_chat_completion(
                     regular_content,
                     tokenizer=engine.tokenizer,
                     tools=tools_for_template,
+                    finish_reason=output.finish_reason,
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
+                if failure := _tool_call_failure(extraction):
+                    raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
             # Process response_format if specified
@@ -4937,7 +5048,11 @@ async def stream_completion(
     thinking_budget = _resolve_thinking_budget(request, request.model)
     if thinking_budget is not None:
         gen_kwargs["thinking_budget"] = thinking_budget
-    repetition_context_size = getattr(request, "repetition_context_size", None)
+    # Widen the repetition-penalty look-back window when the client
+    # asks for it (mlx-lm default window is 20 tokens).
+    repetition_context_size = getattr(
+        request, "repetition_context_size", None
+    )
     if repetition_context_size is not None:
         gen_kwargs["repetition_context_size"] = repetition_context_size
     if inference_request_id is not None:
@@ -5019,6 +5134,7 @@ async def stream_completion(
             prefill_duration=metric_prefill_duration,
             generation_duration=metric_gen_duration,
             model_id=serving_model,
+            request_duration=total_duration,
         )
         speed_duration = total_duration if is_diffusion else gen_duration
         tokens_per_sec = (
@@ -5145,6 +5261,29 @@ def _render_chat_prompt_for_thinking_detection(
     return str(prompt), None
 
 
+class _ToolCallGenerationError(HTTPException):
+    """Keep generation failure codes through JSON keepalive responses."""
+
+    def __init__(self, error: dict):
+        super().__init__(status_code=500, detail=error["message"])
+        self.code = error["code"]
+
+
+def _tool_call_failure(extraction: ToolCallExtraction) -> dict | None:
+    failed = extraction.parse_errors
+    if not failed:
+        return None
+    code = "incomplete_tool_call" if "incomplete" in failed else "invalid_tool_call"
+    message = (
+        "Model output contains an unrecoverable tool call. "
+        "Previously delivered tool calls must not be executed again on retry."
+    )
+    logger.warning(
+        "Tool call generation failed: code=%s, failed_calls=%d", code, len(failed)
+    )
+    return _openai_error_body(message, 500, code=code)
+
+
 def _registered_tool_names(tools: object) -> set[str]:
     """Return nonempty function names explicitly registered by the request."""
 
@@ -5168,8 +5307,8 @@ def _registered_tool_names(tools: object) -> set[str]:
 def _tool_call_semantic_key(tool_call: object) -> tuple[str, str] | None:
     """Canonical name/JSON-object identity, or ``None`` when malformed.
 
-    This is syntactic validation plus the separate registered-name check at the
-    call site; it is deliberately not full JSON Schema argument validation.
+    Unknown names remain callable output for client-side error feedback.
+    This is syntactic validation, not full JSON Schema argument validation.
     """
 
     function = getattr(tool_call, "function", None)
@@ -5310,13 +5449,16 @@ async def stream_chat_completion(
         stream_completed_qwen_tools = qwen_tool_envelope_streaming_capable
         _content_filter = ToolCallStreamFilter(
             engine.tokenizer,
+            tools=kwargs.get("tools"),
             capture_ordered_segments=stream_completed_qwen_tools,
         )
         # The thinking channel never contains a separator-prefixed DSML
         # block; holding trailing newlines would flush them as a late
         # reasoning delta after the channel closed.
         _thinking_filter = ToolCallStreamFilter(
-            engine.tokenizer, consume_dsml_separator=False
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+            consume_dsml_separator=False,
         )
         if _content_filter.active:
             tool_filter = _content_filter
@@ -5434,10 +5576,11 @@ async def stream_chat_completion(
                         if segment.kind != "envelope":
                             stream_tool_sequence_safe = False
                             continue
-                        _cleaned, completed_calls = parse_tool_calls(
+                        _, completed_calls, _ = parse_qwen_tool_calls(
                             segment.text,
                             engine.tokenizer,
                             kwargs.get("tools"),
+                            finish_reason="stop",
                         )
                         completed_calls = completed_calls or []
                         completed_keys = [
@@ -5446,11 +5589,6 @@ async def stream_chat_completion(
                         if (
                             not completed_calls
                             or any(key is None for key in completed_keys)
-                            or any(
-                                key[0] not in registered_tool_names
-                                for key in completed_keys
-                                if key is not None
-                            )
                         ):
                             stream_tool_sequence_safe = False
                             continue
@@ -5500,7 +5638,9 @@ async def stream_chat_completion(
     # Flush remaining buffered content from thinking/tool-call parsers
     unfinished_thinking = False
     if stream_content:
-        thinking_delta, content_delta = thinking_parser.finish()
+        thinking_delta, content_delta = thinking_parser.finish(
+            truncated=last_output is not None and last_output.finish_reason == "length"
+        )
         unfinished_thinking = thinking_parser.unfinished_thinking
         if thinking_delta:
             if thinking_filter:
@@ -5576,6 +5716,7 @@ async def stream_chat_completion(
 
     # Parse tool calls from accumulated text
     tool_calls = None
+    tool_failure = None
     cleaned_text = accumulated_text
     terminal_tool_calls_authoritative = bool(
         not unfinished_thinking and last_output and last_output.tool_calls
@@ -5592,31 +5733,21 @@ async def stream_chat_completion(
     elif has_tools and accumulated_text:
         # Separate thinking from content, then parse tool calls from content
         # (falls back to thinking content for small models)
-        thinking_content, regular_content = extract_thinking(accumulated_text)
+        thinking_content, regular_content = extract_thinking(
+            accumulated_text,
+            truncated=last_output is not None and last_output.finish_reason == "length",
+        )
         extraction = extract_tool_calls_with_thinking(
             thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
+            finish_reason=last_output.finish_reason if last_output else "stop",
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
+        tool_failure = _tool_call_failure(extraction)
         cleaned_thinking = extraction.cleaned_thinking
-        if tool_calls and qwen_tool_envelope_streaming_capable:
-            # Raw-text parsing is never allowed to promote malformed or
-            # unregistered functions on the explicitly capability-gated qwen
-            # early-stream path. Other parser families retain their existing
-            # terminal semantics; engine-native structured calls above are
-            # authoritative and intentionally bypass this API-layer filter.
-            tool_calls = [
-                tool_call
-                for tool_call in tool_calls
-                if (
-                    (key := _tool_call_semantic_key(tool_call)) is not None
-                    and key[0] in registered_tool_names
-                )
-            ]
-
         # Process response_format if specified
         if request.response_format and not tool_calls:
             cleaned_text, parsed_json, is_valid, error = parse_json_output(
@@ -5669,7 +5800,7 @@ async def stream_chat_completion(
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
     if unfinished_thinking:
         recovered_content = ""
-    if not tool_calls:
+    if not tool_calls and not tool_failure:
         if recovered_thinking:
             chunk = ChatCompletionChunk(
                 id=response_id,
@@ -5777,6 +5908,11 @@ async def stream_chat_completion(
             mark_visible_delta()
             yield event
 
+    if tool_failure:
+        yield f"data: {json.dumps(tool_failure)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+
     # Final chunk with finish_reason
     finish_reason = (
         "tool_calls"
@@ -5851,6 +5987,7 @@ async def stream_chat_completion(
             prefill_duration=metric_prefill_duration,
             generation_duration=metric_gen_duration,
             model_id=resolved_model or request.model,
+            request_duration=total_duration,
         )
         speed_duration = total_duration if is_diffusion else gen_duration
         tokens_per_sec = (
@@ -5990,12 +6127,17 @@ async def stream_anthropic_messages(
     tool_filter = None
     thinking_filter = None
     if has_tools:
-        _content_filter = ToolCallStreamFilter(engine.tokenizer)
+        _content_filter = ToolCallStreamFilter(
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+        )
         # The thinking channel never contains a separator-prefixed DSML
         # block; holding trailing newlines would flush them as a late
         # reasoning delta after the channel closed.
         _thinking_filter = ToolCallStreamFilter(
-            engine.tokenizer, consume_dsml_separator=False
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+            consume_dsml_separator=False,
         )
         if _content_filter.active:
             tool_filter = _content_filter
@@ -6127,7 +6269,9 @@ async def stream_anthropic_messages(
         await _aclose_async_iterator(engine_stream)
 
     # Flush remaining buffered content from thinking parser
-    thinking_delta, content_delta = thinking_parser.finish()
+    thinking_delta, content_delta = thinking_parser.finish(
+        truncated=last_output is not None and last_output.finish_reason == "length"
+    )
     unfinished_thinking = thinking_parser.unfinished_thinking
     if thinking_delta:
         if thinking_filter:
@@ -6202,6 +6346,7 @@ async def stream_anthropic_messages(
     # For Harmony models, use tool_calls from output (parsed by HarmonyStreamingParser)
     # For other models, parse from accumulated text
     tool_calls = None
+    tool_failure = None
     if unfinished_thinking:
         # Never execute a tool candidate emitted inside a malformed/private
         # reasoning region.
@@ -6212,14 +6357,19 @@ async def stream_anthropic_messages(
     elif kwargs.get("tools"):
         # Non-Harmony: separate thinking, then parse tool calls from content
         # (falls back to thinking content for small models)
-        thinking_content, regular_content = extract_thinking(accumulated_text)
+        thinking_content, regular_content = extract_thinking(
+            accumulated_text,
+            truncated=last_output is not None and last_output.finish_reason == "length",
+        )
         extraction = extract_tool_calls_with_thinking(
             thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
+            finish_reason=last_output.finish_reason if last_output else "stop",
         )
         tool_calls = extraction.tool_calls
+        tool_failure = _tool_call_failure(extraction)
 
     recovered_thinking = (
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
@@ -6227,7 +6377,7 @@ async def stream_anthropic_messages(
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
     if unfinished_thinking:
         recovered_content = ""
-    if not tool_calls:
+    if not tool_calls and not tool_failure:
         if recovered_thinking:
             if text_block_started:
                 yield create_content_block_stop_event(index=block_index)
@@ -6305,6 +6455,22 @@ async def stream_anthropic_messages(
             # Close tool block
             yield create_content_block_stop_event(index=i)
 
+    if tool_failure:
+        error = tool_failure["error"]
+        yield format_sse_event(
+            "error",
+            {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": error["message"],
+                    "code": error["code"],
+                },
+            },
+        )
+        yield create_message_stop_event()
+        return
+
     # 6. Send message_delta with stop_reason and actual token counts
     anthropic_finish_reason = output.finish_reason if output else "stop"
     if (
@@ -6350,6 +6516,7 @@ async def stream_anthropic_messages(
             prefill_duration=ttft,
             generation_duration=gen_duration,
             model_id=serving_model,
+            request_duration=total_duration,
         )
         tokens_per_sec = (
             last_output.completion_tokens / total_duration if total_duration > 0 else 0
@@ -6368,7 +6535,7 @@ async def stream_anthropic_messages(
 async def create_anthropic_message(
     request: AnthropicMessagesRequest,
     http_request: FastAPIRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """
     Create a message using Anthropic Messages API format.
@@ -6545,10 +6712,14 @@ async def create_anthropic_message(
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
 
-        # Auto-set enable_thinking in chat template kwargs when a thinking
+        # Auto-set enable_thinking in chat template kwargs when a positive thinking
         # budget is active but enable_thinking was not already set (e.g. via
         # the Anthropic thinking.type field above or model settings).
-        if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
+        if (
+            thinking_budget is not None
+            and thinking_budget > 0
+            and "enable_thinking" not in merged_ct_kwargs
+        ):
             merged_ct_kwargs["enable_thinking"] = True
 
         # Auto-set preserve_thinking only when the template advertises support
@@ -6601,6 +6772,9 @@ async def create_anthropic_message(
 
         # Forward partial-mode decision to the engine explicitly
         chat_kwargs["is_partial"] = is_partial
+        chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
+            ms, native_reasoning=native_reasoning, chat_template_kwargs=merged_ct_kwargs
+        )
 
         await _ensure_tokenizer_for_system_probe(engine, messages)
         messages = prepare_system_messages_for_template(
@@ -6704,11 +6878,14 @@ async def create_anthropic_message(
                 prefill_duration=prefill_duration,
                 generation_duration=gen_duration,
                 model_id=resolved_model,
+                request_duration=elapsed,
             )
 
             # Separate thinking from content
             raw_text = clean_special_tokens(output.text) if output.text else ""
-            thinking_content, regular_content = extract_thinking(raw_text)
+            thinking_content, regular_content = extract_thinking(
+                raw_text, truncated=output.finish_reason == "length"
+            )
             cleaned_thinking = sanitize_tool_call_markup(
                 thinking_content, engine.tokenizer
             )
@@ -6723,9 +6900,12 @@ async def create_anthropic_message(
                     regular_content,
                     tokenizer=engine.tokenizer,
                     tools=internal_tools,
+                    finish_reason=output.finish_reason,
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
+                if failure := _tool_call_failure(extraction):
+                    raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
             # Reverse Gemma 4 parameter renaming
@@ -6769,7 +6949,7 @@ async def create_anthropic_message(
 @app.post("/v1/messages/count_tokens")
 async def count_anthropic_tokens(
     request: TokenCountRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """
     Count tokens in a message request.
@@ -6896,7 +7076,7 @@ def _store_response_state(
 async def create_response(
     request: ResponsesRequest,
     http_request: FastAPIRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """Create a response (OpenAI Responses API)."""
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
@@ -6947,8 +7127,11 @@ async def create_response(
             preserve_images=preserve_tool_images,
         )
 
-        # Convert tools: flat → nested
-        openai_tools = convert_responses_tools(request.tools)
+        # Convert tools: flat → nested. namespace_aliases maps each expanded
+        # namespace member's wire name back for the return path.
+        namespace_aliases: dict = {}
+        openai_tools = convert_responses_tools(request.tools, namespace_aliases)
+        apply_namespace_tool_aliases(messages, namespace_aliases)
         if (
             getattr(engine, "is_diffusion_model", False)
             and not getattr(engine, "supports_tool_calling", False)
@@ -7028,18 +7211,19 @@ async def create_response(
             else:
                 compiled_grammar = None
 
-        # Merge MCP tools
-        effective_tools = (
-            None
-            if (
-                getattr(engine, "is_diffusion_model", False)
-                and not getattr(engine, "supports_tool_calling", False)
-            )
-            else openai_tools
+        # Merge MCP tools, matching create_chat_completion's tools_disabled
+        # semantics: tool_choice="none" suppresses tool exposure to the chat
+        # template, and the MCP merge itself must run even when the client
+        # sent no tools of its own, since MCP servers can offer tools the
+        # client never listed.
+        tools_disabled = request.tool_choice == "none" or (
+            getattr(engine, "is_diffusion_model", False)
+            and not getattr(engine, "supports_tool_calling", False)
         )
+        effective_tools = None if tools_disabled else openai_tools
         if (
             _server_state.mcp_manager
-            and effective_tools
+            and not tools_disabled
             and mcp_tools_exposed()
         ):
             effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
@@ -7131,8 +7315,12 @@ async def create_response(
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
 
-        # Auto-set enable_thinking when thinking budget is active.
-        if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
+        # Auto-set enable_thinking when a positive thinking budget is active.
+        if (
+            thinking_budget is not None
+            and thinking_budget > 0
+            and "enable_thinking" not in merged_ct_kwargs
+        ):
             merged_ct_kwargs["enable_thinking"] = True
 
         # Auto-set preserve_thinking only when the template advertises support
@@ -7161,6 +7349,19 @@ async def create_response(
             chat_kwargs["tools"] = tools_for_template
         if merged_ct_kwargs:
             chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
+
+        chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
+            ms,
+            native_reasoning=uses_native_reasoning_content(
+                resolved_model,
+                config_model_type=getattr(_entry, "config_model_type", None),
+                engine_model_type=getattr(engine, "model_type", None),
+                preserve_thinking_default=getattr(
+                    _entry, "preserve_thinking_default", None
+                ),
+            ),
+            chat_template_kwargs=merged_ct_kwargs,
+        )
 
         # Pre-flight prefill memory guard — must precede any StreamingResponse
         # return so PrefillMemoryExceededError can be mapped to HTTP 400.
@@ -7193,6 +7394,7 @@ async def create_response(
                                 resolved_model=resolved_model,
                                 response_format=response_format,
                                 native_reasoning=native_reasoning,
+                                namespace_aliases=namespace_aliases,
                                 **chat_kwargs,
                             ),
                             http_request=http_request,
@@ -7236,11 +7438,14 @@ async def create_response(
                 prefill_duration=prefill_duration,
                 generation_duration=gen_duration,
                 model_id=resolved_model,
+                request_duration=elapsed,
             )
 
             # Process output text
             raw_text = clean_special_tokens(output.text) if output.text else ""
-            thinking_content, regular_content = extract_thinking(raw_text)
+            thinking_content, regular_content = extract_thinking(
+                raw_text, truncated=output.finish_reason == "length"
+            )
 
             # Parse tool calls
             if output.tool_calls:
@@ -7255,9 +7460,12 @@ async def create_response(
                     regular_content,
                     tokenizer=engine.tokenizer,
                     tools=tools_for_template,
+                    finish_reason=output.finish_reason,
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
+                if failure := _tool_call_failure(extraction):
+                    raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
             # Reverse Gemma 4 parameter renaming
@@ -7305,11 +7513,13 @@ async def create_response(
                         arguments = tc.get("arguments", "{}")
                     else:
                         continue
+                    namespace, name = split_namespace_tool_name(name, namespace_aliases)
                     output_items.append(
                         build_function_call_output_item(
                             name=name,
                             arguments=arguments,
                             call_id=call_id,
+                            namespace=namespace,
                         )
                     )
 
@@ -7377,6 +7587,7 @@ async def stream_responses_api(
     resolved_model: Optional[str] = None,
     response_format=None,
     native_reasoning: bool = False,
+    namespace_aliases: Optional[dict] = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream Responses API events (SSE with named event types)."""
@@ -7629,12 +7840,17 @@ async def stream_responses_api(
     thinking_filter = None
     stream_content = True
     if has_tools:
-        _content_filter = ToolCallStreamFilter(engine.tokenizer)
+        _content_filter = ToolCallStreamFilter(
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+        )
         # The thinking channel never contains a separator-prefixed DSML
         # block; holding trailing newlines would flush them as a late
         # reasoning delta after the channel closed.
         _thinking_filter = ToolCallStreamFilter(
-            engine.tokenizer, consume_dsml_separator=False
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+            consume_dsml_separator=False,
         )
         if _content_filter.active:
             tool_filter = _content_filter
@@ -7715,7 +7931,9 @@ async def stream_responses_api(
     # Flush remaining content from parsers
     unfinished_thinking = False
     if stream_content:
-        thinking_delta, content_delta = thinking_parser.finish()
+        thinking_delta, content_delta = thinking_parser.finish(
+            truncated=last_output is not None and last_output.finish_reason == "length"
+        )
         unfinished_thinking = thinking_parser.unfinished_thinking
         if thinking_delta:
             if thinking_filter:
@@ -7774,6 +7992,7 @@ async def stream_responses_api(
     # tag-free text; otherwise Responses would correctly stream it as reasoning
     # and then duplicate it into ``output_text.done`` at finalization.
     tool_calls = None
+    tool_failure = None
     cleaned_text = accumulated_text
     if unfinished_thinking:
         cleaned_text = ""
@@ -7781,15 +8000,20 @@ async def stream_responses_api(
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
         cleaned_text = ""
     elif has_tools and accumulated_text:
-        thinking_content, regular_content = extract_thinking(accumulated_text)
+        thinking_content, regular_content = extract_thinking(
+            accumulated_text,
+            truncated=last_output is not None and last_output.finish_reason == "length",
+        )
         extraction = extract_tool_calls_with_thinking(
             thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
+            finish_reason=last_output.finish_reason if last_output else "stop",
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
+        tool_failure = _tool_call_failure(extraction)
         if not stream_content:
             cleaned_thinking = (extraction.cleaned_thinking or "").strip()
             for ev in _emit_reasoning_delta(cleaned_thinking):
@@ -7814,7 +8038,10 @@ async def stream_responses_api(
             )
     else:
         # No tools — use raw accumulated text minus thinking.
-        thinking_content, regular_content = extract_thinking(accumulated_text)
+        thinking_content, regular_content = extract_thinking(
+            accumulated_text,
+            truncated=last_output is not None and last_output.finish_reason == "length",
+        )
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""
 
     recovered_thinking = (
@@ -7825,7 +8052,7 @@ async def stream_responses_api(
         # Filter recovery is only for a complete output protocol. Never promote
         # a buffered candidate from an unfinished reasoning region.
         recovered_content = ""
-    if not tool_calls:
+    if not tool_calls and not tool_failure:
         for ev in _emit_reasoning_delta(recovered_thinking):
             yield ev
         if recovered_content:
@@ -7964,6 +8191,7 @@ async def stream_responses_api(
             else:
                 continue
 
+            namespace, name = split_namespace_tool_name(name, namespace_aliases)
             fc_id = generate_id(IDPrefix.FUNCTION_CALL)
             fc_item = {
                 "type": "function_call",
@@ -7973,6 +8201,8 @@ async def stream_responses_api(
                 "arguments": "",
                 "status": "in_progress",
             }
+            if namespace:
+                fc_item["namespace"] = namespace
 
             # output_item.added
             seq += 1
@@ -8021,6 +8251,8 @@ async def stream_responses_api(
                 "arguments": arguments,
                 "status": "completed",
             }
+            if namespace:
+                completed_fc["namespace"] = namespace
             seq += 1
             yield format_sse_event(
                 "response.output_item.done",
@@ -8035,6 +8267,23 @@ async def stream_responses_api(
             output_items.append(completed_fc)
             output_index += 1
             next_output_index = output_index
+
+    if tool_failure:
+        seq += 1
+        yield format_sse_event(
+            "response.failed",
+            {
+                "type": "response.failed",
+                "response": {
+                    **initial_data,
+                    "status": "failed",
+                    "output": output_items,
+                    "error": tool_failure["error"],
+                },
+                "sequence_number": seq,
+            },
+        )
+        return
 
     # Record metrics
     usage_data = None
@@ -8054,6 +8303,7 @@ async def stream_responses_api(
             prefill_duration=ttft,
             generation_duration=gen_duration,
             model_id=serving_model,
+            request_duration=total_duration,
         )
         tokens_per_sec = (
             last_output.completion_tokens / total_duration if total_duration > 0 else 0
@@ -8121,7 +8371,7 @@ async def stream_responses_api(
 @app.get("/v1/responses/{response_id}")
 async def get_response(
     response_id: str,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """Retrieve a stored response."""
     data = _server_state.responses_store.get(response_id)
@@ -8133,7 +8383,7 @@ async def get_response(
 @app.delete("/v1/responses/{response_id}")
 async def delete_response(
     response_id: str,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """Delete a stored response."""
     if not _server_state.responses_store.delete(response_id):
@@ -8206,8 +8456,8 @@ model and sampling defaults are managed via the admin page.
     parser.add_argument(
         "--host",
         type=str,
-        default="0.0.0.0",
-        help="Host to bind to",
+        default=None,
+        help="Host to bind to (default: settings or 127.0.0.1)",
     )
     parser.add_argument(
         "--port",
@@ -8220,6 +8470,12 @@ model and sampling defaults are managed via the admin page.
         type=str,
         default=None,
         help="Path to MCP configuration file (JSON/YAML)",
+    )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="API key for authentication (required for non-loopback binds)",
     )
 
     args = parser.parse_args()
@@ -8238,6 +8494,15 @@ model and sampling defaults are managed via the admin page.
     from .settings import init_settings
 
     settings = init_settings()
+    if args.host is not None:
+        settings.server.host = args.host
+    if args.api_key is not None:
+        settings.auth.api_key = args.api_key
+    errors = settings.validate()
+    if errors:
+        for error in errors:
+            print(f"Configuration error: {error}")
+        raise SystemExit(1)
     settings.ensure_directories()
 
     # Match the cli.py launcher: keep freed GPU buffers in the pool so
@@ -8260,7 +8525,7 @@ model and sampling defaults are managed via the admin page.
     # Start server
     import uvicorn
 
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(app, host=settings.server.host, port=args.port)
 
 
 if __name__ == "__main__":

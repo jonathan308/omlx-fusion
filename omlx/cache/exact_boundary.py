@@ -208,6 +208,23 @@ def _copy_exact_array(array: mx.array) -> mx.array:
     return mx.contiguous(detached)
 
 
+def _arrays_cache_types(base: type) -> tuple[type, ...]:
+    """Recurrent-state cache classes the boundary providers accept.
+
+    mlx-vlm >= 0.7 builds its hybrid models with its own ``ArraysCache``
+    (``mlx_vlm.models.cache``), a separate class with the same ``cache`` list
+    contract as mlx-lm's; clones are made with the source's own class.
+    """
+    types: list[type] = [base]
+    try:
+        from mlx_vlm.models.cache import ArraysCache as _VlmArraysCache
+    except Exception:  # noqa: BLE001 - optional dependency
+        return tuple(types)
+    if _VlmArraysCache is not base:
+        types.append(_VlmArraysCache)
+    return tuple(types)
+
+
 def plan_hybrid_arrays_kv_boundary(
     cache_list: Any,
     *,
@@ -228,6 +245,7 @@ def plan_hybrid_arrays_kv_boundary(
         from .type_handlers import SizedArraysCache
     except ImportError:
         return None
+    arrays_types = _arrays_cache_types(ArraysCache)
     if (
         not isinstance(cache_list, list)
         or not cache_list
@@ -246,9 +264,9 @@ def plan_hybrid_arrays_kv_boundary(
     for cache in cache_list:
         wrapped = type(cache) is SizedArraysCache
         inner = vars(cache).get("_inner") if wrapped else cache
-        if type(cache) is ArraysCache or wrapped:
+        if type(cache) in arrays_types or wrapped:
             if wrapped and (
-                type(inner) is not ArraysCache
+                type(inner) not in arrays_types
                 or getattr(cache, "_token_count", None) != target_tokens
             ):
                 return None
@@ -355,6 +373,7 @@ def materialize_hybrid_arrays_kv_boundary(
         from .type_handlers import SizedArraysCache
     except ImportError:
         return None
+    arrays_types = _arrays_cache_types(ArraysCache)
     if not isinstance(plan, HybridArraysKVBoundaryPlan) or not plan.layers:
         return None
 
@@ -367,10 +386,10 @@ def materialize_hybrid_arrays_kv_boundary(
                 (
                     type(cache) is not SizedArraysCache
                     if layer.wrapped
-                    else type(cache) is not ArraysCache
+                    else type(cache) not in arrays_types
                 )
                 or inner is not layer.inner
-                or type(inner) is not ArraysCache
+                or type(inner) not in arrays_types
                 or (
                     layer.wrapped
                     and getattr(cache, "_token_count", None)
@@ -422,7 +441,7 @@ def materialize_hybrid_arrays_kv_boundary(
             for layer in plan.layers:
                 if isinstance(layer, _HybridArraysLayerPlan):
                     copied = [_copy_exact_array(value) for value in layer.arrays]
-                    inner_clone = ArraysCache(size=len(copied))
+                    inner_clone = type(layer.inner)(size=len(copied))
                     inner_clone.cache = copied
                     clone = (
                         SizedArraysCache(

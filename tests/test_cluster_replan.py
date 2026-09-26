@@ -13,9 +13,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from omlx.cluster import routes
-from omlx.cluster.deployment import ClusterDeployment, ClusterHost
-from omlx.cluster.planner import ModelLayout
+from omlx.cluster.deployment import ClusterDeployment
 from omlx.cluster.performance import NodePerformanceProfile
+from omlx.cluster.planner import ModelLayout
 from omlx.cluster.registry import configure_cluster_registry
 from omlx.cluster.replan import (
     hosts_from_deployment,
@@ -136,8 +136,9 @@ class _RecordingPool:
 
     async def get_engine(self, model_id):
         assert model_id == self.model_id
-        deployment = routes.get_cluster_registry().get_for_model(self.model_path)
-        self.entry.engine = _ReadyEngine(deployment)
+        if self.entry.engine is None:
+            deployment = routes.get_cluster_registry().get_for_model(self.model_path)
+            self.entry.engine = _ReadyEngine(deployment)
         return self.entry.engine
 
 
@@ -290,73 +291,12 @@ def test_replan_inherits_tensor_parallelism_and_context(tmp_path, monkeypatch):
     deployment_id = activation.json()["deployment"]["deployment_id"]
     preview = _client().post(
         "/admin/api/cluster/replan",
-        json={"deployment_id": deployment_id, "mtp_enabled": True},
+        json={"deployment_id": deployment_id},
     )
 
     assert preview.status_code == 200, preview.json()
     assert preview.json()["plan"]["tensor_parallel_size"] == 2
     assert preview.json()["plan"]["cluster"]["target_context_tokens"] == 32768
-
-
-def test_replan_snapshot_toggle_is_signed_and_forces_reload(active_deployment):
-    deployment_id = active_deployment.deployment["deployment_id"]
-    preview = _client().post(
-        "/admin/api/cluster/replan",
-        json={"deployment_id": deployment_id, "prompt_cache_ssd": True},
-    )
-
-    assert preview.status_code == 200, preview.json()
-    payload = preview.json()
-    assert payload["plan"]["prompt_cache_ssd"] is True
-    assert payload["changes"]["settings"]["prompt_cache_ssd"] == {
-        "before": False,
-        "after": True,
-    }
-
-    applied = _client().post(
-        "/admin/api/cluster/replan",
-        json={
-            "deployment_id": deployment_id,
-            "prompt_cache_ssd": True,
-            "approved_placement": payload["plan"]["placement_signature"],
-        },
-    )
-
-    assert applied.status_code == 200, applied.json()
-    assert active_deployment.pool.reloads == 2
-    assert active_deployment.pool.entry.engine.deployment.execution.prompt_cache_ssd
-
-
-def test_replan_preserves_disaggregated_phase_ownership(tmp_path, monkeypatch):
-    configure_cluster_registry(tmp_path)
-    model_path = tmp_path / "models" / "phase-model"
-    model_path.mkdir(parents=True)
-    _install_layout(monkeypatch)
-    pool = _RecordingPool(model_path)
-    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
-
-    body = _deployment_payload(model_path, capacity_large=100, capacity_small=100)
-    body.update(
-        serving_mode="disaggregated",
-        prefill_rank=1,
-        decode_rank=0,
-    )
-    body["approved_placement"] = _approval_for(body)
-    activation = _client().post("/admin/api/cluster/deployments", json=body)
-    assert activation.status_code == 200, activation.json()
-
-    deployment_id = activation.json()["deployment"]["deployment_id"]
-    preview = _client().post(
-        "/admin/api/cluster/replan",
-        json={"deployment_id": deployment_id, "execution_profile": "throughput"},
-    )
-
-    assert preview.status_code == 200, preview.json()
-    plan = preview.json()["plan"]
-    assert plan["serving_mode"] == "disaggregated"
-    assert plan["prefill_rank"] == 1
-    assert plan["decode_rank"] == 0
-    assert all(item["start_layer"] == 0 for item in plan["assignments"])
 
 
 def test_replan_carries_path_map_forward(tmp_path, monkeypatch):
@@ -426,13 +366,17 @@ def test_replan_preview_detects_changed_split(active_deployment):
 
 
 def test_replan_applied_runs_full_dance(active_deployment):
-    preview = _client().post(
-        "/admin/api/cluster/replan",
-        json={
-            "deployment_id": active_deployment.deployment["deployment_id"],
-            "target_context_tokens": 16384,
-        },
-    ).json()
+    preview = (
+        _client()
+        .post(
+            "/admin/api/cluster/replan",
+            json={
+                "deployment_id": active_deployment.deployment["deployment_id"],
+                "target_context_tokens": 16384,
+            },
+        )
+        .json()
+    )
 
     response = _client().post(
         "/admin/api/cluster/replan",
@@ -447,14 +391,252 @@ def test_replan_applied_runs_full_dance(active_deployment):
     payload = response.json()
     assert payload["mode"] == "applied"
     assert payload["readiness"]["canary_passed"] is True
-    assert payload["replan"]["previous"]["deployment_id"] == (
-        active_deployment.deployment["deployment_id"]
+    assert (
+        payload["replan"]["previous"]["deployment_id"]
+        == (active_deployment.deployment["deployment_id"])
     )
     # One reload for the initial activation, one for the replan.
     assert active_deployment.pool.reloads == 2
     engine = active_deployment.pool.entry.engine
     assert engine.deployment.target_context_tokens == 16384
 
+
+def test_replan_rejects_a_stale_approval(active_deployment):
+    _client().post(
+        "/admin/api/cluster/replan",
+        json={"deployment_id": active_deployment.deployment["deployment_id"]},
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/replan",
+        json={
+            "deployment_id": active_deployment.deployment["deployment_id"],
+            "target_context_tokens": 4096,
+            "approved_placement": "f" * 16,
+        },
+    )
+
+    assert response.status_code == 409
+    assert "not the plan" in response.json()["detail"]
+    assert active_deployment.pool.reloads == 1
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"target_context_tokens": 16384}, {"path_map": {"small": "/models/new"}}],
+    ids=["context", "path"],
+)
+def test_replan_refuses_to_interrupt_active_requests(tmp_path, monkeypatch, change):
+    configure_cluster_registry(tmp_path)
+    model_path = tmp_path / "models" / "nemotron"
+    model_path.mkdir(parents=True)
+    _install_layout(monkeypatch)
+    pool = _BusyPool(model_path)
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+
+    body = _deployment_payload(model_path)
+    body["approved_placement"] = _approval_for(body)
+    response = _client().post("/admin/api/cluster/deployments", json=body)
+    assert response.status_code == 200, response.json()
+    deployment_id = response.json()["deployment"]["deployment_id"]
+    pool.busy = True
+
+    preview = (
+        _client()
+        .post(
+            "/admin/api/cluster/replan",
+            json={
+                "deployment_id": deployment_id,
+                **change,
+            },
+        )
+        .json()
+    )
+    response = _client().post(
+        "/admin/api/cluster/replan",
+        json={
+            "deployment_id": deployment_id,
+            **change,
+            "approved_placement": preview["plan"]["placement_signature"],
+        },
+    )
+
+    assert response.status_code == 409
+    assert "serving a request" in response.json()["detail"]
+    # The old deployment must survive a refused replan.
+    listed = _client().get("/admin/api/cluster/deployments")
+    assert listed.json()["deployments"][0]["deployment_id"] == deployment_id
+
+    assert pool.entry.engine.deployment.path_map == {}
+    assert listed.json()["deployments"][0]["path_map"] == {}
+
+
+def test_replan_unknown_deployment_is_404(tmp_path, monkeypatch):
+    configure_cluster_registry(tmp_path)
+    _install_layout(monkeypatch)
+    monkeypatch.setattr(
+        routes, "_get_engine_pool", lambda: _RecordingPool(tmp_path / "m")
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/replan", json={"deployment_id": "nope"}
+    )
+
+    assert response.status_code == 404
+
+
+def test_replan_without_context_requires_explicit_cluster(tmp_path, monkeypatch):
+    configure_cluster_registry(tmp_path)
+    _install_layout(monkeypatch)
+    monkeypatch.setattr(
+        routes, "_get_engine_pool", lambda: _RecordingPool(tmp_path / "m")
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/replan",
+        json={"model_path": "/models/never-deployed"},
+    )
+
+    assert response.status_code == 400
+    assert "nodes and hosts" in response.json()["detail"]
+
+
+def test_replan_membership_change_adds_a_node(active_deployment):
+    """N-node replan: explicit nodes/hosts express the membership change."""
+
+    nodes = [
+        {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
+        {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
+        {"node_id": "mini", "capacity_bytes": 50, "reserve_bytes": 10},
+    ]
+    hosts = [
+        {"node_id": "large", "ssh": "127.0.0.1", "ips": ["192.168.5.1"]},
+        {"node_id": "small", "ssh": "studio.local", "ips": ["192.168.5.2"]},
+        {"node_id": "mini", "ssh": "mini.local", "ips": ["192.168.5.3"]},
+    ]
+    preview = _client().post(
+        "/admin/api/cluster/replan",
+        json={
+            "deployment_id": active_deployment.deployment["deployment_id"],
+            "nodes": nodes,
+            "hosts": hosts,
+        },
+    )
+    assert preview.status_code == 200, preview.json()
+    assert preview.json()["plan"]["assignments"][2]["node_id"] == "mini"
+
+    response = _client().post(
+        "/admin/api/cluster/replan",
+        json={
+            "deployment_id": active_deployment.deployment["deployment_id"],
+            "nodes": nodes,
+            "hosts": hosts,
+            "approved_placement": preview.json()["plan"]["placement_signature"],
+        },
+    )
+
+    assert response.status_code == 200, response.json()
+    payload = response.json()
+    assert payload["deployment"].get("world_size", True)
+    assert len(payload["deployment"]["assignments"]) == 3
+    assert payload["replan"]["previous"]["world_size"] == 2
+    ranks = sorted(
+        (item["rank"], item["node_id"]) for item in payload["deployment"]["assignments"]
+    )
+    assert ranks == [(0, "large"), (1, "small"), (2, "mini")]
+
+
+@pytest.mark.parametrize(
+    "old_paths,new_paths",
+    [
+        ({}, {"small": "/models/new"}),
+        ({"small": "/models/old"}, {"small": "/models/new"}),
+        ({"small": "/models/old"}, {}),
+        ({"small": "/models/old"}, {"small": "/models/old"}),
+    ],
+    ids=["add", "change", "remove", "unchanged"],
+)
+def test_replan_path_map_matches_resident_engine(
+    active_deployment, old_paths, new_paths
+):
+    pool = active_deployment.pool
+    current = replace(pool.entry.engine.deployment, path_map=old_paths)
+    pool.entry.engine.deployment = current
+    registry = routes.get_cluster_registry()
+    registry.upsert(current)
+    previous_engine = pool.entry.engine
+    reloads = pool.reloads
+    request = {"deployment_id": current.deployment_id, "path_map": new_paths}
+    client = _client()
+    preview = client.post("/admin/api/cluster/replan", json=request)
+    assert preview.status_code == 200, preview.json()
+    request["approved_placement"] = preview.json()["plan"]["placement_signature"]
+    applied = client.post("/admin/api/cluster/replan", json=request)
+    assert applied.status_code == 200, applied.json()
+    assert pool.reloads == reloads + int(old_paths != new_paths)
+    assert pool.entry.engine.deployment.path_map == new_paths
+    assert registry.get(current.deployment_id).path_map == new_paths
+    assert (pool.entry.engine is previous_engine) == (old_paths == new_paths)
+
+
+def test_replan_snapshot_toggle_is_signed_and_forces_reload(active_deployment):
+    deployment_id = active_deployment.deployment["deployment_id"]
+    preview = _client().post(
+        "/admin/api/cluster/replan",
+        json={"deployment_id": deployment_id, "prompt_cache_ssd": True},
+    )
+
+    assert preview.status_code == 200, preview.json()
+    payload = preview.json()
+    assert payload["plan"]["prompt_cache_ssd"] is True
+    assert payload["changes"]["settings"]["prompt_cache_ssd"] == {
+        "before": False,
+        "after": True,
+    }
+
+    applied = _client().post(
+        "/admin/api/cluster/replan",
+        json={
+            "deployment_id": deployment_id,
+            "prompt_cache_ssd": True,
+            "approved_placement": payload["plan"]["placement_signature"],
+        },
+    )
+
+    assert applied.status_code == 200, applied.json()
+    assert active_deployment.pool.reloads == 2
+    assert active_deployment.pool.entry.engine.deployment.execution.prompt_cache_ssd
+
+def test_replan_preserves_disaggregated_phase_ownership(tmp_path, monkeypatch):
+    configure_cluster_registry(tmp_path)
+    model_path = tmp_path / "models" / "phase-model"
+    model_path.mkdir(parents=True)
+    _install_layout(monkeypatch)
+    pool = _RecordingPool(model_path)
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+
+    body = _deployment_payload(model_path, capacity_large=100, capacity_small=100)
+    body.update(
+        serving_mode="disaggregated",
+        prefill_rank=1,
+        decode_rank=0,
+    )
+    body["approved_placement"] = _approval_for(body)
+    activation = _client().post("/admin/api/cluster/deployments", json=body)
+    assert activation.status_code == 200, activation.json()
+
+    deployment_id = activation.json()["deployment"]["deployment_id"]
+    preview = _client().post(
+        "/admin/api/cluster/replan",
+        json={"deployment_id": deployment_id, "execution_profile": "throughput"},
+    )
+
+    assert preview.status_code == 200, preview.json()
+    plan = preview.json()["plan"]
+    assert plan["serving_mode"] == "disaggregated"
+    assert plan["prefill_rank"] == 1
+    assert plan["decode_rank"] == 0
+    assert all(item["start_layer"] == 0 for item in plan["assignments"])
 
 def test_replan_mtp_toggle_is_signed_and_forces_reload(active_deployment):
     deployment_id = active_deployment.deployment["deployment_id"]
@@ -508,138 +690,3 @@ def test_replan_mtp_toggle_is_signed_and_forces_reload(active_deployment):
         "mtp_enabled": {"before": True, "after": False},
         "mtp_num_draft_tokens": {"before": 3, "after": None},
     }
-
-
-def test_replan_rejects_a_stale_approval(active_deployment):
-    _client().post(
-        "/admin/api/cluster/replan",
-        json={"deployment_id": active_deployment.deployment["deployment_id"]},
-    )
-
-    response = _client().post(
-        "/admin/api/cluster/replan",
-        json={
-            "deployment_id": active_deployment.deployment["deployment_id"],
-            "target_context_tokens": 4096,
-            "approved_placement": "f" * 16,
-        },
-    )
-
-    assert response.status_code == 409
-    assert "not the plan" in response.json()["detail"]
-    assert active_deployment.pool.reloads == 1
-
-
-def test_replan_refuses_to_interrupt_active_requests(tmp_path, monkeypatch):
-    configure_cluster_registry(tmp_path)
-    model_path = tmp_path / "models" / "nemotron"
-    model_path.mkdir(parents=True)
-    _install_layout(monkeypatch)
-    pool = _BusyPool(model_path)
-    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
-
-    body = _deployment_payload(model_path)
-    body["approved_placement"] = _approval_for(body)
-    response = _client().post("/admin/api/cluster/deployments", json=body)
-    assert response.status_code == 200, response.json()
-    deployment_id = response.json()["deployment"]["deployment_id"]
-    pool.busy = True
-
-    preview = _client().post(
-        "/admin/api/cluster/replan",
-        json={
-            "deployment_id": deployment_id,
-            "target_context_tokens": 16384,
-        },
-    ).json()
-    response = _client().post(
-        "/admin/api/cluster/replan",
-        json={
-            "deployment_id": deployment_id,
-            "target_context_tokens": 16384,
-            "approved_placement": preview["plan"]["placement_signature"],
-        },
-    )
-
-    assert response.status_code == 409
-    assert "serving a request" in response.json()["detail"]
-    # The old deployment must survive a refused replan.
-    listed = _client().get("/admin/api/cluster/deployments")
-    assert listed.json()["deployments"][0]["deployment_id"] == deployment_id
-
-
-def test_replan_unknown_deployment_is_404(tmp_path, monkeypatch):
-    configure_cluster_registry(tmp_path)
-    _install_layout(monkeypatch)
-    monkeypatch.setattr(
-        routes, "_get_engine_pool", lambda: _RecordingPool(tmp_path / "m")
-    )
-
-    response = _client().post(
-        "/admin/api/cluster/replan", json={"deployment_id": "nope"}
-    )
-
-    assert response.status_code == 404
-
-
-def test_replan_without_context_requires_explicit_cluster(tmp_path, monkeypatch):
-    configure_cluster_registry(tmp_path)
-    _install_layout(monkeypatch)
-    monkeypatch.setattr(
-        routes, "_get_engine_pool", lambda: _RecordingPool(tmp_path / "m")
-    )
-
-    response = _client().post(
-        "/admin/api/cluster/replan",
-        json={"model_path": "/models/never-deployed"},
-    )
-
-    assert response.status_code == 400
-    assert "nodes and hosts" in response.json()["detail"]
-
-
-def test_replan_membership_change_adds_a_node(active_deployment):
-    """N-node replan: explicit nodes/hosts express the membership change."""
-
-    model_path = active_deployment.model_path
-    nodes = [
-        {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
-        {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
-        {"node_id": "mini", "capacity_bytes": 50, "reserve_bytes": 10},
-    ]
-    hosts = [
-        {"node_id": "large", "ssh": "127.0.0.1", "ips": ["192.168.5.1"]},
-        {"node_id": "small", "ssh": "studio.local", "ips": ["192.168.5.2"]},
-        {"node_id": "mini", "ssh": "mini.local", "ips": ["192.168.5.3"]},
-    ]
-    preview = _client().post(
-        "/admin/api/cluster/replan",
-        json={
-            "deployment_id": active_deployment.deployment["deployment_id"],
-            "nodes": nodes,
-            "hosts": hosts,
-        },
-    )
-    assert preview.status_code == 200, preview.json()
-    assert preview.json()["plan"]["assignments"][2]["node_id"] == "mini"
-
-    response = _client().post(
-        "/admin/api/cluster/replan",
-        json={
-            "deployment_id": active_deployment.deployment["deployment_id"],
-            "nodes": nodes,
-            "hosts": hosts,
-            "approved_placement": preview.json()["plan"]["placement_signature"],
-        },
-    )
-
-    assert response.status_code == 200, response.json()
-    payload = response.json()
-    assert payload["deployment"]["world_size"] if "world_size" in payload["deployment"] else True
-    assert len(payload["deployment"]["assignments"]) == 3
-    assert payload["replan"]["previous"]["world_size"] == 2
-    ranks = sorted(
-        (item["rank"], item["node_id"])
-        for item in payload["deployment"]["assignments"]
-    )
-    assert ranks == [(0, "large"), (1, "small"), (2, "mini")]

@@ -108,172 +108,24 @@ def test_qwen4_exp_config_normalizes_reference_layer_type():
     assert config.text_config.rope_parameters["type"] == "default"
 
 
-def test_qwen4_decode_profiler_is_strictly_gated_and_sparse(monkeypatch):
-    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
-    import mlx_vlm.models.qwen4_exp.language as language
+def test_qwen4_exp_model_file_checkpoints_resolve_to_vendored_module(tmp_path):
+    """mlx-vlm 0.7.x short-circuits ``config['model_file']`` to an imported
+    ``custom_model`` module that lacks ``ModelConfig``; qwen4_exp checkpoints
+    ship ``qwen4_exp.py`` (``ModelArgs``-style only), so resolution must keep
+    landing on the vendored registry entry (regression: "module
+    'custom_model' has no attribute 'ModelConfig'").
+    """
+    assert compat.apply_mlx_vlm_qwen4_exp_compat_patch() in {True, False}
+    from mlx_vlm.models import qwen4_exp
+    from mlx_vlm.utils import get_model_and_args
 
-    model = SimpleNamespace(fa_idx=0)
-    cache = [SimpleNamespace(offset=12)]
-    inputs = mx.array([[3]], dtype=mx.int32)
-    monkeypatch.setattr(language, "_DECODE_PROFILE_CALLS", 0)
-    monkeypatch.setattr(
-        language,
-        "_MTP_RUNTIME",
-        language.Qwen4ExpMTPRuntime(enabled=False),
-    )
+    (tmp_path / "qwen4_exp.py").write_text("class Model:\n    pass\n")
+    config = {"model_type": "qwen4_exp", "model_file": "qwen4_exp.py"}
 
-    monkeypatch.delenv("OMLX_QWEN4_DECODE_PROFILE", raising=False)
-    assert (
-        language._new_decode_profile_sample(
-            model, inputs, None, None, cache, {}
-        )
-        is None
-    )
+    module, model_type = get_model_and_args(config, model_path=tmp_path)
 
-    monkeypatch.setenv("OMLX_QWEN4_DECODE_PROFILE", "1")
-    monkeypatch.setenv("OMLX_QWEN4_DECODE_PROFILE_WARMUP", "0")
-    monkeypatch.setenv("OMLX_QWEN4_DECODE_PROFILE_INTERVAL", "2")
-    first = language._new_decode_profile_sample(
-        model, inputs, None, None, cache, {}
-    )
-    skipped = language._new_decode_profile_sample(
-        model, inputs, None, None, cache, {}
-    )
-    third = language._new_decode_profile_sample(
-        model, inputs, None, None, cache, {}
-    )
-    assert first is not None
-    assert skipped is None
-    assert third is not None
-    assert (first.call_index, third.call_index) == (1, 3)
-
-    assert (
-        language._new_decode_profile_sample(
-            model, mx.array([[1, 2]]), None, None, cache, {}
-        )
-        is None
-    )
-    assert (
-        language._new_decode_profile_sample(
-            model, inputs, None, None, cache, {"skip_logits": True}
-        )
-        is None
-    )
-
-
-def test_qwen4_decode_profiler_reports_synchronized_model_stages(
-    monkeypatch, caplog
-):
-    config = _tiny_config()
-    config.text_config.ple_layer_ids = []
-    import mlx_vlm.models.qwen4_exp.language as language
-
-    monkeypatch.setattr(language, "_DECODE_PROFILE_CALLS", 0)
-    monkeypatch.setattr(
-        language,
-        "_MTP_RUNTIME",
-        language.Qwen4ExpMTPRuntime(enabled=False),
-    )
-    monkeypatch.delenv("OMLX_QWEN4_DECODE_PROFILE", raising=False)
-    model = language.LanguageModel(config.text_config, config)
-    cache = model.make_cache()
-    prefix = model(mx.array([[2, 3, 4, 5, 6, 7, 8, 9, 10, 11]]), cache=cache)
-    mx.eval(prefix.logits)
-
-    monkeypatch.setenv("OMLX_QWEN4_DECODE_PROFILE", "1")
-    monkeypatch.setenv("OMLX_QWEN4_DECODE_PROFILE_WARMUP", "0")
-    monkeypatch.setenv("OMLX_QWEN4_DECODE_PROFILE_INTERVAL", "1")
-    with caplog.at_level("INFO", logger=language.__name__):
-        output = model(mx.array([[12]]), cache=cache)
-        mx.eval(output.logits)
-
-    message = next(
-        record.message
-        for record in caplog.records
-        if "[qwen4-decode-profile]" in record.message
-    )
-    assert "context=10" in message
-    assert "gdn=" in message
-    assert "qsa=" in message
-    assert "moe=" in message
-    assert "outer+logits=" in message
-
-
-def test_qwen4_coarse_profiler_is_exclusive_and_sparse(monkeypatch):
-    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
-    import mlx_vlm.models.qwen4_exp.language as language
-
-    model = SimpleNamespace(fa_idx=0)
-    cache = [SimpleNamespace(offset=12)]
-    inputs = mx.array([[3]], dtype=mx.int32)
-    monkeypatch.setattr(language, "_COARSE_PROFILE_CALLS", 0)
-    monkeypatch.setattr(
-        language,
-        "_MTP_RUNTIME",
-        language.Qwen4ExpMTPRuntime(enabled=False),
-    )
-    monkeypatch.delenv("OMLX_QWEN4_DECODE_PROFILE", raising=False)
-    monkeypatch.setenv("OMLX_QWEN4_DECODE_COARSE_PROFILE", "1")
-    monkeypatch.setenv("OMLX_QWEN4_DECODE_COARSE_PROFILE_WARMUP", "0")
-    monkeypatch.setenv("OMLX_QWEN4_DECODE_COARSE_PROFILE_INTERVAL", "2")
-
-    first = language._new_coarse_profile_sample(
-        model, inputs, None, None, cache, {}
-    )
-    skipped = language._new_coarse_profile_sample(
-        model, inputs, None, None, cache, {}
-    )
-    third = language._new_coarse_profile_sample(
-        model, inputs, None, None, cache, {}
-    )
-    assert first is not None
-    assert skipped is None
-    assert third is not None
-
-    monkeypatch.setenv("OMLX_QWEN4_DECODE_PROFILE", "1")
-    assert (
-        language._new_coarse_profile_sample(
-            model, inputs, None, None, cache, {}
-        )
-        is None
-    )
-
-
-def test_qwen4_coarse_profiler_reports_graph_build_and_final_eval(
-    monkeypatch, caplog
-):
-    config = _tiny_config()
-    config.text_config.ple_layer_ids = []
-    import mlx_vlm.models.qwen4_exp.language as language
-
-    monkeypatch.setattr(language, "_COARSE_PROFILE_CALLS", 0)
-    monkeypatch.setattr(
-        language,
-        "_MTP_RUNTIME",
-        language.Qwen4ExpMTPRuntime(enabled=False),
-    )
-    monkeypatch.delenv("OMLX_QWEN4_DECODE_PROFILE", raising=False)
-    monkeypatch.delenv("OMLX_QWEN4_DECODE_COARSE_PROFILE", raising=False)
-    model = language.LanguageModel(config.text_config, config)
-    cache = model.make_cache()
-    prefix = model(mx.array([[2, 3, 4, 5, 6, 7, 8, 9, 10, 11]]), cache=cache)
-    mx.eval(prefix.logits)
-
-    monkeypatch.setenv("OMLX_QWEN4_DECODE_COARSE_PROFILE", "1")
-    monkeypatch.setenv("OMLX_QWEN4_DECODE_COARSE_PROFILE_WARMUP", "0")
-    monkeypatch.setenv("OMLX_QWEN4_DECODE_COARSE_PROFILE_INTERVAL", "1")
-    with caplog.at_level("INFO", logger=language.__name__):
-        output = model(mx.array([[12]]), cache=cache)
-        mx.eval(output.logits)
-
-    message = next(
-        record.message
-        for record in caplog.records
-        if "[qwen4-decode-coarse]" in record.message
-    )
-    assert "context=10" in message
-    assert "graph_build=" in message
-    assert "final_eval=" in message
+    assert model_type == "qwen4_exp"
+    assert module is qwen4_exp
 
 
 @pytest.mark.parametrize("quantized", [False, True])
@@ -437,16 +289,10 @@ def test_qwen4_exp_load_enables_hyper_connection_optimizations(monkeypatch, capl
     fuse = MagicMock(return_value=96)
     fuse_ple = MagicMock(return_value=1)
     compile_connections = MagicMock(return_value=97)
-    fused_hc_bytes = MagicMock(return_value=194_301_952)
     monkeypatch.setattr(Qwen3_5Model, "load_weights", base_load)
     monkeypatch.setattr(model_module, "fuse_hyper_connection_projections", fuse)
     monkeypatch.setattr(model_module, "fuse_resident_ple_embeddings", fuse_ple)
     monkeypatch.setattr(model_module, "compile_hyper_connections", compile_connections)
-    monkeypatch.setattr(
-        model_module,
-        "hyper_connection_fused_copy_nbytes",
-        fused_hc_bytes,
-    )
     monkeypatch.setattr(
         model_module,
         "get_mtp_runtime",
@@ -462,16 +308,14 @@ def test_qwen4_exp_load_enables_hyper_connection_optimizations(monkeypatch, capl
     fuse.assert_called_once_with(model)
     fuse_ple.assert_called_once_with(model)
     compile_connections.assert_called_once_with(model)
-    fused_hc_bytes.assert_called_once_with(model)
     assert (
         "96 exact hybrid projection pairs, 97 compiled decode paths"
         in caplog.text
     )
     assert "Fused 1 resident Qwen4-Exp PLE table" in caplog.text
-    assert "185.3 MiB extra" in caplog.text
 
 
-def test_qwen4_exp_load_prepares_exact_projection_paths_during_mtp_verify(
+def test_qwen4_exp_load_skips_projection_fusion_during_mtp_verify(
     monkeypatch, caplog
 ):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
@@ -485,16 +329,10 @@ def test_qwen4_exp_load_prepares_exact_projection_paths_during_mtp_verify(
     fuse = MagicMock(return_value=96)
     fuse_ple = MagicMock(return_value=1)
     compile_connections = MagicMock(return_value=100)
-    fused_hc_bytes = MagicMock(return_value=194_301_952)
     monkeypatch.setattr(Qwen3_5Model, "load_weights", base_load)
     monkeypatch.setattr(model_module, "fuse_hyper_connection_projections", fuse)
     monkeypatch.setattr(model_module, "fuse_resident_ple_embeddings", fuse_ple)
     monkeypatch.setattr(model_module, "compile_hyper_connections", compile_connections)
-    monkeypatch.setattr(
-        model_module,
-        "hyper_connection_fused_copy_nbytes",
-        fused_hc_bytes,
-    )
     monkeypatch.setattr(
         model_module,
         "get_mtp_runtime",
@@ -504,13 +342,12 @@ def test_qwen4_exp_load_prepares_exact_projection_paths_during_mtp_verify(
 
     assert model.load_weights([], strict=False) is model
 
-    fuse.assert_called_once_with(model)
-    fused_hc_bytes.assert_called_once_with(model)
+    fuse.assert_not_called()
     fuse_ple.assert_called_once_with(model)
     compile_connections.assert_called_once_with(model)
-    assert "Prepared Qwen4-Exp exact HC projections for Lightning MTP" in caplog.text
+    assert "Skipped Qwen4-Exp exact hybrid projections" in caplog.text
     assert (
-        "96 exact hybrid projection pairs, 100 compiled decode paths"
+        "0 exact hybrid projection pairs, 100 compiled decode paths"
         in caplog.text
     )
 
@@ -797,14 +634,27 @@ def test_qwen4_exp_tiny_text_prefill_and_decode():
     assert next_logits.logits.shape == (1, 1, 64)
 
 
-def test_qwen4_gathered_qsa_prefill_matches_official_mask_path(monkeypatch):
+# The tiny config has budget 8 and ratio 2: query rows 0..8 see every block.
+@pytest.mark.parametrize(
+    ("prefix", "length", "gathered_rows"),
+    [
+        (0, 10, 2),  # the gathered arm keeps at least two rows
+        (5, 16, 12),
+        (20, 16, 16),
+    ],
+)
+def test_qwen4_gathered_qsa_prefill_matches_official_mask_path(
+    monkeypatch, prefix, length, gathered_rows
+):
+    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "2")
     config = _tiny_config()
     import mlx_vlm.models.qwen4_exp.language as language
     from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpAttention
 
     attention = Qwen4ExpAttention(config.text_config)
     mx.eval(attention.parameters())
-    hidden = mx.random.normal((1, 20, config.text_config.hidden_size))
+    total = prefix + length
+    hidden = mx.random.normal((1, total, config.text_config.hidden_size))
 
     calls = []
     gathered = language.contiguous_causal_gathered_qsa
@@ -813,9 +663,16 @@ def test_qwen4_gathered_qsa_prefill_matches_official_mask_path(monkeypatch):
         calls.append((args[0].shape, args[1].shape))
         return gathered(*args, **kwargs)
 
+    def run(cache):
+        if prefix:
+            attention(hidden[:, :prefix], mask="causal", cache=cache)
+        calls.clear()
+        return attention(hidden[:, prefix:], mask="causal", cache=cache)
+
     monkeypatch.setattr(language, "contiguous_causal_gathered_qsa", tracked)
     fast_cache = QSAKVCache()
-    actual = attention(hidden, mask="causal", cache=fast_cache)
+    actual = run(fast_cache)
+    fast_calls = list(calls)
 
     monkeypatch.setattr(
         Qwen4ExpAttention,
@@ -823,12 +680,12 @@ def test_qwen4_gathered_qsa_prefill_matches_official_mask_path(monkeypatch):
         staticmethod(lambda *args, **kwargs: False),
     )
     reference_cache = QSAKVCache()
-    expected = attention(hidden, mask="causal", cache=reference_cache)
+    expected = run(reference_cache)
     mx.eval(actual, expected)
 
-    assert calls == [((1, 4, 20, 8), (1, 2, 20, 8))]
+    assert fast_calls == [((1, 4, gathered_rows, 8), (1, 2, total, 8))]
     assert mx.allclose(actual, expected, rtol=2e-5, atol=2e-5).item()
-    assert fast_cache.offset == reference_cache.offset == 20
+    assert fast_cache.offset == reference_cache.offset == total
     assert mx.array_equal(fast_cache.index_keys, reference_cache.index_keys).item()
     assert mx.array_equal(
         fast_cache.index_position_ids,
@@ -860,11 +717,23 @@ def test_qwen4_rank_two_text_positions_match_identical_mrope_plane_logits(
         None,
         False,
     )
-    assert not attention._gathered_text_prefill_eligible(
+    assert attention._gathered_text_prefill_eligible(
         hidden,
         "causal",
         QSAKVCache(),
         identical_mrope,
+        None,
+        False,
+    )
+    unequal_mrope = mx.concatenate(
+        [text_positions[None], text_positions[None], text_positions[None] + 1],
+        axis=0,
+    )
+    assert not attention._gathered_text_prefill_eligible(
+        hidden,
+        "causal",
+        QSAKVCache(),
+        unequal_mrope,
         None,
         False,
     )
@@ -899,7 +768,8 @@ def test_qwen4_rank_two_text_positions_match_identical_mrope_plane_logits(
     expected_logits = expected @ projection
     mx.eval(actual_logits, expected_logits)
 
-    assert gathered_calls == [True]
+    # Both the 2-D and the broadcast 3-D text positions take the gathered arm.
+    assert gathered_calls == [True, True]
     assert mx.allclose(actual, expected, rtol=2e-5, atol=2e-5).item()
     assert mx.allclose(
         actual_logits,
@@ -913,9 +783,7 @@ def test_qwen4_rank_two_text_positions_match_identical_mrope_plane_logits(
     ).item()
     assert fast_cache.offset == reference_cache.offset == 20
     fast_keys, fast_values, fast_index_keys, _ = fast_cache.state
-    reference_keys, reference_values, reference_index_keys, _ = (
-        reference_cache.state
-    )
+    reference_keys, reference_values, reference_index_keys, _ = reference_cache.state
     for fast_value, reference_value in (
         (fast_keys, reference_keys),
         (fast_values, reference_values),
@@ -983,179 +851,6 @@ def test_qwen4_gathered_qsa_fails_closed_for_batched_prefill(monkeypatch):
     assert output.shape == hidden.shape
 
 
-@pytest.mark.parametrize("prefix_lengths", [(10, 10), (10, 13)])
-@pytest.mark.parametrize("position_kind", ["text", "mrope"])
-def test_qwen4_b2_qsa_matches_independent_rows_past_budget(
-    monkeypatch,
-    prefix_lengths,
-    position_kind,
-):
-    """B2 QSA selection is row-local across equal and unequal histories."""
-    config = _tiny_config().text_config
-    config.ple_layer_ids = []
-    import mlx_vlm.models.qwen4_exp.language as language
-
-    mx.random.seed(421)
-    attention = language.Qwen4ExpAttention(config)
-    lm_head = mx.random.normal((64, config.hidden_size))
-    mx.eval(attention.parameters(), lm_head)
-    monkeypatch.setattr(
-        language.Qwen4ExpAttention,
-        "_gathered_text_prefill_eligible",
-        lambda *args, **kwargs: False,
-    )
-    monkeypatch.setattr(
-        language.Qwen4ExpAttention,
-        "_gathered_text_decode_eligible",
-        lambda *args, **kwargs: False,
-    )
-
-    def positions(length):
-        text = mx.arange(length, dtype=mx.int32)
-        if position_kind == "text":
-            return text[None]
-        return mx.stack(
-            [text, text // 2, (text + 1) // 3],
-            axis=0,
-        )[:, None, :]
-
-    def batch_decode_positions():
-        rows = [positions(length + 1)[..., -1:] for length in prefix_lengths]
-        return mx.concatenate(rows, axis=0 if position_kind == "text" else 1)
-
-    def clone(cache):
-        cloned = language.QSAKVCache()
-        cloned.state = cache.state
-        return cloned
-
-    prefix_caches = []
-    decode_rows = []
-    for length in prefix_lengths:
-        cache = language.QSAKVCache()
-        prefix = mx.random.normal((1, length, config.hidden_size))
-        decode_rows.append(mx.random.normal((1, 1, config.hidden_size)))
-        prefix_output = attention(
-            prefix,
-            mask="causal",
-            cache=cache,
-            position_ids=positions(length),
-        )
-        mx.eval(prefix_output, cache.state)
-        prefix_caches.append(cache)
-
-    decode_hidden = mx.concatenate(decode_rows, axis=0)
-    decode_positions = batch_decode_positions()
-
-    # First compare the discrete selector itself.  The batched mask is on the
-    # physical, right-aligned KV axis; removing each row's left pad must yield
-    # the exact singleton logical mask and no padding column may be selected.
-    batch_selector_cache = language.BatchQSAKVCache.merge(
-        [clone(cache) for cache in prefix_caches]
-    )
-    single_selector_caches = [clone(cache) for cache in prefix_caches]
-    projected = attention.indexer.index_qk_proj(decode_hidden)
-    batch_mask = attention.indexer.from_projected(
-        projected,
-        batch_selector_cache,
-        decode_positions,
-    )
-    single_masks = [
-        attention.indexer.from_projected(
-            projected[index : index + 1],
-            cache,
-            positions(length + 1)[..., -1:],
-        )
-        for index, (cache, length) in enumerate(
-            zip(single_selector_caches, prefix_lengths)
-        )
-    ]
-    mx.eval(batch_mask, *single_masks, batch_selector_cache.state)
-    paddings = batch_selector_cache.left_padding.tolist()
-    for index, (padding, single_mask) in enumerate(zip(paddings, single_masks)):
-        if padding:
-            assert not mx.any(batch_mask[index, ..., :padding]).item()
-        assert mx.array_equal(
-            batch_mask[index : index + 1, ..., padding:],
-            single_mask,
-        ).item()
-        extracted = batch_selector_cache.extract(index)
-        mx.eval(extracted.state, single_selector_caches[index].state)
-        assert mx.array_equal(
-            extracted.index_keys,
-            single_selector_caches[index].index_keys,
-        ).item()
-        assert mx.array_equal(
-            extracted.index_position_ids,
-            single_selector_caches[index].index_position_ids,
-        ).item()
-
-    # Then compare the actual attention result and a shared vocabulary
-    # projection.  Floating matrix kernels may differ by a final ULP between
-    # B2 and two B1 calls, while selected tokens and position state above are
-    # required to be bit-exact.
-    batch_cache = language.BatchQSAKVCache.merge(
-        [clone(cache) for cache in prefix_caches]
-    )
-    batch_output = attention(
-        decode_hidden,
-        mask=batch_cache.make_mask(1),
-        cache=batch_cache,
-        position_ids=decode_positions,
-    )
-    mx.eval(batch_output, batch_cache.state)
-
-    singleton_outputs = []
-    singleton_caches = []
-    for decode_row, prefix_cache, length in zip(
-        decode_rows,
-        prefix_caches,
-        prefix_lengths,
-    ):
-        cache = clone(prefix_cache)
-        singleton_outputs.append(
-            attention(
-                decode_row,
-                cache=cache,
-                position_ids=positions(length + 1)[..., -1:],
-            )
-        )
-        singleton_caches.append(cache)
-    singleton_output = mx.concatenate(singleton_outputs, axis=0)
-    batch_logits = batch_output @ lm_head.T
-    singleton_logits = singleton_output @ lm_head.T
-    mx.eval(batch_logits, singleton_logits)
-
-    assert mx.allclose(batch_logits, singleton_logits, rtol=2e-5, atol=2e-5).item()
-    assert mx.array_equal(
-        mx.argmax(batch_logits, axis=-1),
-        mx.argmax(singleton_logits, axis=-1),
-    ).item()
-    for index, singleton_cache in enumerate(singleton_caches):
-        extracted = batch_cache.extract(index)
-        mx.eval(extracted.state, singleton_cache.state)
-        for actual, expected in zip(extracted.state[:3], singleton_cache.state[:3]):
-            assert mx.allclose(actual, expected, rtol=2e-5, atol=2e-5).item()
-        assert mx.array_equal(
-            extracted.index_position_ids,
-            singleton_cache.index_position_ids,
-        ).item()
-
-
-def test_qwen4_qsa_default_positions_honor_vector_batch_offsets():
-    config = _tiny_config().text_config
-    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpQSAIndexer
-
-    indexer = Qwen4ExpQSAIndexer(config, rotary_emb=SimpleNamespace())
-    positions = indexer._default_position_ids(
-        2,
-        mx.array([10, 13], dtype=mx.int32),
-        3,
-    )
-    mx.eval(positions)
-
-    assert positions.tolist() == [[10, 11, 12], [13, 14, 15]]
-
-
 def test_qwen4_gathered_qsa_keeps_official_path_at_sparse_budget(monkeypatch):
     config = _tiny_config()
     import mlx_vlm.models.qwen4_exp.language as language
@@ -1204,7 +899,7 @@ def test_qwen4_adapter_cache_only_prefill_skips_vocab_projection():
     assert offsets and max(offsets) == 4
 
 
-def test_qwen4_batch_factory_honors_model_owned_cache_conversion():
+def test_qwen4_batch_join_honors_model_owned_cache_conversion():
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache, QSAKVCache
 
@@ -1225,7 +920,10 @@ def test_qwen4_batch_factory_honors_model_owned_cache_conversion():
             return [qsa_cache]
 
     generate = importlib.import_module("mlx_lm.generate")
-    caches = generate._make_cache(Model(), [0], None)
+    caches = [
+        omlx.scheduler._to_batched_cache_layer(c)
+        for c in generate._merge_caches([Model().make_cache()])
+    ]
 
     assert len(caches) == 1
     assert isinstance(caches[0], BatchQSAKVCache)
@@ -1257,6 +955,25 @@ def test_qwen4_fp8_ple_dequantizes_only_selected_rows():
     assert mx.array_equal(result, expected).item()
 
 
+def test_qwen4_sharded_embedding_keeps_token_order_across_shards():
+    _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import ShardedEmbedding
+
+    embedding = ShardedEmbedding(num_embeddings=11, dims=3, num_shards=3)
+    table = mx.arange(33, dtype=mx.float32).reshape(11, 3)
+    offsets = embedding.shard_offsets
+    for shard, start, end in zip(embedding.shards, offsets, offsets[1:]):
+        shard.weight = table[start:end]
+    embedding.weight_scale = mx.array([0.5], dtype=mx.bfloat16)
+    indices = mx.array([[10, 0, 4, 4, 7], [3, 10, 8, 0, 5]], dtype=mx.int32)
+
+    result = embedding(indices)
+    expected = table[indices] * embedding.weight_scale
+
+    assert result.shape == (2, 5, 3)
+    assert mx.array_equal(result, expected).item()
+
+
 def test_qwen4_qsa_cache_round_trip_preserves_greedy_decode():
     config = _tiny_config()
     from mlx_vlm.models.qwen4_exp.language import LanguageModel
@@ -1279,6 +996,13 @@ def test_qwen4_qsa_cache_round_trip_preserves_greedy_decode():
         else:
             restored.append(handler.reconstruct_cache(state))
 
+    from types import SimpleNamespace
+
+    from omlx.models.vlm import VLMModelAdapter
+
+    restored = VLMModelAdapter(SimpleNamespace(language_model=model)).restore_cache(
+        restored
+    )
     resumed = model(mx.array([[5]], dtype=mx.int32), cache=restored)
     expected = mx.argmax(full.logits[:, -1], axis=-1)
     actual = mx.argmax(resumed.logits[:, -1], axis=-1)
@@ -1314,7 +1038,7 @@ def test_qwen4_verify_matches_singleton_greedy_and_rolls_back_qsa():
 
     assert mx.array_equal(verified_tokens, singleton_tokens).item()
     assert verified.hidden_states[0].shape == (1, 2, 64)
-    assert len(verified.gdn_states) == 1
+    assert verified.gdn_states.active
 
     model.rollback_speculative_cache(
         verify_cache,
@@ -1328,80 +1052,6 @@ def test_qwen4_verify_matches_singleton_greedy_and_rolls_back_qsa():
     assert qsa_cache.index_position_ids.shape[-1] == 4
 
 
-def test_qwen4_scalar_return_hidden_is_canonical_and_mtp_compatible():
-    """L=1 hidden capture preserves ordinary target math and raw HC width."""
-
-    config = _tiny_config()
-    from mlx_vlm.models.qwen4_exp.language import (
-        LanguageModel,
-        Qwen4ExpMTPModule,
-    )
-
-    model = LanguageModel(config.text_config, config)
-    model.mtp = Qwen4ExpMTPModule(config.text_config)
-    canonical_cache = model.make_cache()
-    hidden_cache = model.make_cache()
-    raw_cache = model.make_cache()
-    prefix = mx.array([[2, 3, 4, 5, 6]], dtype=mx.int32)
-    prefix_positions = mx.arange(prefix.shape[1], dtype=mx.int32)[None]
-    for cache in (canonical_cache, hidden_cache, raw_cache):
-        model(prefix, cache=cache, position_ids=prefix_positions)
-
-    token = mx.array([[7]], dtype=mx.int32)
-    token_position = mx.array([[prefix.shape[1]]], dtype=mx.int32)
-    canonical = model(
-        token,
-        cache=canonical_cache,
-        position_ids=token_position,
-    )
-    with_hidden = model(
-        token,
-        cache=hidden_cache,
-        position_ids=token_position,
-        return_hidden=True,
-    )
-    raw_sink = []
-    raw_mixed = model.model(
-        token,
-        cache=raw_cache,
-        position_ids=token_position,
-        capture_layer_ids=[],
-        hidden_sink=raw_sink,
-        gdn_sink=None,
-    )
-    mx.eval(canonical.logits, with_hidden.logits, raw_mixed, *raw_sink)
-
-    assert with_hidden.gdn_states is None
-    assert len(with_hidden.hidden_states) == len(raw_sink) == 1
-    assert with_hidden.hidden_states[0].shape == (1, 1, 64)
-    assert mx.array_equal(canonical.logits, with_hidden.logits).item()
-    assert mx.array_equal(with_hidden.hidden_states[0], raw_sink[0]).item()
-
-    for canonical_layer, hidden_layer, raw_layer in zip(
-        canonical_cache,
-        hidden_cache,
-        raw_cache,
-    ):
-        for canonical_value, hidden_value, raw_value in zip(
-            canonical_layer.state,
-            hidden_layer.state,
-            raw_layer.state,
-        ):
-            mx.eval(canonical_value, hidden_value, raw_value)
-            assert mx.array_equal(canonical_value, hidden_value).item()
-            assert mx.array_equal(hidden_value, raw_value).item()
-
-    mtp_logits, mtp_hidden = model.mtp_forward(
-        with_hidden.hidden_states[0],
-        mx.array([[8]], dtype=mx.int32),
-        model.make_mtp_cache(),
-        return_hidden=True,
-    )
-    mx.eval(mtp_logits, mtp_hidden)
-    assert mtp_logits.shape == (1, 1, config.text_config.vocab_size)
-    assert mtp_hidden.shape == (1, 1, 64)
-
-
 def _assert_ple_state_matches(actual_cache, expected_cache):
     mx.eval(
         actual_cache[2],
@@ -1410,88 +1060,10 @@ def _assert_ple_state_matches(actual_cache, expected_cache):
         expected_cache[3],
     )
     assert mx.array_equal(actual_cache[3], expected_cache[3]).item()
-    assert mx.allclose(
-        actual_cache[2],
-        expected_cache[2],
-        rtol=1e-3,
-        atol=1e-3,
-    ).item()
+    assert mx.allclose(actual_cache[2], expected_cache[2], rtol=1e-3, atol=1e-3).item()
 
 
-@pytest.mark.parametrize("batch", [1, 2, 4, 6])
-def test_qwen4_ple_restore_selection_covers_every_depth_and_batch_row(batch):
-    """The transactional selector is exact for every depth 0..8.
-
-    Rotating the accepted vector makes every row in B1/B2/B4/B6 exercise
-    every retained-prefix depth, including mixed accept counts in one batch.
-    This isolates the selection math from the much heavier end-to-end model
-    checks below.
-    """
-
-    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
-    from mlx_vlm.models.qwen4_exp import language
-
-    window = 9
-    history_len = 2
-    state_len = 6
-    width = 5
-    history = mx.arange(batch * history_len, dtype=mx.int64).reshape(
-        batch, history_len
-    )
-    input_ids = (
-        100
-        + mx.arange(batch * window, dtype=mx.int64).reshape(batch, window)
-    )
-    conv_state = mx.arange(
-        batch * state_len * width, dtype=mx.float32
-    ).reshape(batch, state_len, width)
-    conv_inputs = (
-        1000
-        + mx.arange(batch * window * width, dtype=mx.float32).reshape(
-            batch, window, width
-        )
-    )
-    snapshot = language._PLESpeculativeState(
-        history=history,
-        input_ids=input_ids,
-        conv_state=conv_state,
-        conv_inputs=conv_inputs,
-        complete=True,
-    )
-
-    all_history = mx.concatenate([history, input_ids], axis=1)
-    all_conv = mx.concatenate([conv_state, conv_inputs], axis=1)
-    for rotation in range(window):
-        accepted = [(rotation + row) % window for row in range(batch)]
-        language.LanguageModel._validate_ple_snapshot(
-            snapshot,
-            accepted,
-            window,
-        )
-        actual_conv, actual_history = (
-            language.LanguageModel._prepare_ple_restore(snapshot, accepted)
-        )
-        expected_history = mx.stack(
-            [
-                all_history[row, depth + 1 : depth + 1 + history_len]
-                for row, depth in enumerate(accepted)
-            ]
-        )
-        expected_conv = mx.stack(
-            [
-                all_conv[row, depth + 1 : depth + 1 + state_len]
-                for row, depth in enumerate(accepted)
-            ]
-        )
-        mx.eval(actual_conv, actual_history, expected_conv, expected_history)
-        assert mx.array_equal(actual_history, expected_history).item()
-        assert mx.array_equal(actual_conv, expected_conv).item()
-
-
-@pytest.mark.parametrize("accepted", range(9))
-def test_qwen4_ple_b1_partial_rollback_matches_committed_replay(accepted):
-    """A real target verifier restores B1 PLE at every depth 0..8."""
-
+def test_qwen4_ple_rollback_keeps_only_committed_verify_prefix():
     config = _tiny_config()
     from mlx_vlm.models.qwen4_exp.language import LanguageModel
 
@@ -1499,109 +1071,68 @@ def test_qwen4_ple_b1_partial_rollback_matches_committed_replay(accepted):
     verify_cache = model.make_cache()
     replay_cache = model.make_cache()
     prefix = mx.array([[2, 3, 4]], dtype=mx.int32)
-    verify_tokens = mx.arange(5, 14, dtype=mx.int32)[None]
+    confirmed = mx.array([[5]], dtype=mx.int32)
+    draft = mx.array([[6]], dtype=mx.int32)
+    next_token = mx.array([[7]], dtype=mx.int32)
     model(prefix, cache=verify_cache)
     model(prefix, cache=replay_cache)
 
-    verified = model(verify_tokens, cache=verify_cache, return_hidden=True)
-    model(verify_tokens[:, : accepted + 1], cache=replay_cache)
+    verified = model(
+        mx.concatenate([confirmed, draft], axis=1),
+        cache=verify_cache,
+        return_hidden=True,
+    )
+    model(confirmed, cache=replay_cache)
     model.rollback_speculative_cache(
         verify_cache,
         verified.gdn_states,
-        accepted=accepted,
-        block_size=verify_tokens.shape[1],
+        accepted=0,
+        block_size=2,
     )
 
     _assert_ple_state_matches(verify_cache[0], replay_cache[0])
-    assert getattr(
-        verify_cache[0], "_qwen4_exp_ple_speculative_state", None
-    ) is None
-    probe = mx.array([[50]], dtype=mx.int32)
-    actual_next = model(probe, cache=verify_cache).logits
-    expected_next = model(probe, cache=replay_cache).logits
-    mx.eval(actual_next, expected_next)
-    assert mx.allclose(actual_next, expected_next, rtol=1e-3, atol=1e-3).item()
-    assert mx.array_equal(
-        mx.argmax(actual_next[:, -1], axis=-1),
-        mx.argmax(expected_next[:, -1], axis=-1),
-    ).item()
+    rolled_back = model(next_token, cache=verify_cache)
+    replayed = model(next_token, cache=replay_cache)
+    mx.eval(rolled_back.logits, replayed.logits)
+    assert mx.allclose(rolled_back.logits, replayed.logits, rtol=1e-3, atol=1e-3).item()
 
 
-@pytest.mark.parametrize(
-    "accepted",
-    [
-        [0, 8],
-        [0, 2, 5, 8],
-        [0, 1, 3, 4, 6, 8],
-    ],
-    ids=["b2", "b4", "b6"],
-)
-def test_qwen4_ple_batched_partial_rollback_is_row_exact(accepted):
-    """One mixed accepted vector restores every request-owned PLE row."""
-
+def test_qwen4_ple_partial_rollback_and_accept_match_sequential_replay():
     config = _tiny_config()
     from mlx_vlm.models.qwen4_exp.language import LanguageModel
 
     model = LanguageModel(config.text_config, config)
-    batch = len(accepted)
-    prefixes = [
-        mx.array([[2 + row, 12 + row, 22 + row]], dtype=mx.int32)
-        for row in range(batch)
-    ]
-    verify_rows = [
-        mx.arange(30 + row, 39 + row, dtype=mx.int32)[None]
-        for row in range(batch)
-    ]
-    row_caches = []
-    replay_caches = []
-    for prefix in prefixes:
-        row_cache = model.make_cache()
-        replay_cache = model.make_cache()
-        model(prefix, cache=row_cache)
-        model(prefix, cache=replay_cache)
-        row_caches.append(row_cache)
-        replay_caches.append(replay_cache)
+    prefix = mx.array([[2, 3, 4]], dtype=mx.int32)
+    verify_tokens = mx.array([[5, 6, 7, 8]], dtype=mx.int32)
 
-    batch_cache = [
-        type(layer_rows[0]).merge(layer_rows)
-        for layer_rows in zip(*row_caches)
-    ]
-    verify_tokens = mx.concatenate(verify_rows, axis=0)
-    verified = model(verify_tokens, cache=batch_cache, return_hidden=True)
-    for row, depth in enumerate(accepted):
-        model(verify_rows[row][:, : depth + 1], cache=replay_caches[row])
+    accepted_cache = model.make_cache()
+    sequential_cache = model.make_cache()
+    model(prefix, cache=accepted_cache)
+    model(prefix, cache=sequential_cache)
+    model(verify_tokens, cache=accepted_cache, return_hidden=True)
+    for token in (5, 6, 7, 8):
+        model(mx.array([[token]], dtype=mx.int32), cache=sequential_cache)
+    _assert_ple_state_matches(accepted_cache[0], sequential_cache[0])
 
+    partial_cache = model.make_cache()
+    replay_cache = model.make_cache()
+    model(prefix, cache=partial_cache)
+    model(prefix, cache=replay_cache)
+    verified = model(verify_tokens, cache=partial_cache, return_hidden=True)
+    for token in (5, 6, 7):
+        model(mx.array([[token]], dtype=mx.int32), cache=replay_cache)
     model.rollback_speculative_cache(
-        batch_cache,
+        partial_cache,
         verified.gdn_states,
-        accepted=accepted,
-        block_size=verify_tokens.shape[1],
+        accepted=2,
+        block_size=4,
     )
 
-    for row, expected_cache in enumerate(replay_caches):
-        actual_ple = batch_cache[0].extract(row)
-        _assert_ple_state_matches(actual_ple, expected_cache[0])
-    assert getattr(
-        batch_cache[0], "_qwen4_exp_ple_speculative_state", None
-    ) is None
-    probe = mx.arange(50, 50 + batch, dtype=mx.int32)[:, None]
-    actual_next = model(probe, cache=batch_cache).logits
-    expected_next = mx.concatenate(
-        [
-            model(probe[row : row + 1], cache=replay_caches[row]).logits
-            for row in range(batch)
-        ],
-        axis=0,
-    )
-    mx.eval(actual_next, expected_next)
-    assert mx.allclose(actual_next, expected_next, rtol=1e-3, atol=1e-3).item()
-    assert mx.array_equal(
-        mx.argmax(actual_next[:, -1], axis=-1),
-        mx.argmax(expected_next[:, -1], axis=-1),
-    ).item()
+    _assert_ple_state_matches(partial_cache[0], replay_cache[0])
 
 
-def test_qwen4_ple_ordinary_forward_disarms_fully_accepted_snapshot():
+def test_qwen4_ple_ordinary_forward_disarms_stale_snapshot():
+    """Commit a full verify window before the next ordinary forward."""
     config = _tiny_config()
     from mlx_vlm.models.qwen4_exp.language import LanguageModel
 
@@ -1609,84 +1140,35 @@ def test_qwen4_ple_ordinary_forward_disarms_fully_accepted_snapshot():
     cache = model.make_cache()
     ple_cache = cache[0]
     model(mx.array([[2, 3, 4]], dtype=mx.int32), cache=cache)
-    model(mx.array([[5, 6]], dtype=mx.int32), cache=cache, return_hidden=True)
+
+    verified = model(
+        mx.array([[5, 6]], dtype=mx.int32), cache=cache, return_hidden=True
+    )
     assert getattr(ple_cache, "_qwen4_exp_ple_speculative_state", None) is not None
+    model.rollback_speculative_cache(cache, verified.gdn_states, 1, 2)
 
     model(mx.array([[7]], dtype=mx.int32), cache=cache)
     assert getattr(ple_cache, "_qwen4_exp_ple_speculative_state", None) is None
 
 
-@pytest.mark.parametrize(
-    ("mutation", "accepted", "block_size", "message"),
-    [
-        ("incomplete", [0], 2, "incomplete"),
-        ("history-rank", [0], 2, "not rank-2"),
-        ("history-batch", [0], 2, "batch mismatch"),
-        ("accepted-batch", [0, 0], 2, "does not match batch size"),
-        ("accepted-negative", [-1], 2, "outside the verify window"),
-        ("accepted-overflow", [2], 2, "outside the verify window"),
-        ("block-size", [0], 3, "does not match rollback block size"),
-        ("missing-conv", [0], 2, "capture is incomplete"),
-        ("conv-rank", [0], 2, "capture is malformed"),
-        ("conv-window", [0], 2, "capture is malformed"),
-    ],
-)
-def test_qwen4_ple_rollback_snapshot_validation_fails_closed(
-    mutation,
-    accepted,
-    block_size,
-    message,
-):
-    """Malformed transactions are rejected before inherited cache mutation."""
-
+def test_qwen4_ple_rollback_validates_accepted_count_before_qsa_mutation():
     config = _tiny_config()
-    from mlx_vlm.models.qwen4_exp.language import (
-        LanguageModel,
-        _PLESpeculativeRollbackError,
-    )
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
 
     model = LanguageModel(config.text_config, config)
     cache = model.make_cache()
     model(mx.array([[2, 3, 4]], dtype=mx.int32), cache=cache)
     verified = model(
-        mx.array([[5, 6]], dtype=mx.int32),
-        cache=cache,
-        return_hidden=True,
+        mx.array([[5, 6]], dtype=mx.int32), cache=cache, return_hidden=True
     )
-    ple_cache = cache[0]
-    qsa_cache = cache[1]
-    snapshot = ple_cache._qwen4_exp_ple_speculative_state
-    before_history = ple_cache[3] * 1
-    before_conv = ple_cache[2] * 1
-    before_qsa = tuple(value * 1 for value in qsa_cache.state)
+    before_offset = int(cache[1].offset)
 
-    if mutation == "incomplete":
-        snapshot.complete = False
-    elif mutation == "history-rank":
-        snapshot.history = snapshot.history.reshape(-1)
-    elif mutation == "history-batch":
-        snapshot.history = mx.concatenate([snapshot.history, snapshot.history])
-    elif mutation == "missing-conv":
-        snapshot.conv_inputs = None
-    elif mutation == "conv-rank":
-        snapshot.conv_state = snapshot.conv_state.reshape(-1)
-    elif mutation == "conv-window":
-        snapshot.conv_inputs = snapshot.conv_inputs[:, :-1]
-
-    with pytest.raises(_PLESpeculativeRollbackError, match=message):
+    with pytest.raises(ValueError, match="outside the verify window"):
         model.rollback_speculative_cache(
-            cache,
-            verified.gdn_states,
-            accepted=accepted,
-            block_size=block_size,
+            cache, verified.gdn_states, accepted=2, block_size=2
         )
-
-    mx.eval(before_history, before_conv, *before_qsa)
-    assert mx.array_equal(ple_cache[3], before_history).item()
-    assert mx.array_equal(ple_cache[2], before_conv).item()
-    for actual, before in zip(qsa_cache.state, before_qsa):
-        assert mx.array_equal(actual, before).item()
-    assert getattr(ple_cache, "_qwen4_exp_ple_speculative_state", None) is None
+    assert int(cache[1].offset) == before_offset
+    assert getattr(cache[0], "_qwen4_exp_ple_speculative_state", None) is None
 
 
 def test_qwen4_lightning_mtp_rejects_nextn_only_layout(tmp_path):
@@ -1766,7 +1248,8 @@ def test_qwen4_lightning_mtp_fusion_and_runtime_attachment(tmp_path):
         configure_mtp_runtime(tmp_path, enabled=False)
 
 
-def test_qwen4_sanitize_dequantizes_and_stacks_fp8_experts(tmp_path):
+@pytest.mark.parametrize("mtp_num_experts", [None, 6, 3])
+def test_qwen4_sanitize_dequantizes_and_stacks_fp8_experts(tmp_path, mtp_num_experts):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import configure_mtp_runtime
     from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
@@ -1783,15 +1266,16 @@ def test_qwen4_sanitize_dequantizes_and_stacks_fp8_experts(tmp_path):
                     tie_word_embeddings=False,
                     num_hidden_layers=1,
                     num_experts=4,
+                    mtp_num_experts=mtp_num_experts,
                 )
             )
         )
         weights = {}
-        for root in (
-            "model.language_model.layers.0.mlp",
-            "mtp.layers.0.mlp",
+        for root, count in (
+            ("model.language_model.layers.0.mlp", 4),
+            ("mtp.layers.0.mlp", mtp_num_experts or 4),
         ):
-            for expert in range(4):
+            for expert in range(count):
                 for projection in ("gate_proj", "up_proj", "down_proj"):
                     key = f"{root}.experts.{expert}.{projection}.weight"
                     weights[key] = mx.to_fp8(mx.ones((2, 2), dtype=mx.float32))
@@ -1802,7 +1286,8 @@ def test_qwen4_sanitize_dequantizes_and_stacks_fp8_experts(tmp_path):
         base_key = "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight"
         mtp_key = "mtp.layers.0.mlp.switch_mlp.gate_proj.weight"
         assert result[base_key].shape == (4, 2, 2)
-        assert result[mtp_key].shape == (4, 2, 2)
+        assert result[mtp_key].shape == (mtp_num_experts or 4, 2, 2)
+        assert not any(".experts." in key for key in result)
         assert result[base_key].dtype == mx.bfloat16
         assert not any(key.endswith("weight_scale_inv") for key in result)
     finally:
@@ -1841,6 +1326,142 @@ def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path):
     assert embedding.last_touched_shards == (0, 1)
     assert embedding.rows_read == 2
     embedding.close()
+
+
+@pytest.fixture
+def disk_ple_reader(tmp_path):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp import language as ple
+
+    # 166-byte rows exercise reads that straddle page boundaries.
+    dense = (mx.arange(4096 * 83).reshape(4096, 83) / 3.0).astype(mx.bfloat16)
+    path = tmp_path / "ple.safetensors"
+    mx.save_safetensors(str(path), {"weight": dense})
+    reader = ple._SafeTensorMMap(path)
+    try:
+        yield ple, reader, dense
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize("short_reads", [False, True])
+def test_disk_backed_ple_page_prefetch_returns_identical_rows(
+    disk_ple_reader, monkeypatch, short_reads
+):
+    """Read every required page once, retry short reads, and skip warm prefetch."""
+    ple, reader, dense = disk_ple_reader
+    page_size = ple._PLE_PAGE_SIZE
+    row_bytes = 83 * 2
+    base = reader._data_start + reader._header["weight"]["data_offsets"][0]
+    crossing = next(
+        row
+        for row in range(4096)
+        if (base + row * row_bytes) % page_size + row_bytes > page_size
+    )
+    indices = [crossing, crossing, 0, 1, 1000, 2000, 3000, 4000, 4095]
+    expected = dense[mx.array(indices, dtype=mx.int32)]
+    # Enumerate the byte spans independently of the prefetch endpoint formula.
+    needed_pages = {
+        offset // page_size
+        for row in indices
+        for offset in range(base + row * row_bytes, base + (row + 1) * row_bytes)
+    }
+    reads = []
+    original_pread = ple.os.pread
+
+    def record_pread(fd, size, offset):
+        limit = min(size, page_size // 3) if short_reads else size
+        data = original_pread(fd, limit, offset)
+        reads.append((offset, len(data)))
+        return data
+
+    monkeypatch.setattr(ple.os, "pread", record_pread)
+    assert mx.array_equal(reader.rows("weight", indices), expected).item()
+    assert {offset // page_size for offset, _ in reads} == needed_pages
+    file_size = reader.path.stat().st_size
+    for page in needed_pages:
+        spans = sorted(
+            (offset, length)
+            for offset, length in reads
+            if offset // page_size == page and length
+        )
+        cursor = page * page_size
+        for offset, length in spans:
+            assert offset == cursor
+            cursor += length
+        assert cursor == min((page + 1) * page_size, file_size)
+    assert all(reader._seen_pages[page] for page in needed_pages)
+
+    # Fix the measured time so a busy test host cannot trigger reactivation.
+    monkeypatch.setattr(ple, "time", SimpleNamespace(perf_counter=lambda: 0.0))
+    reads.clear()
+    assert mx.array_equal(reader.rows("weight", indices), expected).item()
+    assert reads == []
+
+
+@pytest.mark.parametrize("row_count", [0, 1, 8])
+def test_disk_backed_ple_small_gathers_skip_prefetch(
+    disk_ple_reader, monkeypatch, row_count
+):
+    _, reader, dense = disk_ple_reader
+    prefetch = MagicMock(side_effect=AssertionError("Unexpected prefetch"))
+    monkeypatch.setattr(reader, "_prefetch_missing_pages", prefetch)
+    indices = list(range(row_count))
+    expected = dense[mx.array(indices, dtype=mx.int32)]
+    assert mx.array_equal(reader.rows("weight", indices), expected).item()
+    prefetch.assert_not_called()
+
+
+def test_disk_backed_ple_rearms_seen_bitmap_on_slow_gather(
+    disk_ple_reader, monkeypatch, caplog
+):
+    """Control both clocks to verify the budget, retry, and interval boundary."""
+    ple, reader, dense = disk_ple_reader
+    indices = list(range(16))
+    expected = dense[mx.array(indices, dtype=mx.int32)]
+    pread = MagicMock(wraps=ple.os.pread)
+    monkeypatch.setattr(ple.os, "pread", pread)
+    budget = (
+        ple._PLE_REARM_FLOOR_SECONDS + len(indices) * ple._PLE_REARM_PER_ROW_SECONDS
+    )
+    interval = ple._PLE_REARM_MIN_INTERVAL_SECONDS
+    caplog.set_level("INFO", logger=ple.__name__)
+
+    def gather(elapsed, now):
+        ticks = iter((0.0, elapsed))
+        monkeypatch.setattr(
+            ple,
+            "time",
+            SimpleNamespace(perf_counter=lambda: next(ticks), monotonic=lambda: now),
+        )
+        values = reader.rows("weight", indices)
+        assert mx.array_equal(values, expected).item()
+
+    gather(0.0, 1000.0)
+    assert pread.call_count > 0
+    pread.reset_mock()
+    gather(budget / 2, 1000.0)
+    assert reader._rearm_count == 0
+    assert any(reader._seen_pages)
+    pread.assert_not_called()
+
+    gather(budget * 2, 1000.0)
+    assert reader._rearm_count == 1
+    assert not any(reader._seen_pages)
+    assert "re-armed seen-page bitmap" in caplog.text
+    pread.assert_not_called()
+
+    gather(0.0, 1001.0)
+    assert pread.call_count > 0
+    assert any(reader._seen_pages)
+    pread.reset_mock()
+    gather(budget * 2, 1000.0 + interval - 1.0)
+    assert reader._rearm_count == 1
+    assert any(reader._seen_pages)
+    gather(budget * 2, 1000.0 + interval)
+    assert reader._rearm_count == 2
+    assert not any(reader._seen_pages)
+    pread.assert_not_called()
 
 
 @pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
@@ -1899,26 +1520,491 @@ def test_disk_backed_affine_ple_supports_all_oq_bits(tmp_path, bits):
     assert embedding._shard_specs[0][3:] == (bits, 32)
     embedding.close()
 
+# ---------------------------------------------------------------------------
+# Continuous-batching join regressions (issue #3245, PR #3246)
+# ---------------------------------------------------------------------------
 
-def test_external_ple_path_is_bounded_and_ssd_alias_resolves(tmp_path):
-    compute = tmp_path / "compute"
-    ple = tmp_path / "ple"
-    compute.mkdir()
-    ple.mkdir()
-    (compute / "config.json").write_text(
-        json.dumps(
-            {
-                "qwen4_exp_artifact": {
-                    "ple_artifact": "../ple",
-                    "ple_residency": "ssd_mmap",
-                }
-            }
-        ),
-        encoding="utf-8",
+
+def _warm_qsa_row(length: int, start: int, index_dim: int = 4):
+    """Build a warm singleton QSAKVCache holding ``length`` cached tokens.
+
+    Adapted from the fixture in PR #3215 (DiscoStew6082).
+    """
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+
+    cache = QSAKVCache()
+    values = mx.arange(start, start + 2 * length * 4, dtype=mx.float32).reshape(
+        1, 2, length, 4
     )
-    try:
-        assert compat.configure_qwen4_exp_runtime(compute) == "mmap"
-    finally:
-        from mlx_vlm.models.qwen4_exp.language import configure_ple_runtime
+    cache.state = (
+        values,
+        values + 100,
+        mx.arange(start, start + length * index_dim, dtype=mx.float32).reshape(
+            1, length, index_dim
+        ),
+        mx.arange(start, start + length, dtype=mx.int32)[None],
+    )
+    return cache
 
-        configure_ple_runtime(compute, mode="resident")
+
+def test_qwen4_cache_extension_promotes_singletons_to_model_owned_batch():
+    """A warm QSA singleton joining a running batch must be promoted via the
+    model-owned ``to_batch`` before ``extend`` — previously the join path
+    raised AttributeError ('QSAKVCache' object has no attribute 'extend').
+
+    Adapted from PR #3215 (DiscoStew6082), which fixes the same seam.
+    """
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache
+
+    import omlx.scheduler  # noqa: F401  (installs BatchGenerator cache patches)
+
+    left = _warm_qsa_row(3, 10)
+    right = _warm_qsa_row(1, 30)
+    generate = importlib.import_module("mlx_lm.generate")
+
+    caches = generate._extend_cache([left], [right])
+
+    assert len(caches) == 1
+    assert isinstance(caches[0], BatchQSAKVCache)
+    mx.eval(caches[0].offset, caches[0].index_keys, caches[0].index_position_ids)
+    assert caches[0].offset.tolist() == [3, 1]
+    assert caches[0].index_offset == 3
+    assert caches[0].extract(0).offset == 3
+    assert caches[0].extract(1).offset == 1
+    assert mx.array_equal(
+        caches[0].extract(1).index_position_ids, right.index_position_ids
+    ).item()
+
+
+def test_qwen4_cache_extension_accepts_existing_model_owned_batch():
+    """A singleton QSA row can join an existing model-owned batch.
+
+    Adapted from PR #3214 (HaloFour).
+    """
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache
+
+    import omlx.scheduler  # noqa: F401  (installs BatchGenerator cache patches)
+
+    left = _warm_qsa_row(3, 10)
+    right_rows = [_warm_qsa_row(2, 30), _warm_qsa_row(1, 50)]
+    right = BatchQSAKVCache.merge(right_rows)
+    generate = importlib.import_module("mlx_lm.generate")
+
+    caches = generate._extend_cache([left], [right])
+
+    assert len(caches) == 1
+    assert isinstance(caches[0], BatchQSAKVCache)
+    mx.eval(caches[0].offset, caches[0].left_padding, caches[0].index_keys)
+    assert caches[0].offset.tolist() == [3, 2, 1]
+    assert caches[0].left_padding.tolist() == [0, 1, 2]
+    assert [caches[0].extract(i).offset for i in range(3)] == [3, 2, 1]
+
+
+def test_qwen4_cache_extension_keeps_existing_batch_in_place():
+    """Extending two batched QSA caches must retain the left batch object.
+
+    Adapted from PR #3214 (HaloFour).
+    """
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache
+
+    import omlx.scheduler  # noqa: F401  (installs BatchGenerator cache patches)
+
+    left = BatchQSAKVCache.merge([_warm_qsa_row(3, 10)])
+    right = BatchQSAKVCache.merge([_warm_qsa_row(2, 30)])
+    generate = importlib.import_module("mlx_lm.generate")
+
+    caches = generate._extend_cache([left], [right])
+
+    assert caches[0] is left
+    mx.eval(left.offset, left.left_padding, left.index_keys)
+    assert left.offset.tolist() == [3, 2]
+    assert left.left_padding.tolist() == [0, 1]
+    assert [left.extract(i).offset for i in range(2)] == [3, 2]
+
+
+def test_qwen4_qsa_indexer_handles_ragged_batch_offsets():
+    """``from_projected`` on a batched cache whose ``offset`` is a per-row
+    array must keep the mask math on aligned-column scalars — previously the
+    (batch,) offsets broadcast into the seq axis and produced selected_tokens
+    of shape (batch, batch, key_len), crashing mx.concatenate."""
+    config = _tiny_config().text_config
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache, Qwen4ExpQSAIndexer
+
+    class _PassthroughRope:
+        @staticmethod
+        def apply_rotary(q, k, position_ids, unsqueeze_dim=1):
+            return q, k
+
+    indexer = Qwen4ExpQSAIndexer(config, _PassthroughRope())
+    index_dim = config.indexer_head_dim
+
+    batch = _warm_qsa_row(12, 0, index_dim=index_dim).to_batch([0])
+    batch.extend(_warm_qsa_row(4, 100, index_dim=index_dim).to_batch([0]))
+    assert isinstance(batch, BatchQSAKVCache)
+    assert isinstance(batch.offset, mx.array)  # ragged per-row KV offsets
+    assert batch.offset.tolist() == [12, 4]
+
+    total = (config.indexer_n_heads + config.indexer_kv_heads) * index_dim
+    qk = (mx.arange(2 * total, dtype=mx.float32) / total).reshape(2, 1, total)
+    positions = mx.array([[12], [4]], dtype=mx.int32)
+
+    selected = indexer.from_projected(qk, batch, positions)
+
+    assert selected is not None
+    mx.eval(selected)
+    key_len = batch.index_offset
+    assert key_len == 13
+    assert selected.shape == (2, 1, 1, key_len)
+    assert selected.dtype == mx.bool_
+
+
+def test_qwen4_batch_qsa_trim_slices_indexer_arrays():
+    """``BatchQSAKVCache.trim`` must slice the physical indexer arrays like the
+    singleton trim does — previously only ``index_offset`` was decremented, so
+    a later ``update_indexer`` resynced it to the stale physical width and the
+    rejected draft columns fossilized inside the index."""
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+
+    batch = _warm_qsa_row(6, 0).to_batch([0])
+    assert batch.index_offset == 6
+
+    trimmed = batch.trim(2)
+
+    assert trimmed == 2
+    assert batch.offset.tolist() == [4]
+    assert batch.index_offset == 4
+    assert batch.index_keys.shape[1] == 4
+    assert batch.index_position_ids.shape[-1] == 4
+
+    # The next indexer update must resync against the trimmed length, not the
+    # stale physical width.
+    batch.update_indexer(
+        mx.zeros((1, 1, 4), dtype=mx.float32),
+        mx.array([[4]], dtype=mx.int32),
+    )
+    assert batch.index_offset == 5
+    assert batch.index_keys.shape[1] == 5
+    assert batch.index_position_ids.shape[-1] == 5
+def _make_bound_qwen4_language_model(config):
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel, Qwen4ExpMTPModule
+
+    class MTPOwner:
+        pass
+
+    model = LanguageModel(config.text_config, config)
+    owner = MTPOwner()
+    owner.mtp = Qwen4ExpMTPModule(config.text_config)
+    model.bind_mtp_owner(owner)
+    return model, owner
+
+
+def _assert_qwen4_lightning_mtp_hidden_width(model, text_config):
+    expected_width = text_config.hc_count * text_config.hidden_size
+    output = model(
+        mx.array([[2, 3, 4]], dtype=mx.int32),
+        cache=model.make_cache(),
+        return_hidden=True,
+    )
+    hidden = output.hidden_states[-1]
+    logits, head_hidden = model.mtp_forward(
+        hidden[:, -1:],
+        mx.array([[7]], dtype=mx.uint32),
+        model.make_mtp_cache(),
+        return_hidden=True,
+        logits_keep=1,
+    )
+    mx.eval(hidden, logits, head_hidden)
+
+    assert hidden.shape == (1, 3, expected_width)
+    assert logits.shape == (1, 1, text_config.vocab_size)
+    assert head_hidden.shape == (1, 1, expected_width)
+
+
+def test_qwen4_lightning_mtp_isolated_from_dense_qwen35_runtime_patch():
+    """Qwen3.5 patching must preserve resident and later Qwen4 MTP models."""
+    from omlx.patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_runtime_patch
+
+    config = _tiny_config()
+    resident_model, resident_owner = _make_bound_qwen4_language_model(config)
+    _assert_qwen4_lightning_mtp_hidden_width(resident_model, config.text_config)
+
+    apply_mlx_vlm_mtp_runtime_patch()
+    _assert_qwen4_lightning_mtp_hidden_width(resident_model, config.text_config)
+
+    later_model, later_owner = _make_bound_qwen4_language_model(config)
+    _assert_qwen4_lightning_mtp_hidden_width(later_model, config.text_config)
+
+    assert resident_owner.mtp is not None
+    assert later_owner.mtp is not None
+
+
+def _disk_ple(tmp_path, *, shards, rows, dims, bits=None):
+    """Write a sharded PLE table (affine-packed when ``bits`` is set, else dense bf16) and open it from disk."""
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import DiskBackedShardedEmbedding
+
+    prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    tensors, dense_rows = {}, []
+    for shard_index in range(shards):
+        dense = (mx.random.normal((rows, dims)) * (shard_index + 1)).astype(mx.bfloat16)
+        base = f"{prefix}.shard_{shard_index}"
+        if bits is None:
+            tensors[f"{base}.weight"] = dense
+            dense_rows.append(dense)
+        else:
+            weight, scales, biases = mx.quantize(dense, group_size=32, bits=bits, mode="affine")
+            tensors[f"{base}.weight"], tensors[f"{base}.scales"], tensors[f"{base}.biases"] = weight, scales, biases
+            dense_rows.append(mx.dequantize(weight, scales, biases, group_size=32, bits=bits, mode="affine").astype(mx.bfloat16))
+    mx.eval(*tensors.values(), *dense_rows)
+    filename = "model-00001-of-00001.safetensors"
+    mx.save_safetensors(str(tmp_path / filename), tensors, metadata={"format": "mlx"})
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {key: filename for key in tensors}}), encoding="utf-8")
+    table = mx.concatenate(dense_rows)
+    return DiskBackedShardedEmbedding(tmp_path, prefix, num_embeddings=shards * rows, dims=dims, num_shards=shards), table
+
+
+@pytest.mark.parametrize("bits", [None, 4, 5])
+def test_disk_backed_ple_gathers_a_chunk_with_one_upload_per_tensor(tmp_path, bits):
+    """A chunk's rows are assembled on the host and uploaded once per tensor, not once per shard."""
+    embedding, table = _disk_ple(tmp_path, shards=3, rows=8, dims=64, bits=bits)
+    mx.random.seed(11)
+    indices = mx.random.randint(0, 24, (2, 40)).astype(mx.int32)
+    mx.eval(indices)
+    values = embedding(indices)
+    mx.eval(values)
+    expected = mx.take(table, indices.reshape(-1), axis=0).reshape(2, 40, 64)
+    assert values.dtype == mx.bfloat16
+    assert mx.array_equal(values, expected).item()
+    assert embedding.rows_read == 80
+    assert embedding.last_touched_shards == (0, 1, 2)
+    assert embedding.last_uploads == (1 if bits is None else 3)
+    embedding.close()
+
+
+def test_disk_backed_ple_rejects_out_of_range_indices(tmp_path):
+    embedding, _ = _disk_ple(tmp_path, shards=2, rows=4, dims=32, bits=4)
+    with pytest.raises(IndexError):
+        embedding(mx.array([[1, 8]], dtype=mx.int32))
+    embedding.close()
+
+
+def test_disk_backed_ple_prefetch_serves_the_matching_call(tmp_path):
+    """A prefetched chunk is assembled off the main thread and consumed by the next call with the same indices."""
+    embedding, table = _disk_ple(tmp_path, shards=3, rows=8, dims=64, bits=5)
+    first = mx.array([[3, 17, 5, 22, 3, 9]], dtype=mx.int32)
+    other = mx.array([[1, 2]], dtype=mx.int32)
+    embedding.prefetch(first)
+    # The prefill loops announce chunk k+1 before chunk k gathers: both must stay pending until consumed.
+    embedding.prefetch(other)
+    values = embedding(first)
+    mx.eval(values)
+    assert embedding.last_prefetch_hit is True
+    values_other = embedding(other)
+    mx.eval(values_other)
+    assert embedding.last_prefetch_hit is True
+    assert mx.array_equal(values_other, mx.take(table, other.reshape(-1), axis=0)[None]).item()
+    assert embedding(other) is not None and embedding.last_prefetch_hit is False
+    values = embedding(first)
+    mx.eval(values)
+    assert embedding.last_prefetch_hit is False
+    assert mx.array_equal(values, mx.take(table, first.reshape(-1), axis=0)[None]).item()
+    values = embedding(other)
+    mx.eval(values)
+    assert embedding.last_prefetch_hit is False
+    assert mx.array_equal(values, mx.take(table, other.reshape(-1), axis=0)[None]).item()
+    embedding.close()
+
+
+def test_prompt_loop_prefetches_the_next_chunk(monkeypatch):
+    """While a chunk runs, the model is told the next chunk and the chunk it follows."""
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_lm.generate import PromptProcessingBatch
+
+    seen, forwards = [], []
+
+    class Model:
+        def __call__(self, tokens, cache=None):
+            forwards.append(tokens.tolist()[0])
+
+        def prefetch_ple(self, next_ids, current_ids):
+            seen.append((next_ids.tolist()[0], current_ids.tolist()[0]))
+
+    batch = PromptProcessingBatch(Model(), uids=[0], caches=[[]], prefill_step_size=4)
+    batch.prompt([list(range(10, 20))])
+    assert forwards == [[10, 11, 12, 13], [14, 15, 16, 17], [18, 19]]
+    assert seen == [([14, 15, 16, 17], [10, 11, 12, 13]), ([18, 19], [14, 15, 16, 17])]
+
+
+def test_prompt_loop_without_a_prefetch_hook_is_unchanged():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_lm.generate import PromptProcessingBatch
+
+    forwards = []
+
+    class Model:
+        def __call__(self, tokens, cache=None):
+            forwards.append(tokens.shape[1])
+
+    PromptProcessingBatch(Model(), uids=[0], caches=[[]], prefill_step_size=3).prompt([list(range(7))])
+    assert forwards == [3, 3, 1]
+
+
+def test_ngram_prefetch_computes_the_next_chunks_indices():
+    """prefetch(next, tail of current) hashes exactly the rows the next real call will gather."""
+    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpNGramEmbedding
+
+    config = _tiny_config()
+    config = getattr(config, "text_config", config)
+    embedding = Qwen4ExpNGramEmbedding(config, config.ple_embed_dim, 1, 0)
+    inner = embedding.ngram_embedding
+    seen = {}
+
+    class Recorder:
+        def __call__(self, indices):
+            seen["call"] = indices
+            return inner(indices)
+
+        def prefetch(self, indices):
+            seen["prefetch"] = indices
+
+    embedding.ngram_embedding = Recorder()
+    from mlx_vlm.models.cache import ArraysCache
+
+    cache = ArraysCache(4)
+    chunk1 = mx.array([[5, 9, 2, 7, 1, 4, 4, 8]], dtype=mx.int64)
+    chunk2 = mx.array([[3, 3, 6, 1, 9]], dtype=mx.int64)
+    mx.eval(embedding(chunk1, cache))
+    embedding.prefetch(chunk2, chunk1[:, -embedding.context_len :])
+    mx.eval(embedding(chunk2, cache))
+    assert seen["prefetch"].shape == seen["call"].shape
+    assert mx.array_equal(seen["prefetch"], seen["call"]).item()
+
+
+def test_prompt_lookahead_keeps_the_schedulers_mrope_hook(monkeypatch):
+    """The scheduler wraps prompt() to set mRoPE deltas first; the lookahead loop must run under it, not over it."""
+    import omlx.scheduler as scheduler  # installs the wrapper
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_lm.generate import PromptProcessingBatch
+
+    order = []
+    monkeypatch.setattr(scheduler, "_prepare_mrope_prompt", lambda self: order.append("before"))
+
+    class Model:
+        def __call__(self, tokens, cache=None):
+            order.append(("forward", tokens.shape[1]))
+
+        def prefetch_ple(self, next_ids, current_ids):
+            order.append(("prefetch", next_ids.shape[1]))
+
+    PromptProcessingBatch(Model(), uids=[0], caches=[[]], prefill_step_size=4).prompt([list(range(6))])
+    assert order == ["before", ("prefetch", 2), ("forward", 4), ("forward", 2)]
+
+
+def test_disk_ple_cancels_displaced_queued_prefetches(tmp_path, monkeypatch):
+    from threading import Event
+
+    embedding, _ = _disk_ple(tmp_path, shards=3, rows=8, dims=64, bits=4)
+    entered, release = Event(), Event()
+    assemble = embedding._assemble
+
+    def paused_assemble(host, plan):
+        entered.set()
+        assert release.wait(10)
+        return assemble(host, plan)
+
+    monkeypatch.setattr(embedding, "_assemble", paused_assemble)
+    futures = []
+    try:
+        for index in range(10):
+            embedding.prefetch(mx.array([[index]], dtype=mx.int32))
+            futures.append(list(embedding._pending.values())[-1][1])
+            if index == 0:
+                assert entered.wait(10)
+        assert len(embedding._pending) == 2
+        assert futures[0].running()
+        assert all(future.cancelled() for future in futures[1:8])
+        assert sum(not future.done() for future in futures) == 3
+    finally:
+        release.set()
+        embedding.close()
+
+
+def test_disk_ple_close_drains_displaced_running_read(tmp_path, monkeypatch):
+    from threading import Event, Thread
+
+    embedding, _ = _disk_ple(tmp_path, shards=3, rows=8, dims=64, bits=4)
+    entered, release, closing, closed = Event(), Event(), Event(), Event()
+    assemble = embedding._assemble
+    shutdown = embedding._prefetch_executor.shutdown
+    readers = list(embedding._readers.values())
+    errors = []
+
+    def paused_assemble(host, plan):
+        entered.set()
+        assert release.wait(10)
+        return assemble(host, plan)
+
+    def observed_shutdown(*args, **kwargs):
+        closing.set()
+        return shutdown(*args, **kwargs)
+
+    def close():
+        try:
+            embedding.close()
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            closed.set()
+
+    monkeypatch.setattr(embedding, "_assemble", paused_assemble)
+    monkeypatch.setattr(embedding._prefetch_executor, "shutdown", observed_shutdown)
+    thread = Thread(target=close)
+    try:
+        embedding.prefetch(mx.array([[1]], dtype=mx.int32))
+        active = next(iter(embedding._pending.values()))[1]
+        assert entered.wait(10)
+        embedding.prefetch(mx.array([[2]], dtype=mx.int32))
+        embedding.prefetch(mx.array([[3]], dtype=mx.int32))
+        assert all(future is not active for _, future in embedding._pending.values())
+        thread.start()
+        assert closing.wait(10)
+        assert not closed.is_set()
+        assert all(reader._mapping is not None for reader in readers)
+    finally:
+        release.set()
+        if thread.ident is not None:
+            thread.join(timeout=10)
+        else:
+            embedding.close()
+    assert closed.is_set() and not errors
+    assert active.result(timeout=10)
+    assert all(reader._mapping is None for reader in readers)
+    assert not embedding._pending
+    embedding.prefetch(mx.array([[4]], dtype=mx.int32))
+    assert not embedding._pending
+    embedding.close()
+
+
+def test_mtp_batched_positions_match_for_identical_rows():
+    config = _tiny_config().text_config
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpMTPModule
+    import mlx.nn as nn
+
+    mx.random.seed(17)
+    head = Qwen4ExpMTPModule(config)
+    head.eval()
+    embed = nn.Embedding(config.vocab_size, config.hidden_size)
+    hidden = mx.repeat(
+        mx.random.normal((1, 5, config.hidden_size * config.hc_count)), 2, axis=0
+    )
+    tokens = mx.array([[1, 2, 3, 4, 5], [1, 2, 3, 4, 5]])
+    cache = [QSAKVCache()]
+    for _ in range(2):
+        output, _ = head(hidden, tokens, embed, cache)
+        mx.eval(output)
+        assert mx.allclose(output[0], output[1], atol=1e-6).item()
+    assert cache[0].offset == 10

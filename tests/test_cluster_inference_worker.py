@@ -5,7 +5,9 @@ import contextlib
 import json
 import os
 import signal
+import subprocess
 import sys
+import textwrap
 import threading
 import time
 from pathlib import Path
@@ -138,6 +140,42 @@ def test_worker_waits_for_matching_supervisor_serve_release(tmp_path):
     )
 
     _wait_for_serve_release(tmp_path, deployment_id, plan_hash, 2, timeout=0)
+
+
+@pytest.mark.parametrize("timeout", [None, 300.0, 60.0])
+def test_worker_wait_budget_allows_slow_peer_loading(tmp_path, timeout):
+    elapsed = 0.0
+
+    def advance(seconds):
+        nonlocal elapsed
+        elapsed += seconds
+        if elapsed >= 121.0:
+            (tmp_path / "cluster-test-serve.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "deployment_id": "cluster-test",
+                        "plan_hash": "a" * 64,
+                        "world_size": 2,
+                    }
+                )
+            )
+
+    kwargs = {} if timeout is None else {"timeout": timeout}
+    outcome = (
+        pytest.raises(TimeoutError) if timeout == 60.0 else contextlib.nullcontext()
+    )
+    with outcome:
+        _wait_for_serve_release(
+            tmp_path,
+            "cluster-test",
+            "a" * 64,
+            2,
+            clock=lambda: elapsed,
+            sleep=advance,
+            **kwargs,
+        )
+    assert elapsed == 60.0 if timeout == 60.0 else elapsed >= 121.0
 
 
 def test_worker_rejects_stale_supervisor_serve_release(tmp_path):
@@ -1224,6 +1262,8 @@ def _run_rank(
         "decode_worker_path_map",
         lambda _plan: {},
     )
+    # Likewise its stage links: none, so ranks keep MLX's own send and receive.
+    monkeypatch.setattr(inference_worker, "decode_worker_stage_links", lambda _plan: ())
     monkeypatch.setattr(
         inference_worker,
         "decode_worker_speculation",
@@ -1773,15 +1813,15 @@ def test_launcher_watchdog_ignores_a_fresh_lease(tmp_path):
 
     polls = [0]
 
-    class StopLoop(Exception):
+    class StopLoopError(Exception):
         pass
 
     def wait(_seconds):
         polls[0] += 1
         if polls[0] >= 3:
-            raise StopLoop
+            raise StopLoopError
 
-    with pytest.raises(StopLoop):
+    with pytest.raises(StopLoopError):
         _watch_launcher_parent(
             42,
             marker,
@@ -1803,15 +1843,15 @@ def test_launcher_watchdog_ignores_a_lease_that_never_appeared(tmp_path):
 
     polls = [0]
 
-    class StopLoop(Exception):
+    class StopLoopError(Exception):
         pass
 
     def wait(_seconds):
         polls[0] += 1
         if polls[0] >= 3:
-            raise StopLoop
+            raise StopLoopError
 
-    with pytest.raises(StopLoop):
+    with pytest.raises(StopLoopError):
         _watch_launcher_parent(
             42,
             marker,
@@ -1886,7 +1926,9 @@ def test_launcher_watchdog_exits_when_dead_server_breaks_diagnostics(tmp_path):
 
 
 def test_cancel_request_file_matches_the_telemetry_contract(tmp_path):
-    _write_cancel_request(str(tmp_path), "dep-9", "peer watchdog test", plan_hash="e" * 64)
+    _write_cancel_request(
+        str(tmp_path), "dep-9", "peer watchdog test", plan_hash="e" * 64
+    )
 
     payload = json.loads((tmp_path / "dep-9-cancel.json").read_text(encoding="utf-8"))
     assert payload["schema_version"] == 1
@@ -1899,12 +1941,14 @@ def test_cancel_request_file_matches_the_telemetry_contract(tmp_path):
 
 def test_cancel_request_epoch_advances_past_an_existing_clock_jump(tmp_path):
     path = tmp_path / "dep-9-cancel.json"
-    path.write_text(json.dumps({"epoch": 9999999999999}), encoding="utf-8")
+    path.write_text(json.dumps({"epoch": 9_999_999_999_999}), encoding="utf-8")
 
-    _write_cancel_request(str(tmp_path), "dep-9", "new event", plan_hash="f" * 64)
+    _write_cancel_request(
+        str(tmp_path), "dep-9", "new event", plan_hash="f" * 64
+    )
 
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["epoch"] == 10000000000000
+    assert payload["epoch"] == 10_000_000_000_000
 
 
 def _fake_mlx_core(calls: list[str], *, with_metal: bool = True) -> SimpleNamespace:
@@ -1981,9 +2025,7 @@ def test_release_metal_memory_without_mlx_is_a_noop(monkeypatch):
 
 def test_sigterm_handler_releases_metal_before_interrupt(monkeypatch):
     releases: list[str] = []
-    monkeypatch.setattr(
-        inference_worker, "_release_metal_memory", releases.append
-    )
+    monkeypatch.setattr(inference_worker, "_release_metal_memory", releases.append)
     previous_term = signal.getsignal(signal.SIGTERM)
     previous_int = signal.getsignal(signal.SIGINT)
     previous_alrm = signal.getsignal(signal.SIGALRM)
@@ -2053,6 +2095,8 @@ def test_peer_watchdog_on_lost_releases_metal_before_exit(monkeypatch, tmp_path)
     assert isinstance(watchdog, FakePeerWatchdog)
     captured["on_lost"]("peer vanished")
     assert order == ["release", "exit:1"]
+
+
 class _ThinkTokenizer:
     think_end_id = 55
     think_start_id = 54
@@ -2211,6 +2255,64 @@ def test_install_thinking_budget_support_appends_processor_per_request():
         calls and server._make_logits_processors is FakeServer._make_logits_processors
     )
     assert server.ResponseGenerator._tokenize is FakeResponseGenerator._tokenize
+
+
+def test_install_thinking_budget_support_does_not_need_the_http_stack():
+    """CUDA worker venvs ship without FastAPI (#3519), so the rank's budget hook
+    must not import it. Run in a fresh interpreter where the HTTP stack cannot be
+    imported, because this test process already has FastAPI loaded."""
+    script = textwrap.dedent(
+        """
+        import importlib.abc
+        import sys
+
+        HTTP_STACK = {"fastapi", "starlette", "sse_starlette", "uvicorn"}
+
+
+        class NoHttpStack(importlib.abc.MetaPathFinder):
+            def find_spec(self, name, path=None, target=None):
+                if name.partition(".")[0] in HTTP_STACK:
+                    raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+                return None
+
+
+        sys.meta_path.insert(0, NoHttpStack())
+
+        from omlx.cluster import inference_worker
+
+
+        class Tokenizer:
+            think_end_id = 55
+            think_start_id = 54
+            unk_token_id = 0
+
+
+        class ResponseGenerator:
+            def _tokenize(self, tokenizer, request, args):
+                return [54], [[54]], ["assistant"], "reasoning"
+
+
+        class Server:
+            ResponseGenerator = ResponseGenerator
+
+            @staticmethod
+            def _make_logits_processors(args):
+                return []
+
+
+        with inference_worker._install_thinking_budget_support(Server(), Tokenizer()):
+            pass
+        loaded = sorted(m for m in sys.modules if m.partition(".")[0] in HTTP_STACK)
+        assert not loaded, loaded
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
 
 
 def test_thinking_close_pattern_and_utf8_piece_match_scheduler_rules():

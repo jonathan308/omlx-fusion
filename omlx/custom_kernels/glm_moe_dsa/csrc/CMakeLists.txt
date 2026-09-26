@@ -44,6 +44,8 @@ target_sources(
   ${CMAKE_CURRENT_LIST_DIR}/ds4_prefill_moe.cpp
   ${CMAKE_CURRENT_LIST_DIR}/ds4_qkv_bundle.cpp
   ${CMAKE_CURRENT_LIST_DIR}/deepseek_v4_sparse_attention.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/deepseek_v41_packed_attention.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/deepseek_v41_grouped_expert.cpp
   ${CMAKE_CURRENT_LIST_DIR}/dspark_gemm.cpp
   ${CMAKE_CURRENT_LIST_DIR}/dspark_qmv.cpp
   ${CMAKE_CURRENT_LIST_DIR}/exact_block_attention.cpp
@@ -65,6 +67,7 @@ if(MLX_BUILD_METAL AND NOT OMLX_SKIP_METALLIB_BUILD)
       ${CMAKE_CURRENT_LIST_DIR}/ds4_output_chain.metal
       ${CMAKE_CURRENT_LIST_DIR}/deepseek_moe.metal
       ${CMAKE_CURRENT_LIST_DIR}/deepseek_v4_sparse_attention.metal
+      ${CMAKE_CURRENT_LIST_DIR}/deepseek_v41_packed_attention.metal
       ${CMAKE_CURRENT_LIST_DIR}/dspark_gemm.metal
       ${CMAKE_CURRENT_LIST_DIR}/dspark_qmv.metal
       ${CMAKE_CURRENT_LIST_DIR}/dsa_indexer.metal

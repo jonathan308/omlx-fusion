@@ -369,6 +369,10 @@ def eligible(module, inputs: mx.array) -> bool:
     """Return whether ``module(inputs)`` has an exact fast-kernel layout."""
     if inputs.ndim < 2 or module.weight.ndim != 2:
         return False
+    # Unquantized (plain ``nn.Linear``) modules carry no scales/bits; the
+    # fast kernel is a quantized-only layout.
+    if getattr(module, "scales", None) is None or getattr(module, "bits", None) is None:
+        return False
     input_dims = int(inputs.shape[-1])
     rows = int(inputs.size) // input_dims
     output_dims = int(module.scales.shape[0])
@@ -542,7 +546,7 @@ def exact_verify_qmv_pair(module_a, module_b, inputs: mx.array):
 
 def multi_eligible(module, inputs: mx.array) -> bool:
     """Return whether a grouped MultiLinear has the exact shared-row path."""
-    if inputs.ndim < 3 or module.weight.ndim != 3:
+    if inputs.ndim < 3 or module.weight.ndim != 3 or not hasattr(module, "scales"):
         return False
     groups = int(module.scales.shape[0])
     input_dims = int(inputs.shape[-1])

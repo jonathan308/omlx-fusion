@@ -473,17 +473,15 @@ class RuntimeTelemetry:
                 and now > previous_at
                 and processed > previous_processed
             ):
-                sample.prefill_speed = (
-                    processed - previous_processed
-                ) / (now - previous_at)
+                sample.prefill_speed = (processed - previous_processed) / (
+                    now - previous_at
+                )
             elif (
                 processed > 0
                 and now > sample.prefill_started_at
                 and sample.prefill_speed <= 0
             ):
-                sample.prefill_speed = processed / (
-                    now - sample.prefill_started_at
-                )
+                sample.prefill_speed = processed / (now - sample.prefill_started_at)
             prefill_elapsed = now - sample.prefill_started_at
             if processed > 0 and prefill_elapsed > 0:
                 sample.prefill_average_speed = processed / prefill_elapsed
@@ -771,8 +769,7 @@ class RuntimeTelemetry:
             requested = [
                 self._request_to_uid[request_id]
                 for request_id in self._cancel_requested_requests
-                if request_id in self._request_to_uid
-                and request_id in self._requests
+                if request_id in self._request_to_uid and request_id in self._requests
             ]
         for uid in requested:
             if uid not in merged:
@@ -1491,6 +1488,7 @@ def install_server_telemetry(
     ssd_cache_dir: str | None = None,
     ssd_max_entries: int = 512,
     ssd_max_bytes: int | None = None,
+    ssd_cache_max_bytes: int | None = None,
     ssd_cache_persistent: bool = False,
     ssd_write_behind: bool = False,
     prefill_step_size: int = 2048,
@@ -1516,6 +1514,10 @@ def install_server_telemetry(
     import mlx.core as mx
     import mlx_lm.server as mlx_server
 
+    if ssd_max_bytes is None:
+        # ``ssd_cache_max_bytes`` is upstream's keyword for the same SSD bound;
+        # accept either spelling so both worker call sites keep working.
+        ssd_max_bytes = ssd_cache_max_bytes
     original = mlx_server.ResponseGenerator
     original_batch_generator = mlx_server.BatchGenerator
     original_prompt_cache = mlx_server.LRUPromptCache
@@ -1809,9 +1811,7 @@ def install_server_telemetry(
         plans: list[tuple[int, int, int]] = []
         if control_plane is not None:
             for source in range(world_size):
-                payload = (
-                    struct.pack("!QQQ", *local) if rank == source else None
-                )
+                payload = struct.pack("!QQQ", *local) if rank == source else None
                 packet = control_plane.broadcast_owned_bytes(
                     payload,
                     source_rank=source,
@@ -1821,9 +1821,7 @@ def install_server_telemetry(
         else:
             fields = [0] * (3 * world_size)
             fields[3 * rank : 3 * rank + 3] = local
-            agreed = mx.distributed.all_sum(
-                mx.array(fields, dtype=mx.int32)
-            )
+            agreed = mx.distributed.all_sum(mx.array(fields, dtype=mx.int32))
             mx.eval(agreed)
             values = [int(value) for value in agreed.tolist()]
             plans = [
@@ -2366,8 +2364,7 @@ def install_server_telemetry(
         @staticmethod
         def _finish_shared_cancel_vote(shared: Any) -> Any:
             if not (
-                isinstance(shared, dict)
-                and shared.get("kind") == _CANCEL_VOTE_KIND
+                isinstance(shared, dict) and shared.get("kind") == _CANCEL_VOTE_KIND
             ):
                 return shared
             epoch, uids = telemetry.accept_cancel_vote(shared)
@@ -2571,9 +2568,7 @@ def install_server_telemetry(
     ) -> Any:
         """Attach the private coordinator id before ranks share the request."""
 
-        request_id = _transport_request_id(
-            handler.headers.get("X-oMLX-Request-ID")
-        )
+        request_id = _transport_request_id(handler.headers.get("X-oMLX-Request-ID"))
         if request_id is not None:
             request._omlx_transport_request_id = request_id
         return original_handle_completion(handler, request, stop_words)

@@ -103,6 +103,8 @@ class PrefixCacheStats(BaseCacheStats):
     mtp_prefix_snapshot_oversize_drops: int = 0
     mtp_prefix_snapshot_accounting_drops: int = 0
     mtp_prefix_snapshot_max_bytes: int = 0
+    tail_blocks_stored: int = 0
+    tail_block_hits: int = 0
     _total_queries: int = field(default=0, repr=False)
 
     @property
@@ -141,6 +143,8 @@ class PrefixCacheStats(BaseCacheStats):
         self.mtp_prefix_snapshot_oversize_drops = 0
         self.mtp_prefix_snapshot_accounting_drops = 0
         self.mtp_prefix_snapshot_max_bytes = 0
+        self.tail_blocks_stored = 0
+        self.tail_block_hits = 0
         self._total_queries = 0
 
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DeepSeek V4 monkey-patch for mlx-lm v0.31.3.
+"""DeepSeek V4 runtime support for the pinned mlx-lm.
 
 Brings PR 1192 (https://github.com/ml-explore/mlx-lm/pull/1192) into omlx
 without modifying the pinned mlx-lm. The patch:
@@ -14,14 +14,12 @@ without modifying the pinned mlx-lm. The patch:
    encode the MTP variant in ``model_type``.
 3. Replaces ``mlx_lm.utils.load_model`` with a copy that handles
    ``F8_E8M0`` dtype fallback and the DeepSeek V4 ``fp8`` quant_method.
-4. Replaces ``mlx_lm.generate._make_cache`` with a copy aware of
-   ``PoolingCache`` → ``BatchPoolingCache`` conversion.
-5. Wraps ``mlx_lm.tokenizer_utils.AutoTokenizer`` with a fallback that
+4. Wraps ``mlx_lm.tokenizer_utils.AutoTokenizer`` with a fallback that
    retries with an empty ``PreTrainedConfig()`` when transformers does
    not yet recognize the ``deepseek_v4`` model_type (PR 45643 was
    merged 2026-05-02 but is missing from transformers <=5.7.0). This
    adopts PR 1189's tokenizer-fallback strategy.
-6. Registers omlx-side cache handlers for the two new cache classes so
+5. Registers omlx-side cache handlers for the two new cache classes so
    prefix-cache / SSD-cache state extraction does not silently fall
    through to ``DefaultCacheHandler``.
 
@@ -224,12 +222,43 @@ def apply_pooling_cache_support() -> bool:
 
     _inject_cache_extras()
 
-    from .generate_patch import apply_generate_patch
-
-    apply_generate_patch()
+    _preserve_singleton_rotating_offset()
     _register_cache_handlers()
     _POOLING_APPLIED = True
     return True
+
+
+def _preserve_singleton_rotating_offset() -> None:
+    """Keep the absolute offset when a single rotating cache is batched.
+
+    ``BatchRotatingKVCache.merge`` initializes its host ``_offset`` from the
+    retained physical window length. That is sufficient for generic batched
+    masking, but wrong for a singleton restored prefix: the public per-row
+    offset may be 4096 while the rotating window holds only 128 rows. DS4's
+    exact B1 WSDPA/native-mask route intentionally consumes the host scalar
+    (``_resolve_cache_offset``) to avoid synchronizing the public MLX vector on
+    every layer. Keep the absolute scalar for the singleton; real multi-row
+    batches retain the upstream physical-length behavior and their vector ABI.
+
+    Fusion carried this in ``generate_patch.py`` ("Preserve absolute DS4
+    offsets across cache restore"); that module was retired with the mlx-lm
+    0.32.0 pin, so the wrapper lives here now. Idempotent.
+    """
+    from mlx_lm.models.cache import BatchRotatingKVCache
+
+    if getattr(BatchRotatingKVCache.merge, "_omlx_absolute_singleton", False):
+        return
+
+    original_rotating_merge = BatchRotatingKVCache.merge
+
+    def _merge_rotating_with_absolute_singleton(cls, caches):
+        merged = original_rotating_merge(caches)
+        if len(caches) == 1 and type(getattr(caches[0], "offset", None)) is int:
+            merged._offset = int(caches[0].offset)
+        return merged
+
+    _merge_rotating_with_absolute_singleton._omlx_absolute_singleton = True
+    BatchRotatingKVCache.merge = classmethod(_merge_rotating_with_absolute_singleton)
 
 
 def apply_deepseek_v4_patch() -> bool:

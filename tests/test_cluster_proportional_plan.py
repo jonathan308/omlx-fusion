@@ -126,9 +126,7 @@ def test_proportional_plan_two_unequal_nodes():
     assert (by_rank[0].start_layer, by_rank[0].end_layer) == (1, 4)
     assert by_rank[0].node_id == "large"
     # Full, contiguous coverage.
-    covered = sorted(
-        (item.start_layer, item.end_layer) for item in plan.assignments
-    )
+    covered = sorted((item.start_layer, item.end_layer) for item in plan.assignments)
     assert covered == [(0, 1), (1, 4)]
 
 
@@ -143,17 +141,14 @@ def test_proportional_plan_three_nodes_covers_every_layer_once():
     )
 
     assert len(plan.assignments) == 3
-    covered = sorted(
-        (item.start_layer, item.end_layer) for item in plan.assignments
-    )
+    covered = sorted((item.start_layer, item.end_layer) for item in plan.assignments)
     assert covered[0][0] == 0
     assert covered[-1][1] == 12
     for previous, following in zip(covered, covered[1:]):
         assert previous[1] == following[0]
     # Shares 190:90:50 → counts ∝ usable RAM, descending by node size.
     counts = {
-        item.node_id: item.end_layer - item.start_layer
-        for item in plan.assignments
+        item.node_id: item.end_layer - item.start_layer for item in plan.assignments
     }
     assert counts["a"] > counts["b"] > counts["c"]
     assert sum(counts.values()) == 12
@@ -231,9 +226,7 @@ def test_plan_route_runs_proportional_allocator(monkeypatch):
     payload = response.json()
     assert payload["optimization"] == "ram-proportional"
     assert payload["placement_signature"]
-    counts = {
-        item["node_id"]: item["layer_count"] for item in payload["assignments"]
-    }
+    counts = {item["node_id"]: item["layer_count"] for item in payload["assignments"]}
     assert counts["a"] > counts["b"] > counts["c"]
 
 

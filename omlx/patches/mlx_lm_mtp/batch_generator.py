@@ -1,74 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Conditional MTP dispatch inside ``mlx_lm.generate.GenerationBatch``.
+"""Lightning MTP dispatch for mlx-lm continuous batching.
 
-This is the integration point that lets the existing oMLX scheduler /
-paged cache / prefix cache / SSD cache stack drive MTP without touching any
-of those layers. ``GenerationBatch`` is mlx-lm's per-step decoder for the
-active set of sequences in continuous batching. We patch:
+Qwen and GLM adapters share compatible verification forwards; DeepSeek V4.1
+verifies each request independently. Other adapters retain singleton MTP.
+Draft history, acceptance, processors and termination belong to each UID.
 
-- ``GenerationBatch.__init__`` — leave the standard mlx-lm initialization
-  untouched. Fresh singleton donor batches may still be merged into a larger
-  continuous batch, so MTP must not mutate cache state in ``__init__``.
-
-- ``GenerationBatch.next`` — when the batch holds exactly one MTP-capable
-  sequence, lazily initialize MTP from the standard post-prefill state. We
-  emit from the per-batch queue first; once empty, we run a 2-token verify
-  forward over ``[next_main, draft]`` with ``n_confirmed=1`` and a single
-  MTP-head forward at the bonus position (accept) or confirmed position
-  (reject), refilling the queue from the verify outputs.
-
-- ``GenerationBatch.extend`` / ``filter`` — drop MTP state whenever continuous
-  batching reshapes ownership. MTP state belongs to one uid in one singleton
-  timeline; it must not survive standard batched decoding.
-
-The throughput math (greedy, accept rate p):
-  - Cost per *cycle*: 1× backbone (2-token verify) + 1× MTP head ≈ 1.15
-  - Tokens per cycle: 1 + p (accept emits draft+bonus; reject emits verify_pred only)
-  - At p≈1: 0.575 cost/token → ~1.74× throughput
-  - At p≈0.5: ~0.77 cost/token → ~1.30× throughput
-
-Known limitation (compute-bound single-stream Apple Silicon):
-  The cost model above assumes the 2-token verify forward is nearly free
-  relative to a 1-token forward, which is the bandwidth-bound decode regime
-  speculative decoding targets. On lower-end single-stream Apple Silicon
-  (e.g. M1/M2 base/Pro) decode is compute-bound, so the verify forward costs
-  ~2× a 1-token forward and MTP can be net-negative regardless of accept
-  rate. Wins are expected on M3/M4 or higher-end parts, on MoE models with a
-  smaller per-step backbone, or under continuous batching where spare
-  compute exists. See #1097 / #1311 for measurements.
-
-Greedy identity (sampler is None): the patched dispatch produces the same
-tokens as the standard step. PR 990's ``test_mtp_generate_identity``
-encodes this contract; the oMLX-side equivalent lives in
-``tests/test_mlx_lm_mtp_patch.py``.
-
-Stochastic acceptance (sampler is not None): we use ``min(1, p_target / p_draft)``
-(Leviathan & Chen 2023). On rejection we sample from the residual
-``max(p_target - p_draft, 0) / Z`` so the marginal output distribution
-equals the target distribution exactly.
-
-PagedCacheManager interaction
------------------------------
-``cache.trim(1)`` on a ``BatchKVCache`` only updates ``self._idx``; the
-underlying paged blocks are untouched. ``ArraysCache.rollback_state``
-holds ``(conv_snap, ssm_snap)`` snapshots produced by the patched
-``GatedDeltaNet.__call__`` and is restored on reject. Because both code
-paths only mutate cache *length* (not block ownership), oMLX's
-``PagedCacheManager`` is oblivious to the trim — its block_table is
-unaffected and prefix-cache lookups continue to work normally.
-
-TokenBuffer interaction
------------------------
-``GenerationBatch._token_context[0]`` is a ``TokenBuffer`` accumulating
-the prompt + every forward-input token. We update it in lock-step with
-each forward-input position so that ``logits_processors`` see the same
-token sequence the standard step would see. On reject we shrink the
-buffer's ``_size`` by 1 to discard the rejected draft (mirroring PR 990's
-``prev_tokens = prev_tokens[:-1]``).
+Activation starts from the committed post-prefill cache. Batch reshaping
+preserves owned histories or reconciles them before standard decoding resumes.
+Auto depth and parking use the measured cost of the whole active batch.
 """
 
 from __future__ import annotations
 
+import contextlib
+import inspect
 import logging
 import math
 import os
@@ -76,6 +21,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from statistics import median
 from types import SimpleNamespace
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
@@ -223,8 +169,9 @@ def apply() -> bool:
         original_filter = GenerationBatch.filter
         original_extend = GenerationBatch.extend
 
-        def patched_init(self, *args, **kwargs):
-            original_init(self, *args, **kwargs)
+        def patched_init(self, model, uids, *args, **kwargs):
+            with _prompt_priming.decode_scope(model, uids), _drafter_scope(model, uids):
+                original_init(self, model, uids, *args, **kwargs)
             # Stock GenerationBatch owns an exact one-token pipeline. Qwen4
             # MTP clears this marker before its first extra target forward and
             # restores it only after an exact reconcile/park/handoff.
@@ -240,22 +187,47 @@ def apply() -> bool:
                     logger.debug("MTP path not active: %s", reason)
 
         def patched_next(self, *args, **kwargs):
-            realign_rows = getattr(self, "_omlx_realign_rows", None)
-            if callable(realign_rows):
-                realign_rows()
-            _maybe_clear_multirow_marker(self)
-
             if _is_mtp_batch_eligible(self):
+                policy = _batch_policy_for_next(self)
+                if policy is not None and policy.needs_standard():
+                    if not _reconcile_mtp_batch_to_standard(self):
+                        raise RuntimeError(
+                            "Lightning MTP could not restore batch calibration state"
+                        )
+                    _drop_mtp_batch_state(
+                        self, "batch-standard-calibration", log_stats=True
+                    )
+                    started = time.perf_counter()
+                    result = original_next(self, *args, **kwargs)
+                    if tuple(self.uids) == policy.uids:
+                        elapsed = policy.cycle_time_ms(
+                            "standard", started, time.perf_counter()
+                        )
+                        policy.observe_standard(elapsed)
+                        if elapsed is not None:
+                            logger.debug(
+                                "Lightning MTP ordinary batch sample: rows=%d ms=%.3f",
+                                len(self.uids),
+                                elapsed,
+                            )
+                    return result
                 try:
                     batch_state = _prepare_mtp_batch_state_for_next(self)
                     if batch_state is not None:
-                        return _mtp_batch_next(self, batch_state)
+                        with _spec_command_buffers():
+                            return _mtp_batch_next(self, batch_state)
                 except _MtpStepFallback as exc:
                     logger.debug("MTP batch next() fallback to standard step: %s", exc)
-                    _reconcile_mtp_batch_to_standard(self)
+                    if not _reconcile_mtp_batch_to_standard(self):
+                        raise RuntimeError(
+                            "Lightning MTP could not restore the committed batch cache"
+                        ) from exc
                     _drop_mtp_batch_state(self, "batch-step-fallback")
             elif getattr(self, "_omlx_mtp_batch_state", None) is not None:
-                _reconcile_mtp_batch_to_standard(self)
+                if not _reconcile_mtp_batch_to_standard(self):
+                    raise RuntimeError(
+                        "Lightning MTP could not restore the committed batch cache"
+                    )
                 _drop_mtp_batch_state(self, "batch-ineligible")
 
             if _is_mtp_eligible(self):
@@ -264,24 +236,20 @@ def apply() -> bool:
                     # A prefill is waiting on this batch generator; hand the
                     # singleton back to the standard step at the drained-queue
                     # boundary so the late join merges this very call (#2515).
-                    handed_off = _handoff_mtp_for_late_join(
-                        self, self._omlx_mtp_state
-                    )
+                    handed_off = _handoff_mtp_for_late_join(self, self._omlx_mtp_state)
                 if not handed_off:
                     try:
                         state = _prepare_mtp_state_for_next(self)
                         if state is not None:
-                            return _mtp_next(self, state)
+                            with _spec_command_buffers():
+                                return _mtp_next(self, state)
                     except _MtpStepFallback as exc:
-                        logger.debug(
-                            "MTP next() fallback to standard step: %s", exc
-                        )
+                        logger.debug("MTP next() fallback to standard step: %s", exc)
                         active = getattr(self, "_omlx_mtp_state", None)
                         if active is not None:
                             if not _reconcile_mtp_to_standard(self, active):
                                 raise RuntimeError(
-                                    "MTP step fallback could not reconstruct "
-                                    "an exact standard target cache"
+                                    "Lightning MTP could not restore the committed cache"
                                 ) from exc
                             if active.reentry_probe:
                                 try:
@@ -317,12 +285,12 @@ def apply() -> bool:
             )
 
         def patched_extend(self, batch, *args, **kwargs):
-            # The host (self) may have active MTP about to gain a co-runner.
-            # The MTP path never maintains mlx-lm's _next_tokens, so a plain
-            # drop here would leave standard batched decode resuming from a
-            # stale _next_tokens against an MTP-advanced cache. Reconcile
-            # before merge while ownership is still well defined.
-            _reconcile_mtp_batch_to_standard(self)
+            # Reconcile before adding rows without MTP state so the drained
+            # batch can feed its last tokens without replaying its history.
+            if not _reconcile_mtp_batch_to_standard(self):
+                raise RuntimeError(
+                    "Lightning MTP could not restore the committed batch cache"
+                )
             _drop_mtp_batch_state(self, "extend-reconciled")
             _drop_mtp_batch_state(batch, "donor-extended")
 
@@ -332,7 +300,10 @@ def apply() -> bool:
                     park_state = _mtp_park_state_for_batch(self)
                     if park_state is not None:
                         park_state.defer_probe()
-                _reconcile_mtp_to_standard(self, host_state)
+                if not _reconcile_mtp_to_standard(self, host_state):
+                    raise RuntimeError(
+                        "Lightning MTP could not restore the committed cache"
+                    )
                 _drop_mtp_state(self, "extend-reconciled")
             result = original_extend(self, batch, *args, **kwargs)
             _drop_mtp_state(batch, "donor-extended")
@@ -352,7 +323,15 @@ def apply() -> bool:
                 getattr(self, "_omlx_mtp_batch_state", None) is not None
             )
             compact_survivor = None
-            if had_rowwise_state and len(old_uids) > 1 and len(keep) == 1:
+            if (
+                had_rowwise_state
+                and len(old_uids) > 1
+                and len(keep) == 1
+                and _batch_has_qsa_cache(getattr(self, "prompt_cache", None))
+            ):
+                # Fusion's scalar-survivor compaction exists for Qwen4's QSA
+                # selection; other families keep upstream's batched container
+                # at B=1 (their singleton caches cannot be re-extracted).
                 # Prove and detach the survivor before stock filter mutates any
                 # batch-owned field. A failed Qwen4 timeline proof therefore
                 # leaves the original B2 entirely intact for the request-error
@@ -362,6 +341,8 @@ def apply() -> bool:
                     int(keep[0]),
                 )
             result = original_filter(self, keep, *args, **kwargs)
+            _prompt_priming.release_uids(self.model, set(old_uids) - set(self.uids))
+            _release_drafter_uids(self.model, set(old_uids) - set(self.uids))
             _drop_invalid_mtp_state(self, "filter", log_empty=True)
             if compact_survivor is not None:
                 _compact_rowwise_mtp_survivor(
@@ -377,18 +358,52 @@ def apply() -> bool:
             _mtp_park_state_for_batch(self)
             return result
 
+        def scoped_next(self, *args, **kwargs):
+            realign_rows = getattr(self, "_omlx_realign_rows", None)
+            if callable(realign_rows):
+                realign_rows()
+            _maybe_clear_multirow_marker(self)
+            model = getattr(self, "model", None)
+            uids = getattr(self, "uids", ())
+            with _prompt_priming.decode_scope(model, uids), _drafter_scope(model, uids):
+                return patched_next(self, *args, **kwargs)
+
         GenerationBatch.__init__ = patched_init
-        GenerationBatch.next = patched_next
+        GenerationBatch.next = scoped_next
         GenerationBatch.filter = patched_filter
         GenerationBatch.extend = patched_extend
         GenerationBatch._omlx_mtp_patched = True
 
     if not hasattr(BatchGenerator, "_omlx_mtp_patched"):
         original_bg_next = BatchGenerator._next
+        original_bg_remove = BatchGenerator.remove
+        original_bg_close = BatchGenerator.close
+
+        def patched_bg_remove(self, uids, *args, **kwargs):
+            uids = tuple(uids)
+            result = original_bg_remove(self, uids, *args, **kwargs)
+            _prompt_priming.release_uids(self.model, uids)
+            _release_drafter_uids(self.model, uids)
+            return result
+
+        def patched_bg_close(self):
+            _stash_mtp_terminal_completions(self, ())
+            uids = []
+            for name in ("_prompt_batch", "_generation_batch"):
+                uids.extend(getattr(getattr(self, name, None), "uids", ()))
+            uids.extend(seq[0] for seq in getattr(self, "_unprocessed_sequences", ()))
+            try:
+                return original_bg_close(self)
+            finally:
+                _prompt_priming.release_uids(getattr(self, "model", None), uids)
+                _release_drafter_uids(getattr(self, "model", None), uids)
 
         def patched_bg_next(self, *args, **kwargs):
             gen_batch = getattr(self, "_generation_batch", None)
             if gen_batch is not None:
+                # Reconcile runs on GenerationBatch, which upstream creates
+                # without the owning generator's prefill configuration.
+                gen_batch.prefill_step_size = getattr(self, "prefill_step_size", 512)
                 local_safe = _batch_generator_allows_mtp_activation(self)
                 gen_batch._omlx_mtp_activation_safe = (
                     _synchronize_mtp_activation_safe(
@@ -396,17 +411,18 @@ def apply() -> bool:
                         local_safe,
                     )
                 )
-            if _generation_batch_has_active_mtp(
-                gen_batch
-            ) and not _singleton_mtp_handoff_ready(gen_batch):
+            if (
+                _generation_batch_has_active_mtp(gen_batch)
+                and not _singleton_mtp_handoff_ready(gen_batch)
+                and getattr(gen_batch, "_omlx_mtp_batch_state", None) is None
+            ):
                 old_completion_batch_size = getattr(
                     self,
                     "completion_batch_size",
                     None,
                 )
                 had_completion_batch_size = hasattr(self, "completion_batch_size")
-                # Force mlx-lm's "hands full" early return after generation,
-                # even if an active row-wise MTP batch shrinks during next().
+                # Drain singleton speculation before admitting a late join.
                 self.completion_batch_size = 0
                 try:
                     return original_bg_next(self, *args, **kwargs)
@@ -415,12 +431,26 @@ def apply() -> bool:
                         self.completion_batch_size = old_completion_batch_size
                     elif hasattr(self, "completion_batch_size"):
                         delattr(self, "completion_batch_size")
-            return original_bg_next(self, *args, **kwargs)
+            result = original_bg_next(self, *args, **kwargs)
+            if result[0]:
+                interrupt_batch_timing(self)
+            _stash_mtp_terminal_completions(self, result[1])
+            return result
 
         BatchGenerator._next = patched_bg_next
         BatchGenerator.omlx_mtp_post_emit = _batch_generator_mtp_post_emit
+        BatchGenerator.remove = patched_bg_remove
+        BatchGenerator.close = patched_bg_close
         BatchGenerator._omlx_mtp_patched = True
     return True
+
+
+def interrupt_batch_timing(generator: Any) -> None:
+    """Exclude a prefill-interrupted interval from batch cost learning."""
+    batch = getattr(generator, "_generation_batch", None)
+    policy = getattr(batch, "_omlx_mtp_batch_policy", None)
+    if policy is not None:
+        policy.interrupt_timing()
 
 
 def _model_has_mtp_module(model: Any) -> bool:
@@ -435,6 +465,83 @@ def _model_has_mtp_module(model: Any) -> bool:
     """
     inner = getattr(model, "language_model", model)
     return hasattr(inner, "mtp") and getattr(inner, "mtp", None) is not None
+
+
+# MLX commits a command buffer every ~50 ops or 50 MB of inputs, weights
+# included, and blocks eval at ten in flight, so a cycle could not queue the
+# next draft behind a running verify. Prefill keeps MLX's caps: larger ones
+# raise its peak memory.
+_SPEC_BUFFER_CAPS = (200, 512)
+
+
+@contextlib.contextmanager
+def _spec_command_buffers():
+    """Raise MLX's command-buffer caps for one speculative decode step.
+
+    Measured on M5 only, so other GPUs keep MLX's caps.
+    """
+    from omlx.custom_kernels.nax import is_nax_available
+    from omlx.custom_kernels.qwen35_prefill.fast import set_command_buffer_caps
+
+    previous = None
+    if is_nax_available():
+        previous = set_command_buffer_caps(*_SPEC_BUFFER_CAPS)
+    try:
+        yield
+    finally:
+        if previous is not None:
+            set_command_buffer_caps(*previous)
+
+
+def _drafter_for(model: Any) -> Optional[Any]:
+    """Return the external block drafter attached to the model, if any.
+
+    A drafter replaces the embedded MTP head as the draft source. It is
+    stamped on the language model as ``_omlx_drafter`` at attach time and
+    exposes ``depth``, ``target_layer_ids``, ``draft``, ``observe``,
+    ``release`` and ``decode_scope`` (see omlx.speculative.dflash_drafter).
+    """
+    candidates = [model]
+    for attr in ("language_model", "_language_model"):
+        inner = getattr(model, attr, None)
+        if inner is not None and inner is not model:
+            candidates.append(inner)
+    for candidate in candidates:
+        # Only an attribute attach_drafter actually set counts; a dynamic
+        # __getattr__ (mocks, adapters) must not look like a drafter.
+        drafter = inspect.getattr_static(candidate, "_omlx_drafter", None)
+        if drafter is not None:
+            return drafter
+    return None
+
+
+def _drafter_capture_ids(model: Any) -> Optional[List[int]]:
+    drafter = _drafter_for(model)
+    if drafter is None:
+        return None
+    return list(drafter.target_layer_ids)
+
+
+def _release_drafter_uids(model: Any, uids) -> None:
+    drafter = _drafter_for(model)
+    if drafter is not None:
+        drafter.release(uids)
+
+
+@contextlib.contextmanager
+def _drafter_scope(model: Any, uids):
+    """Attribute ordinary decode forwards inside the scope to ``uids``.
+
+    The model runtime captures the drafter's layers on every plain decode
+    forward while a scope is open, so tokens processed by ordinary steps
+    (batch init, calibration, late-join handoff) stay in the drafter context.
+    """
+    drafter = _drafter_for(model) if model is not None else None
+    if drafter is None or uids is None:
+        yield
+        return
+    with drafter.decode_scope(uids):
+        yield
 
 
 def _model_mtp_decode_enabled(model: Any) -> bool:
@@ -613,16 +720,7 @@ def _synchronize_mtp_activation_safe(
 
 
 def _generation_batch_has_active_mtp(gen_batch: Any) -> bool:
-    """True while a generation batch owns Native MTP cache state.
-
-    mlx-lm's ``BatchGenerator._next`` generates first and then may promote
-    pending prompt work into the same ``GenerationBatch`` via ``extend()``. That
-    merge path forces MTP reconciliation, which can re-prefill a long streamed
-    context outside the scheduler's guarded prefill path. Treat active MTP as
-    a temporary full generation batch so late-join requests wait, except when
-    ``_singleton_mtp_handoff_ready`` says the singleton path can hand off to
-    the standard step this very call (#2515).
-    """
+    """True while a generation batch owns Lightning MTP cache state."""
     if gen_batch is None:
         return False
     try:
@@ -637,16 +735,7 @@ def _generation_batch_has_active_mtp(gen_batch: Any) -> bool:
 
 
 def _singleton_mtp_handoff_ready(gen_batch: Any) -> bool:
-    """True when a pending late join should be admitted this call (#2515).
-
-    Requires pending prefill work (the activation-safe stamp is False), no
-    row-wise batch state (that opt-in path keeps the deferral), a valid
-    singleton MTP state, and a drained queue: with at most one committed
-    token left unstreamed the handoff to the standard step is exact and
-    (near-)zero cost, so ``patched_bg_next`` skips the completion pin and
-    ``patched_next`` performs the handoff in the same call. Deep queues keep
-    the pin — each call drains one token, bounded by depth + 1.
-    """
+    """Allow a singleton handoff once at most one committed token is unstreamed."""
     if gen_batch is None:
         return False
     if getattr(gen_batch, "_omlx_mtp_activation_safe", True):
@@ -682,25 +771,24 @@ def _mtp_common_eligible(gen_batch: Any) -> bool:
     if os.environ.get(_MTP_FORCE_STANDARD_ENV, "").strip() == "1":
         return False
     park_state = _mtp_park_state_for_batch(gen_batch)
-    if park_state is not None:
-        uids = getattr(gen_batch, "uids", None) or ()
+    if park_state is not None and len(getattr(gen_batch, "uids", ()) or ()) == 1:
         active = getattr(gen_batch, "_omlx_mtp_state", None)
         active_probe = bool(
             active is not None
             and getattr(active, "uid", None) == park_state.uid
             and getattr(active, "reentry_probe", False)
         )
-        # Performance parking is reversible, but re-entry is deliberately a
-        # singleton operation. Multi-row decode keeps using the standard path
-        # until the parked row is alone and its cache is activation-safe.
-        if len(uids) != 1 or (not active_probe and not park_state.probe_ready()):
+        # Batch parking uses its own cost policy; this cooldown belongs to one UID.
+        if not active_probe and not park_state.probe_ready():
             return False
     if not hasattr(gen_batch, "model"):
         return False
-    if not hasattr(gen_batch.model, "mtp_forward"):
-        return False
-    if not _model_has_mtp_module(gen_batch.model):
-        return False
+    drafter = _drafter_for(gen_batch.model)
+    if drafter is None:
+        if not hasattr(gen_batch.model, "mtp_forward"):
+            return False
+        if not _model_has_mtp_module(gen_batch.model):
+            return False
     if not _model_mtp_decode_enabled(gen_batch.model):
         return False
     uids = getattr(gen_batch, "uids", None)
@@ -708,7 +796,9 @@ def _mtp_common_eligible(gen_batch: Any) -> bool:
         return False
     if _has_grammar_processors(gen_batch):
         return False
-    return True
+    # XTC changes the target distribution but is absent from acceptance math.
+    # Resolve each active row's sampler because the generator is reused.
+    return not _has_xtc_sampler(gen_batch)
 
 
 _ROWWISE_BATCH_MTP_ENV = "OMLX_MTP_ROWWISE_BATCH"
@@ -860,22 +950,13 @@ def _batch_wants_api_logprobs(gen_batch: Any) -> bool:
 
 
 def _rowwise_batch_mtp_enabled(gen_batch: Any = None) -> bool:
-    """Choose row-wise MTP using an override plus one measured Qwen4 B2 policy.
+    """Explicit policy override for multi-request Lightning MTP.
 
-    The row-wise path runs one backbone forward per row per cycle, so its
-    aggregate throughput is roughly single-stream MTP throughput regardless
-    of batch size, while standard batched decode amortizes one forward over
-    all rows. Measured on Qwen3.6-27B-oQ4e-mtp / M3 Ultra (pp1024/tg128):
-    row-wise 53.3 / 52.5 tok/s aggregate at batch 2 / 4 versus 65.2 / 86.5
-    for standard batched decode — despite 83-93% draft acceptance. It only
-    pays off when tokens-per-cycle exceeds the row count.  Generic models keep
-    that opt-in policy.  Qwen4-Exp is the narrow measured exception: on the M3
-    Ultra, exact row-wise depth-5 B2 delivered 48.72 aggregate tok/s with only
-    1.13 s finish skew, versus 25.55 tok/s and 18 s skew for standard B2.
-
-    ``OMLX_MTP_ROWWISE_BATCH=1`` remains an explicit force and ``=0`` an
-    explicit disable.  With no override, only eligible Qwen4-Exp B2 requests
-    that did not ask for API logprobs select row-wise MTP.
+    Upstream's shared batched verification (#3695/#3797) superseded Fusion's
+    row-wise B2 policy: multi-request MTP now engages for every adapter that
+    declares ``_omlx_mtp_multi_request``.  ``OMLX_MTP_ROWWISE_BATCH=0`` remains
+    an explicit disable of that path and ``=1`` an explicit enable; with no
+    override the adapter capability decides.
     """
 
     override = _rowwise_batch_mtp_override()
@@ -883,12 +964,7 @@ def _rowwise_batch_mtp_enabled(gen_batch: Any = None) -> bool:
         return override
     if gen_batch is None:
         return False
-    uids = getattr(gen_batch, "uids", None) or ()
-    return bool(
-        len(uids) == 2
-        and _is_qwen4_exp_model(getattr(gen_batch, "model", None))
-        and not _batch_wants_api_logprobs(gen_batch)
-    )
+    return _model_supports_batch_mtp(getattr(gen_batch, "model", None))
 
 
 def _standard_multirow_next(gen_batch: Any, call: Any) -> Any:
@@ -973,19 +1049,11 @@ def _log_multirow_mtp_inactive_once(gen_batch: Any) -> None:
     if not _mtp_common_eligible(gen_batch):
         return
     gen_batch._omlx_mtp_inactive_logged = True
-    if not _rowwise_batch_mtp_enabled(gen_batch):
-        logger.info(
-            "MTP inactive for %d-row batch: standard batched decode is faster "
-            "at this batch size (set %s=1 to force row-wise MTP)",
-            len(uids),
-            _ROWWISE_BATCH_MTP_ENV,
-        )
-    else:
-        logger.info(
-            "MTP inactive for %d-row batch: %s",
-            len(uids),
-            _ineligibility_reason(gen_batch) or "activation deferred",
-        )
+    logger.info(
+        "MTP inactive for %d-row batch: %s",
+        len(uids),
+        _ineligibility_reason(gen_batch) or "activation deferred",
+    )
 
 
 def _maybe_clear_multirow_marker(gen_batch: Any) -> None:
@@ -1049,34 +1117,32 @@ def _is_mtp_eligible(gen_batch: Any) -> bool:
     return True
 
 
+def _model_supports_batch_mtp(model: Any) -> bool:
+    """Only validated model adapters opt into multi-request Lightning MTP."""
+    return any(
+        getattr(host, "_omlx_mtp_multi_request", False) is True
+        for host in (
+            model,
+            getattr(model, "_language_model", None),
+            getattr(model, "language_model", None),
+        )
+    )
+
+
 def _is_mtp_batch_eligible(gen_batch: Any) -> bool:
     if not _mtp_common_eligible(gen_batch):
         return False
     model = getattr(gen_batch, "model", None)
-    if getattr(model, "_omlx_mtp_rowwise_unsupported", False) or getattr(
-        getattr(model, "_language_model", None),
-        "_omlx_mtp_rowwise_unsupported",
-        False,
-    ):
-        # Multi-block window heads (inkling) keep per-request cycle state
-        # on the cache list; the row-wise extract/merge path does not
-        # model that.
+    if not _model_supports_batch_mtp(model):
         return False
     uids = getattr(gen_batch, "uids", None)
     if uids is None or len(uids) <= 1:
         return False
     if not _allows_new_mtp_activation(gen_batch, "_omlx_mtp_batch_state"):
         return False
-    if getattr(
-        gen_batch, "_omlx_mtp_batch_state", None
-    ) is None and not _rowwise_batch_mtp_enabled(gen_batch):
+    if _rowwise_batch_mtp_override() is False:
+        # Fusion's explicit disable knob for multi-request Lightning MTP.
         return False
-    # No cache-position alignment requirement: activation seeds each row from
-    # its own extract_cache(idx) view and steady-state row cycles diverge the
-    # per-row offsets immediately anyway (accept counts differ per row), so
-    # the merge path already handles ragged rows. Under continuous batching
-    # rows join at different times, so requiring aligned offsets at
-    # activation kept this path from ever engaging (#2150).
     return True
 
 
@@ -1103,23 +1169,17 @@ def _ineligibility_reason(gen_batch: Any) -> str:
     uids = getattr(gen_batch, "uids", None)
     if uids is None:
         return "GenerationBatch has no uids"
+    if _has_xtc_sampler(gen_batch):
+        return "XTC sampling is not supported by Lightning MTP acceptance math"
     if len(uids) != 1:
+        if not _model_supports_batch_mtp(gen_batch.model):
+            return "this model supports single-request Lightning MTP only"
         if not _allows_new_mtp_activation(gen_batch, "_omlx_mtp_batch_state"):
             return "pending prompt work may still merge into this batch"
-        if (
-            _rowwise_batch_mtp_override() is None
-            and len(uids) == 2
-            and _is_qwen4_exp_model(getattr(gen_batch, "model", None))
-            and _batch_wants_api_logprobs(gen_batch)
-        ):
-            return "row-wise batch MTP does not serve API logprobs requests"
-        if getattr(
-            gen_batch, "_omlx_mtp_batch_state", None
-        ) is None and not _rowwise_batch_mtp_enabled(gen_batch):
+        if _rowwise_batch_mtp_override() is False:
             return (
-                f"row-wise batch MTP is disabled by policy "
-                f"(set {_ROWWISE_BATCH_MTP_ENV}=1 to force); "
-                "generic models use standard batched decode"
+                "multi-request Lightning MTP is disabled by policy "
+                f"({_ROWWISE_BATCH_MTP_ENV}=0)"
             )
         return ""
     if not _allows_new_mtp_activation(gen_batch, "_omlx_mtp_state"):
@@ -1238,6 +1298,8 @@ class _MtpState:
     # use target_expected_offset to trim the head cache.
     target_expected_offset: Optional[int] = None
     suffix_local_priming: bool = False
+    # A consumed priming context proves this request's hidden capture works.
+    head_history_primed: bool = False
     # Sampler for draft tokens (lazily resolved). For stochastic target
     # samplers this is a *sharper* distribution than the target (temp 0.6 /
     # top_p 0.95 / top_k 20) — the Leviathan/Chen acceptance ratio uses the
@@ -1253,6 +1315,9 @@ class _MtpState:
     # True while this state is a bounded re-entry probe after a performance
     # handoff. Correctness fallbacks and late-join handoffs do not set it.
     reentry_probe: bool = False
+
+    # Boundary tokens need a one-row forward on a private cache.
+    boundary_emit_pending: bool = False
 
     # Accept-rate / throughput counters. Surfaced via logger.info on finish.
     stats: _MtpStats = field(default_factory=_MtpStats)
@@ -1400,9 +1465,10 @@ class _MtpPostEmitResult:
 
 @dataclass
 class _MtpBatchState:
-    """Experimental row-wise MTP state for a multi-sequence GenerationBatch."""
+    """Request-local Lightning MTP state for a continuous generation batch."""
 
     states: Dict[Any, _MtpState] = field(default_factory=dict)
+    head: Optional[Any] = None
 
 
 # The existing depth controller decides whether a re-entry probe wins. This
@@ -1527,6 +1593,21 @@ def _maybe_finish_mtp_reentry_probe(
 # ---------------------------------------------------------------------------
 
 
+def _has_xtc_sampler(gen_batch: Any) -> bool:
+    samplers = getattr(gen_batch, "samplers", None)
+    fallback = getattr(gen_batch, "fallback_sampler", None)
+    for idx in range(len(gen_batch.uids)):
+        sampler = _row_value(samplers, idx)
+        if sampler is None:
+            sampler = fallback
+        if (
+            getattr(sampler, "temp", 0.0) != 0.0
+            and getattr(sampler, "xtc_probability", 0.0) > 0.0
+        ):
+            return True
+    return False
+
+
 def _resolve_sampler(gen_batch: Any):
     """Match ``GenerationBatch._step``'s per-sequence sampler resolution (batch=1)."""
     if gen_batch.samplers and gen_batch.samplers[0] is not None:
@@ -1646,6 +1727,9 @@ def _drop_mtp_batch_state(
     batch_state = getattr(gen_batch, "_omlx_mtp_batch_state", None)
     if batch_state is None:
         return None
+    from . import batched_head
+
+    batched_head.flush(batch_state)
     if log_stats:
         for state in list(batch_state.states.values()):
             try:
@@ -1674,6 +1758,9 @@ def _drop_invalid_mtp_batch_state(
     batch_state = getattr(gen_batch, "_omlx_mtp_batch_state", None)
     if batch_state is None:
         return None
+    from . import batched_head
+
+    batched_head.flush(batch_state)
     uids = list(getattr(gen_batch, "uids", []) or [])
     if not uids:
         return _drop_mtp_batch_state(
@@ -1728,6 +1815,7 @@ def _make_row_batch(
     next_logprobs = getattr(gen_batch, "_next_logprobs", None)
     row = SimpleNamespace(
         model=gen_batch.model,
+        prefill_step_size=getattr(gen_batch, "prefill_step_size", 512),
         uids=[gen_batch.uids[idx]],
         prompt_cache=prompt_cache,
         tokens=[gen_batch.tokens[idx]],
@@ -1736,7 +1824,7 @@ def _make_row_batch(
         logits_processors=[
             _row_value(getattr(gen_batch, "logits_processors", None), idx, [])
         ],
-        state_machines=[_row_value(getattr(gen_batch, "state_machines", None), idx)],
+        stop_sequences=[_row_value(getattr(gen_batch, "stop_sequences", None), idx)],
         max_tokens=[_row_value(getattr(gen_batch, "max_tokens", None), idx)],
         _next_tokens=next_tokens[idx : idx + 1] if next_tokens is not None else None,
         _next_logprobs=(
@@ -1746,7 +1834,7 @@ def _make_row_batch(
         ),
         _token_context=[gen_batch._token_context[idx]],
         _num_tokens=[gen_batch._num_tokens[idx]],
-        _matcher_states=[gen_batch._matcher_states[idx]],
+        _matchers=[gen_batch._matchers[idx]],
         _omlx_rowwise_mtp=True,
     )
     if state is not None:
@@ -1794,6 +1882,26 @@ def _qsa_singleton_alignment_error(prompt_cache: List[Any]) -> Optional[str]:
                 f"index_keys={key_length}, positions={position_length}"
             )
     return None
+
+
+def _batch_has_qsa_cache(prompt_cache: Any) -> bool:
+    if not isinstance(prompt_cache, list):
+        return False
+    return any("QSA" in type(c).__name__ for c in _iter_mtp_cache_leaves(prompt_cache))
+
+
+def _extract_terminal_cache(gen_batch: Any) -> List[Any]:
+    """Detach the finished singleton row's cache list.
+
+    A Qwen4 survivor compacted by ``_compact_rowwise_mtp_survivor`` already
+    holds request-isolated scalar caches without ``extract``; hand those over
+    as they are.
+    """
+
+    try:
+        return gen_batch.extract_cache(0)
+    except AttributeError:
+        return list(gen_batch.prompt_cache)
 
 
 def _prepare_compact_rowwise_mtp_survivor(
@@ -1937,28 +2045,99 @@ def _replace_cache_rows(
     gen_batch.prompt_cache = _merge_row_caches(row_caches)
 
 
+def _initial_batch_forward(gen_batch):
+    """Advance fresh Qwen rows together without extracting target caches."""
+    from mlx_lm.models.cache import ArraysCache, BatchKVCache
+
+    cache_types = (ArraysCache, BatchKVCache)
+    try:
+        from mlx_vlm.models.cache import ArraysCache as VLMArray
+        from mlx_vlm.models.cache import BatchKVCache as VLMKV
+    except ImportError:
+        pass
+    else:
+        cache_types += (VLMArray, VLMKV)
+
+    host = getattr(gen_batch.model, "_language_model", None)
+    chain, _, head_clone = _resolve_mtp_chain_depth(gen_batch.model)
+    if not (
+        len(gen_batch.uids) > 1
+        and chain
+        and not head_clone
+        and getattr(host, "_omlx_mtp_batch_rollback", False)
+        and gen_batch._next_tokens is not None
+        and all(type(c) in cache_types for c in gen_batch.prompt_cache)
+        and all(
+            _is_greedy(
+                _make_row_batch(gen_batch, i, prompt_cache=gen_batch.prompt_cache)
+            )
+            and not _row_value(gen_batch.logits_processors, i)
+            for i in range(len(gen_batch.uids))
+        )
+    ):
+        return None
+    # Validate the offset layout before advancing the shared target cache.
+    offsets = _prompt_priming._row_offsets(gen_batch.prompt_cache, len(gen_batch.uids))
+    if offsets is None:
+        return None
+    _set_batched_mrope_deltas(gen_batch, list(gen_batch.uids))
+    logits, hidden, _, captured = _call_backbone_captured(
+        gen_batch.model,
+        gen_batch._next_tokens[:, None],
+        gen_batch.prompt_cache,
+        capture_layer_ids=_drafter_capture_ids(gen_batch.model),
+    )
+    _clear_rollback(gen_batch.prompt_cache)
+    return logits, hidden, [offset + 1 for offset in offsets], captured
+
+
+def _slice_captured(captured: Optional[List[Any]], idx: int) -> Optional[List[Any]]:
+    if captured is None:
+        return None
+    return [layer[idx : idx + 1] for layer in captured]
+
+
 def _prepare_mtp_batch_state_for_next(gen_batch: Any) -> Optional[_MtpBatchState]:
     """Return a valid row-wise MTP state, lazily initializing every row."""
     batch_state = getattr(gen_batch, "_omlx_mtp_batch_state", None)
     if _mtp_batch_state_valid_for_batch(gen_batch, batch_state):
         return batch_state
-    if batch_state is not None:
-        _drop_mtp_batch_state(gen_batch, "stale-batch-owner")
 
     replacements: Dict[int, List[Any]] = {}
     token_context_updates: Dict[int, Any] = {}
-    states: Dict[Any, _MtpState] = {}
+    states = dict(batch_state.states) if batch_state is not None else {}
 
+    shared = _initial_batch_forward(gen_batch) if not states else None
     for idx, uid in enumerate(gen_batch.uids):
-        row = _make_row_batch(gen_batch, idx)
+        if uid in states:
+            continue
+        row = _make_row_batch(
+            gen_batch,
+            idx,
+            prompt_cache=gen_batch.prompt_cache if shared is not None else None,
+        )
         _set_singleton_mrope_delta(row)
-        _post_init_mtp(row)
+        if shared is None:
+            _post_init_mtp(row)
+        else:
+            logits, hidden, offsets, captured = shared
+            _post_init_mtp(
+                row,
+                verify_result=(
+                    logits[idx : idx + 1],
+                    hidden[idx : idx + 1],
+                    None,
+                    _slice_captured(captured, idx),
+                ),
+                priming_offset=offsets[idx],
+            )
         state = getattr(row, "_omlx_mtp_state", None)
         if not _mtp_state_valid_for_batch(row, state):
             _drop_mtp_batch_state(gen_batch, "batch-post-init-invalid")
             return None
         states[uid] = state
-        replacements[idx] = row.prompt_cache
+        if shared is None:
+            replacements[idx] = row.prompt_cache
         token_context_updates[idx] = row._token_context[0]
 
     _replace_cache_rows(gen_batch, replacements)
@@ -1968,17 +2147,39 @@ def _prepare_mtp_batch_state_for_next(gen_batch: Any) -> Optional[_MtpBatchState
     batch_state = _MtpBatchState(states=states)
     gen_batch._omlx_mtp_batch_state = batch_state
     gen_batch._omlx_standard_target_exact_v1 = False
+    if hasattr(gen_batch, "_omlx_mtp_park_state"):
+        # A singleton timing decision does not describe shared verification.
+        del gen_batch._omlx_mtp_park_state
     logger.info(
-        "MTP row-wise batch path activated for %d sequences",
+        "Lightning MTP batch activated for %d sequences",
         len(gen_batch.uids),
     )
     return batch_state
+
+
+def _batch_policy_for_next(gen_batch: Any):
+    from .batch_policy import BatchPolicy
+
+    policy = getattr(gen_batch, "_omlx_mtp_batch_policy", None)
+    if policy is None or policy.uids != tuple(gen_batch.uids):
+        chain, depth, _ = _resolve_mtp_chain_depth(gen_batch.model)
+        policy = BatchPolicy(
+            gen_batch.uids,
+            depth if chain else 1,
+            fixed=_drafter_for(gen_batch.model) is not None
+            or _mtp_depth_fixed(gen_batch.model),
+        )
+        gen_batch._omlx_mtp_batch_policy = policy
+    return policy
 
 
 def _reconcile_mtp_batch_to_standard(gen_batch: Any) -> bool:
     batch_state = getattr(gen_batch, "_omlx_mtp_batch_state", None)
     if batch_state is None:
         return True
+    from . import batched_head
+
+    batched_head.flush(batch_state)
     if not getattr(gen_batch, "uids", None):
         return True
 
@@ -1990,6 +2191,8 @@ def _reconcile_mtp_batch_to_standard(gen_batch: Any) -> bool:
     token_context_updates: Dict[int, Any] = {}
 
     try:
+        if _feed_batch_mains_to_standard(gen_batch, batch_state):
+            return True
         for idx, uid in enumerate(gen_batch.uids):
             state = batch_state.states.get(uid)
             if state is None:
@@ -2003,7 +2206,7 @@ def _reconcile_mtp_batch_to_standard(gen_batch: Any) -> bool:
             row = _make_row_batch(gen_batch, idx, state=state)
             if not _reconcile_mtp_to_standard(row, state):
                 return False
-            row_caches[idx] = row.prompt_cache
+            row_caches[idx] = [cache.extract(0) for cache in row.prompt_cache]
             next_tokens.append(row._next_tokens)
             next_logprobs.extend(row._next_logprobs)
             token_context_updates[idx] = row._token_context[0]
@@ -2089,21 +2292,22 @@ def _set_singleton_mrope_delta(gen_batch: Any) -> None:
         import mlx.core as mx
 
         delta = model._uid_rope_deltas.get(uids[0], 0.0)
-        model.set_batch_rope_deltas(mx.array([delta]))
+        # uid-aware seam keeps a text-proven request on Qwen4's rank-two
+        # positions for the verify window (gathered-QSA eligibility).
+        step_setter = getattr(type(model), "set_step_rope_deltas", None)
+        if callable(step_setter):
+            step_setter(model, mx.array([delta]), list(uids))
+        else:
+            model.set_batch_rope_deltas(mx.array([delta]))
 
 
 def _rebuild_singleton_cache(model: Any) -> Optional[List[Any]]:
-    """Build a fresh single-sequence batch-aware cache (left_padding=[0]).
-
-    Reuses mlx-lm's own ``_make_cache`` so the per-layer types match exactly
-    what ``extend()`` / ``_extend_cache`` expects, keeping the subsequent merge
-    type-compatible. Returns None if the converter is unavailable.
-    """
-    import sys
+    """Build a fresh cache through the same merge path as prompt processing."""
+    from mlx_lm.models.cache import make_prompt_cache
+    from omlx.scheduler import _patched_merge_caches
 
     try:
-        make_cache = sys.modules["mlx_lm.generate"]._make_cache
-        return make_cache(model, [0], None)
+        return _patched_merge_caches([make_prompt_cache(model)])
     except Exception as exc:
         # Qwen4's vendored ArraysCache is intentionally not a subclass of
         # mlx-lm's class with the same name, so mlx-lm's isinstance dispatch
@@ -2157,7 +2361,7 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
 
     Leaves ``tokens[0]`` / ``_num_tokens[0]`` untouched (they already reflect
     streamed tokens), so there is no duplicated or skipped token. Returns False
-    (caller falls back to a plain drop) when reconcile cannot be done safely.
+    when reconcile cannot be done safely; callers must stop decoding.
     """
     import mlx.core as mx
 
@@ -2171,8 +2375,18 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         procs = _proc_list(gen_batch)
         _set_singleton_mrope_delta(gen_batch)
         tok_arr = _ensure_uint32(mx.array(list(tokens)))
+        # Bound each rebuild forward by the owning generator's prefill size.
+        step = int(getattr(gen_batch, "prefill_step_size", 0) or 0) or 512
+        total = int(tok_arr.shape[0])
+        logits = None
         # Inherits the per-engine stream from the enclosing BatchGenerator context.
-        logits, _, _ = _call_backbone(gen_batch.model, tok_arr[None, :], new_cache)
+        for start in range(0, total, step):
+            # Committed history needs no per-token speculative rollback states.
+            logits = gen_batch.model(
+                tok_arr[None, start : start + step], cache=new_cache
+            )
+            if start + step < total:
+                mx.eval(logits)
         last_logits = logits[:, -1, :]  # (1, vocab) — dist after tokens[-1]
 
         if state.queue:
@@ -2180,16 +2394,15 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
             next_tok = mx.array([int(next_id)], dtype=mx.uint32)
             next_lp = next_lp_1d
         else:
-            prev_buf = gen_batch._token_context[0].tokens if procs is not None else None
+            prev_buf = (
+                mx.array(list(tokens), dtype=mx.int32) if procs is not None else None
+            )
             ll = _apply_processors(procs, prev_buf, last_logits)
             next_lp_2d = _logprobs(ll)
             next_tok = _ensure_uint32(_resolve_sampler(gen_batch)(next_lp_2d))
             next_lp = next_lp_2d.squeeze(0)
 
         mx.eval(next_tok)
-        # Reconciliation produces committed standard-decoding state. A long
-        # re-prefill is still an armed MTP-managed backbone call, so discard
-        # its speculative snapshots before exposing or merging the cache.
         _clear_rollback(new_cache)
         if _model_qwen4_terminal_commit_enabled(gen_batch.model):
             expected = len(tokens)
@@ -2218,7 +2431,7 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         )
         return True
     except Exception as exc:
-        logger.warning("MTP reconcile failed, falling back to plain drop: %s", exc)
+        logger.warning("MTP reconcile failed: %s", exc)
         return False
 
 
@@ -2382,6 +2595,17 @@ def _mtp_sample(gen_batch: Any, sampler: Any, logprobs: Any) -> Any:
     return adapter.sync_tokens(proposal, tuple(logprobs.shape[:-1]))
 
 
+def _mtp_sample_draft_with_logprobs(gen_batch: Any, sampler: Any, logprobs: Any):
+    """Draft one token plus its acceptance row, distributed-vocabulary aware."""
+
+    if _mtp_vocab_coordinator(gen_batch) is None:
+        return _sample_draft_with_logprobs(sampler, logprobs)
+    return (
+        _mtp_sample(gen_batch, sampler, logprobs),
+        _mtp_accept_lp(gen_batch, sampler, logprobs),
+    )
+
+
 def _mtp_sync_packet(gen_batch: Any, packet: Any, length: int) -> list[int]:
     """Broadcast a small coordinator decision packet and materialize it once."""
 
@@ -2419,7 +2643,12 @@ def _accept_lp_for(sampler, lp):
     """
     import mlx.core as mx
 
-    from omlx.utils.sampling import apply_min_p, apply_top_k, apply_top_p
+    from omlx.utils.sampling import (
+        apply_min_p,
+        apply_top_k,
+        apply_top_p,
+        apply_top_p_top_k,
+    )
 
     temp = float(getattr(sampler, "temp", 0.0) or 0.0)
     if temp == 0.0:
@@ -2428,20 +2657,30 @@ def _accept_lp_for(sampler, lp):
 
     out = lp
     top_p = float(getattr(sampler, "top_p", 0.0) or 0.0)
-    if 0.0 < top_p < 1.0:
-        out = apply_top_p(out, top_p)
     min_p = float(getattr(sampler, "min_p", 0.0) or 0.0)
-    if min_p != 0.0:
-        min_keep = int(getattr(sampler, "min_tokens_to_keep", 1) or 1)
-        out = apply_min_p(out, min_p, min_keep)
     top_k = int(getattr(sampler, "top_k", 0) or 0)
-    if top_k > 0:
-        out = apply_top_k(out, top_k)
+    if 0.0 < top_p < 1.0 and top_k > 0 and min_p == 0.0:
+        out = apply_top_p_top_k(out, top_p, top_k)
+    else:
+        if 0.0 < top_p < 1.0:
+            out = apply_top_p(out, top_p)
+        if min_p != 0.0:
+            min_keep = int(getattr(sampler, "min_tokens_to_keep", 1) or 1)
+            out = apply_min_p(out, min_p, min_keep)
+        if top_k > 0:
+            out = apply_top_k(out, top_k)
 
     # Temperature scale + renormalize so the output is a proper logprob
     # distribution that can be indexed by token id for the acceptance check.
-    scaled = out * (1.0 / temp)
+    scaled = (out * (1.0 / temp)).astype(mx.float32)
     return scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
+
+
+def _sample_draft_with_logprobs(sampler, lp):
+    shared = getattr(sampler, "sample_with_logprobs", None)
+    if shared is not None:
+        return shared(lp)
+    return sampler(lp), _accept_lp_for(sampler, lp)
 
 
 def _trim_token_buffer(gen_batch: Any, n: int) -> None:
@@ -2605,9 +2844,47 @@ def _call_backbone(
     cache: List[Any],
     n_confirmed: int = 0,
 ) -> Tuple[Any, Any, Optional[list]]:
+    """Backbone forward without layer captures; see ``_call_backbone_impl``."""
+    return _call_backbone_impl(model, inputs, cache, n_confirmed, None)[:3]
+
+
+def _call_backbone_captured(
+    model: Any,
+    inputs: Any,
+    cache: List[Any],
+    n_confirmed: int = 0,
+    capture_layer_ids: Optional[List[int]] = None,
+) -> Tuple[Any, Any, Optional[list], Optional[List[Any]]]:
+    """``_call_backbone`` plus the drafter's layer captures as a 4th entry.
+
+    Without a capture request this defers to ``_call_backbone`` so the
+    plain forward keeps one entry point.
+    """
+    if not capture_layer_ids:
+        if n_confirmed:
+            plain = _call_backbone(model, inputs, cache, n_confirmed=n_confirmed)
+        else:
+            plain = _call_backbone(model, inputs, cache)
+        return (*plain, None)
+    return _call_backbone_impl(model, inputs, cache, n_confirmed, capture_layer_ids)
+
+
+def _call_backbone_impl(
+    model: Any,
+    inputs: Any,
+    cache: List[Any],
+    n_confirmed: int,
+    capture_layer_ids: Optional[List[int]],
+) -> Tuple[Any, Any, Optional[list], Optional[List[Any]]]:
     """Run the backbone with ``return_hidden=True`` and normalise the result.
 
-    Returns ``(logits, hidden_pre_norm, gdn_states_or_None)``:
+    Returns ``(logits, hidden_pre_norm, gdn_states_or_None, captured)``.
+    ``captured`` is the list of per-layer hidden states requested through
+    ``capture_layer_ids`` (block drafters consume them), or ``None``. The
+    MTP head's ``hidden_pre_norm`` is the same array with or without a
+    capture request.
+
+    The first three entries:
 
     - mlx-lm path returns the 2-tuple ``(logits, hidden)``; ``gdn_states``
       is ``None`` and rollback uses ``cache.rollback_state``.
@@ -2626,6 +2903,8 @@ def _call_backbone(
     kwargs = {"cache": cache, "return_hidden": True}
     if n_confirmed:
         kwargs["n_confirmed"] = n_confirmed
+    if capture_layer_ids:
+        kwargs["capture_layer_ids"] = list(capture_layer_ids)
     dspark_verify = bool(n_confirmed and _dspark_host(model) is not None)
     _rollback_mod.set_undo_armed(True)
     # The affine verify qmm kernel is a Qwen-specific optimization. Keep the
@@ -2643,14 +2922,40 @@ def _call_backbone(
     # LanguageModelOutput (mlx-vlm dataclass)
     if hasattr(result, "logits") and hasattr(result, "hidden_states"):
         hidden = result.hidden_states
+        captured = None
         if isinstance(hidden, list):
+            if capture_layer_ids:
+                # The runtime wrapper orders the list as the requested
+                # captures followed by the head's last-layer hidden.
+                captured = list(hidden[:-1])
+                if len(captured) != len(capture_layer_ids):
+                    raise TypeError(
+                        "backbone returned %d captures for %d requested layers"
+                        % (len(captured), len(capture_layer_ids))
+                    )
             hidden = hidden[-1] if hidden else None
-        return result.logits, hidden, getattr(result, "gdn_states", None)
+        rollback_state = getattr(result, "gdn_states", None)
+        try:
+            from mlx_vlm.speculative.cache_state import SpeculativeCacheTransaction
+        except ImportError:
+            SpeculativeCacheTransaction = ()
+
+        if not n_confirmed and isinstance(rollback_state, SpeculativeCacheTransaction):
+            model.rollback_speculative_cache(
+                cache,
+                rollback_state,
+                [inputs.shape[1] - 1] * inputs.shape[0],
+                inputs.shape[1],
+            )
+            rollback_state = None
+        return result.logits, hidden, rollback_state, captured
     if isinstance(result, tuple):
+        if capture_layer_ids:
+            raise TypeError("backbone tuple output cannot carry layer captures")
         if len(result) == 3:
-            return result
+            return (*result, None)
         if len(result) == 2:
-            return result[0], result[1], None
+            return result[0], result[1], None, None
     raise TypeError(f"backbone returned unexpected shape: {type(result).__name__}")
 
 
@@ -2671,6 +2976,109 @@ def _clear_rollback(prompt_cache: List[Any]) -> None:
         if getattr(c, "_undo", None) is not None:
             c._undo = None
             c._undo_chain = False
+
+
+@dataclass
+class _MtpTerminalCompletion:
+    """Deferred exact-terminal completion for a generic-MTP finished row."""
+
+    model: Any
+    uid: Any
+    prompt_cache: List[Any]
+    tokens: List[int]
+
+
+def _stash_mtp_terminal_completions(batch_generator: Any, responses: Any) -> None:
+    """Keep this step's deferred completions reachable by uid for the hook.
+
+    Retention is bounded to one ``BatchGenerator._next`` call: a scheduler
+    that never invokes ``omlx_mtp_post_emit`` simply drops them.
+    """
+
+    pending: Dict[Any, Any] = {}
+    for response in responses or ():
+        if getattr(response, "_omlx_mtp_terminal_completion", None) is not None:
+            pending[response.uid] = response
+    try:
+        batch_generator._omlx_mtp_terminal_completions = pending
+    except Exception:
+        pass
+
+
+def _pop_mtp_terminal_completion(batch_generator: Any, uid: Any) -> Any:
+    pending = getattr(batch_generator, "_omlx_mtp_terminal_completions", None)
+    if not isinstance(pending, dict):
+        return None
+    return pending.pop(uid, None)
+
+
+def _cache_has_speculative_markers(prompt_cache: List[Any]) -> bool:
+    for cache in _iter_mtp_cache_leaves(prompt_cache):
+        for marker in (
+            "rollback_state",
+            "_mtp_draft_stash",
+            "_mtp_undo",
+            "_qwen4_exp_ple_speculative_state",
+            "_undo",
+        ):
+            if getattr(cache, marker, None) is not None:
+                return True
+    return False
+
+
+def _complete_mtp_terminal_response(response: Any) -> bool:
+    """Feed the emitted terminal token so the response cache is exact.
+
+    The natural generic-MTP terminal cache holds every token but the emitted
+    one.  Completing it costs one single-token forward, after which the
+    response is stamped ``_omlx_mtp_standard_terminal_exact`` for the
+    resident-tier gate.  Any other shape fails closed and leaves the natural
+    cache unstamped.
+    """
+
+    pending = getattr(response, "_omlx_mtp_terminal_completion", None)
+    try:
+        delattr(response, "_omlx_mtp_terminal_completion")
+    except AttributeError:
+        pass
+    if not isinstance(pending, _MtpTerminalCompletion):
+        return False
+    cache = pending.prompt_cache
+    tokens = pending.tokens
+    count = len(tokens)
+    if not cache or count <= 0:
+        return False
+    try:
+        import mlx.core as mx
+
+        offset = _prompt_priming.target_cache_offset(cache)
+        if offset == count - 1:
+            _set_singleton_mrope_delta(
+                SimpleNamespace(model=pending.model, uids=[pending.uid])
+            )
+            last = _ensure_uint32(mx.array([int(tokens[-1])]))
+            # Committed history needs no speculative rollback state.
+            logits = pending.model(last[None, :], cache=cache)
+            mx.eval(logits)
+            _clear_rollback(cache)
+            offset = _prompt_priming.target_cache_offset(cache)
+        if offset != count or _cache_has_speculative_markers(cache):
+            logger.debug(
+                "MTP terminal completion declined for uid=%s: offset=%s tokens=%d",
+                pending.uid,
+                offset,
+                count,
+            )
+            return False
+    except Exception as exc:
+        logger.warning(
+            "MTP terminal completion failed closed for uid=%s: %s", pending.uid, exc
+        )
+        return False
+    response.prompt_cache = cache
+    response.all_tokens = tokens
+    response._omlx_mtp_standard_terminal_exact = True
+    return True
 
 
 def _generic_mtp_terminal_cache_is_exact(gen_batch: Any) -> bool:
@@ -2700,17 +3108,7 @@ def _generic_mtp_terminal_cache_is_exact(gen_batch: Any) -> bool:
         return False
     if _prompt_priming.target_cache_offset(prompt_cache) != len(tokens[0]):
         return False
-    for cache in _iter_mtp_cache_leaves(prompt_cache):
-        for marker in (
-            "rollback_state",
-            "_mtp_draft_stash",
-            "_mtp_undo",
-            "_qwen4_exp_ple_speculative_state",
-            "_undo",
-        ):
-            if getattr(cache, marker, None) is not None:
-                return False
-    return True
+    return not _cache_has_speculative_markers(prompt_cache)
 
 
 def _iter_mtp_cache_leaves(cache_list: List[Any]):
@@ -3833,6 +4231,20 @@ def _resolve_mtp_chain_depth(model: Any) -> Tuple[bool, int, bool]:
     return False, 1, False
 
 
+def _mtp_depth_fixed(model: Any) -> bool:
+    """True when the model was loaded with a fixed draft depth (no controller)."""
+    candidates = [model]
+    for attr in ("language_model", "_language_model"):
+        inner = getattr(model, attr, None)
+        if inner is not None and inner is not model:
+            candidates.append(inner)
+    return any(
+        getattr(candidate, "_omlx_mtp_chain", False)
+        and bool(getattr(candidate, "_omlx_mtp_depth_fixed", False))
+        for candidate in candidates
+    )
+
+
 def _clone_mtp_head_cache(mtp_cache: List[Any]) -> List[Any]:
     """Detached per-cycle copy of the MTP-head cache for speculative steps.
 
@@ -3859,7 +4271,9 @@ def _clone_mtp_head_cache(mtp_cache: List[Any]) -> List[Any]:
                 setattr(new, attr, list(val))
         return new
 
-    return [clone_one(c) for c in mtp_cache]
+    cloned = copy.copy(mtp_cache)
+    cloned[:] = [clone_one(c) for c in mtp_cache]
+    return cloned
 
 
 def _trunk_norm_module(model: Any):
@@ -3994,16 +4408,12 @@ _STD_TAX_DECAY_S = 600.0  # stale latch decays toward the default margin
 
 def _prefill_activity_recent() -> bool:
     try:
-        return get_prefill_tracker().recently_active(
-            _STD_TAX_CONTENTION_WINDOW_S
-        )
+        return get_prefill_tracker().recently_active(_STD_TAX_CONTENTION_WINDOW_S)
     except Exception:
         return False
 
 
-def _arm_std_tax_probe(
-    gen_batch: Any, t0_ms: Optional[float], uid: Any = None
-) -> None:
+def _arm_std_tax_probe(gen_batch: Any, t0_ms: Optional[float], uid: Any = None) -> None:
     if not (t0_ms and t0_ms > 0.0):
         return
     if _prefill_activity_recent():
@@ -4193,16 +4603,17 @@ class _DepthController:
         max_depth: int,
         marginal_ms: Optional[float] = None,
         exit_margin: Optional[float] = None,
+        seed: Optional["_DepthController"] = None,
     ):
         if marginal_ms:
             self.MARGINAL_MS = float(marginal_ms)
         if exit_margin:
-            self.EXIT_MARGIN = min(
-                _STD_TAX_MAX, max(1.0, float(exit_margin))
-            )
+            self.EXIT_MARGIN = min(_STD_TAX_MAX, max(1.0, float(exit_margin)))
         self.max_depth = max(1, int(max_depth))
         self.cur = self.max_depth  # first cycle drafts deep; warmup sweeps down
-        self.p = [0.6] * self.max_depth
+        # A position never reached yet (None) borrows the estimate of the
+        # position before it; a flat 0.6 prior kept deep drafts unexplored.
+        self.p: List[Optional[float]] = [0.6] + [None] * (self.max_depth - 1)
         self.t: Dict[int, float] = {}
         self.t_age: Dict[int, float] = {}  # ms since each depth was measured
         self.cycles = 0
@@ -4220,6 +4631,15 @@ class _DepthController:
         self._warmup: List[int] = list(range(self.max_depth, 0, -1))
         if self.max_depth > 1:
             self._warmup.extend([0, 0, 0])
+        if seed is not None and seed.t:
+            self._adopt(seed)
+
+    def _adopt(self, seed: "_DepthController") -> None:
+        """Reuse estimates, then remeasure costs in the new request's warmup."""
+        for j in range(min(self.max_depth, len(seed.p))):
+            self.p[j] = seed.p[j]
+        self.t = {d: v for d, v in seed.t.items() if d <= self.max_depth}
+        self.t_age = {d: math.inf for d in self.t}
 
     def observe(
         self,
@@ -4234,6 +4654,8 @@ class _DepthController:
         # Acceptance: token-domain EMA (a property of model/content, not load).
         a = self.ALPHA
         for j in range(used):
+            if self.p[j] is None:
+                self.p[j] = self._p_eff(j)
             hit = 1.0 if j < accepted else 0.0
             self.p[j] = (1.0 - a) * self.p[j] + a * hit
             if j >= accepted:
@@ -4260,6 +4682,8 @@ class _DepthController:
 
         # Warmup sweep: keep walking max..1 until every depth is measured once.
         if self._warmup:
+            if not time_sample:
+                return
             self._warmup.pop(0)
             if self._warmup:
                 self.cur = self._warmup[0]
@@ -4290,9 +4714,7 @@ class _DepthController:
                 explore_due = self._ms_explore >= max(
                     self.PROBE_PERIOD_MAX_MS, 2.0 * period
                 )
-                target = (
-                    self._most_stale() if explore_due else self._best_rival()
-                )
+                target = self._most_stale() if explore_due else self._best_rival()
                 if target is not None:
                     self.cur = target
                     self.probe_left = self.PROBE_LEN
@@ -4309,7 +4731,8 @@ class _DepthController:
     def _update_time(self, used: int, cycle_ms: float) -> None:
         cycle_ms = max(0.0, float(cycle_ms))
         prev = self.t.get(used)
-        if prev is None:
+        # Inherited costs must not cap the new request's first measurement.
+        if prev is None or self.t_age.get(used) == math.inf:
             self.t[used] = cycle_ms
             return
         if self._warmup:
@@ -4362,11 +4785,16 @@ class _DepthController:
         ref = min(self.t, key=lambda x: abs(x - d))
         return max(1e-3, self.t[ref] + self._marginal_est() * (d - ref))
 
+    def _p_eff(self, j: int) -> float:
+        while self.p[j] is None:
+            j -= 1
+        return self.p[j]
+
     def _score(self, d: int) -> float:
         expected = 1.0
         run = 1.0
         for j in range(d):
-            run *= self.p[j]
+            run *= self._p_eff(j)
             expected += run
         return expected / max(1e-6, self._t_est(d))
 
@@ -5101,22 +5529,24 @@ class _LockstepAcceptanceDepthController:
 def _new_depth_controller(model: Any, max_depth: int) -> Any:
     if _lockstep_depth_enabled() or _qwen4_acceptance_depth_enabled(model):
         return _LockstepAcceptanceDepthController(max_depth)
-    controller_type = (
-        _EvidenceDepthController
-        if _qwen4_evidence_depth_enabled(model)
-        else _DepthController
-    )
-    return controller_type(
+    if _qwen4_evidence_depth_enabled(model):
+        return _EvidenceDepthController(
+            max_depth,
+            marginal_ms=getattr(model, "_omlx_mtp_marginal_ms", None),
+            exit_margin=_effective_loop_tax(model),
+        )
+    # The next sequence starts from the previous controller's latest
+    # estimates (upstream seeding). Tests may replace ``_DepthController``
+    # with a factory, so the seed is passed through without a type check.
+    return _DepthController(
         max_depth,
         marginal_ms=getattr(model, "_omlx_mtp_marginal_ms", None),
         exit_margin=_effective_loop_tax(model),
+        seed=getattr(model, "_omlx_mtp_depth_seed", None),
     )
 
 
-# Draft sampler for stochastic (temp > 0) decoding. A sharper distribution
-# than the target: the 1-layer head's noisy tail otherwise gets sampled and
-# rejected, collapsing acceptance on high-entropy content. Exactness holds
-# because the Leviathan/Chen ratio uses this sampler's own distribution as q.
+# Legacy defaults for custom samplers without request sampling metadata.
 _DRAFT_SAMPLER_TEMP = 0.6
 _DRAFT_SAMPLER_TOP_P = 0.95
 _DRAFT_SAMPLER_TOP_K = 20
@@ -5126,9 +5556,10 @@ def _resolve_draft_sampler(gen_batch: Any, state: _MtpState):
     """Sampler used to draw MTP draft tokens.
 
     Greedy target → greedy drafts (preserves the greedy-identity contract).
-    Stochastic target → the sharper draft sampler above. The acceptance ratio
-    and residual sampling use this sampler's filtered distribution as q, so
-    the emitted token distribution still equals the target sampler's exactly.
+    Match a stochastic target's temperature and deterministic filters rather
+    than sharpening a high-entropy request's draft distribution. Acceptance
+    and residual sampling use the resulting normalized distribution as q.
+    Callables without sampling metadata retain the original draft defaults.
     """
     if state.draft_sampler is not None:
         return state.draft_sampler
@@ -5138,10 +5569,13 @@ def _resolve_draft_sampler(gen_batch: Any, state: _MtpState):
 
     from omlx.utils.sampling import make_sampler
 
+    target = _resolve_sampler(gen_batch)
     state.draft_sampler = make_sampler(
-        temp=_DRAFT_SAMPLER_TEMP,
-        top_p=_DRAFT_SAMPLER_TOP_P,
-        top_k=_DRAFT_SAMPLER_TOP_K,
+        temp=getattr(target, "temp", _DRAFT_SAMPLER_TEMP),
+        top_p=getattr(target, "top_p", _DRAFT_SAMPLER_TOP_P),
+        top_k=getattr(target, "top_k", _DRAFT_SAMPLER_TOP_K),
+        min_p=getattr(target, "min_p", 0.0),
+        min_tokens_to_keep=getattr(target, "min_tokens_to_keep", 1),
     )
     return state.draft_sampler
 
@@ -5348,14 +5782,15 @@ def _chain_next_drafts(
             )
             logits_2d = _apply_processors(procs, prev, logits_2d)
         lp_2d = _mtp_logprobs(gen_batch, logits_2d)
-        tok = _ensure_uint32(_mtp_sample(gen_batch, sampler, lp_2d))
+        tok, accept_lp = _mtp_sample_draft_with_logprobs(gen_batch, sampler, lp_2d)
+        tok = _ensure_uint32(tok)
         draft_toks.append(tok)
         draft_lps.append(lp_2d.squeeze(0))
-        draft_accept_lps.append(
-            _mtp_accept_lp(gen_batch, sampler, lp_2d).squeeze(0)
-        )
+        draft_accept_lps.append(accept_lp.squeeze(0))
         if j + 1 == depth:
             break
+        # Start this step on the GPU while the host encodes the next one.
+        mx.async_eval(tok, h)
         logits, head_hidden = model.mtp_forward(
             h,
             tok.reshape(1, 1),
@@ -5718,7 +6153,7 @@ def _finish_qwen4_active_verify_parity(
 # ---------------------------------------------------------------------------
 
 
-def _post_init_mtp(gen_batch: Any) -> None:
+def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -> None:
     """Bridge from standard ``__init__``'s ``_step()`` into PR 990's cycle 1.
 
     State on entry (after standard ``__init__``):
@@ -5762,10 +6197,21 @@ def _post_init_mtp(gen_batch: Any) -> None:
     # 1-token backbone forward at main_tok with hidden state. No draft yet,
     # so no rollback is possible — discard gdn_states.
     # Inherits the per-engine stream from the enclosing BatchGenerator context.
-    logits, hidden, _ = _call_backbone(
-        gen_batch.model, main_tok[:, None], gen_batch.prompt_cache
-    )
+    drafter = _drafter_for(gen_batch.model)
+    if verify_result is None:
+        verify_result = _call_backbone_captured(
+            gen_batch.model,
+            main_tok[:, None],
+            gen_batch.prompt_cache,
+            capture_layer_ids=_drafter_capture_ids(gen_batch.model),
+        )
+    logits, hidden, rollback_state = verify_result[:3]
+    captured = verify_result[3] if len(verify_result) > 3 else None
     _materialize_distributed_hidden_sibling(logits, hidden, mx_module=mx)
+    if rollback_state is not None:
+        gen_batch.model.rollback_speculative_cache(
+            gen_batch.prompt_cache, rollback_state, 0, 1
+        )
     _clear_rollback(gen_batch.prompt_cache)
 
     next_main_logits = _mtp_prepare_logits(
@@ -5791,21 +6237,50 @@ def _post_init_mtp(gen_batch: Any) -> None:
         state.chain = True
         state.depth = depth
         state.head_clone = head_clone
+        if drafter is not None:
+            # Block drafters keep their own per-request context and draft a
+            # fixed block, so neither the head cache nor the depth
+            # controller applies. The captured hidden of main_tok is the
+            # newest context entry; next_main is the anchor.
+            state.mtp_cache = []
+            state.next_main = _ensure_uint32(next_main_tok)
+            state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
+            state.queue.append(
+                (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
+            )
+            drafter.draft([(gen_batch, state, captured, state.next_main, prev_buf)])
+            gen_batch._omlx_mtp_state = state
+            return
         fixed = _fixed_depth_override(depth)
         if fixed is not None:
             state.depth = fixed
-        elif depth > 1:
-            state.controller = _new_depth_controller(
-                gen_batch.model, depth
+        elif depth > 1 and not _mtp_depth_fixed(gen_batch.model):
+            factory = getattr(
+                _dspark_host(gen_batch.model), "make_mtp_depth_controller", None
             )
+            if factory is not None:
+                state.controller = factory(depth)
+            else:
+                state.controller = _new_depth_controller(gen_batch.model, depth)
+                try:
+                    # The next sequence starts from this one's latest estimates.
+                    gen_batch.model._omlx_mtp_depth_seed = state.controller
+                except Exception:
+                    pass
         primed = _prompt_priming.take_primed(
-            gen_batch.model, gen_batch.prompt_cache, main_tok
+            gen_batch.model,
+            gen_batch.prompt_cache,
+            main_tok,
+            uid=gen_batch.uids[0],
+            cache_offset=priming_offset,
         )
-        if primed is None or not _adopt_primed_head_state(
+        if primed is not None and _adopt_primed_head_state(
             state,
             primed,
             gen_batch.prompt_cache,
         ):
+            state.head_history_primed = True
+        else:
             state.mtp_cache = gen_batch.model.make_mtp_cache()
         state.next_main = _ensure_uint32(next_main_tok)
         main_id = int(main_tok.tolist()[0])
@@ -5907,132 +6382,241 @@ def _post_init_mtp(gen_batch: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Shared target verification and request-local emission.
+# ---------------------------------------------------------------------------
+
+
+def _set_batched_mrope_deltas(gen_batch: Any, uids: list[Any]) -> None:
+    """Per-row mRoPE deltas for the batched verify (batched _set_singleton_mrope_delta)."""
+    model = getattr(gen_batch, "model", None)
+    if (
+        model is not None
+        and getattr(model, "_uses_mrope", False)
+        and getattr(model, "_uid_rope_deltas", None)
+        and hasattr(model, "set_batch_rope_deltas")
+    ):
+        import mlx.core as mx
+
+        deltas = [float(model._uid_rope_deltas.get(u, 0.0)) for u in uids]
+        step_setter = getattr(type(model), "set_step_rope_deltas", None)
+        if callable(step_setter):
+            step_setter(model, mx.array(deltas), list(uids))
+        else:
+            model.set_batch_rope_deltas(mx.array(deltas))
+
+
+def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> Any:
+    from .fused_batch import advance
+
+    states = [batch_state.states[uid] for uid in gen_batch.uids]
+    policy = getattr(gen_batch, "_omlx_mtp_batch_policy", None)
+    if policy is not None and policy.uids != tuple(gen_batch.uids):
+        policy = None
+    saved = [(state.controller, state.depth) for state in states]
+    depths = [int(state.drafts.shape[0]) if state.chain else 1 for state in states]
+    previous = [(state.stats.cycles, state.stats.accepts) for state in states]
+    requested = policy.cur if policy is not None else None
+    if policy is not None:
+        for state in states:
+            state.controller = None
+            state.depth = requested
+    started = time.perf_counter()
+    try:
+        advance(gen_batch, batch_state)
+        per_row = {}
+        for uid in gen_batch.uids:
+            state = batch_state.states[uid]
+            per_row[uid] = list(state.queue)
+            state.queue.clear()
+        result = _emit_ragged_responses(gen_batch, batch_state, per_row)
+    finally:
+        for state, (controller, depth) in zip(states, saved):
+            state.controller, state.depth = controller, depth
+    elapsed = (
+        policy.cycle_time_ms("mtp", started, time.perf_counter())
+        if policy is not None
+        else 0.0
+    )
+    if (
+        policy is not None
+        and tuple(gen_batch.uids) == policy.uids
+        and len(set(depths)) == 1
+        and depths[0] > 0
+        and all(
+            state.stats.cycles == cycles + 1
+            for state, (cycles, _) in zip(states, previous)
+        )
+    ):
+        accepted = [
+            state.stats.accepts - count for state, (_, count) in zip(states, previous)
+        ]
+        policy.observe_mtp(depths[0], accepted, elapsed, stable=depths[0] == requested)
+        if elapsed is not None:
+            logger.debug(
+                "Lightning MTP batch cost: rows=%d depth=%d accepts=%s ms=%.3f next_depth=%d",
+                len(states),
+                depths[0],
+                accepted,
+                elapsed,
+                policy.cur,
+            )
+        if policy.should_park():
+            if not _reconcile_mtp_batch_to_standard(gen_batch):
+                raise RuntimeError(
+                    "Lightning MTP could not restore batch parking state"
+                )
+            policy.park()
+            logger.info(
+                "Lightning MTP batch parked: rows=%d standard_ms=%.3f cooldown=%d",
+                len(states),
+                median(policy.standard),
+                policy.remaining,
+            )
+            _drop_mtp_batch_state(gen_batch, "batch-parked", log_stats=True)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # next() dispatch
 # ---------------------------------------------------------------------------
 
 
 def _mtp_batch_next(gen_batch: Any, batch_state: _MtpBatchState) -> Any:
-    """Emit one token per row using independent MTP state per active uid.
-
-    This is intentionally conservative: rows whose queues are empty are
-    advanced through the proven singleton MTP cycle against extracted row
-    caches, then the modified rows are merged back into the batched cache.
-    That keeps continuous-batching ownership correct while enabling MTP in
-    multi-request decode without sharing singleton state across rows.
-    """
+    """Verify compatible rows together and emit each request's accepted run."""
     if not getattr(gen_batch, "uids", None):
         return []
-
-    replacements: Dict[int, List[Any]] = {}
-    token_context_updates: Dict[int, Any] = {}
-
-    for idx, uid in enumerate(list(gen_batch.uids)):
-        state = batch_state.states.get(uid)
-        if state is None:
-            raise _MtpStepFallback(f"missing row state for uid={uid}")
-        if state.queue:
-            continue
-
-        row = _make_row_batch(
-            gen_batch,
-            idx,
-            prompt_cache=gen_batch.extract_cache(idx),
-            state=state,
-        )
-        _set_singleton_mrope_delta(row)
-        _run_verify_cycle(row, state)
-        if not state.queue:
-            raise _MtpStepFallback(f"row uid={uid} verify produced no tokens")
-        replacements[idx] = row.prompt_cache
-        token_context_updates[idx] = row._token_context[0]
-
-    _replace_cache_rows(gen_batch, replacements)
-    for idx, token_context in token_context_updates.items():
-        gen_batch._token_context[idx] = token_context
-
-    return _emit_batch_responses(gen_batch, batch_state)
+    return _run_verify_cycle_batched(gen_batch, batch_state)
 
 
-def _emit_batch_responses(gen_batch: Any, batch_state: _MtpBatchState) -> List[Any]:
+def _emit_ragged_responses(
+    gen_batch: Any, batch_state: _MtpBatchState, per_row: dict[Any, list]
+) -> list[Any]:
+    """Emit ordered runs, stopping each UID at its first terminal token."""
     Response = type(gen_batch).Response
-
-    keep = []
-    responses = []
-    finished_uids = []
+    keep: list[int] = []
+    responses: list[Any] = []
+    finished_uids: list[Any] = []
 
     for idx, uid in enumerate(list(gen_batch.uids)):
+        toks = per_row.get(uid)
+        if not toks:
+            raise _MtpStepFallback(f"ragged emit: row uid={uid} produced no tokens")
         state = batch_state.states.get(uid)
-        if state is None or not state.queue:
-            raise _MtpStepFallback(f"row uid={uid} has no queued token")
-
-        token_id, logprobs_1d, source = state.queue.popleft()
-        token_id = _validated_emitted_token(token_id, logprobs_1d)
-        _bump_emit_stat(state, source)
-
-        finish_reason: Optional[str] = None
-        match_sequence = None
-
-        gen_batch.tokens[idx].append(token_id)
-        gen_batch._num_tokens[idx] += 1
-        if gen_batch._num_tokens[idx] >= gen_batch.max_tokens[idx]:
-            finish_reason = "length"
-
-        new_state, match_sequence, current_state = gen_batch.state_machines[idx].match(
-            gen_batch._matcher_states[idx],
-            token_id,
-        )
-        gen_batch._matcher_states[idx] = new_state
-        if match_sequence is not None and current_state is None:
-            finish_reason = "stop"
-
-        if finish_reason is not None:
-            responses.append(
-                Response(
-                    uid=uid,
-                    token=token_id,
-                    logprobs=logprobs_1d,
-                    finish_reason=finish_reason,
-                    current_state=current_state,
-                    match_sequence=match_sequence,
-                    prompt_cache=gen_batch.extract_cache(idx),
-                    all_tokens=gen_batch.tokens[idx],
+        row_finished = False
+        for token_id, logprobs_1d, source in toks:
+            token_id = _validated_emitted_token(token_id, logprobs_1d)
+            if state is not None:
+                _bump_emit_stat(state, source)
+            finish_reason: Optional[str] = None
+            gen_batch.tokens[idx].append(token_id)
+            gen_batch._num_tokens[idx] += 1
+            if gen_batch._num_tokens[idx] >= gen_batch.max_tokens[idx]:
+                finish_reason = "length"
+            if gen_batch._matchers[idx].advance(token_id):
+                finish_reason = "stop"
+            if finish_reason is not None:
+                responses.append(
+                    Response(
+                        uid=uid,
+                        token=token_id,
+                        logprobs=logprobs_1d,
+                        finish_reason=finish_reason,
+                        prompt_cache=gen_batch.extract_cache(idx),
+                        all_tokens=gen_batch.tokens[idx],
+                    )
                 )
-            )
-            _log_mtp_stats(uid, state.stats, finish_reason)
-            finished_uids.append(uid)
-        else:
-            keep.append(idx)
+                if state is not None:
+                    _log_mtp_stats(uid, state.stats, finish_reason)
+                finished_uids.append(uid)
+                row_finished = True
+                break
             responses.append(
                 Response(
                     uid=uid,
                     token=token_id,
                     logprobs=logprobs_1d,
                     finish_reason=None,
-                    current_state=current_state,
-                    match_sequence=match_sequence,
                     prompt_cache=None,
                     all_tokens=None,
                 )
             )
+        if not row_finished:
+            keep.append(idx)
 
     for uid in finished_uids:
         batch_state.states.pop(uid, None)
-
     if len(keep) < len(gen_batch.uids):
         gen_batch.filter(keep)
-
     return responses
 
 
-def _feed_next_main_to_standard(gen_batch: Any, state: _MtpState) -> bool:
-    """Materialize ``state.next_main`` and sample its successor.
+def _feed_batch_mains_to_standard(gen_batch: Any, batch_state: _MtpBatchState) -> bool:
+    """Restore the ordinary batched step at drained chain frontiers.
 
-    At a cycle boundary with an empty queue the cache is exactly one token
-    behind the streamed sequence: ``state.next_main`` (already streamed) has
-    no KV yet. Feed it through the backbone, sample ``_next_tokens`` from
-    the resulting logits, and leave the batch in the standard-resumable
-    state. Shared by the depth-0 park and the late-join handoff. Returns
-    False on failure with the batch untouched.
+    Every row's last emitted token is still outside its target cache, even
+    when acceptance has left rows at different offsets. Feed those tokens
+    together and retain the resulting successors for GenerationBatch._step.
+    No emitted token is replayed into the stream and no prompt is re-prefilled.
+    """
+    import mlx.core as mx
+
+    states = [batch_state.states.get(uid) for uid in gen_batch.uids]
+    if not states or any(
+        state is None or not state.chain or state.queue or state.next_main is None
+        for state in states
+    ):
+        return False
+    _prompt_priming.retain_batch_head_history(gen_batch, batch_state)
+    rows = [
+        _make_row_batch(gen_batch, i, prompt_cache=gen_batch.prompt_cache, state=state)
+        for i, state in enumerate(states)
+    ]
+    contexts = []
+    for row, state in zip(rows, states):
+        procs = _proc_list(row)
+        previous = (
+            row._token_context[0].update_and_fetch(state.next_main)
+            if procs is not None
+            else None
+        )
+        contexts.append((procs, previous))
+    _set_batched_mrope_deltas(gen_batch, gen_batch.uids)
+    inputs = mx.stack([state.next_main for state in states])
+    # Match GenerationBatch._step, including models whose hidden capture is
+    # singleton-only even though their ordinary forward accepts a batch.
+    drafter = _drafter_for(gen_batch.model)
+    with _prompt_priming.decode_scope(gen_batch.model, gen_batch.uids):
+        if drafter is not None:
+            # Keep every committed token in the drafter context, even the
+            # ones processed by an ordinary step.
+            logits, _, _, captured = _call_backbone_captured(
+                gen_batch.model,
+                inputs,
+                gen_batch.prompt_cache,
+                capture_layer_ids=list(drafter.target_layer_ids),
+            )
+            drafter.observe(gen_batch.uids, captured)
+        else:
+            logits = gen_batch.model(inputs, cache=gen_batch.prompt_cache)
+    tokens, logprobs = [], []
+    for i, (row, (procs, previous)) in enumerate(zip(rows, contexts)):
+        last = _apply_processors(procs, previous, logits[i : i + 1, -1, :])
+        lp = _logprobs(last)
+        tokens.append(_ensure_uint32(_resolve_sampler(row)(lp)))
+        logprobs.append(lp.squeeze(0))
+    next_tokens = mx.concatenate(tokens)
+    mx.eval(next_tokens)
+    gen_batch._next_tokens = next_tokens
+    gen_batch._next_logprobs = logprobs
+    _clear_rollback(gen_batch.prompt_cache)
+    return True
+
+
+def _feed_next_main_to_standard(gen_batch: Any, state: _MtpState) -> bool:
+    """Materialize the committed main token and sample its successor.
+
+    A failed one-token handoff retries once by rebuilding committed history.
+    Only an absent main token returns False; failed recovery stops decoding.
     """
     import mlx.core as mx
 
@@ -6044,15 +6628,22 @@ def _feed_next_main_to_standard(gen_batch: Any, state: _MtpState) -> bool:
     )
     if qwen4_terminal and target_before is None:
         return False
+    procs = _proc_list(gen_batch)
+    snapshot = _snap_snapshotable(procs)
     try:
-        procs = _proc_list(gen_batch)
         _set_singleton_mrope_delta(gen_batch)
         prev_buf = None
         if procs is not None:
             prev_buf = gen_batch._token_context[0].update_and_fetch(state.next_main)
-        logits, _, _ = _call_backbone(
-            gen_batch.model, state.next_main[:, None], gen_batch.prompt_cache
+        drafter = _drafter_for(gen_batch.model)
+        logits, _, _, captured = _call_backbone_captured(
+            gen_batch.model,
+            state.next_main[:, None],
+            gen_batch.prompt_cache,
+            capture_layer_ids=_drafter_capture_ids(gen_batch.model),
         )
+        if drafter is not None:
+            drafter.observe(gen_batch.uids, captured)
         last = _mtp_prepare_logits(gen_batch, logits[:, -1, :])
         last = _apply_processors(procs, prev_buf, last)
         lp_2d = _mtp_logprobs(gen_batch, last)
@@ -6062,10 +6653,17 @@ def _feed_next_main_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         mx.eval(next_tok)
         gen_batch._next_tokens = next_tok
         gen_batch._next_logprobs = [lp_2d.squeeze(0)]
+        _clear_rollback(gen_batch.prompt_cache)
     except Exception as exc:
-        logger.debug("MTP feed-to-standard handoff failed: %s", exc)
-        return False
-    _clear_rollback(gen_batch.prompt_cache)
+        logger.warning("MTP handoff failed; rebuilding committed cache: %s", exc)
+        _restore_snapshotable(procs, snapshot)
+        if not _reconcile_mtp_to_standard(gen_batch, state):
+            raise RuntimeError(
+                "Lightning MTP could not restore the committed cache"
+            ) from exc
+        # A rebuilt standard cache is exact by construction.
+        gen_batch._omlx_standard_target_exact_v1 = True
+        return True
     if qwen4_terminal:
         expected = int(target_before) + 1
         if (
@@ -6076,7 +6674,15 @@ def _feed_next_main_to_standard(gen_batch: Any, state: _MtpState) -> bool:
                 allowed_current={expected},
             )
         ):
-            return False
+            # The one-token handoff left an unprovable Qwen4 target timeline;
+            # rebuild the committed history rather than resume on it.
+            logger.warning(
+                "MTP handoff left an inexact Qwen4 target cache; rebuilding"
+            )
+            if not _reconcile_mtp_to_standard(gen_batch, state):
+                raise RuntimeError(
+                    "Lightning MTP could not restore the committed cache"
+                )
     gen_batch._omlx_standard_target_exact_v1 = True
     return True
 
@@ -6394,6 +7000,23 @@ def _batch_generator_mtp_post_emit(
 ) -> _MtpPostEmitResult:
     """Scheduler hook: resolve parser/text stops before filtering the row."""
 
+    pending = _pop_mtp_terminal_completion(batch_generator, uid)
+    if pending is not None:
+        # Generic (non-Qwen4) Lightning MTP finished this row with the natural
+        # target cache. Only a scheduler that wants an exact resident tail pays
+        # for completing it, so plain BatchGenerator consumers never see an
+        # extra forward at finish.
+        if terminal:
+            completed = _complete_mtp_terminal_response(pending)
+            return _MtpPostEmitResult(
+                reason=(
+                    "mtp-standard-terminal-completed"
+                    if completed
+                    else "mtp-standard-terminal-declined"
+                )
+            )
+        return _MtpPostEmitResult(reason="mtp-standard-terminal-pending")
+
     gen_batch = getattr(batch_generator, "_generation_batch", None)
     if gen_batch is None:
         return _MtpPostEmitResult(reason="no-generation-batch")
@@ -6475,21 +7098,23 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
     token_id, logprobs_1d, source = state.queue.popleft()
     _bump_emit_stat(state, source)
     _mark_qwen4_pending_emit(state, token_id, source)
+    # Record the emitted token before a handoff can rebuild its history.
+    result = _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
     should_exit = False
     if state.chain and state.controller is not None:
         should_exit = state.controller.should_exit()
         if not getattr(state.controller, "rank_lockstep", False):
             should_exit = _mtp_sync_flag(gen_batch, should_exit)
-    if should_exit:
+    if should_exit and result[0].finish_reason is None:
         if not state.queue and state.pending_commit is None:
-            # Emit this cycle's token either way; on a successful handoff the
-            # next next() call runs the standard step with _next_tokens set.
+            # On a successful handoff the next next() call runs the standard
+            # step with _next_tokens set.
             _park_mtp_to_standard(gen_batch, state)
         elif state.pending_commit is not None:
             # The verifier is still private while its queue drains. Preserve
             # the controller decision and park at the scheduler-ACK seam.
             state.park_after_commit = True
-    return _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
+    return result
 
 
 def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
@@ -6517,12 +7142,16 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
         else "n/a"
     )
     if stats.depth_drafted:
-        depth_str = " depth[" + ",".join(
-            f"d{i + 1}={a}/{d}"
-            for i, (a, d) in enumerate(
-                zip(stats.depth_accepted, stats.depth_drafted)
+        depth_str = (
+            " depth["
+            + ",".join(
+                f"d{i + 1}={a}/{d}"
+                for i, (a, d) in enumerate(
+                    zip(stats.depth_accepted, stats.depth_drafted)
+                )
             )
-        ) + "]"
+            + "]"
+        )
     else:
         depth_str = ""
     if stats.zero_cycles:
@@ -7084,7 +7713,155 @@ def _run_qwen4_sequential_verify_cycle(
         ) from exc
 
 
-def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
+def _sparse_top_k(sampler) -> int:
+    """Top-k of a sampler whose target filter is exactly top-p + top-k, else 0."""
+    top_k = int(getattr(sampler, "top_k", 0) or 0)
+    if (
+        float(getattr(sampler, "temp", 0.0) or 0.0) <= 0.0
+        or not 0 < top_k <= 64
+        or float(getattr(sampler, "min_p", 0.0) or 0.0) != 0.0
+        or float(getattr(sampler, "xtc_probability", 0.0) or 0.0) > 0.0
+    ):
+        return 0
+    return top_k
+
+
+def _stochastic_verify_tokens_sparse(
+    sampler, combined_lp, drafts, draft_accept_lps, top_k
+):
+    """``_stochastic_verify_tokens`` on the target's top-k support only.
+
+    With a top-k filter the target density p is zero outside its top-k
+    tokens, and so are the residual max(p - q, 0) and the bonus draw. Only the
+    draft densities q are read at the needed ids, so no vocab-wide op runs
+    after the top-k selection. The sampled distributions are unchanged.
+    """
+    import mlx.core as mx
+
+    from omlx.utils.sampling import top_k_indices
+
+    k = int(drafts.shape[0])
+    top_p = float(getattr(sampler, "top_p", 0.0) or 0.0)
+    temp = float(sampler.temp)
+    ids = top_k_indices(combined_lp, top_k)
+    vals = mx.take_along_axis(combined_lp, ids, axis=-1).astype(mx.float32)
+    order = mx.argsort(-vals, axis=-1)
+    vals = mx.take_along_axis(vals, order, axis=-1)
+    ids = mx.take_along_axis(ids, order, axis=-1)
+    if 0.0 < top_p < 1.0:
+        probs = mx.exp(vals)
+        vals = mx.where(mx.cumsum(probs, axis=-1) - probs < top_p, vals, -float("inf"))
+    scaled = vals * (1.0 / temp)
+    logp = scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)  # (k+1, top_k)
+
+    d = drafts.astype(mx.int32)
+    hit = ids[:k] == d[:, None]
+    p_at = mx.where(
+        mx.any(hit, axis=-1),
+        mx.sum(mx.where(hit, logp[:k], 0.0), axis=-1),
+        -float("inf"),
+    )
+    q_rows = mx.stack(draft_accept_lps)  # (k, V)
+    q_at = mx.take_along_axis(q_rows, d[:, None], axis=-1).squeeze(-1)
+    ratio = p_at - q_at
+    u = mx.random.uniform(shape=(k,))
+    acc = mx.logical_or(ratio >= 0, mx.log(u) < ratio)
+    m_arr = mx.cumprod(acc.astype(mx.int32)).sum().reshape(1)
+    p_sup = mx.exp(logp[:k])
+    q_sup = mx.exp(mx.take_along_axis(q_rows, ids[:k], axis=-1).astype(mx.float32))
+    res = mx.maximum(p_sup - q_sup, 0.0)
+    z = res.sum(axis=-1, keepdims=True)
+    res_dist = mx.where(z > 0, res, p_sup)
+    res_pos = mx.random.categorical(mx.log(res_dist))
+    res_samples = mx.take_along_axis(ids[:k], res_pos[:, None], axis=-1).squeeze(-1)
+    bonus_pos = mx.random.categorical(logp[k : k + 1])
+    bonus_tok = mx.take_along_axis(ids[k : k + 1], bonus_pos[:, None], axis=-1).reshape(
+        1
+    )
+    return mx.concatenate(
+        [
+            m_arr.astype(mx.int32),
+            d,
+            res_samples.astype(mx.int32),
+            bonus_tok.astype(mx.int32),
+        ]
+    )
+
+
+def _stochastic_verify_tokens(sampler, combined_lp, drafts, draft_accept_lps):
+    """Build acceptance and correction tokens without a host synchronization."""
+    import mlx.core as mx
+
+    k = int(drafts.shape[0])
+    top_k = _sparse_top_k(sampler)
+    if top_k and k > 0:
+        return _stochastic_verify_tokens_sparse(
+            sampler, combined_lp, drafts, draft_accept_lps, top_k
+        )
+    sampling_logits = getattr(sampler, "_mtp_sampling_logits", None)
+    filtered = None
+    if sampling_logits is None:
+        accept_rows = _accept_lp_for(sampler, combined_lp)
+    else:
+        filtered = sampling_logits(combined_lp)
+        density = filtered.astype(mx.float32)
+        accept_rows = density - mx.logsumexp(density, axis=-1, keepdims=True)
+    q_rows = mx.stack(draft_accept_lps)  # (k, V)
+    idx = drafts.astype(mx.int32)[:, None]
+    p_at = mx.take_along_axis(accept_rows[:k], idx, axis=-1).squeeze(-1)
+    q_at = mx.take_along_axis(q_rows, idx, axis=-1).squeeze(-1)
+    ratio = p_at - q_at  # (k,) log acceptance ratios
+    u = mx.random.uniform(shape=(k,))
+    acc = mx.logical_or(ratio >= 0, mx.log(u) < ratio)
+    m_arr = mx.cumprod(acc.astype(mx.int32)).sum().reshape(1)
+    # Residual distributions max(p - q, 0) per draft position. Only the
+    # reject position's sample is used; computing all k keeps the cycle
+    # single-sync and costs a few elementwise vocab ops on GPU.
+    p_all = mx.exp(accept_rows[:k])
+    res = mx.maximum(p_all - mx.exp(q_rows), 0.0)
+    z = res.sum(axis=-1, keepdims=True)
+    res_dist = mx.where(z > 0, res, p_all)
+    res_samples = mx.random.categorical(mx.log(res_dist))  # (k,)
+    bonus_tok = (
+        sampler(combined_lp[k : k + 1])
+        if filtered is None
+        else mx.random.categorical(filtered[k : k + 1])
+    ).reshape(1)
+    return mx.concatenate(
+        [
+            m_arr.astype(mx.int32),
+            drafts.astype(mx.int32),
+            res_samples.astype(mx.int32),
+            bonus_tok.astype(mx.int32),
+        ]
+    )
+
+
+def _predraft(gen_batch, state, drafter, captured, host_arr, m_arr, anchor) -> bool:
+    """Queue the next block draft behind this cycle's acceptance, pre-sync."""
+    import mlx.core as mx
+
+    predraft = getattr(drafter, "predraft", None)
+    if predraft is None or captured is None:
+        return False
+    # Scheduled alone, the host read gets its own completion event; read as
+    # an input of the draft it would wait for the whole draft.
+    mx.async_eval(host_arr)
+    return bool(predraft(gen_batch, state, captured, m_arr + 1, anchor))
+
+
+def _run_verify_cycle_chain(
+    gen_batch: Any,
+    state: _MtpState,
+    *,
+    verify_result=None,
+    commit_cache=None,
+    verify_ms=0.0,
+    defer_commit=False,
+    greedy_result=None,
+    stochastic_result=None,
+    draft_jobs=None,
+) -> None:
     """One depth-k verify cycle.
 
     Verify ``[next_main, d1..dk]`` in a single backbone forward with
@@ -7093,6 +7870,15 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
     chain is dispatched with ``mx.async_eval`` and resolves inside the next
     cycle's sync. Emits ``m + 1`` tokens per cycle (m = accepted drafts, plus
     bonus on full accept or the verify-position correction on reject).
+
+    The keyword arguments belong to the shared batched verification in
+    ``fused_batch``: it supplies this row's slice of one batched forward
+    (``verify_result``), a ``commit_cache`` callback that materializes the
+    accepted prefix, the per-row share of the shared verify time, and with
+    ``defer_commit`` the cycle returns ``(m, finish)`` so every row's
+    acceptance is known before the batched rollback commits.  Fusion's Qwen4
+    two-phase target transaction, the scalar sequential oracle and the verify
+    parity probes are singleton-only and never engage on a shared forward.
     """
     import time
 
@@ -7108,8 +7894,15 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
     # tokens this cycle — the verify window follows the actual drafts.
     k = int(state.drafts.shape[0])
     cycle_t0 = time.perf_counter()
+    shared_verify = bool(
+        verify_result is not None
+        or commit_cache is not None
+        or defer_commit
+        or draft_jobs is not None
+    )
     two_phase_qwen4 = bool(
-        len(getattr(gen_batch, "uids", ()) or ()) == 1
+        not shared_verify
+        and len(getattr(gen_batch, "uids", ()) or ()) == 1
         and _model_qwen4_terminal_commit_enabled(gen_batch.model)
         and not getattr(gen_batch, "_omlx_rowwise_mtp", False)
     )
@@ -7126,7 +7919,7 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
                 "Qwen4 verifier target cache has no uniform base offset"
             )
 
-    if _qwen4_sequential_cycle_eligible(
+    if not shared_verify and _qwen4_sequential_cycle_eligible(
         gen_batch,
         k=k,
         is_greedy=is_greedy,
@@ -7155,7 +7948,9 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
             )
 
     inputs = mx.concatenate([state.next_main, state.drafts])  # (k+1,)
-    if _maybe_probe_qwen4_verify_parity(gen_batch, state, inputs):
+    if not shared_verify and _maybe_probe_qwen4_verify_parity(
+        gen_batch, state, inputs
+    ):
         # Diagnostic replay is not part of target-cycle economics.  Excluding
         # it prevents an explicitly requested trace from poisoning the
         # adaptive depth controller's cost evidence.
@@ -7172,12 +7967,20 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
 
     # --- backbone verify forward + single host sync ---
     t0 = time.perf_counter()
-    logits, hidden, gdn_states = _call_backbone(
-        gen_batch.model,
-        inputs[None, :],
-        gen_batch.prompt_cache,
-        n_confirmed=1,
-    )
+    drafter = _drafter_for(gen_batch.model)
+    if verify_result is None:
+        verify_result = _call_backbone_captured(
+            gen_batch.model,
+            inputs[None, :],
+            gen_batch.prompt_cache,
+            n_confirmed=1,
+            capture_layer_ids=_drafter_capture_ids(gen_batch.model),
+        )
+    logits, hidden, gdn_states = verify_result[:3]
+    captured = verify_result[3] if len(verify_result) > 3 else None
+    if drafter is not None and captured is None:
+        raise _MtpStepFallback("block drafter verify returned no layer captures")
+    state.stats.backbone_ms += verify_ms
     _materialize_distributed_hidden_sibling(logits, hidden, mx_module=mx)
     ple_snapshots: Tuple[Tuple[Any, Any], ...] = ()
     qsa_snapshots: Tuple[_Qwen4QSARollbackSnapshot, ...] = ()
@@ -7189,7 +7992,8 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
             verify_width=k + 1,
         )
     rows = _mtp_prepare_logits(gen_batch, logits[0])  # (k+1, vocab)
-    _capture_qwen4_active_verify_parity(gen_batch, state, rows)
+    if not shared_verify:
+        _capture_qwen4_active_verify_parity(gen_batch, state, rows)
     row_snaps: List[Optional[Any]] = [None] * (k + 1)
     if procs is not None:
         applied = []
@@ -7207,6 +8011,16 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
 
     adapter = _mtp_vocab_coordinator(gen_batch)
     greedy_target_ids: Optional[List[int]] = None
+    # A block drafter can start the next block on the GPU while the host
+    # settles this cycle; plain single-row cycles only.
+    can_predraft = (
+        drafter is not None
+        and procs is None
+        and draft_jobs is None
+        and commit_cache is None
+        and not defer_commit
+    )
+    predrafted = False
 
     if k == 0:
         # Depth-0 cycle (controller escape hatch): the forward above was a
@@ -7281,12 +8095,24 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         t0 = time.perf_counter()
         emit_last_lp = combined_lp[m if m < k else k]
     elif is_greedy:
-        targets = mx.argmax(rows, axis=-1).astype(mx.int32)  # (k+1,)
-        matches = (targets[:k] == state.drafts.astype(mx.int32)).astype(mx.int32)
-        m_arr = mx.cumprod(matches).sum().reshape(1)
-        host = mx.concatenate(
-            [m_arr, targets, state.drafts.astype(mx.int32)]
-        ).tolist()
+        if greedy_result is None:
+            targets = mx.argmax(rows, axis=-1).astype(mx.int32)  # (k+1,)
+            matches = (targets[:k] == state.drafts.astype(mx.int32)).astype(mx.int32)
+            m_arr = mx.cumprod(matches).sum().reshape(1)
+            host_arr = mx.concatenate([m_arr, targets, state.drafts.astype(mx.int32)])
+            if can_predraft:
+                predrafted = _predraft(
+                    gen_batch,
+                    state,
+                    drafter,
+                    captured,
+                    host_arr,
+                    m_arr,
+                    mx.take(targets, m_arr),
+                )
+            host = host_arr.tolist()
+        else:
+            host = greedy_result
         m = int(host[0])
         target_ids = host[1 : k + 2]
         greedy_target_ids = target_ids
@@ -7301,32 +8127,22 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         # draft sampler's filtered rows (q), cumulative accept, residual
         # samples for every position, and the bonus draw, all resolved in
         # ONE host sync (mirrors the greedy path's sync structure).
-        accept_rows = _accept_lp_for(sampler, combined_lp)  # (k+1, V)
-        q_rows = mx.stack(state.draft_accept_lps)  # (k, V)
-        idx = state.drafts.astype(mx.int32)[:, None]
-        p_at = mx.take_along_axis(accept_rows[:k], idx, axis=-1).squeeze(-1)
-        q_at = mx.take_along_axis(q_rows, idx, axis=-1).squeeze(-1)
-        ratio = p_at - q_at  # (k,) log acceptance ratios
-        u = mx.random.uniform(shape=(k,))
-        acc = mx.logical_or(ratio >= 0, mx.log(u) < ratio)
-        m_arr = mx.cumprod(acc.astype(mx.int32)).sum().reshape(1)
-        # Residual distributions max(p - q, 0) per draft position. Only the
-        # reject position's sample is used; computing all k keeps the cycle
-        # single-sync and costs a few elementwise vocab ops on GPU.
-        p_all = mx.exp(accept_rows[:k])
-        res = mx.maximum(p_all - mx.exp(q_rows), 0.0)
-        z = res.sum(axis=-1, keepdims=True)
-        res_dist = mx.where(z > 0, res, p_all)
-        res_samples = mx.random.categorical(mx.log(res_dist))  # (k,)
-        bonus_tok = sampler(combined_lp[k : k + 1]).reshape(1)
-        host = mx.concatenate(
-            [
-                m_arr.astype(mx.int32),
-                state.drafts.astype(mx.int32),
-                res_samples.astype(mx.int32),
-                bonus_tok.astype(mx.int32),
-            ]
-        ).tolist()
+        host = stochastic_result
+        if host is None:
+            result = _stochastic_verify_tokens(
+                sampler, combined_lp, state.drafts, state.draft_accept_lps
+            )
+            if can_predraft:
+                m_arr = result[:1]
+                anchor = mx.where(
+                    m_arr < k,
+                    mx.take(result[k + 1 : 2 * k + 1], mx.minimum(m_arr, k - 1)),
+                    result[2 * k + 1 : 2 * k + 2],
+                )
+                predrafted = _predraft(
+                    gen_batch, state, drafter, captured, result, m_arr, anchor
+                )
+            host = result.tolist()
         m = int(host[0])
         draft_ids = host[1 : k + 1]
         res_ids = host[k + 1 : 2 * k + 1]
@@ -7345,6 +8161,7 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
     # bounded). Emitting fewer verified drafts is always correct; position
     # ``m`` was itself accepted when the clamp lowers it, so its draft
     # token is a fair emit for the correction slot.
+    m_gpu = m
     clamp = getattr(gen_batch.model, "mtp_clamp_accept", None)
     if m < k:
         if callable(clamp):
@@ -7369,6 +8186,29 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         emit_last_id = draft_ids[m]
         emit_last_lp = combined_lp[m]
 
+    # Stop at the first terminal token (per-stream stop matcher) and never
+    # queue past the request's remaining length budget. Fusion's Qwen4 cycle
+    # fakes carry neither field; they keep the unbounded historical behaviour.
+    max_tokens = getattr(gen_batch, "max_tokens", None)
+    num_tokens = getattr(gen_batch, "_num_tokens", None)
+    matchers = getattr(gen_batch, "_matchers", None)
+    limit = m
+    if max_tokens and num_tokens:
+        remaining = max_tokens[0] - num_tokens[0]
+        limit = max(0, remaining - 1)
+    if matchers:
+        from copy import copy
+
+        matcher = copy(matchers[0])
+        for j, token in enumerate(draft_ids[:m] + [emit_last_id]):
+            if matcher.advance(token):
+                limit = min(limit, j)
+                break
+    if limit < m:
+        m = limit
+        emit_last_id = draft_ids[m]
+        emit_last_lp = combined_lp[m]
+
     # Rewind budget-capable processors to the last emitted position.
     # Rows 0..m produced the m+1 emitted tokens (m accepted drafts + the
     # bonus/verify correction); rows m+1..k predicted rejected drafts that
@@ -7383,6 +8223,7 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
     # accept can put its bonus token there. Neither token is present in the
     # backbone cache yet, so materialize it before the queue reaches it.
     materialize_boundary_emit = align > 0 and to_boundary > 0 and to_boundary == m + 1
+    state.boundary_emit_pending = materialize_boundary_emit
 
     # --- stats ---
     state.stats.cycles += 1
@@ -7402,123 +8243,156 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         state.stats.rejects += 1
     state.stats.sample_ms += (time.perf_counter() - t0) * 1000
 
-    # --- stage queue; Qwen4 defers the target commit to scheduler post-emit ---
-    t0 = time.perf_counter()
-    for j in range(m):
-        state.queue.append((int(draft_ids[j]), state.draft_lps[j], "draft"))
-    if m == k:
-        state.queue.append((int(emit_last_id), emit_last_lp, "bonus"))
-    else:
-        state.queue.append((int(emit_last_id), emit_last_lp, "verify"))
-        if procs is not None:
-            _trim_token_buffer(gen_batch, k - m)
+    accept_ms = (time.perf_counter() - cycle_t0) * 1000
 
-    if two_phase_qwen4:
-        assert target_base_offset is not None
-        if k == 0:
-            # The width-one depth-0 forward committed ``next_main`` and
-            # sampled exactly one pipeline-tail token. No speculative target
-            # state exists, but terminal emission of that tail still needs an
-            # L=1 target-only commit.
-            expected = target_base_offset + 1
-            if not _qwen4_reconcile_sized_recurrent_timeline(
-                gen_batch.prompt_cache,
-                expected=expected,
-                allowed_current={expected},
-            ) or not _set_qwen4_target_expected_offset(
-                state,
-                gen_batch.prompt_cache,
-                expected,
-            ):
-                raise _MtpStepFallback(
-                    "Qwen4 depth-zero target commit offset mismatch"
+    def finish(shared_commit_ms=0.0):
+        finish_t0 = time.perf_counter()
+        # --- stage queue; Qwen4 defers the target commit to scheduler post-emit ---
+        t0 = time.perf_counter()
+        for j in range(m):
+            # Block drafters carry no draft distribution; the target row is
+            # the distribution the accepted token was verified against.
+            draft_lp = state.draft_lps[j] if state.draft_lps else combined_lp[j]
+            state.queue.append((int(draft_ids[j]), draft_lp, "draft"))
+        state.queue.append(
+            (int(emit_last_id), emit_last_lp, "bonus" if m == k else "verify")
+        )
+
+        if two_phase_qwen4:
+            assert target_base_offset is not None
+            if k == 0:
+                # The width-one depth-0 forward committed ``next_main`` and
+                # sampled exactly one pipeline-tail token. No speculative target
+                # state exists, but terminal emission of that tail still needs an
+                # L=1 target-only commit.
+                expected = target_base_offset + 1
+                if not _qwen4_reconcile_sized_recurrent_timeline(
+                    gen_batch.prompt_cache,
+                    expected=expected,
+                    allowed_current={expected},
+                ) or not _set_qwen4_target_expected_offset(
+                    state,
+                    gen_batch.prompt_cache,
+                    expected,
+                ):
+                    raise _MtpStepFallback(
+                        "Qwen4 depth-zero target commit offset mismatch"
+                    )
+                state.pending_commit = _MtpPendingCommit(
+                    kind="tail",
+                    target_base_offset=expected,
+                    head_base_offset=head_base_offset,
+                    verify_width=0,
+                    accepted=0,
+                    source_map=("bonus",),
+                    token_map=(int(emit_last_id),),
+                    deferred_boundary=materialize_boundary_emit,
+                    final_source="bonus",
                 )
-            state.pending_commit = _MtpPendingCommit(
-                kind="tail",
-                target_base_offset=expected,
-                head_base_offset=head_base_offset,
-                verify_width=0,
-                accepted=0,
-                source_map=("bonus",),
-                token_map=(int(emit_last_id),),
-                deferred_boundary=materialize_boundary_emit,
-                final_source="bonus",
-            )
+            else:
+                sources = tuple(["draft"] * m + ["bonus" if m == k else "verify"])
+                tokens = tuple(
+                    [int(draft_ids[j]) for j in range(m)] + [int(emit_last_id)]
+                )
+                state.pending_commit = _MtpPendingCommit(
+                    kind="verify",
+                    target_base_offset=target_base_offset,
+                    head_base_offset=head_base_offset,
+                    verify_width=k + 1,
+                    accepted=m,
+                    source_map=sources,
+                    token_map=tokens,
+                    gdn_states=gdn_states,
+                    ple_snapshots=ple_snapshots,
+                    qsa_snapshots=qsa_snapshots,
+                    deferred_boundary=materialize_boundary_emit,
+                    final_source=sources[-1],
+                )
         else:
-            sources = tuple(["draft"] * m + ["bonus" if m == k else "verify"])
-            tokens = tuple(
-                [int(draft_ids[j]) for j in range(m)] + [int(emit_last_id)]
-            )
-            state.pending_commit = _MtpPendingCommit(
-                kind="verify",
-                target_base_offset=target_base_offset,
-                head_base_offset=head_base_offset,
-                verify_width=k + 1,
-                accepted=m,
-                source_map=sources,
-                token_map=tokens,
-                gdn_states=gdn_states,
-                ple_snapshots=ple_snapshots,
-                qsa_snapshots=qsa_snapshots,
-                deferred_boundary=materialize_boundary_emit,
-                final_source=sources[-1],
-            )
-    else:
-        if m == k:
-            _clear_rollback(gen_batch.prompt_cache)
-        elif not _chain_rollback(
-            gen_batch.model, gen_batch.prompt_cache, m, k, gdn_states
-        ):
-            raise _MtpStepFallback("cache layer rejects chain rollback")
-        # Target verification committed exactly m accepted drafts plus the
-        # confirmed input row. Keep its absolute timeline independent from
-        # the suffix-local draft-head offset.
-        _advance_suffix_local_target(state, gen_batch.prompt_cache, m + 1)
-    state.stats.cache_ops_ms += (time.perf_counter() - t0) * 1000
+            if commit_cache is not None:
+                gen_batch.prompt_cache = commit_cache(m)
+            elif m == k and gdn_states is None:
+                _clear_rollback(gen_batch.prompt_cache)
+            elif not _chain_rollback(
+                gen_batch.model, gen_batch.prompt_cache, m, k, gdn_states
+            ):
+                if procs is not None:
+                    _trim_token_buffer(gen_batch, k - m)
+                raise _MtpStepFallback("cache layer rejects chain rollback")
+            # Target verification committed exactly m accepted drafts plus the
+            # confirmed input row. Keep its absolute timeline independent from
+            # the suffix-local draft-head offset.
+            _advance_suffix_local_target(state, gen_batch.prompt_cache, m + 1)
+        if m < k and procs is not None:
+            _trim_token_buffer(gen_batch, k - m)
+        state.stats.cache_ops_ms += (time.perf_counter() - t0) * 1000 + shared_commit_ms
 
-    # --- MTP-head history + next draft chain (async-dispatched) ---
-    t0 = time.perf_counter()
-    if not state.head_clone:
-        _trim_committed_mtp_head(state)
-    committed = mx.array(
-        [int(d) for d in draft_ids[:m]] + [int(emit_last_id)], dtype=mx.uint32
-    )
-    next_main = committed[-1:]
-    hidden_rows = hidden[:, : m + 1]
-    prev_buf = None
-    if procs is not None:
-        prev_buf = gen_batch._token_context[0].tokens
-    _chain_next_drafts(gen_batch, state, hidden_rows, committed, prev_buf)
-    state.next_main = next_main
-    if two_phase_qwen4 and state.pending_commit is not None:
-        state.pending_commit.head_committed_offset = int(state.hist_offset)
-    state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
-    if materialize_boundary_emit and not two_phase_qwen4:
-        _materialize_mtp_boundary_emit(gen_batch, state)
-    if state.controller is not None:
-        was_warmup = bool(state.controller._warmup)
-        keepalive = bool(getattr(state.mtp_cache, "fold_keepalive", False))
-        if keepalive:
-            state.mtp_cache.fold_keepalive = False
-        state.controller.observe(
-            k,
-            m,
-            (time.perf_counter() - cycle_t0) * 1000,
-            time_sample=not keepalive,
+        # --- MTP-head history + next draft chain (async-dispatched) ---
+        t0 = time.perf_counter()
+        if draft_jobs is None and not state.head_clone:
+            _trim_committed_mtp_head(state)
+        committed = mx.array(
+            [int(d) for d in draft_ids[:m]] + [int(emit_last_id)], dtype=mx.uint32
         )
-        _maybe_finish_mtp_reentry_probe(
-            gen_batch,
-            state,
-            was_warmup=was_warmup,
-        )
-    _finish_qwen4_active_verify_parity(
-        gen_batch,
-        state,
-        target_ids=greedy_target_ids,
-        draft_ids=draft_ids,
-        accepted=m,
-        emitted_id=emit_last_id,
-    )
+        next_main = committed[-1:]
+        hidden_rows = hidden[:, : m + 1]
+        prev_buf = None
+        if procs is not None:
+            prev_buf = gen_batch._token_context[0].tokens
+        if drafter is not None and predrafted and m == m_gpu:
+            drafter.adopt_predraft(state, m + 1)
+        elif drafter is not None:
+            if predrafted:
+                drafter.discard_predraft()
+            rows_hidden = [c[:, : m + 1] for c in captured]
+            job = (gen_batch, state, rows_hidden, committed, prev_buf)
+            if draft_jobs is None:
+                drafter.draft([job])
+            else:
+                draft_jobs.append(job)
+        elif draft_jobs is None:
+            _chain_next_drafts(gen_batch, state, hidden_rows, committed, prev_buf)
+        else:
+            draft_jobs.append((gen_batch, state, hidden_rows, committed, prev_buf))
+        state.next_main = next_main
+        if two_phase_qwen4 and state.pending_commit is not None:
+            state.pending_commit.head_committed_offset = int(state.hist_offset)
+        state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
+        if materialize_boundary_emit and not two_phase_qwen4:
+            _materialize_mtp_boundary_emit(gen_batch, state)
+            state.boundary_emit_pending = False
+        if state.controller is not None:
+            was_warmup = bool(state.controller._warmup)
+            keepalive = bool(getattr(state.mtp_cache, "fold_keepalive", False))
+            if keepalive:
+                state.mtp_cache.fold_keepalive = False
+            state.controller.observe(
+                k,
+                m,
+                accept_ms
+                + (time.perf_counter() - finish_t0) * 1000
+                + verify_ms
+                + shared_commit_ms,
+                time_sample=not keepalive,
+            )
+            _maybe_finish_mtp_reentry_probe(
+                gen_batch,
+                state,
+                was_warmup=was_warmup,
+            )
+        if not shared_verify:
+            _finish_qwen4_active_verify_parity(
+                gen_batch,
+                state,
+                target_ids=greedy_target_ids,
+                draft_ids=draft_ids,
+                accepted=m,
+                emitted_id=emit_last_id,
+            )
+
+    if defer_commit:
+        return m, finish
+    finish()
 
 
 def _materialize_mtp_boundary_emit(gen_batch: Any, state: _MtpState) -> None:
@@ -7545,10 +8419,12 @@ def _materialize_mtp_boundary_emit(gen_batch: Any, state: _MtpState) -> None:
         prev_buf = gen_batch._token_context[0].update_and_fetch(boundary_tok)
 
     t0 = time.perf_counter()
-    logits, hidden, _ = _call_backbone(
+    drafter = _drafter_for(gen_batch.model)
+    logits, hidden, _, captured = _call_backbone_captured(
         gen_batch.model,
         boundary_tok[:, None],
         gen_batch.prompt_cache,
+        capture_layer_ids=_drafter_capture_ids(gen_batch.model),
     )
     _clear_rollback(gen_batch.prompt_cache)
     _advance_suffix_local_target(state, gen_batch.prompt_cache, 1)
@@ -7568,13 +8444,16 @@ def _materialize_mtp_boundary_emit(gen_batch: Any, state: _MtpState) -> None:
         # token before rebuilding that chain, so rewind to the local committed
         # seam first (head-clone families already keep the persistent cache clean).
         _trim_committed_mtp_head(state)
-    _chain_next_drafts(
-        gen_batch,
-        state,
-        hidden[:, -1:],
-        next_tok,
-        prev_buf,
-    )
+    if drafter is not None:
+        drafter.draft([(gen_batch, state, captured, next_tok, prev_buf)])
+    else:
+        _chain_next_drafts(
+            gen_batch,
+            state,
+            hidden[:, -1:],
+            next_tok,
+            prev_buf,
+        )
     state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
     next_id = int(next_tok.tolist()[0])
     state.next_main = next_tok
@@ -7695,9 +8574,18 @@ def _chain_rollback(
             )
             return True
         except Exception as exc:
-            logger.debug("rollback_speculative_cache failed: %s", exc)
+            logger.debug("rollback_speculative_cache failed: %s", exc, exc_info=True)
             return False
-    rollback = getattr(model, "mtp_partial_rollback", None)
+    # VLM adapters keep the rollback hook on the inner language model.
+    rollback = None
+    for candidate in (
+        model,
+        getattr(model, "language_model", None),
+        getattr(model, "_language_model", None),
+    ):
+        rollback = getattr(candidate, "mtp_partial_rollback", None)
+        if callable(rollback):
+            break
     if callable(rollback):
         try:
             return bool(rollback(prompt_cache, accepted, num_drafts))
@@ -7818,6 +8706,10 @@ def _run_verify_cycle_legacy(gen_batch: Any, state: _MtpState) -> None:
         state.stats.accepts += 1
         # --- cache cleanup (timed) ---
         t0 = time.perf_counter()
+        if gdn_states is not None:
+            gen_batch.model.rollback_speculative_cache(
+                gen_batch.prompt_cache, gdn_states, 1, 2
+            )
         _clear_rollback(gen_batch.prompt_cache)
         state.stats.cache_ops_ms += (time.perf_counter() - t0) * 1000
 
@@ -7997,18 +8889,13 @@ def _emit_response(
     token_id = _validated_emitted_token(token_id, logprobs_1d)
 
     finish_reason: Optional[str] = None
-    match_sequence = None
 
     gen_batch.tokens[0].append(token_id)
     gen_batch._num_tokens[0] += 1
     if gen_batch._num_tokens[0] >= gen_batch.max_tokens[0]:
         finish_reason = "length"
 
-    new_state, match_sequence, current_state = gen_batch.state_machines[0].match(
-        gen_batch._matcher_states[0], token_id
-    )
-    gen_batch._matcher_states[0] = new_state
-    if match_sequence is not None and current_state is None:
+    if gen_batch._matchers[0].advance(token_id):
         finish_reason = "stop"
 
     if finish_reason is not None:
@@ -8027,54 +8914,45 @@ def _emit_response(
                     token=token_id,
                     logprobs=logprobs_1d,
                     finish_reason=finish_reason,
-                    current_state=current_state,
-                    match_sequence=match_sequence,
                     prompt_cache=None,
                     all_tokens=None,
                 )
             ]
 
         # Legacy Qwen3.5-style MTP does not have Qwen4's explicit two-phase
-        # target transaction.  Its verifier may leave the backbone cache ahead
-        # of the visible terminal token while a queued draft is still parked.
-        # Never publish that speculative cache to the exact resident tier:
-        # reconcile the singleton by replaying the committed token ledger into
-        # a fresh standard cache first.  This work is paid at request
-        # completion, off the TTFT-critical next-turn path, and preserves the
-        # lossless target distribution.  If reconciliation fails closed, the
-        # response remains usable but exposes no cache candidate.
-        standard_terminal_exact = False
+        # target transaction.  The terminal response carries the natural MTP
+        # target cache: every committed input token, i.e. all tokens except
+        # the one being emitted (upstream's contract, and the standard
+        # GenerationBatch shape after a park/handoff).  When that cache
+        # already matches the visible ledger it is stamped exact; otherwise a
+        # deferred completion is attached so a scheduler that wants an exact
+        # resident tail (Fusion's ExactResident tier) can feed the final token
+        # through ``omlx_mtp_post_emit`` after emission, without replaying the
+        # whole committed history or charging plain consumers an extra
+        # forward at finish.
         active_state = getattr(gen_batch, "_omlx_mtp_state", None)
-        if active_state is not None:
-            standard_terminal_exact = _generic_mtp_terminal_cache_is_exact(
-                gen_batch
-            )
-            if not standard_terminal_exact:
-                standard_terminal_exact = _reconcile_mtp_to_standard(
-                    gen_batch,
-                    active_state,
-                )
-            if not standard_terminal_exact:
-                logger.warning(
-                    "MTP terminal cache reconciliation failed closed; "
-                    "suppressing resident cache for uid=%s",
-                    getattr(active_state, "uid", "?"),
-                )
-
-        prompt_cache = gen_batch.extract_cache(0) if standard_terminal_exact else None
-        all_tokens = gen_batch.tokens[0] if standard_terminal_exact else None
+        standard_terminal_exact = (
+            active_state is not None and _generic_mtp_terminal_cache_is_exact(gen_batch)
+        )
+        prompt_cache = _extract_terminal_cache(gen_batch)
+        all_tokens = gen_batch.tokens[0]
         response = Response(
             uid=gen_batch.uids[0],
             token=token_id,
             logprobs=logprobs_1d,
             finish_reason=finish_reason,
-            current_state=current_state,
-            match_sequence=match_sequence,
             prompt_cache=prompt_cache,
             all_tokens=all_tokens,
         )
         if standard_terminal_exact:
             response._omlx_mtp_standard_terminal_exact = True
+        elif active_state is not None and isinstance(prompt_cache, list):
+            response._omlx_mtp_terminal_completion = _MtpTerminalCompletion(
+                model=gen_batch.model,
+                uid=gen_batch.uids[0],
+                prompt_cache=prompt_cache,
+                tokens=list(all_tokens),
+            )
         if stats is not None:
             _log_mtp_stats(gen_batch.uids[0], stats, finish_reason)
         # Drop state *before* filter([]) so the patched_filter epilogue
@@ -8093,8 +8971,6 @@ def _emit_response(
             token=token_id,
             logprobs=logprobs_1d,
             finish_reason=None,
-            current_state=current_state,
-            match_sequence=match_sequence,
             prompt_cache=None,
             all_tokens=None,
         )
@@ -8113,6 +8989,12 @@ def _validated_emitted_token(token_id: Any, logprobs_1d: Any) -> int:
     """
 
     value = int(token_id)
+    if logprobs_1d is None:
+        # Rows that did not compute logprobs (mlx-lm compute_logprobs=False)
+        # carry no distribution to index; only the host-side range applies.
+        if value < 0 or value >= 2**31:
+            raise RuntimeError(f"MTP synchronized an invalid token ID: token={value}")
+        return value
     try:
         vocab_size = int(logprobs_1d.shape[-1])
     except (AttributeError, IndexError, TypeError, ValueError) as exc:

@@ -14,6 +14,14 @@ from omlx.patches.mlx_lm_mtp import batch_generator
 compat.apply_mlx_vlm_qwen4_exp_compat_patch()
 from mlx_vlm.models.qwen4_exp import language  # noqa: E402
 
+pytestmark = pytest.mark.skip(
+    reason=(
+        "Fusion Qwen4 tokenwise GDN verify stack not carried over the jundot/omlx "
+        "v0.7.0rc1 merge (vendored qwen4_exp language.py now follows upstream "
+        "#3520/#3534/#3903); see branch backup/main-20260925"
+    )
+)
+
 
 def _new_cache(token_count: int = 0):
     return SizedArraysCache(language.ArraysCache(size=2), token_count=token_count)

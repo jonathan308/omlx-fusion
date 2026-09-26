@@ -83,6 +83,8 @@ class ModelRegistry:
                 owner = weak_ref()
 
                 if owner is not None and owner_id != engine_id:
+                    if getattr(owner, "_closing", False) is True:
+                        raise ModelOwnershipError("Previous owner is still closing")
                     # Resetting only the prior scheduler is not an ownership
                     # transfer: that core still holds the shared model and its
                     # later close() can release resources under the replacement

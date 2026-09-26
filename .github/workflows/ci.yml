@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -44,6 +44,7 @@ jobs:
           # only moves a stale lazy mapping to its next array-evaluating node.
           # The main suite still covers every other test in one process.
           python -m pytest tests/ -m "not slow and not integration" \
+            --durations=50 --junitxml=test-results.xml \
             --ignore=tests/test_cluster_prompt_snapshot_cache.py \
             --ignore=tests/test_gdn_sidecar_quantization.py \
             --ignore=tests/test_prefix_cache_gdn_split.py \
@@ -79,3 +80,11 @@ jobs:
           )
           python -m pytest -q tests/test_cluster_ds4f_tp.py -m "not slow and not integration"
           python -m pytest -q tests/test_embedding.py -m "not slow and not integration"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-results-py${{ matrix.python-version }}
+          path: test-results.xml
+          retention-days: 14

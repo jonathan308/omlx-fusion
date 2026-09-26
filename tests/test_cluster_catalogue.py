@@ -249,9 +249,7 @@ def _node_payload(capacity_gib, node_id="studio"):
 
 
 def test_the_endpoint_needs_somewhere_to_look():
-    response = _client().post(
-        CATALOGUE, json={"nodes": [_node_payload(128)]}
-    )
+    response = _client().post(CATALOGUE, json={"nodes": [_node_payload(128)]})
     assert response.status_code == 400
     assert "model_paths or model_dir" in response.json()["detail"]
 
@@ -433,9 +431,7 @@ def test_prefer_tensor_still_prefers_fewer_nodes_first():
 def test_prefer_tensor_never_offers_tp_to_an_unshardable_model():
     layout = _model(90)
     object.__setattr__(layout, "supports_tensor_parallel", False)
-    fit = assess_model(
-        layout, _nodes(64, 64), model_id="m", prefer_tensor=True
-    )
+    fit = assess_model(layout, _nodes(64, 64), model_id="m", prefer_tensor=True)
     assert fit.fits
     assert fit.strategy == "pipeline"
 
@@ -482,12 +478,9 @@ def test_requested_links_fast(tmp_path):
         )
 
         # Paired over JACCL/Thunderbolt: tensor becomes the recommendation.
-        registry.mark_paired(
-            "peer2", caps={"jaccl": True, "thunderbolt": True}
-        )
+        registry.mark_paired("peer2", caps={"jaccl": True, "thunderbolt": True})
         assert (
-            cluster_routes._requested_links_fast([node(self_id), node("peer2")])
-            is True
+            cluster_routes._requested_links_fast([node(self_id), node("peer2")]) is True
         )
         # One slow peer in a larger pool fails the whole request closed.
         assert (

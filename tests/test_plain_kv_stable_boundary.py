@@ -38,6 +38,18 @@ def _plain_kv(token_count=4, *, heads=2, key_dim=3, value_dim=4):
     return cache
 
 
+def _kv_state(cache):
+    """Logical (keys, values) prefix of a KVCache.
+
+    mlx-lm 0.32's ``KVCache.state`` returns the whole allocated buffer plus
+    the offset; the boundary contract is about the first ``offset`` rows.
+    """
+    return (
+        cache.keys[..., : cache.offset, :],
+        cache.values[..., : cache.offset, :],
+    )
+
+
 def _scheduler(*, slots=2, max_bytes=1 << 30, block_size=4):
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.model = SimpleNamespace()
@@ -74,7 +86,7 @@ def test_plain_kv_provider_copies_only_logical_boundary_and_preserves_source():
     source = [_plain_kv(), _plain_kv(key_dim=5, value_dim=6)]
     source_arrays = [(cache.keys, cache.values) for cache in source]
     source_states = [
-        (mx.array(cache.state[0]), mx.array(cache.state[1])) for cache in source
+        (mx.array(_kv_state(cache)[0]), mx.array(_kv_state(cache)[1])) for cache in source
     ]
     mx.eval(*(array for pair in source_states for array in pair))
 
@@ -105,8 +117,8 @@ def test_plain_kv_provider_copies_only_logical_boundary_and_preserves_source():
         assert original.keys is source_arrays[index][0]
         assert original.values is source_arrays[index][1]
         assert original.offset == 4
-        assert mx.array_equal(original.state[0], source_states[index][0]).item()
-        assert mx.array_equal(original.state[1], source_states[index][1]).item()
+        assert mx.array_equal(_kv_state(original)[0], source_states[index][0]).item()
+        assert mx.array_equal(_kv_state(original)[1], source_states[index][1]).item()
         assert mx.array_equal(clone.keys, source_states[index][0]).item()
         assert mx.array_equal(clone.values, source_states[index][1]).item()
 
@@ -129,19 +141,19 @@ def test_plain_kv_detached_boundary_has_canonical_next_token_kickoff():
     next_values = mx.full((1, 2, 1, 4), 888, dtype=mx.float32)
     clone = detached.cache[0]
     clone.update_and_fetch(
-        mx.concatenate([prefix.state[0][:, :, 8:, :], next_keys], axis=2),
-        mx.concatenate([prefix.state[1][:, :, 8:, :], next_values], axis=2),
+        mx.concatenate([_kv_state(prefix)[0][:, :, 8:, :], next_keys], axis=2),
+        mx.concatenate([_kv_state(prefix)[1][:, :, 8:, :], next_values], axis=2),
     )
 
     canonical = KVCache()
     canonical.update_and_fetch(
-        mx.concatenate([prefix.state[0], next_keys], axis=2),
-        mx.concatenate([prefix.state[1], next_values], axis=2),
+        mx.concatenate([_kv_state(prefix)[0], next_keys], axis=2),
+        mx.concatenate([_kv_state(prefix)[1], next_values], axis=2),
     )
-    mx.eval(clone.state[0], clone.state[1], canonical.state[0], canonical.state[1])
+    mx.eval(_kv_state(clone)[0], _kv_state(clone)[1], _kv_state(canonical)[0], _kv_state(canonical)[1])
     assert clone.offset == canonical.offset == 14
-    assert mx.array_equal(clone.state[0], canonical.state[0]).item()
-    assert mx.array_equal(clone.state[1], canonical.state[1]).item()
+    assert mx.array_equal(_kv_state(clone)[0], _kv_state(canonical)[0]).item()
+    assert mx.array_equal(_kv_state(clone)[1], _kv_state(canonical)[1]).item()
 
 
 def test_plain_kv_whole_graph_preflight_rejects_subclass_before_allocation(

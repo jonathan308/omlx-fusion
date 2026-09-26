@@ -17,7 +17,6 @@ from .language import (
     fuse_hyper_connection_projections,
     fuse_resident_ple_embeddings,
     get_mtp_runtime,
-    hyper_connection_fused_copy_nbytes,
     get_ple_runtime_mode,
 )
 from .vision import VisionModel
@@ -187,7 +186,7 @@ class Model(Qwen3_5Model):
 
         num_experts = int(getattr(self.config.text_config, "num_experts", 0) or 0)
 
-        def stack_experts(prefix):
+        def stack_experts(prefix, expert_count):
             if f"{prefix}.switch_mlp.gate_proj.weight" in weights:
                 return
 
@@ -229,14 +228,17 @@ class Model(Qwen3_5Model):
                             weights.pop(
                                 f"{prefix}.experts.{expert}.{projection}.{suffix}"
                             )
-                            for expert in range(num_experts)
+                            for expert in range(expert_count)
                         ]
                     )
 
         for layer_idx in range(self.config.text_config.num_hidden_layers):
-            stack_experts(f"model.language_model.layers.{layer_idx}.mlp")
+            stack_experts(f"model.language_model.layers.{layer_idx}.mlp", num_experts)
 
         if mtp_enabled:
+            mtp_num_experts = getattr(self.config.text_config, "mtp_num_experts", None)
+            if mtp_num_experts is None:
+                mtp_num_experts = num_experts
             mtp_layer_indices = sorted(
                 {
                     int(key.split(".")[2])
@@ -247,7 +249,7 @@ class Model(Qwen3_5Model):
                 }
             )
             for layer_idx in mtp_layer_indices:
-                stack_experts(f"mtp.layers.{layer_idx}.mlp")
+                stack_experts(f"mtp.layers.{layer_idx}.mlp", mtp_num_experts)
 
         sanitized = {}
         for key, value in weights.items():
@@ -262,14 +264,13 @@ class Model(Qwen3_5Model):
     def load_weights(self, weights, strict=True):
         result = super().load_weights(weights, strict=strict)
         mtp_enabled = get_mtp_runtime().enabled
-        hybrid = fuse_hyper_connection_projections(self)
-        fused_hc_bytes = hyper_connection_fused_copy_nbytes(self)
+        hybrid = 0 if mtp_enabled else fuse_hyper_connection_projections(self)
         fused_ple = fuse_resident_ple_embeddings(self)
         compiled = compile_hyper_connections(self)
         if mtp_enabled:
             logger.info(
-                "Prepared Qwen4-Exp exact HC projections for Lightning MTP: "
-                "scalar hybrid plus strict fused widths 2..6"
+                "Skipped Qwen4-Exp exact hybrid projections while "
+                "Lightning MTP target verification is enabled"
             )
         logger.info(
             "Enabled Qwen4-Exp hyper-connection optimizations: "
@@ -277,13 +278,6 @@ class Model(Qwen3_5Model):
             hybrid,
             compiled,
         )
-        if fused_hc_bytes:
-            logger.info(
-                "Retained canonical Qwen4 HC banks plus bounded verify copies: "
-                "%.1f MiB extra across %d exact HC pairs",
-                fused_hc_bytes / 2**20,
-                hybrid,
-            )
         if fused_ple:
             logger.info(
                 "Fused %d resident Qwen4-Exp PLE table into one packed "

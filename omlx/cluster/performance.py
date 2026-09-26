@@ -283,7 +283,7 @@ class ExecutionSettings:
     # Snapshot the prompt cache to SSD at prefill boundaries so a model whose
     # per-layer state cannot be sliced (rotating window, gated-delta-net) still
     # reuses a long prefix across requests instead of recomputing it.
-    prompt_cache_ssd: bool = False
+    prompt_cache_ssd: bool = True
     prompt_cache_ssd_max_bytes: int = DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
     sampling_rank_only: bool = True
     async_overlap: bool = True

@@ -17,13 +17,14 @@ from __future__ import annotations
 
 import ast
 import re
+from collections import Counter
 from pathlib import Path
 
 import pytest
 
 _REPO = Path(__file__).resolve().parents[1]
 _CLUSTER = _REPO / "omlx" / "cluster"
-_DASHBOARD_JS = (
+_DASHBOARD_SCRIPTS = (
     _REPO / "omlx" / "admin" / "static" / "js" / "dashboard.js",
     _REPO / "omlx" / "admin" / "static" / "js" / "cluster_v2.js",
 )
@@ -32,7 +33,8 @@ _PREFIX = "/admin/api/cluster"
 # Template literals interpolate with ${...}, which may contain calls and nested
 # parens: /deployments/${encodeURIComponent(id)}
 _CLUSTER_URL = re.compile(
-    re.escape(_PREFIX) + r"(?P<path>(?:\$\{[^{}]*(?:\([^)]*\))?[^{}]*\}|[A-Za-z0-9/_\-.])*)"
+    re.escape(_PREFIX)
+    + r"(?P<path>(?:\$\{[^{}]*(?:\([^)]*\))?[^{}]*\}|[A-Za-z0-9/_\-.])*)"
 )
 
 
@@ -50,14 +52,12 @@ def _js_called_paths() -> set[str]:
     """Cluster URLs the dashboard builds, normalised to their route shape."""
 
     called = set()
-    for source in _DASHBOARD_JS:
-        for match in _CLUSTER_URL.finditer(source.read_text()):
+    for script in _DASHBOARD_SCRIPTS:
+        for match in _CLUSTER_URL.finditer(script.read_text()):
             path = match.group("path").split("?")[0]
             # Any interpolated segment stands for a path parameter.
             path = re.sub(
-                r"\$\{[^{}]*(?:\([^)]*\))?[^{}]*\}",
-                "{parameter}",
-                path,
+                r"\$\{[^{}]*(?:\([^)]*\))?[^{}]*\}", "{parameter}", path
             )
             path = path.rstrip("/") if path not in ("", "/") else path
             called.add(_PREFIX + path)
@@ -81,13 +81,33 @@ def test_no_cluster_route_is_unreachable_from_the_dashboard():
     both worth knowing about.
     """
 
+    # These are compatibility/manual operator APIs retained after the v1
+    # dashboard console was removed. Cluster v2 uses discovery/pairing,
+    # autoconfigure, deployment lifecycle, CUDA enrollment, and diagnostics;
+    # scripts and older clients may still use these explicit low-level probes.
     allowed_without_caller: set[str] = {
-        # Cluster v2 runtime endpoints (Module E). Their callers ship with
-        # the wizard UI (Module C): /replan is the one-action
-        # deactivate→re-plan→reload the wizard's plan view drives, and
-        # /backend-selection renders the jaccl-vs-ring decision beside it.
-        "/admin/api/cluster/replan",
         "/admin/api/cluster/backend-selection",
+        "/admin/api/cluster/collective-smoke",
+        "/admin/api/cluster/discover",
+        "/admin/api/cluster/fabric",
+        "/admin/api/cluster/guidance",
+        "/admin/api/cluster/incidents",
+        "/admin/api/cluster/incidents/{parameter}/dismiss",
+        "/admin/api/cluster/link-setup",
+        "/admin/api/cluster/link-status",
+        "/admin/api/cluster/pairing-token",
+        "/admin/api/cluster/peer-health",
+        "/admin/api/cluster/pipeline-smoke",
+        "/admin/api/cluster/plan",
+        "/admin/api/cluster/ssh-key",
+        "/admin/api/cluster/ssh-key/exchange",
+        "/admin/api/cluster/ssh-key/exchange-token",
+        "/admin/api/cluster/ssh-key/generate",
+        "/admin/api/cluster/ssh-key/store-keychain",
+        "/admin/api/cluster/status",
+        "/admin/api/cluster/transports",
+        "/admin/api/cluster/verify-pairing-token",
+        "/admin/api/cluster/worker-smoke",
     }
     unreachable = _registered_routes() - _js_called_paths() - allowed_without_caller
     assert not unreachable, (
@@ -103,7 +123,7 @@ def test_fetch_calls_never_use_a_params_option():
     the suite stayed green.
     """
 
-    source = "\n".join(path.read_text() for path in _DASHBOARD_JS)
+    source = "\n".join(script.read_text() for script in _DASHBOARD_SCRIPTS)
     offenders = []
     for index, line in enumerate(source.splitlines(), start=1):
         if re.search(r"^\s*params:\s*\{", line):
@@ -120,10 +140,13 @@ def test_pairing_token_round_trips():
     from omlx.cluster.discovery import generate_pairing_token, verify_pairing_token
 
     secret = "correct-horse-battery-staple"
-    assert verify_pairing_token(
-        generate_pairing_token(shared_secret=secret),
-        shared_secret=secret,
-    ) is True
+    assert (
+        verify_pairing_token(
+            generate_pairing_token(shared_secret=secret),
+            shared_secret=secret,
+        )
+        is True
+    )
 
 
 def test_pairing_token_rejects_a_tampered_payload():
@@ -251,7 +274,6 @@ def test_no_unreachable_functions_in_the_cluster_package():
         ("identity.py", "reset_configured_identity"),
         ("registry.py", "reset_configured_device_registry"),
         ("pairing.py", "reset_pairing_manager"),
-        # Test hook injecting a PairingManager double into the route module.
         ("pairing_routes.py", "set_pairing_manager_getter"),
         # Settings write path for cluster.json; the admin settings endpoint
         # that calls it lands with the cluster settings UI.
@@ -263,15 +285,16 @@ def test_no_unreachable_functions_in_the_cluster_package():
         ("planner.py", "_tensor_shard_weights"),
     }
 
-    sources = {
-        path: path.read_text() for path in (_REPO / "omlx").rglob("*.py")
-    }
+    name_counts = Counter(
+        name
+        for path in (_REPO / "omlx").rglob("*.py")
+        for name in re.findall(r"\w+", path.read_text())
+    )
 
     uncalled = []
-    for path in sorted(_CLUSTER.glob("*.py")):
+    for path in sorted(_CLUSTER.rglob("*.py")):
         for name in _public_functions(path):
-            pattern = re.compile(rf"\b{re.escape(name)}\b")
-            hits = sum(len(pattern.findall(text)) for text in sources.values())
+            hits = name_counts[name]
             if hits <= 1 and (path.name, name) not in allowed_uncalled:
                 uncalled.append(f"{path.name}:{name}")
 
@@ -285,7 +308,7 @@ def test_every_literal_ssh_and_scp_command_uses_the_shared_policy():
     """One raw subprocess is enough to bring an interactive prompt back."""
 
     offenders = []
-    for path in sorted(_CLUSTER.glob("*.py")):
+    for path in sorted(_CLUSTER.rglob("*.py")):
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if not isinstance(node, ast.List) or not node.elts:
@@ -323,8 +346,8 @@ def test_discovery_does_not_import_the_transport_prober():
             )
 
 
-def test_every_get_route_answers_without_a_server_error():
-    """Smoke every read-only route through the real app.
+def test_every_get_route_answers_without_a_server_error(cluster_home):
+    """Smoke every GET route through the real app.
 
     Not about the payloads — about the wiring. A route that raises on import,
     a missing dependency, or a handler signature FastAPI cannot satisfy shows up
@@ -357,6 +380,11 @@ def test_every_get_route_answers_without_a_server_error():
             assert response.status_code != 500, (
                 f"GET {route.path} returned {response.status_code}: {response.text[:200]}"
             )
+            if route.path == "/admin/api/cluster/ssh-key":
+                key_path = cluster_home / ".ssh/omlx_cluster"
+                assert response.json()["private_key_path"] == str(key_path)
+                assert key_path.is_file()
+                assert key_path.with_suffix(".pub").is_file()
             checked += 1
     assert checked >= 5, "expected to smoke several GET routes"
 
@@ -460,10 +488,13 @@ def test_key_exchange_rejects_a_tampered_token():
     payload["node_id"] = "attacker-mac"
     forged = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
 
-    assert ssh_keys.verify_key_exchange_token(
-        forged,
-        shared_secret="correct-horse-battery-staple",
-    ) is None
+    assert (
+        ssh_keys.verify_key_exchange_token(
+            forged,
+            shared_secret="correct-horse-battery-staple",
+        )
+        is None
+    )
 
 
 def test_key_exchange_rejects_the_wrong_shared_secret():
@@ -478,10 +509,13 @@ def test_key_exchange_rejects_the_wrong_shared_secret():
         shared_secret="correct-horse-battery-staple",
     )
 
-    assert ssh_keys.verify_key_exchange_token(
-        token,
-        shared_secret="a-different-shared-secret",
-    ) is None
+    assert (
+        ssh_keys.verify_key_exchange_token(
+            token,
+            shared_secret="a-different-shared-secret",
+        )
+        is None
+    )
 
 
 def test_key_exchange_rejects_an_authenticated_ssh_option_target():
@@ -519,7 +553,10 @@ def test_key_exchange_rejects_an_authenticated_ssh_option_target():
     ).hexdigest()
     forged = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
 
-    assert ssh_keys.verify_key_exchange_token(
-        forged,
-        shared_secret=secret,
-    ) is None
+    assert (
+        ssh_keys.verify_key_exchange_token(
+            forged,
+            shared_secret=secret,
+        )
+        is None
+    )

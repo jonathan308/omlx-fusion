@@ -26,28 +26,24 @@ def test_cache_transfer_window_is_bounded(monkeypatch, raw, expected):
 
 
 def _fixture_cache():
-    arrays = ArraysCache.from_state(
-        [
-            mx.arange(24, dtype=mx.float32).reshape(1, 3, 8),
-            mx.arange(16, dtype=mx.bfloat16).reshape(1, 2, 8),
-        ],
-        "",
-    )
-    kv = KVCache.from_state(
-        (
-            mx.arange(64, dtype=mx.bfloat16).reshape(1, 2, 4, 8),
-            mx.arange(64, dtype=mx.bfloat16).reshape(1, 2, 4, 8) + 1,
-        ),
-        "",
-    )
-    mx.eval(arrays.state, kv.state)
+    arrays = ArraysCache(2)
+    arrays.cache = [
+        mx.arange(24, dtype=mx.float32).reshape(1, 3, 8),
+        mx.arange(16, dtype=mx.bfloat16).reshape(1, 2, 8),
+    ]
+    kv = KVCache()
+    kv.keys = mx.arange(64, dtype=mx.bfloat16).reshape(1, 2, 4, 8)
+    kv.values = mx.arange(64, dtype=mx.bfloat16).reshape(1, 2, 4, 8) + 1
+    kv.offset = 4
+    mx.eval(arrays.cache, kv.keys, kv.values)
     return [arrays, kv]
 
 
 def _flatten_arrays(value):
     from mlx.utils import tree_flatten
 
-    return [leaf for _key, leaf in tree_flatten(value)]
+    # mlx-lm 0.32 cache ``state`` mixes arrays with scalar/None metadata.
+    return [leaf for _key, leaf in tree_flatten(value) if isinstance(leaf, mx.array)]
 
 
 def test_cache_transfer_round_trip_preserves_classes_metadata_and_arrays():
@@ -64,7 +60,7 @@ def test_cache_transfer_round_trip_preserves_classes_metadata_and_arrays():
     )
 
     assert [type(value) for value in restored] == [ArraysCache, KVCache]
-    assert [value.meta_state for value in restored] == ["", ""]
+    assert len(restored[0].cache) == 2
     assert prepared.nbytes == sum(value.nbytes for value in prepared.arrays)
     left = _flatten_arrays([value.state for value in original])
     right = _flatten_arrays([value.state for value in restored])

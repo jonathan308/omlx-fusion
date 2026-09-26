@@ -25,6 +25,7 @@ from .planner import (
     normalize_memory_guard_tier,
     normalize_node_role,
 )
+from .rdma.stage_plan import StageLink, validate_stage_links
 from .tp_qualifications import TPQualificationProvenance
 
 DistributedBackend = Literal["ring", "jaccl", "jaccl-ring"]
@@ -42,6 +43,7 @@ def distributed_mtp_model_supported(model_type: object) -> bool:
 
     normalized = str(model_type or "").strip().lower()
     return normalized.startswith(_DISTRIBUTED_MTP_MODEL_PREFIXES)
+
 
 # Version 3 adds the signed serving mode and prefill/decode rank ownership.
 # Version 2 adds ``path_map``: an optional per-node absolute model path, so
@@ -63,7 +65,10 @@ _MAX_PLAN_BYTES = 256 * 1024
 
 # Rank-environment defaults carried by the mlx launch hostfile. Each value
 # yields to the coordinator's own environment: an operator who pinned a knob
-# keeps their value, and everyone else gets the tuned default.
+# keeps their value, and everyone else gets the default.
+#
+# Match MLX's disabled fast-sync default: fast fences can deadlock across
+# CPU/GPU streams (https://github.com/ml-explore/mlx/pull/4005).
 #
 # MLX_MAX_OPS_PER_BUFFER / MLX_MAX_MB_PER_BUFFER bound how much work lands in
 # one Metal command buffer. An unbounded buffer overruns the GPU driver's
@@ -79,7 +84,7 @@ _MAX_PLAN_BYTES = 256 * 1024
 # wheel ships compiled defaults; pinning them here keeps the posture explicit
 # and identical across every rank.
 _RANK_ENV_DEFAULTS = (
-    ("MLX_METAL_FAST_SYNCH", "1"),
+    ("MLX_METAL_FAST_SYNCH", "0"),
     ("MLX_MAX_OPS_PER_BUFFER", "16"),
     ("MLX_MAX_MB_PER_BUFFER", "512"),
     # One JACCL communicator remains strictly ordered, but batching eight
@@ -413,6 +418,8 @@ def validate_model_path_map(
         if (
             not path
             or "\x00" in path
+            or "\n" in path
+            or "\r" in path
             or len(path.encode()) > _MAX_MODEL_PATH_BYTES
             or not Path(path).is_absolute()
         ):
@@ -606,6 +613,8 @@ class ClusterDeployment:
     # only the nodes they name; the coordinator path stays the fallback.
     path_map: dict[str, str] = field(default_factory=dict)
     tensor_parallel_qualification: TPQualificationProvenance | None = None
+    # RDMA stage edges for one launch only; never stored or compared.
+    stage_links: tuple[StageLink, ...] = field(default=(), compare=False)
 
     def __post_init__(self) -> None:
         if _NODE_ID.fullmatch(self.deployment_id) is None:
@@ -661,6 +670,9 @@ class ClusterDeployment:
             char not in "0123456789abcdef" for char in self.plan_hash
         ):
             raise ValueError("plan_hash must be a lowercase SHA-256 digest")
+        object.__setattr__(
+            self, "stage_links", validate_stage_links(self.stage_links, len(self.hosts))
+        )
 
         assignments = sorted(self.assignments, key=lambda item: item.rank)
         if [item.rank for item in assignments] != list(range(len(self.hosts))):
@@ -907,6 +919,7 @@ class ClusterDeployment:
             "decode_rank": self.decode_rank,
             "execution": self.execution.to_dict(),
             "path_map": dict(sorted(self.path_map.items())),
+            "stage_links": [link.to_dict() for link in self.stage_links],
         }
         if self.tensor_parallel_qualification is not None:
             worker_payload["tensor_parallel_qualification"] = (
@@ -1026,6 +1039,15 @@ def decode_worker_path_map(encoded: str) -> dict[str, str]:
 
     payload = _decode_worker_payload(encoded)
     return validate_model_path_map(payload.get("path_map"))
+
+
+def decode_worker_stage_links(encoded: str) -> tuple[StageLink, ...]:
+    """Stage edges this launch verified onto RDMA; older contracts carry none."""
+
+    payload = _decode_worker_payload(encoded)
+    return validate_stage_links(
+        payload.get("stage_links"), len(payload.get("assignments", []))
+    )
 
 
 def decode_worker_speculation(encoded: str) -> tuple[bool, int | None]:

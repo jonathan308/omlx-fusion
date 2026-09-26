@@ -158,9 +158,7 @@ def shards_for_stage(
 
     wanted = set(range(start_layer, end_layer))
     return tuple(
-        shard
-        for shard in shards
-        if (shard.layers & wanted) or shard.has_shared_tensors
+        shard for shard in shards if (shard.layers & wanted) or shard.has_shared_tensors
     )
 
 
@@ -311,7 +309,9 @@ def validate_staged_model(
     indexed = _indexed_shards(root)
     shards = indexed if indexed is not None else index_shards(root)
     required = shards_for_stage(shards, start_layer, end_layer)
-    missing = tuple(shard.name for shard in required if not (root / shard.name).is_file())
+    missing = tuple(
+        shard.name for shard in required if not (root / shard.name).is_file()
+    )
     corrupt: list[str] = []
     for shard in required:
         path = root / shard.name
@@ -351,10 +351,7 @@ def model_staging_inventory(model_path: str | Path) -> dict[str, Any]:
             }
             for shard in shards
         ],
-        "sidecars": {
-            name: (root / name).stat().st_size
-            for name in sidecars
-        },
+        "sidecars": {name: (root / name).stat().st_size for name in sidecars},
     }
 
 
@@ -489,6 +486,7 @@ def stage_manifest(
     *,
     source_host: str = "127.0.0.1",
     source_python_executable: str | None = None,
+    path_map: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """What must move before this plan can run, per node.
 
@@ -534,13 +532,18 @@ def stage_manifest(
         if not ssh_target:
             continue
         if is_local_host(ssh_target):
+            destination = Path(
+                (path_map or {}).get(assignment.node_id, remote_dir)
+            ).expanduser()
             present_by_node[assignment.node_id] = {
                 path.name: path.stat().st_size
-                for path in Path(remote_dir).iterdir()
+                for path in (destination.iterdir() if destination.is_dir() else ())
                 if path.is_file()
             }
         else:
-            peer_dir = remote_model_dir(ssh_target, portable)
+            peer_dir = remote_model_dir(
+                ssh_target, (path_map or {}).get(assignment.node_id, portable)
+            )
             present_by_node[assignment.node_id] = remote_file_sizes(
                 ssh_target, peer_dir
             )
@@ -570,9 +573,7 @@ def stage_manifest(
     for plan in plans:
         present = present_by_node.get(plan.node_id, {})
         missing_sidecars = tuple(
-            name
-            for name, size in sidecar_sizes.items()
-            if present.get(name) != size
+            name for name, size in sidecar_sizes.items() if present.get(name) != size
         )
         missing_sidecar_bytes = sum(sidecar_sizes[name] for name in missing_sidecars)
         total_missing_bytes += plan.missing_bytes + missing_sidecar_bytes
@@ -587,9 +588,7 @@ def stage_manifest(
         )
     return {
         "sidecars": list(sidecars),
-        "source_host": (
-            "127.0.0.1" if source_is_local else source_host
-        ),
+        "source_host": ("127.0.0.1" if source_is_local else source_host),
         "nodes": nodes,
         "total_missing_bytes": total_missing_bytes,
         "ready": all(node["ready"] for node in nodes),
@@ -612,9 +611,7 @@ _REMOTE_INSTALL_SNIPPET = (
     "\nos.replace(temporary,final)"
 )
 _REMOTE_DISCARD_SNIPPET = (
-    "import os,sys;"
-    "\ntry: os.unlink(sys.argv[1])"
-    "\nexcept FileNotFoundError: pass"
+    "import os,sys;\ntry: os.unlink(sys.argv[1])\nexcept FileNotFoundError: pass"
 )
 
 
@@ -652,8 +649,7 @@ def _finish_remote_staged_file(
     )
     if result.returncode != 0:
         raise RuntimeError(
-            f"could not install staged file on {host}: "
-            f"{result.stderr.strip()[:200]}"
+            f"could not install staged file on {host}: {result.stderr.strip()[:200]}"
         )
 
 
@@ -749,9 +745,7 @@ def scp_push(
         f"{str(Path(destination_dir).expanduser()).rstrip('/')}/"
         f"{_staging_partial_name()}"
     )
-    final_path = (
-        f"{str(Path(destination_dir).expanduser()).rstrip('/')}/{filename}"
-    )
+    final_path = f"{str(Path(destination_dir).expanduser()).rstrip('/')}/{filename}"
     installed = False
     try:
         result = subprocess.run(
@@ -790,11 +784,7 @@ def _local_file_sizes(model_dir: str | Path) -> dict[str, int]:
     root = Path(model_dir).expanduser()
     if not root.is_dir():
         return {}
-    return {
-        path.name: path.stat().st_size
-        for path in root.iterdir()
-        if path.is_file()
-    }
+    return {path.name: path.stat().st_size for path in root.iterdir() if path.is_file()}
 
 
 def scp_copy(
@@ -877,9 +867,7 @@ def scp_copy(
                 f"could not create model directory on {destination_host}: "
                 f"{mkdir.stderr.strip()[:200]}"
             )
-        temporary_path = (
-            f"{destination_dir.rstrip('/')}/{_staging_partial_name()}"
-        )
+        temporary_path = f"{destination_dir.rstrip('/')}/{_staging_partial_name()}"
         final_path = f"{destination_dir.rstrip('/')}/{filename}"
         installed = False
         try:
@@ -951,9 +939,7 @@ def stage_files_from_source(
     source_dir = (
         str(Path(model_path).expanduser())
         if is_local_host(source_host)
-        else remote_model_dir(
-            source_host, home_relative_model_path(str(model_path))
-        )
+        else remote_model_dir(source_host, home_relative_model_path(str(model_path)))
     )
     destination_dir = destination_dir or source_dir
     expected = dict(expected_sizes)
@@ -968,9 +954,7 @@ def stage_files_from_source(
     ):
         raise RuntimeError("staging source returned an unsafe file inventory")
     if is_local_host(source_host) and not is_local_host(destination_host):
-        common = tuple(
-            name for name in expected if name not in set(plan.required)
-        )
+        common = tuple(name for name in expected if name not in set(plan.required))
         return stage_remote_files(
             plan,
             model_path=model_path,

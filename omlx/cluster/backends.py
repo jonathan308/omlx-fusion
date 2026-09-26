@@ -22,8 +22,9 @@ machinery is backend-conditional.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -37,9 +38,7 @@ class MemberFabric:
     def __post_init__(self) -> None:
         if not self.node_id:
             raise ValueError("member node_id is required")
-        object.__setattr__(
-            self, "rdma_devices", tuple(sorted(set(self.rdma_devices)))
-        )
+        object.__setattr__(self, "rdma_devices", tuple(sorted(set(self.rdma_devices))))
 
     @property
     def jaccl_ready(self) -> bool:
@@ -88,17 +87,12 @@ def select_cluster_backend(members: Iterable[MemberFabric]) -> BackendSelection:
     if len(set(node_ids)) != len(node_ids):
         raise ValueError("cluster member node IDs must be unique")
 
-    blockers = tuple(
-        member.node_id
-        for member in members
-        if not member.jaccl_ready
-    )
+    blockers = tuple(member.node_id for member in members if not member.jaccl_ready)
     if not blockers:
         return BackendSelection(
             backend="jaccl",
             reason=(
-                f"rdma_ctl is enabled with RDMA devices on all "
-                f"{len(members)} members"
+                f"rdma_ctl is enabled with RDMA devices on all {len(members)} members"
             ),
             members=members,
         )
