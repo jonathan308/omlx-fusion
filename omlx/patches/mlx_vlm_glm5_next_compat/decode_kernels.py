@@ -1,0 +1,1555 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Exact fused decode/verify kernels for GLM-5.3-Flash (glm5_next).
+
+Single-token decode and short verify blocks (L <= 8) are dominated by
+thousands of tiny dependent dispatches, which cost both GPU time and host
+encode time. The kernels here fuse chains of them while reproducing the
+stock MLX arithmetic bit for bit:
+
+* hyper-connections: ``hc_mix`` (fp32 RMS + mix GEMV), ``hc_expand_one``
+  (the one-token NAX relaxed-precision comb product + epilogue);
+* MoE: ``moe_router`` (logits GEMV + sigmoid/bias, top-k select with the
+  stable-sort tie order), ``moe_gate_up_swiglu`` and ``moe_down_combine``
+  (routed + shared experts, clamped SwiGLU, routing-weighted sum);
+* KDA linear attention: ``kda_decode_step`` (short conv, SiLU, l2norm,
+  gate projections, vector-gated delta rule, RMSNormGated);
+* DSA indexer: ``dsa_decode_scores`` and ``dsa_expand_topk``.
+
+Exactness rules: every reduction replays the order of the MLX kernel it
+replaces (qmv/qmv_quad lane mapping, gemv shuffle ladders, row_reduce
+orders, Steel/NAX MMA fragments); every intermediate is rounded where the
+reference materializes it; and a product is never contracted into an add
+that consumed it in a different reference kernel (separate statements or
+``volatile``). ``tests/test_glm5_next_decode_kernels.py`` checks bitwise
+equality against the reference op graphs, per kernel and end to end.
+"""
+
+from __future__ import annotations
+
+import os
+import platform
+import re
+from collections import Counter
+from functools import lru_cache
+from typing import Optional
+
+import mlx.core as mx
+
+# Successful fused dispatches by kernel family (graph-build time counts; used
+# by tests and profilers to confirm the fused paths engage).
+STATS: Counter = Counter()
+
+_QMV_HEADER = r"""
+#include <metal_simdgroup>
+#include <metal_stdlib>
+using namespace metal;
+
+template <int bits>
+constexpr int glm_pack_factor() {
+  return (bits == 3 || bits == 5) ? 8 : (bits == 6 ? 4 : 32 / bits);
+}
+
+template <int bits>
+constexpr int glm_bytes_per_pack() {
+  return ((bits & (bits - 1)) == 0) ? 4 : (bits == 5 ? 5 : 3);
+}
+
+// Verbatim copy of MLX quantized.h load_vector (U = float).
+template <typename T, int values_per_thread, int bits>
+inline float glm_load_vector(const device T* x, thread float* x_thread) {
+  float sum = 0;
+  if (bits == 4) {
+    for (int i = 0; i < values_per_thread; i += 4) {
+      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      x_thread[i] = x[i];
+      x_thread[i + 1] = x[i + 1] / 16.0f;
+      x_thread[i + 2] = x[i + 2] / 256.0f;
+      x_thread[i + 3] = x[i + 3] / 4096.0f;
+    }
+  } else if (bits == 5) {
+    for (int i = 0; i < values_per_thread; i += 8) {
+      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
+          x[i + 6] + x[i + 7];
+      x_thread[i] = x[i];
+      x_thread[i + 1] = x[i + 1] / 32.0f;
+      x_thread[i + 2] = x[i + 2] / 4.0f;
+      x_thread[i + 3] = x[i + 3] / 128.0f;
+      x_thread[i + 4] = x[i + 4] / 16.0f;
+      x_thread[i + 5] = x[i + 5] / 2.0f;
+      x_thread[i + 6] = x[i + 6] / 64.0f;
+      x_thread[i + 7] = x[i + 7] / 8.0f;
+    }
+  } else if (bits == 6) {
+    for (int i = 0; i < values_per_thread; i += 4) {
+      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      x_thread[i] = x[i];
+      x_thread[i + 1] = x[i + 1] / 64.0f;
+      x_thread[i + 2] = x[i + 2] / 16.0f;
+      x_thread[i + 3] = x[i + 3] / 4.0f;
+    }
+  } else if (bits == 8) {
+    for (int i = 0; i < values_per_thread; i++) {
+      sum += x[i];
+      x_thread[i] = x[i];
+    }
+  }
+  return sum;
+}
+
+// Verbatim copy of MLX quantized.h qdot (U = float).
+template <int values_per_thread, int bits>
+inline float glm_qdot(
+    const device uint8_t* w,
+    const thread float* x_thread,
+    float scale,
+    float bias,
+    float sum) {
+  float accum = 0;
+  if (bits == 4) {
+    const device uint16_t* ws = (const device uint16_t*)w;
+    for (int i = 0; i < (values_per_thread / 4); i++) {
+      accum +=
+          (x_thread[4 * i] * (ws[i] & 0x000f) +
+           x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
+           x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
+           x_thread[4 * i + 3] * (ws[i] & 0xf000));
+    }
+  } else if (bits == 5) {
+    for (int i = 0; i < (values_per_thread / 8); i++) {
+      x_thread += 8 * i;
+      w += 5 * i;
+      accum += (w[0] & 0x1f) * x_thread[0];
+      accum += (w[0] & 0xe0) * x_thread[1];
+      accum += (w[1] & 0x3) * (x_thread[1] * 256.0f);
+      accum += (w[1] & 0x7c) * x_thread[2];
+      accum += (w[1] & 0x80) * x_thread[3];
+      accum += (w[2] & 0xf) * (x_thread[3] * 256.0f);
+      accum += (w[2] & 0xf0) * x_thread[4];
+      accum += (w[3] & 0x1) * (x_thread[4] * 256.0f);
+      accum += (w[3] & 0x3e) * x_thread[5];
+      accum += (w[3] & 0xc0) * x_thread[6];
+      accum += (w[4] & 0x7) * (x_thread[6] * 256.0f);
+      accum += (w[4] & 0xf8) * x_thread[7];
+    }
+  } else if (bits == 6) {
+    for (int i = 0; i < (values_per_thread / 4); i++) {
+      x_thread += 4 * i;
+      w += 3 * i;
+      accum += (w[0] & 0x3f) * x_thread[0];
+      accum += (w[0] & 0xc0) * x_thread[1];
+      accum += (w[1] & 0x0f) * (x_thread[1] * 256.0f);
+      accum += (w[1] & 0xf0) * x_thread[2];
+      accum += (w[2] & 0x03) * (x_thread[2] * 256.0f);
+      accum += (w[2] & 0xfc) * x_thread[3];
+    }
+  } else if (bits == 8) {
+    for (int i = 0; i < values_per_thread; i++) {
+      accum += x_thread[i] * w[i];
+    }
+  }
+  return scale * accum + sum * bias;
+}
+
+// qmv_fast_impl for RPS consecutive rows of one [N, K] affine matrix
+// (row pointers already offset to the first row), one simdgroup.  Leaves the
+// per-lane partial sums in `result`; the caller simd_sums them.
+template <typename T, int K, int group_size, int bits, int RPS>
+inline void glm_qmv_rows(
+    const device uint8_t* ws,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    uint simd_lid,
+    thread float* result) {
+  constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+  constexpr int pack_factor = glm_pack_factor<bits>();
+  constexpr int bytes_per_pack = glm_bytes_per_pack<bits>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * 32;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+  constexpr int in_vec_size_w = K * bytes_per_pack / pack_factor;
+  constexpr int in_vec_size_g = K / group_size;
+
+  thread float x_thread[values_per_thread];
+  ws += simd_lid * packs_per_thread * bytes_per_pack;
+  scales += simd_lid / scale_step_per_thread;
+  biases += simd_lid / scale_step_per_thread;
+  x += simd_lid * values_per_thread;
+
+  for (int k = 0; k < K; k += block_size) {
+    float sum = glm_load_vector<T, values_per_thread, bits>(x, x_thread);
+    for (int row = 0; row < RPS; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
+      float s = sl[0];
+      float b = bl[0];
+      result[row] += glm_qdot<values_per_thread, bits>(wl, x_thread, s, b, sum);
+    }
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    x += block_size;
+  }
+}
+
+// Same expressions as MLX's Sigmoid / Minimum / Maximum functors.
+template <typename T>
+inline T glm_sigmoid(T x) {
+  auto y = 1 / (1 + metal::exp(metal::abs(x)));
+  return (x < 0) ? y : 1 - y;
+}
+template <typename T>
+inline T glm_minimum(T x, T y) {
+  if (metal::isnan(x)) {
+    return x;
+  }
+  return x < y ? x : y;
+}
+template <typename T>
+inline T glm_maximum(T x, T y) {
+  if (metal::isnan(x)) {
+    return x;
+  }
+  return x > y ? x : y;
+}
+
+// Glm5NextClampedSwiGLU / Glm5NextMLP epilogue on bfloat16 projections:
+//   silu(minimum(gate, limit)) * minimum(maximum(up, -limit), limit)
+template <typename T>
+inline T glm_clamped_swiglu(T gate, T up, T limit, T neg_limit) {
+  T g = glm_minimum(gate, limit);
+  T s = g * glm_sigmoid(g);
+  T u = glm_minimum(glm_maximum(up, neg_limit), limit);
+  return s * u;
+}
+"""
+
+
+# Fused routed-expert (+ optional shared-expert) gate/up projection with the
+# clamped SwiGLU epilogue.  One threadgroup z-slice per (token, route); route
+# TOPK (when HAS_SHARED) is the shared expert.
+_GATE_UP_SOURCE = r"""
+  const uint simd_lid = thread_index_in_simdgroup;
+  const uint simd_gid = simdgroup_index_in_threadgroup;
+  const int tile = int(threadgroup_position_in_grid.y);
+  const int z = int(threadgroup_position_in_grid.z);
+  constexpr int RT = TOPK + HAS_SHARED;
+  const int token = z / RT;
+  const int r = z - token * RT;
+  const int out_row = (tile * NSG + int(simd_gid)) * RPS;
+  const T lim = T(limit[0]);
+  const T neg_lim = T(-limit[0]);
+  const device T* xr = x + token * K;
+
+  float g_res[RPS] = {0};
+  float u_res[RPS] = {0};
+  if (r < TOPK) {
+    const int expert = int(indices[token * TOPK + r]);
+    constexpr int WB = K * RBITS / 8;   // bytes per weight row
+    constexpr int G = K / RGS;          // groups per row
+    const size_t row0 = size_t(expert) * N + out_row;
+    glm_qmv_rows<T, K, RGS, RBITS, RPS>(
+        (const device uint8_t*)gate_w + row0 * WB, gate_s + row0 * G,
+        gate_b + row0 * G, xr, simd_lid, g_res);
+    glm_qmv_rows<T, K, RGS, RBITS, RPS>(
+        (const device uint8_t*)up_w + row0 * WB, up_s + row0 * G,
+        up_b + row0 * G, xr, simd_lid, u_res);
+  } else {
+#if HAS_SHARED
+    constexpr int WB = K * SBITS / 8;
+    constexpr int G = K / SGS;
+    const size_t row0 = size_t(out_row);
+    glm_qmv_rows<T, K, SGS, SBITS, RPS>(
+        (const device uint8_t*)sh_gate_w + row0 * WB, sh_gate_s + row0 * G,
+        sh_gate_b + row0 * G, xr, simd_lid, g_res);
+    glm_qmv_rows<T, K, SGS, SBITS, RPS>(
+        (const device uint8_t*)sh_up_w + row0 * WB, sh_up_s + row0 * G,
+        sh_up_b + row0 * G, xr, simd_lid, u_res);
+#endif
+  }
+  device T* o = out + size_t(z) * N + out_row;
+  for (int row = 0; row < RPS; row++) {
+    float gv = simd_sum(g_res[row]);
+    float uv = simd_sum(u_res[row]);
+    if (simd_lid == 0) {
+      o[row] = glm_clamped_swiglu<T>(static_cast<T>(gv), static_cast<T>(uv), lim, neg_lim);
+    }
+  }
+"""
+
+
+# Fused routed down projection + routing-weighted sum (+ shared expert down
+# projection and residual-free add), reproducing
+#   y = (down(act) * scores[..., None]).sum(-2).astype(T) + shared_down(act_s)
+_DOWN_SOURCE = r"""
+  const uint simd_lid = thread_index_in_simdgroup;
+  const uint simd_gid = simdgroup_index_in_threadgroup;
+  const int tile = int(threadgroup_position_in_grid.y);
+  const int token = int(threadgroup_position_in_grid.z);
+  constexpr int RT = TOPK + HAS_SHARED;
+  const int out_row = (tile * NSG + int(simd_gid)) * RPS;
+
+  float acc[RPS] = {0};
+  constexpr int WB = K * RBITS / 8;
+  constexpr int G = K / RGS;
+  for (int r = 0; r < TOPK; r++) {
+    const int expert = int(indices[token * TOPK + r]);
+    const size_t row0 = size_t(expert) * N + out_row;
+    float res[RPS] = {0};
+    glm_qmv_rows<T, K, RGS, RBITS, RPS>(
+        (const device uint8_t*)down_w + row0 * WB, down_s + row0 * G,
+        down_b + row0 * G, act + (size_t(token) * RT + r) * K, simd_lid, res);
+    const float score = scores[token * TOPK + r];
+    for (int row = 0; row < RPS; row++) {
+      float v = simd_sum(res[row]);
+      // The reference rounds the fp32 product in its own Multiply kernel
+      // before the Sum; keep the compiler from contracting it into an FMA.
+      volatile float weighted = static_cast<float>(static_cast<T>(v)) * score;
+      acc[row] += weighted;
+    }
+  }
+#if HAS_SHARED
+  float sres[RPS] = {0};
+  {
+    constexpr int SWB = K * SBITS / 8;
+    constexpr int SG = K / SGS;
+    const size_t row0 = size_t(out_row);
+    glm_qmv_rows<T, K, SGS, SBITS, RPS>(
+        (const device uint8_t*)sh_down_w + row0 * SWB, sh_down_s + row0 * SG,
+        sh_down_b + row0 * SG, act + (size_t(token) * RT + TOPK) * K,
+        simd_lid, sres);
+  }
+#endif
+  device T* o = out + size_t(token) * N + out_row;
+  for (int row = 0; row < RPS; row++) {
+#if HAS_SHARED
+    float sv = simd_sum(sres[row]);
+#endif
+    if (simd_lid == 0) {
+#if HAS_SHARED
+      o[row] = static_cast<T>(acc[row]) + static_cast<T>(sv);
+#elif ADD_SHARED_Y
+      o[row] = static_cast<T>(acc[row]) + shared_y[size_t(token) * N + out_row + row];
+#else
+      o[row] = static_cast<T>(acc[row]);
+#endif
+    }
+  }
+"""
+
+
+def _source(body: str, **defines) -> str:
+    lines = [f"#define {k} {int(v)}" for k, v in defines.items()]
+    undef = [f"#undef {k}" for k in defines]
+    return "\n".join(lines) + "\n" + body + "\n" + "\n".join(undef) + "\n"
+
+
+@lru_cache(maxsize=None)
+def _gate_up_kernel(has_shared: bool):
+    inputs = ["x", "indices", "limit", "gate_w", "gate_s", "gate_b", "up_w", "up_s", "up_b"]
+    if has_shared:
+        inputs += ["sh_gate_w", "sh_gate_s", "sh_gate_b", "sh_up_w", "sh_up_s", "sh_up_b"]
+    return mx.fast.metal_kernel(
+        name=f"glm5_moe_gate_up_swiglu{'_shared' if has_shared else ''}",
+        input_names=inputs,
+        output_names=["out"],
+        header=_QMV_HEADER,
+        source=_source(_GATE_UP_SOURCE, HAS_SHARED=int(has_shared)),
+    )
+
+
+@lru_cache(maxsize=None)
+def _down_kernel(has_shared: bool, add_shared_y: bool):
+    inputs = ["act", "indices", "scores", "down_w", "down_s", "down_b"]
+    if has_shared:
+        inputs += ["sh_down_w", "sh_down_s", "sh_down_b"]
+    elif add_shared_y:
+        inputs += ["shared_y"]
+    suffix = "_shared" if has_shared else ("_add" if add_shared_y else "")
+    return mx.fast.metal_kernel(
+        name=f"glm5_moe_down_combine{suffix}",
+        input_names=inputs,
+        output_names=["out"],
+        header=_QMV_HEADER,
+        source=_source(
+            _DOWN_SOURCE,
+            HAS_SHARED=int(has_shared),
+            ADD_SHARED_Y=int(add_shared_y and not has_shared),
+        ),
+    )
+
+
+def _qmv_fast_ok(bits: int, group_size: int, n: int, k: int) -> bool:
+    """Shapes on which MLX routes a one-token product to qmv_fast."""
+    if bits not in (4, 5, 6, 8) or group_size not in (32, 64, 128):
+        return False
+    pack_factor = 8 if bits == 5 else (4 if bits == 6 else 32 // bits)
+    values_per_thread = pack_factor * 2
+    if group_size % values_per_thread:
+        return False
+    return n % 8 == 0 and k % (values_per_thread * 32) == 0
+
+
+def _affine_parts(layer):
+    """(weight, scales, biases, bits, group_size) of an affine quantized layer."""
+    if getattr(layer, "mode", "affine") != "affine":
+        return None
+    biases = layer.get("biases") if hasattr(layer, "get") else getattr(layer, "biases", None)
+    if biases is None or "bias" in layer:
+        return None
+    return layer["weight"], layer["scales"], biases, int(layer.bits), int(layer.group_size)
+
+
+def moe_gate_up_swiglu(
+    x: mx.array,
+    indices: mx.array,
+    limit: float,
+    routed_gate,
+    routed_up,
+    shared_gate=None,
+    shared_up=None,
+    *,
+    rps: int = 4,
+    nsg: int = 2,
+) -> Optional[mx.array]:
+    """Clamped-SwiGLU activations for every (token, routed expert[, shared]).
+
+    ``x`` is [T, K] (one row per token), ``indices`` [T, TOPK].  Returns
+    [T, TOPK (+1), N] in ``x.dtype`` or None when the shapes are not covered.
+    """
+    parts = [_affine_parts(m) for m in (routed_gate, routed_up)]
+    if any(p is None for p in parts) or x.ndim != 2 or indices.ndim != 2:
+        return None
+    (gw, gs, gb, rbits, rgs), (uw, us, ub, ubits, ugs) = parts
+    if (rbits, rgs) != (ubits, ugs) or gw.shape != uw.shape or gw.ndim != 3:
+        return None
+    T, K = x.shape
+    E, N, _ = gw.shape
+    topk = indices.shape[1]
+    if x.dtype not in (mx.bfloat16, mx.float16) or gs.dtype != x.dtype or us.dtype != x.dtype:
+        return None
+    if not _qmv_fast_ok(rbits, rgs, N, K) or N % (rps * nsg):
+        return None
+    has_shared = shared_gate is not None
+    inputs = [x, indices, mx.array([limit], dtype=mx.float32), gw, gs, gb, uw, us, ub]
+    template = [
+        ("T", x.dtype), ("K", K), ("N", N), ("TOPK", topk), ("RBITS", rbits),
+        ("RGS", rgs), ("RPS", rps), ("NSG", nsg),
+    ]
+    if has_shared:
+        sparts = [_affine_parts(m) for m in (shared_gate, shared_up)]
+        if any(p is None for p in sparts):
+            return None
+        (sgw, sgs, sgb, sbits, sgsz), (suw, sus, sub, subits, susz) = sparts
+        if (sbits, sgsz) != (subits, susz) or sgw.shape[0] != N or suw.shape[0] != N:
+            return None
+        if sgs.dtype != x.dtype or sus.dtype != x.dtype or not _qmv_fast_ok(sbits, sgsz, N, K):
+            return None
+        inputs += [sgw, sgs, sgb, suw, sus, sub]
+        template += [("SBITS", sbits), ("SGS", sgsz)]
+    rt = topk + int(has_shared)
+    kernel = _gate_up_kernel(has_shared)
+    STATS["moe_gate_up"] += 1
+    return kernel(
+        inputs=inputs,
+        template=template,
+        grid=(32, (N // (rps * nsg)) * nsg, T * rt),
+        threadgroup=(32, nsg, 1),
+        output_shapes=[(T, rt, N)],
+        output_dtypes=[x.dtype],
+    )[0]
+
+
+def moe_down_combine(
+    act: mx.array,
+    indices: mx.array,
+    scores: mx.array,
+    routed_down,
+    shared_down=None,
+    shared_y: Optional[mx.array] = None,
+    *,
+    rps: int = 4,
+    nsg: int = 2,
+) -> Optional[mx.array]:
+    """Routed down projections combined with the routing weights (+ shared).
+
+    ``act`` is [T, TOPK (+1), K] from :func:`moe_gate_up_swiglu`, ``scores``
+    [T, TOPK] float32.  The shared expert is either projected here from the
+    last activation slot (``shared_down``) or added from a precomputed
+    ``shared_y`` [T, N].  Returns [T, N] in ``act.dtype``.
+    """
+    p = _affine_parts(routed_down)
+    if p is None or act.ndim != 3 or scores.dtype != mx.float32:
+        return None
+    dw, ds, db, rbits, rgs = p
+    T, rt, K = act.shape
+    E, N, _ = dw.shape
+    topk = indices.shape[1]
+    has_shared = shared_down is not None
+    if rt != topk + int(has_shared) or ds.dtype != act.dtype:
+        return None
+    if not _qmv_fast_ok(rbits, rgs, N, K) or N % (rps * nsg):
+        return None
+    inputs = [act, indices, scores, dw, ds, db]
+    template = [
+        ("T", act.dtype), ("K", K), ("N", N), ("TOPK", topk), ("RBITS", rbits),
+        ("RGS", rgs), ("RPS", rps), ("NSG", nsg),
+    ]
+    if has_shared:
+        sp = _affine_parts(shared_down)
+        if sp is None:
+            return None
+        sdw, sds, sdb, sbits, sgsz = sp
+        if sdw.shape[0] != N or sds.dtype != act.dtype or not _qmv_fast_ok(sbits, sgsz, N, K):
+            return None
+        inputs += [sdw, sds, sdb]
+        template += [("SBITS", sbits), ("SGS", sgsz)]
+    elif shared_y is not None:
+        if shared_y.shape != (T, N) or shared_y.dtype != act.dtype:
+            return None
+        inputs.append(shared_y)
+    kernel = _down_kernel(has_shared, shared_y is not None)
+    STATS["moe_down"] += 1
+    return kernel(
+        inputs=inputs,
+        template=template,
+        grid=(32, (N // (rps * nsg)) * nsg, T),
+        threadgroup=(32, nsg, 1),
+        output_shapes=[(T, N)],
+        output_dtypes=[act.dtype],
+    )[0]
+
+
+# ---------------------------------------------------------------------------
+# Hyper-connection mix: x.astype(f32) -> rms_norm (no weight) -> @ fn.T
+# ---------------------------------------------------------------------------
+#
+# Reproduces MLX's ``rms_looped`` (1024 threads, 4 reads per thread) for the
+# inverse RMS and the non-transposed ``gemv`` kernel that MLX selects for a
+# [1, HC*D] x [HC*D, MIX] product with MIX < 4096 and K >= 16 * MIX
+# (BM=1, BN=8, SM=1, SN=32, TN=4): every output row is reduced by eight
+# simdgroups, each lane accumulating 4 contiguous products per 1024-wide K
+# block, a shuffle-down ladder inside the simdgroup and a sequential sum over
+# the eight simdgroups.  Each threadgroup recomputes the (cheap) RMS and
+# owns ROWS_PER_TG output rows, so the product runs on many more cores than
+# MLX's 4-rows-per-threadgroup gemv.
+_HC_MIX_SOURCE = r"""
+  const uint lid = thread_position_in_threadgroup.x;
+  const uint simd_lid = thread_index_in_simdgroup;
+  const uint simd_gid = simdgroup_index_in_threadgroup;
+  const int tok = int(threadgroup_position_in_grid.y);
+  const int tile = int(threadgroup_position_in_grid.x);
+  constexpr int KSZ = HCD;           // flattened HC * D
+  const device T* xr = x + size_t(tok) * KSZ;
+
+  // --- rms_looped (lsize = 1024, N_READS = 4) ---
+  threadgroup float local_inv_mean[1];
+  threadgroup float local_sums[32];
+  float acc = 0;
+  for (uint r = 0; r < uint(KSZ); r += 1024 * 4) {
+    for (int i = 0; i < 4; i++) {
+      float xi = static_cast<float>(xr[r + lid * 4 + i]);
+      acc += xi * xi;
+    }
+  }
+  acc = simd_sum(acc);
+  if (simd_gid == 0) {
+    local_sums[simd_lid] = 0;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_lid == 0) {
+    local_sums[simd_gid] = acc;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    acc = simd_sum(local_sums[simd_lid]);
+    if (simd_lid == 0) {
+      local_inv_mean[0] = metal::precise::rsqrt(acc / KSZ + eps[0]);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = local_inv_mean[0];
+
+  // --- gemv rows: 8 simdgroups per row, 4 row slots per threadgroup ---
+  const int slot = int(simd_gid) / 8;
+  const int sgN = int(simd_gid) % 8;
+  threadgroup float partial[4][8];
+  for (int rr = 0; rr < ROWS_PER_TG; rr += 4) {
+    const int row = tile * ROWS_PER_TG + rr + slot;
+    float result = 0;
+    if (rr + slot < ROWS_PER_TG && row < MIX) {
+      const device float* mrow = fn + size_t(row) * KSZ;
+      int bn = (32 * sgN + int(simd_lid)) * 4;
+      for (int i = 0; i < KSZ / 1024; ++i) {
+        float v_coeff[4];
+        float inter[4];
+        for (int tn = 0; tn < 4; tn++) {
+          v_coeff[tn] = static_cast<float>(xr[bn + tn]) * inv;
+        }
+        for (int tn = 0; tn < 4; tn++) {
+          inter[tn] = mrow[bn + tn];
+        }
+        for (int tn = 0; tn < 4; tn++) {
+          result += inter[tn] * v_coeff[tn];
+        }
+        bn += 1024;
+      }
+      for (ushort sn = 16; sn >= 1; sn >>= 1) {
+        result += simd_shuffle_down(result, sn);
+      }
+    }
+    if (simd_lid == 0) {
+      partial[slot][sgN] = result;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgN == 0 && simd_lid == 0 && rr + slot < ROWS_PER_TG && row < MIX) {
+      float total = partial[slot][0];
+      for (int s = 1; s < 8; s++) {
+        total += partial[slot][s];
+      }
+      mixes[size_t(tok) * MIX + row] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _hc_mix_kernel():
+    return mx.fast.metal_kernel(
+        name="glm5_hc_mix_rms_gemv",
+        input_names=["x", "fn", "eps"],
+        output_names=["mixes"],
+        source=_HC_MIX_SOURCE,
+    )
+
+
+def hc_mix(x: mx.array, fn: mx.array, eps: float, *, rows_per_tg: int = 4) -> Optional[mx.array]:
+    """``(rms_norm(x.astype(f32).flatten(-2)) @ fn.T)`` per token, M=1 exact.
+
+    ``x`` is [B, L, HC, D] bf16/fp16, ``fn`` [MIX, HC*D] float32.  Returns
+    [B, L, MIX] float32 or None when the shape is outside the replicated
+    kernel configuration.
+    """
+    if x.ndim != 4 or fn.ndim != 2 or fn.dtype != mx.float32:
+        return None
+    B, L, hc, d = x.shape
+    K = hc * d
+    mix = fn.shape[0]
+    if fn.shape[1] != K or K % 4096 or mix >= 4096 or K < 16 * mix:
+        return None
+    if x.dtype not in (mx.bfloat16, mx.float16, mx.float32):
+        return None
+    tiles = (mix + rows_per_tg - 1) // rows_per_tg
+    STATS["hc_mix"] += 1
+    out = _hc_mix_kernel()(
+        inputs=[x, fn, mx.array([eps], dtype=mx.float32)],
+        template=[("T", x.dtype), ("HCD", K), ("MIX", mix), ("ROWS_PER_TG", rows_per_tg)],
+        grid=(1024 * tiles, B * L, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(B, L, mix)],
+        output_dtypes=[mx.float32],
+    )[0]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# DSA indexer: decode/verify scores and top-k index expansion
+# ---------------------------------------------------------------------------
+#
+# The prefill score kernel (Steel GEMM tile, BM=64) is launched with the
+# query rows zero-padded to 64 and only P/64 threadgroups, which makes it the
+# single most expensive decode kernel once the context passes 2k tokens.  The
+# kernel below computes the same values for up to eight query rows: per head
+# it accumulates the 8x8 simdgroup MMAs over D in the same 8-wide K order as
+# the Steel tile (float fragments, zero rows for missing queries), and it
+# adds max(score, 0) * weight over the heads in the same sequential order.
+# Invalid pooled positions receive the same -1e30 sentinel the Python path
+# writes with ``mx.where``.
+_DSA_SCORES_SOURCE = r"""
+  const uint lane = thread_index_in_simdgroup;
+  const uint sg = simdgroup_index_in_threadgroup;
+  const uint tid = thread_position_in_threadgroup.x + 32 * sg;
+  const int key0 = int(threadgroup_position_in_grid.x) * 8;
+  const int P = int(pool_len_cap[1]);
+  const int pool_len = int(pool_len_cap[0]);
+  const int qpos0 = int(qpos[0]);
+
+  const short qid = lane / 4;
+  const short fm = (qid & 4) + ((lane / 2) % 4);
+  const short fn = (qid & 2) * 2 + (lane % 2) * 2;
+
+  threadgroup float hs[HEADS][8][8];
+
+  // B fragments (K x 8 keys) for this key block, kept in registers.
+  simdgroup_matrix<float, 8, 8> bfrag[DIM / 8];
+  for (int kb = 0; kb < DIM / 8; kb++) {
+    float2 bv = float2(0.0f);
+    for (short e = 0; e < 2; e++) {
+      int key = key0 + fn + e;
+      if (key < P) {
+        bv[e] = static_cast<float>(keys[size_t(key) * DIM + kb * 8 + fm]);
+      }
+    }
+    reinterpret_cast<thread float2&>(bfrag[kb].thread_elements()) = bv;
+  }
+
+  for (int hh = 0; hh < HEADS / NSG; hh++) {
+    const int h = int(sg) * (HEADS / NSG) + hh;
+    simdgroup_matrix<float, 8, 8> c = simdgroup_matrix<float, 8, 8>(0.0f);
+    for (int kb = 0; kb < DIM / 8; kb++) {
+      float2 av = float2(0.0f);
+      if (fm < L) {
+        const device T* qr = q + (size_t(fm) * HEADS + h) * DIM + kb * 8 + fn;
+        av[0] = static_cast<float>(qr[0]);
+        av[1] = static_cast<float>(qr[1]);
+      }
+      simdgroup_matrix<float, 8, 8> a;
+      reinterpret_cast<thread float2&>(a.thread_elements()) = av;
+      simdgroup_multiply_accumulate(c, a, bfrag[kb], c);
+    }
+    float2 cv = reinterpret_cast<thread float2&>(c.thread_elements());
+    hs[h][fm][fn] = cv[0];
+    hs[h][fm][fn + 1] = cv[1];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (tid < uint(L * 8)) {
+    const int row = int(tid) / 8;
+    const int j = int(tid) % 8;
+    const int key = key0 + j;
+    if (key < P) {
+      float accum = 0.0f;
+      for (int h = 0; h < HEADS; h++) {
+        const float weight = static_cast<float>(w[row * HEADS + h]);
+        accum += max(hs[h][row][j], 0.0f) * weight;
+      }
+      const bool valid = key < pool_len && (key + 1) * KPOOL - 1 <= qpos0 + row;
+      scores[size_t(row) * P + key] = valid ? static_cast<T>(accum) : static_cast<T>(-1e30f);
+    }
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _dsa_scores_kernel():
+    return mx.fast.metal_kernel(
+        name="glm5_dsa_decode_scores",
+        input_names=["q", "keys", "w", "qpos", "pool_len_cap"],
+        output_names=["scores"],
+        header="#include <metal_simdgroup>\n#include <metal_simdgroup_matrix>\n",
+        source=_DSA_SCORES_SOURCE,
+    )
+
+
+def dsa_decode_scores(
+    q: mx.array,
+    pool_keys: mx.array,
+    weights: mx.array,
+    query_pos0: int,
+    pool_len: int,
+    kpool: int,
+    *,
+    nsg: int = 8,
+) -> Optional[mx.array]:
+    """Masked indexer scores for L <= 8 query rows of one sequence.
+
+    ``q`` [1, L, H, D], ``pool_keys`` [1, P, D],
+    ``weights`` [1, L, H] (already scaled, q dtype).  Returns [1, L, P]
+    scores equal to the padded Steel kernel followed by the validity
+    ``mx.where``.
+    """
+    if q.ndim != 4 or q.shape[0] != 1 or pool_keys.ndim != 3 or pool_keys.shape[0] != 1:
+        return None
+    _, L, H, D = q.shape
+    P = pool_keys.shape[1]
+    if not (1 <= L <= 8) or D % 8 or H % nsg or P == 0:
+        return None
+    if q.dtype not in (mx.bfloat16, mx.float16) or pool_keys.dtype != q.dtype or weights.dtype != q.dtype:
+        return None
+    # Inputs are made row contiguous by the kernel launch (a no-op for the
+    # pooled cache view, whose rows are contiguous for one sequence).
+    STATS["dsa_scores"] += 1
+    return _dsa_scores_kernel()(
+        inputs=[
+            q,
+            pool_keys,
+            weights,
+            mx.array([query_pos0], dtype=mx.int32),
+            mx.array([pool_len, P], dtype=mx.int32),
+        ],
+        template=[("T", q.dtype), ("L", L), ("HEADS", H), ("DIM", D), ("NSG", nsg), ("KPOOL", kpool)],
+        grid=(32 * ((P + 7) // 8), nsg, 1),
+        threadgroup=(32, nsg, 1),
+        output_shapes=[(1, L, P)],
+        output_dtypes=[q.dtype],
+    )[0]
+
+
+# Expands the selected pooled blocks into token indices exactly like
+# Glm5NextIndexer.__call__ (validity, kpool expansion, left padding, the
+# always-selected tail window and the -1 padding up to the output width).
+_DSA_EXPAND_SOURCE = r"""
+  const int col = int(thread_position_in_grid.x);
+  const int row = int(thread_position_in_grid.y);
+  if (col >= OUT_W) {
+    return;
+  }
+  const int qp = int(qpos[0]) + row;
+  const int pool_len = int(pool_len_arr[0]);
+  const int lp = int(left_padding[0]);
+  int v = -1;
+  if (col < SEL_K * KPOOL) {
+    const int s = int(selected[row * SEL_K + col / KPOOL]);
+    const bool valid = s < pool_len && (s + 1) * KPOOL - 1 <= qp;
+    if (valid) {
+      v = s * KPOOL + (col % KPOOL) + lp;
+    }
+  } else if (TAIL_W > 0 && col < SEL_K * KPOOL + TAIL_W) {
+    const int t = col - SEL_K * KPOOL;
+    const int tail_count = (qp + 1) % KPOOL;
+    if (t < tail_count) {
+      v = qp + 1 - tail_count + t + lp;
+    }
+  }
+  out[row * OUT_W + col] = v;
+"""
+
+
+@lru_cache(maxsize=None)
+def _dsa_expand_kernel():
+    return mx.fast.metal_kernel(
+        name="glm5_dsa_expand_topk",
+        input_names=["selected", "qpos", "pool_len_arr", "left_padding"],
+        output_names=["out"],
+        source=_DSA_EXPAND_SOURCE,
+    )
+
+
+def dsa_expand_topk(
+    selected: mx.array,
+    query_pos0: int,
+    pool_len: int,
+    left_padding: mx.array,
+    kpool: int,
+    tail_width: int,
+    output_width: int,
+) -> mx.array:
+    """[1, L, SEL_K] selected pool rows -> [1, 1, L, output_width] int32.
+
+    ``left_padding`` is the KV cache's [1] padding array (kept on device).
+    """
+    _, L, sel_k = selected.shape
+    return _dsa_expand_kernel()(
+        inputs=[
+            selected,
+            mx.array([query_pos0], dtype=mx.int32),
+            mx.array([pool_len], dtype=mx.int32),
+            left_padding.astype(mx.int32) if left_padding.dtype != mx.int32 else left_padding,
+        ],
+        template=[("SEL_K", sel_k), ("KPOOL", kpool), ("TAIL_W", tail_width), ("OUT_W", output_width)],
+        grid=(output_width, L, 1),
+        threadgroup=(min(256, output_width), 1, 1),
+        output_shapes=[(1, 1, L, output_width)],
+        output_dtypes=[mx.int32],
+    )[0]
+
+
+# ---------------------------------------------------------------------------
+# KDA (linear attention) decode/verify step
+# ---------------------------------------------------------------------------
+#
+# Everything between the fused input projection and o_proj of a
+# Glm5NextLinearAttention layer, for one sequence and T <= 8 tokens, in one
+# dispatch with one 1024-thread threadgroup per head:
+#
+#   1. depthwise short conv over [conv_state, q|k|v] + SiLU (bf16), and the
+#      new conv state (MLX depthwise_conv_1d + the compiled nn.silu);
+#   2. l2-normalization of q (with the 1/sqrt(Dk) scale) and k (fp32, the
+#      row_reduce_simple order of MLX's Sum);
+#   3. the forget-gate / output-gate low-rank projections (MLX qmv_quad for
+#      K == 128), the safe gate g (compiled compute_g_safe) and beta =
+#      sigmoid(b);
+#   4. the vector-gated delta rule (the vendored gated_delta_step_vec
+#      kernel, statement for statement);
+#   5. Glm5NextRMSNormGated (fp32, row_reduce_simple order, separate
+#      product/sum roundings).
+#
+# Each reference op is its own kernel there, so every intermediate is rounded
+# to its dtype here too and products are never contracted into the adds that
+# consumed them in a different kernel.
+_KDA_SOURCE = r"""
+  constexpr int CK = 4;
+  constexpr int NROW = CK - 1 + TOK;
+  constexpr int NP = 3 * QKV;
+  const uint tid = thread_position_in_threadgroup.x;
+  const uint lane = thread_index_in_simdgroup;
+  const uint sg = simdgroup_index_in_threadgroup;
+  const int h = int(threadgroup_position_in_grid.x);
+  const float q_scale = consts[0];
+  const float l2_eps = consts[1];
+  const float norm_eps = consts[2];
+  const float lower = consts[3];
+  const float inv_n = consts[4];
+
+  threadgroup T qs[TOK][DK];
+  threadgroup T ks[TOK][DK];
+  threadgroup T vs[TOK][DK];
+  threadgroup T as_[TOK][DK];
+  threadgroup T gates[TOK][DK];
+  threadgroup T ys[TOK][DK];
+  threadgroup float gs[TOK][DK];
+  threadgroup T betas[TOK];
+
+  // ---- 1. short conv + SiLU -------------------------------------------------
+  if (tid < uint(3 * DK)) {
+    const int part = int(tid) / DK;
+    const int i = int(tid) % DK;
+    const int gc = part * QKV + h * DK + i;
+    T win[NROW];
+    for (int r = 0; r < CK - 1; r++) {
+#if HAS_CONV_STATE
+      win[r] = conv_state[r * NP + gc];
+#else
+      win[r] = static_cast<T>(0);
+#endif
+    }
+    for (int t = 0; t < TOK; t++) {
+      win[CK - 1 + t] = proj[t * PROJ_W + gc];
+    }
+    const device T* w = conv_w + gc * CK;
+    for (int t = 0; t < TOK; t++) {
+      float acc = 0.0;
+      for (int j = 0; j < CK; ++j) {
+        acc += static_cast<float>(win[t + j]) * w[j];
+      }
+      T co = static_cast<T>(acc);
+      T sgm = glm_sigmoid<T>(co);
+      T sv = co * sgm;
+      if (part == 0) {
+        qs[t][i] = sv;
+      } else if (part == 1) {
+        ks[t][i] = sv;
+      } else {
+        vs[t][i] = sv;
+      }
+    }
+    for (int r = 0; r < CK - 1; r++) {
+      conv_state_out[r * NP + gc] = win[TOK + r];
+    }
+  }
+
+  // ---- 3a. low-rank gate projections (qmv_quad rows of this head) ----------
+#if PRE_AG
+  for (int e = int(tid); e < TOK * DK; e += 1024) {
+    const int t = e / DK;
+    const int i = e % DK;
+    as_[t][i] = a_pre[t * QKV + h * DK + i];
+    gates[t][i] = gate_pre[t * QKV + h * DK + i];
+  }
+#else
+  {
+    constexpr int VPT = 32;                       // values per thread (K = 128)
+    constexpr int WBYTES = 128 * BITS / 8;        // bytes per weight row
+    constexpr int G = 128 / GS;                   // groups per row
+    const int quad = int(tid) / 4;
+    const int ql = int(tid) % 4;
+    const int which = quad / DK;
+    const int i = quad % DK;
+    const int row = h * DK + i;
+    const device uint8_t* wl = (const device uint8_t*)(which == 0 ? fb_w : gb_w)
+        + size_t(row) * WBYTES + ql * (VPT * BITS / 8);
+    const device T* sl = (which == 0 ? fb_s : gb_s) + row * G + ql / (GS / VPT);
+    const device T* bl = (which == 0 ? fb_b : gb_b) + row * G + ql / (GS / VPT);
+    const float s = sl[0];
+    const float b = bl[0];
+    for (int t = 0; t < TOK; t++) {
+      const device T* xin = proj + t * PROJ_W + (which == 0 ? OFF_FA : OFF_GA) + ql * VPT;
+      float x_thread[VPT];
+      float sum = glm_load_vector<T, VPT, BITS>(xin, x_thread);
+      float result = 0;
+      result += glm_qdot<VPT, BITS>(wl, x_thread, s, b, sum);
+      result = quad_sum(result);
+      if (ql == 0) {
+        if (which == 0) {
+          as_[t][i] = static_cast<T>(result);
+        } else {
+          gates[t][i] = static_cast<T>(result);
+        }
+      }
+    }
+  }
+#endif
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // ---- 2. l2norm(q) * scale, l2norm(k) --------------------------------------
+  if (sg < uint(2 * TOK)) {
+    const int t = int(sg) / 2;
+    const bool is_q = (sg % 2) == 0;
+    threadgroup T* row = is_q ? qs[t] : ks[t];
+    float x[4];
+    float tot = 0.0f;
+    for (int e = 0; e < 4; e++) {
+      x[e] = static_cast<float>(row[4 * lane + e]);
+      float sq = x[e] * x[e];
+      tot = sq + tot;
+    }
+    tot = simd_sum(tot);
+    float u = tot + l2_eps;
+    float r = metal::precise::rsqrt(u);
+    for (int e = 0; e < 4; e++) {
+      float xn = x[e] * r;
+      if (is_q) {
+        float xs = xn * q_scale;
+        row[4 * lane + e] = static_cast<T>(xs);
+      } else {
+        row[4 * lane + e] = static_cast<T>(xn);
+      }
+    }
+  }
+
+  // ---- 3b. g = exp(lower * sigmoid(exp(A_log) * (a + dt_bias))), beta -------
+  if (tid < uint(TOK * DK)) {
+    const int t = int(tid) / DK;
+    const int i = int(tid) % DK;
+    float ea = metal::precise::exp(a_log[h]);
+    float af = static_cast<float>(as_[t][i]);
+    float s1 = af + dt_bias[h * DK + i];
+    float s2 = ea * s1;
+    float s3 = glm_sigmoid<float>(s2);
+    float s4 = lower * s3;
+    gs[t][i] = metal::precise::exp(s4);
+  }
+  if (tid < uint(TOK)) {
+    betas[tid] = glm_sigmoid<T>(proj[tid * PROJ_W + OFF_B + h]);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // ---- 4. vector-gated delta rule --------------------------------------------
+  for (int j = 0; j < DK / 32; j++) {
+    const int dv_idx = int(sg) + 32 * j;
+    constexpr int n_per_t = DK / 32;
+    const int dk_idx = int(lane);
+    float state[n_per_t];
+    for (int i = 0; i < n_per_t; ++i) {
+      auto s_idx = n_per_t * dk_idx + i;
+#if HAS_STATE
+      state[i] = static_cast<float>(state_in[(size_t(h) * DK + dv_idx) * DK + s_idx]);
+#else
+      state[i] = 0.0f;
+#endif
+    }
+    for (int t = 0; t < TOK; ++t) {
+      float kv_mem = 0.0f;
+      for (int i = 0; i < n_per_t; ++i) {
+        auto s_idx = n_per_t * dk_idx + i;
+        state[i] = state[i] * gs[t][s_idx];
+        kv_mem += state[i] * ks[t][s_idx];
+      }
+      kv_mem = simd_sum(kv_mem);
+
+      auto delta = (vs[t][dv_idx] - kv_mem) * betas[t];
+
+      float out = 0.0f;
+      for (int i = 0; i < n_per_t; ++i) {
+        auto s_idx = n_per_t * dk_idx + i;
+        state[i] = state[i] + ks[t][s_idx] * delta;
+        out += state[i] * qs[t][s_idx];
+      }
+      out = simd_sum(out);
+      if (thread_index_in_simdgroup == 0) {
+        ys[t][dv_idx] = static_cast<T>(out);
+      }
+    }
+    for (int i = 0; i < n_per_t; ++i) {
+      auto s_idx = n_per_t * dk_idx + i;
+      state_out[(size_t(h) * DK + dv_idx) * DK + s_idx] = static_cast<float>(state[i]);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // ---- 5. RMSNormGated ---------------------------------------------------------
+  if (sg < uint(TOK)) {
+    const int t = int(sg);
+    float x[4];
+    float tot = 0.0f;
+    for (int e = 0; e < 4; e++) {
+      x[e] = static_cast<float>(ys[t][4 * lane + e]);
+      float sq = x[e] * x[e];
+      tot = sq + tot;
+    }
+    tot = simd_sum(tot);
+    float var = tot * inv_n;
+    float u = var + norm_eps;
+    float r = metal::precise::rsqrt(u);
+    for (int e = 0; e < 4; e++) {
+      const int c = 4 * lane + e;
+      float xn = x[e] * r;
+      float wf = static_cast<float>(norm_w[c]);
+      float wx = wf * xn;
+      float gf = static_cast<float>(gates[t][c]);
+      float gsg = glm_sigmoid<float>(gf);
+      float o = wx * gsg;
+      y[t * QKV + h * DK + c] = static_cast<T>(o);
+    }
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _kda_kernel(has_conv_state: bool, has_state: bool, pre_ag: bool):
+    inputs = ["proj", "conv_w", "a_log", "dt_bias", "norm_w", "consts"]
+    if has_conv_state:
+        inputs.append("conv_state")
+    if has_state:
+        inputs.append("state_in")
+    if pre_ag:
+        inputs += ["a_pre", "gate_pre"]
+    else:
+        inputs += ["fb_w", "fb_s", "fb_b", "gb_w", "gb_s", "gb_b"]
+    return mx.fast.metal_kernel(
+        name=f"glm5_kda_decode_c{int(has_conv_state)}_s{int(has_state)}_p{int(pre_ag)}",
+        input_names=inputs,
+        output_names=["y", "conv_state_out", "state_out"],
+        header=_QMV_HEADER,
+        source=_source(
+            _KDA_SOURCE,
+            HAS_CONV_STATE=int(has_conv_state),
+            HAS_STATE=int(has_state),
+            PRE_AG=int(pre_ag),
+        ),
+    )
+
+
+def kda_decode_step(
+    proj: mx.array,
+    conv_state: Optional[mx.array],
+    conv_w: mx.array,
+    a_log: mx.array,
+    dt_bias: mx.array,
+    state: Optional[mx.array],
+    norm_w: mx.array,
+    *,
+    heads: int,
+    head_dim: int,
+    off_fa: int,
+    off_ga: int,
+    off_b: int,
+    q_scale: float,
+    l2_eps: float,
+    norm_eps: float,
+    lower_bound: float,
+    f_b=None,
+    g_b=None,
+    a_pre: Optional[mx.array] = None,
+    gate_pre: Optional[mx.array] = None,
+):
+    """Fused KDA layer body for one sequence and T <= 8 tokens.
+
+    ``proj`` is the fused q|k|v|f_a|g_a|b projection [1, T, W] (bf16/fp16).
+    The forget/output gate projections are either the affine quantized
+    ``f_b``/``g_b`` layers (K == 128, 4- or 8-bit: MLX's qmv_quad path) or
+    precomputed ``a_pre``/``gate_pre`` [1, T, H * Dk]. Returns
+    ``(y [1, T, H * Dk], conv_state [1, 3, 3 * H * Dk], state [1, H, Dk, Dk])``
+    or None when the shapes are not covered.
+    """
+    if proj.ndim != 3 or proj.shape[0] != 1 or proj.dtype not in (mx.bfloat16, mx.float16):
+        return None
+    _, T, width = proj.shape
+    qkv = heads * head_dim
+    if not 1 <= T <= 8 or head_dim != 128 or heads < 1:
+        return None
+    if conv_w.shape != (3 * qkv, 4, 1) or conv_w.dtype != proj.dtype:
+        return None
+    if norm_w.shape != (head_dim,) or norm_w.dtype != proj.dtype:
+        return None
+    if a_log.size != heads or a_log.dtype != mx.float32:
+        return None
+    if dt_bias.size != qkv or dt_bias.dtype != mx.float32:
+        return None
+    if conv_state is not None and (
+        conv_state.shape != (1, 3, 3 * qkv) or conv_state.dtype != proj.dtype
+    ):
+        return None
+    if state is not None and (
+        state.shape != (1, heads, head_dim, head_dim) or state.dtype != mx.float32
+    ):
+        return None
+    pre = a_pre is not None
+    inputs_extra = []
+    template = [("T", proj.dtype), ("TOK", T), ("DK", head_dim), ("QKV", qkv),
+                ("PROJ_W", width), ("OFF_FA", off_fa), ("OFF_GA", off_ga), ("OFF_B", off_b)]
+    if pre:
+        if gate_pre is None or a_pre.shape != (1, T, qkv) or gate_pre.shape != (1, T, qkv):
+            return None
+        if a_pre.dtype != proj.dtype or gate_pre.dtype != proj.dtype:
+            return None
+        inputs_extra = [a_pre, gate_pre]
+        template += [("BITS", 8), ("GS", 64)]
+    else:
+        parts = [_affine_parts(m) for m in (f_b, g_b)]
+        if any(p is None for p in parts):
+            return None
+        (fw, fs, fbias, fbits, fgs), (gw, gs_, gbias, gbits, ggs) = parts
+        if (fbits, fgs) != (gbits, ggs) or fbits not in (4, 8) or fgs not in (32, 64, 128):
+            return None
+        if fw.shape != (qkv, 128 * fbits // 32) or gw.shape != fw.shape:
+            return None
+        if fs.dtype != proj.dtype or gs_.dtype != proj.dtype:
+            return None
+        inputs_extra = [fw, fs, fbias, gw, gs_, gbias]
+        template += [("BITS", fbits), ("GS", fgs)]
+    consts = mx.array(
+        [q_scale, l2_eps, norm_eps, lower_bound, 1.0 / head_dim], dtype=mx.float32
+    )
+    inputs = [proj, conv_w, a_log.reshape(-1), dt_bias.reshape(-1), norm_w, consts]
+    if conv_state is not None:
+        inputs.append(conv_state)
+    if state is not None:
+        inputs.append(state)
+    inputs += inputs_extra
+    kernel = _kda_kernel(conv_state is not None, state is not None, pre)
+    STATS["kda"] += 1
+    y, conv_out, state_out = kernel(
+        inputs=inputs,
+        template=template,
+        grid=(1024 * heads, 1, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(1, T, qkv), (1, 3, 3 * qkv), (1, heads, head_dim, head_dim)],
+        output_dtypes=[proj.dtype, proj.dtype, mx.float32],
+    )
+    return y, conv_out, state_out
+
+
+# ---------------------------------------------------------------------------
+# MoE router (one token): logits GEMV + sigmoid + bias, then top-k selection
+# ---------------------------------------------------------------------------
+#
+# The logits reproduce MLX's non-transposed fp32 gemv for x @ W.T with
+# 16 <= E < 4096 outputs and K < 16 * E (BM=4, BN=1, SM=1, SN=32, TM=4, TN=4):
+# each simdgroup owns 4 rows, every lane accumulates 4 contiguous products
+# per 128-wide K block, then a shuffle-down ladder. The epilogue applies the
+# Sigmoid functor and the correction bias as separate roundings (they are
+# separate kernels in the reference). The select kernel reproduces
+# argpartition (a stable ascending merge sort of -(sigmoid + bias), i.e.
+# descending scores with ties to the lower expert index), the gathered
+# sigmoid scores, their sequential sum (row_reduce_small), the division and
+# the routed scaling factor.
+_ROUTER_LOGITS_SOURCE = r"""
+  const uint lane = thread_index_in_simdgroup;
+  const uint sg = simdgroup_index_in_threadgroup;
+  const int tok = int(threadgroup_position_in_grid.y);
+  const int out_row = (int(threadgroup_position_in_grid.x) * 4 + int(sg)) * 4;
+  if (out_row >= E) {
+    return;
+  }
+  const device float* mat = w + size_t(out_row) * K;
+  const device T* xv = x + size_t(tok) * K;
+  float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  int bn = int(lane) * 4;
+  for (int i = 0; i < K / 128; ++i) {
+    float v_coeff[4];
+    for (int tn = 0; tn < 4; tn++) {
+      v_coeff[tn] = static_cast<float>(xv[bn + tn]);
+    }
+    int mat_offset = 0;
+    for (int tm = 0; tm < 4; tm++) {
+      float inter[4];
+      for (int tn = 0; tn < 4; tn++) {
+        inter[tn] = mat[mat_offset + bn + tn];
+      }
+      for (int tn = 0; tn < 4; tn++) {
+        result[tm] += inter[tn] * v_coeff[tn];
+      }
+      mat_offset += K;
+    }
+    bn += 128;
+  }
+  for (int tm = 0; tm < 4; tm++) {
+    for (ushort sn = 16; sn >= 1; sn >>= 1) {
+      result[tm] += simd_shuffle_down(result[tm], sn);
+    }
+  }
+  if (lane == 0) {
+    for (int tm = 0; tm < 4; tm++) {
+      const int e = out_row + tm;
+      float sgm = glm_sigmoid<float>(result[tm]);
+      float biased = sgm + bias[e];
+      sig[size_t(tok) * E + e] = sgm;
+      biased_out[size_t(tok) * E + e] = biased;
+    }
+  }
+"""
+
+_ROUTER_SELECT_SOURCE = r"""
+  const uint lane = thread_index_in_simdgroup;
+  const int tok = int(threadgroup_position_in_grid.x);
+  constexpr int PER = (E + 31) / 32;
+  const device float* bz = biased + size_t(tok) * E;
+  const device float* sz = sig + size_t(tok) * E;
+  float vals[PER];
+  bool taken[PER];
+  for (int j = 0; j < PER; j++) {
+    const int e = j * 32 + int(lane);
+    vals[j] = e < E ? bz[e] : -INFINITY;
+    taken[j] = e >= E;
+  }
+  int picked[TOPK];
+  for (int r = 0; r < TOPK; r++) {
+    // Best remaining candidate of this lane: highest value, lowest index.
+    float best = -INFINITY;
+    int best_e = 0x7fffffff;
+    for (int j = 0; j < PER; j++) {
+      const int e = j * 32 + int(lane);
+      if (!taken[j] && !isnan(vals[j]) &&
+          (best_e == 0x7fffffff || vals[j] > best || (vals[j] == best && e < best_e))) {
+        best = vals[j];
+        best_e = e;
+      }
+    }
+    for (ushort off = 16; off >= 1; off >>= 1) {
+      float ob = simd_shuffle_xor(best, off);
+      int oe = simd_shuffle_xor(best_e, off);
+      const bool other_better = oe != 0x7fffffff &&
+          (best_e == 0x7fffffff || ob > best || (ob == best && oe < best_e));
+      if (other_better) {
+        best = ob;
+        best_e = oe;
+      }
+    }
+    picked[r] = best_e;
+    if (best_e != 0x7fffffff && (best_e % 32) == int(lane)) {
+      taken[best_e / 32] = true;
+    }
+  }
+  if (lane == 0) {
+    float total = 0.0f;
+    float gathered[TOPK];
+    for (int r = 0; r < TOPK; r++) {
+      gathered[r] = sz[picked[r]];
+      total = gathered[r] + total;
+    }
+    for (int r = 0; r < TOPK; r++) {
+      float q = NORM ? gathered[r] / total : gathered[r];
+      float s = q * scaling[0];
+      indices[tok * TOPK + r] = uint(picked[r]);
+      scores[tok * TOPK + r] = s;
+    }
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _router_logits_kernel():
+    return mx.fast.metal_kernel(
+        name="glm5_router_logits_sigmoid",
+        input_names=["x", "w", "bias"],
+        output_names=["sig", "biased_out"],
+        header=_QMV_HEADER,
+        source=_ROUTER_LOGITS_SOURCE,
+    )
+
+
+@lru_cache(maxsize=None)
+def _router_select_kernel():
+    return mx.fast.metal_kernel(
+        name="glm5_router_select",
+        input_names=["sig", "biased", "scaling"],
+        output_names=["indices", "scores"],
+        source=_ROUTER_SELECT_SOURCE,
+    )
+
+
+def moe_router(
+    x: mx.array,
+    weight: mx.array,
+    bias: mx.array,
+    top_k: int,
+    scaling: float,
+    norm_topk_prob: bool,
+):
+    """``group_expert_select(x.astype(f32) @ weight.T, bias, ...)`` for n_group == 1.
+
+    ``x`` [T, K] (one-token rows; bf16/fp16/fp32), ``weight`` [E, K] fp32,
+    ``bias`` [E] fp32. Returns ``(indices uint32 [T, top_k], scores fp32
+    [T, top_k])`` bit-identical to the reference for rows that the reference
+    computes with the one-token gemv, or None when not covered.
+    """
+    if x.ndim != 2 or weight.ndim != 2 or bias.ndim != 1:
+        return None
+    T, K = x.shape
+    E = weight.shape[0]
+    if weight.shape[1] != K or bias.shape[0] != E:
+        return None
+    if weight.dtype != mx.float32 or bias.dtype != mx.float32:
+        return None
+    if x.dtype not in (mx.bfloat16, mx.float16, mx.float32):
+        return None
+    # Config of the reference gemv (see gemv_axbpy): bm=4, bn=1 needs
+    # E < 4096 and K < 16 * E; full 128-wide blocks and whole 16-row tiles.
+    if E < 16 or E >= 4096 or K >= 16 * E or K <= 64 or K % 128 or E % 16:
+        return None
+    if not 1 <= top_k <= min(32, E):
+        return None
+    sig, biased = _router_logits_kernel()(
+        inputs=[x, weight, bias],
+        template=[("T", x.dtype), ("K", K), ("E", E)],
+        grid=(128 * (E // 16), T, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(T, E), (T, E)],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    indices, scores = _router_select_kernel()(
+        inputs=[sig, biased, mx.array([scaling], dtype=mx.float32)],
+        template=[("E", E), ("TOPK", top_k), ("NORM", int(bool(norm_topk_prob) and top_k > 1))],
+        grid=(32 * T, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(T, top_k), (T, top_k)],
+        output_dtypes=[mx.uint32, mx.float32],
+    )
+    STATS["router"] += 1
+    return indices, scores
+
+
+# ---------------------------------------------------------------------------
+# Hyper-connection expand for one token (L == 1)
+# ---------------------------------------------------------------------------
+#
+# The one-token reference (``hyper_connection._hc_expand_op``) computes
+#   bf16(post * float(x) + comb^T @ float(residual))
+# where the [HC, HC] x [HC, D] fp32 product runs on MLX's NAX steel GEMM,
+# i.e. an MPP matmul2d with relaxed precision. This kernel issues the same
+# 16x32x16 relaxed matmul2d on the same zero-padded fragments (bit-identical
+# to mx.matmul for this shape) and applies the compiled epilogue with its
+# separate multiply/add roundings: one dispatch instead of cast + GEMM +
+# elementwise.
+_NAX_HEADER = r"""
+#include <metal_stdlib>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+using namespace mpp::tensor_ops;
+"""
+
+_HC_EXPAND1_SOURCE = r"""
+  const ushort lane = thread_index_in_simdgroup;
+  const int tile = int(threadgroup_position_in_grid.x) * SIMDS + int(simdgroup_index_in_threadgroup);
+  if (tile * 32 >= D) {
+    return;
+  }
+  const short qid = lane >> 2;
+  const short fm = ((qid & 4) | ((lane >> 1) & 3));
+  const short fn = ((qid & 2) | (lane & 1)) * 4;
+  constexpr auto desc = matmul2d_descriptor(
+      16, 32, 16, false, false, true, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  auto ct_a = op.template get_left_input_cooperative_tensor<float, float, float>();
+  auto ct_b = op.template get_right_input_cooperative_tensor<float, float, float>();
+  auto ct_c = op.template get_destination_cooperative_tensor<
+      metal::remove_addrspace_t<decltype(ct_a)>,
+      metal::remove_addrspace_t<decltype(ct_b)>,
+      float>();
+  for (short i = 0; i < 8; i++) {
+    const short r = fm + (i >> 2) * 8;
+    const short c = fn + (i & 3);
+    // A = comb^T (rows: output stream, cols: source stream), zero padded.
+    ct_a[i] = (r < HC && c < HC) ? comb[c * HC + r] : 0.0f;
+    ct_b[i] = (r < HC) ? static_cast<float>(residual[r * D + tile * 32 + c]) : 0.0f;
+    ct_b[8 + i] = (r < HC) ? static_cast<float>(residual[r * D + tile * 32 + 16 + c]) : 0.0f;
+    ct_c[i] = 0.0f;
+    ct_c[8 + i] = 0.0f;
+  }
+  op.run(ct_a, ct_b, ct_c);
+  for (short i = 0; i < 8; i++) {
+    const short r = fm + (i >> 2) * 8;
+    const short c = fn + (i & 3);
+    if (r < HC) {
+      for (short hh = 0; hh < 2; hh++) {
+        const int col = tile * 32 + hh * 16 + c;
+        const float mm = ct_c[hh * 8 + i];
+        // Separate roundings, as in the compiled reference epilogue (the
+        // MPP headers enable FP contraction for the whole kernel).
+        volatile float prod = post[r] * static_cast<float>(x[col]);
+        float sum = prod + mm;
+        out[r * D + col] = static_cast<T>(sum);
+      }
+    }
+  }
+"""
+
+
+def _atoi(text: str) -> int:
+    """C ``atoi`` (how MLX parses its integer environment switches)."""
+    m = re.match(r"\s*([+-]?\d+)", text)
+    return int(m.group(1)) if m else 0
+
+
+@lru_cache(maxsize=None)
+def nax_relaxed_fp32_matmul() -> bool:
+    """True when MLX runs fp32 GEMMs on NAX with relaxed (TF32) precision.
+
+    Mirrors ``metal::is_nax_available()`` (macOS >= 26.2, GPU generation >=
+    17, 18 for phones) and ``env::enable_tf32()`` (MLX_ENABLE_TF32, default
+    1). Kernels that reproduce the NAX product are only valid when both hold.
+    """
+    try:
+        value = os.environ.get("MLX_ENABLE_TF32")
+        if value is not None and _atoi(value) == 0:
+            return False
+        if not mx.metal.is_available():
+            return False
+        arch = str(mx.device_info().get("architecture", ""))
+        m = re.fullmatch(r"applegpu_g(\d+)([a-z])", arch)
+        if m is None or int(m.group(1)) < (18 if m.group(2) == "p" else 17):
+            return False
+        parts = (platform.mac_ver()[0] or "0").split(".") + ["0"]
+        return (int(parts[0]), int(parts[1])) >= (26, 2)
+    except Exception:  # noqa: BLE001 - any doubt keeps the reference path
+        return False
+
+
+@lru_cache(maxsize=None)
+def _hc_expand1_kernel():
+    return mx.fast.metal_kernel(
+        name="glm5_hc_expand_one_token",
+        input_names=["x", "residual", "post", "comb"],
+        output_names=["out"],
+        header=_NAX_HEADER,
+        source=_HC_EXPAND1_SOURCE,
+    )
+
+
+def hc_expand_one(
+    x: mx.array, residual: mx.array, post: mx.array, comb: mx.array
+) -> Optional[mx.array]:
+    """``_hc_expand_op(x, residual, post, comb)`` for a single token.
+
+    ``x`` [1, 1, D], ``residual`` [1, 1, HC, D] (bf16/fp16), ``post``
+    [1, 1, HC] and ``comb`` [1, 1, HC, HC] fp32. Returns [1, 1, HC, D] or
+    None when not covered.
+    """
+    if x.ndim != 3 or x.shape[:2] != (1, 1) or residual.ndim != 4:
+        return None
+    D = x.shape[2]
+    hc = residual.shape[2]
+    if residual.shape != (1, 1, hc, D) or not 1 <= hc <= 16 or D % 32:
+        return None
+    if x.dtype not in (mx.bfloat16, mx.float16) or residual.dtype != x.dtype:
+        return None
+    if post.shape != (1, 1, hc) or comb.shape != (1, 1, hc, hc):
+        return None
+    if post.dtype != mx.float32 or comb.dtype != mx.float32:
+        return None
+    if not nax_relaxed_fp32_matmul():
+        return None
+    simds = 8
+    tiles = D // 32
+    STATS["hc_expand"] += 1
+    return _hc_expand1_kernel()(
+        inputs=[x, residual, post, comb],
+        template=[("T", x.dtype), ("HC", hc), ("D", D), ("SIMDS", simds)],
+        grid=(32 * simds * ((tiles + simds - 1) // simds), 1, 1),
+        threadgroup=(32 * simds, 1, 1),
+        output_shapes=[residual.shape],
+        output_dtypes=[x.dtype],
+    )[0]
