@@ -148,6 +148,9 @@ class _PrimeCtx:
     extra_key_token_start: Optional[int] = None
     extra_key_ranges: Optional[list[tuple[int, tuple[Any, ...]]]] = None
     snapshot_candidate: Any = None
+    # Restarted from the prompt's tail (small rotating head window): the
+    # head offsets no longer map to prompt positions, so no boundary snapshots.
+    tail_only: bool = False
 
     # Fusion's Qwen4 verified-drafter code names the local head timeline
     # ``head_hist_offset`` and the absolute target timeline
@@ -1676,7 +1679,18 @@ def _capture_single(
             return
         setattr(host, _CTX_ATTR, ctx)
 
-    if ctx.pending_hidden is not None:
+    tail = getattr(host, "_omlx_mtp_prime_tail", None)
+    if tail and seq_len > 1 and ctx.folded_this_request + seq_len > int(tail):
+        # Heads with a small rotating window only need the prompt's tail;
+        # folding more would rotate the head cache before the first draft.
+        keep = min(int(tail), seq_len - 1)
+        ctx.mtp_cache = host.make_mtp_cache()
+        ctx.folded = 0
+        ctx.folded_this_request = 0
+        ctx.tail_only = True
+        pairs_hidden = normed[:, -(keep + 1) : -1]
+        pairs_tokens = inputs[:, -keep:]
+    elif ctx.pending_hidden is not None:
         if seq_len > 1:
             pairs_hidden = mx.concatenate([ctx.pending_hidden, normed[:, :-1]], axis=1)
         else:
@@ -1699,12 +1713,13 @@ def _capture_single(
     ctx.folded_this_request += int(pairs_tokens.shape[1])
     ctx.pending_hidden = normed[:, -1:]
     ctx.expected_offset = offset_after
-    _capture_boundary_candidate(
-        ctx,
-        normed,
-        seq_start=offset_after - seq_len,
-        seq_end=offset_after,
-    )
+    if not ctx.tail_only:
+        _capture_boundary_candidate(
+            ctx,
+            normed,
+            seq_start=offset_after - seq_len,
+            seq_end=offset_after,
+        )
     # Materialize the head-cache buffers per chunk so the fold graph never
     # accumulates across a long prefill; the (1,1,H) pending row is evaluated
     # alongside so the chunk's full hidden can be freed.

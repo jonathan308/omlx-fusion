@@ -475,6 +475,8 @@ class Model(nn.Module):
             self._omlx_mtp_depth = min(int(get_mtp_depth()), n_mtp)
             self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
             self._omlx_mtp_head_clone = True
+            # The heads attend through a rotating window; prime only its tail.
+            self._omlx_mtp_prime_tail = max(16, int(config.sliding_window_size) - 32)
             self._omlx_mtp_head_prenorm = True
 
     @property
@@ -489,17 +491,35 @@ class Model(nn.Module):
         return_hidden: bool = False,
         n_confirmed: int = 0,
     ):
-        del n_confirmed
+        from omlx.patches.mlx_lm_mtp import prompt_priming
+
+        # Fold the prompt into the MTP heads' context (pre-norm hidden, the
+        # same input mtp_forward gets at decode time) so the first draft
+        # cycles are not blind; see prompt_priming.
+        # The MTP activation forward runs with return_hidden=True and must not
+        # be folded: take_primed expects the context to stop one token short.
+        capture = (
+            not return_hidden
+            and not n_confirmed
+            and input_embeddings is None
+            and cache is not None
+            and prompt_priming.capture_eligible(self, cache)
+        )
         result = self.model(
             inputs,
             cache,
             input_embeddings,
-            return_hidden=return_hidden,
+            return_hidden=return_hidden or capture,
         )
-        if return_hidden:
+        if return_hidden or capture:
             out, hidden = result
         else:
             out = result
+        if capture:
+            try:
+                prompt_priming.maybe_capture(self, inputs, hidden, cache)
+            except Exception:
+                logger.debug("MiMo MTP prompt-priming capture failed", exc_info=True)
         if self.args.tie_word_embeddings:
             logits = self.model.embed_tokens.as_linear(out)
         else:

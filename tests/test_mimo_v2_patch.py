@@ -806,3 +806,32 @@ def test_fp8_sidecar_qkv_tp_can_be_pinned(monkeypatch):
     assert rows["q"] == [1.0 + s for s in range(2) for _ in range(q_pr)]
     assert rows["k"] == [10.0 + s for s in range(2) for _ in range(k_pr)]
     assert rows["v"] == [32.0 + 4 * s for s in range(2) for _ in range(v_pr)]
+
+
+def test_prompt_priming_folds_the_prompt_into_the_mimo_heads():
+    mimo_v2 = _load_patch_module()
+    from omlx.patches.mlx_lm_mtp import prompt_priming, set_mtp_active
+
+    set_mtp_active(True)
+    try:
+        model = mimo_v2.Model(mimo_v2.ModelArgs.from_dict(_minimal_config(num_nextn_predict_layers=1)))
+    finally:
+        set_mtp_active(False)
+    cache = model.make_cache()
+    prompt_priming.drop_ctx(model)
+    model(mx.array([[1, 2, 3, 4, 5]]), cache=cache)
+    # Five prompt tokens give four (hidden, next-token) pairs for the heads.
+    assert prompt_priming.prime_ctx_stats(model) == 4
+    # A plain decode step extends the context; the activation forward
+    # (return_hidden=True) is left for take_primed to fold.
+    model(mx.array([[6]]), cache=cache)
+    assert prompt_priming.prime_ctx_stats(model) == 5
+    model(mx.array([[7]]), cache=cache, return_hidden=True)
+    assert prompt_priming.prime_ctx_stats(model) == 5
+    prompt_priming.drop_ctx(model)
+
+    # Longer prompts prime only the head window's tail (window 32 -> 16 here).
+    cache = model.make_cache()
+    model(mx.array([list(range(1, 41))]), cache=cache)
+    assert prompt_priming.prime_ctx_stats(model) == 16
+    prompt_priming.drop_ctx(model)
