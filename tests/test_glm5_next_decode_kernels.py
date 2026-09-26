@@ -32,6 +32,14 @@ def _language():
     return language
 
 
+@pytest.fixture(autouse=True)
+def _all_fused_families(monkeypatch):
+    """Exactness tests cover every family, including default-off ones."""
+    from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
+
+    monkeypatch.setattr(dk, "DISABLED", set())
+
+
 def _stats():
     from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels
 
@@ -173,7 +181,7 @@ def _run_with_tf32(snippet: str) -> str:
         "compat.apply_mlx_vlm_glm5_next_compat_patch()\n"
         "import test_glm5_next_decode_kernels as t\n" % (str(here), str(here.parent))
     ) + snippet
-    env = dict(os.environ, MLX_ENABLE_TF32="1")
+    env = dict(os.environ, MLX_ENABLE_TF32="1", OMLX_GLM5_DECODE_DISABLE="")
     done = subprocess.run(
         [sys.executable, "-c", code], env=env, capture_output=True, text=True,
         timeout=900,
@@ -1126,3 +1134,19 @@ def test_decode_experts_read_fused_gate_up_layout(length, monkeypatch):
         monkeypatch.setattr(language, "_DECODE_FUSION", True)
         assert _mismatches(fused_reference, reference) == 0
         assert _mismatches(moe(x), reference) == 0
+
+
+def test_latent_attention_kernels_are_off_by_default():
+    import os
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if k != "OMLX_GLM5_DECODE_DISABLE"}
+    code = (
+        "from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk\n"
+        "print(sorted(dk.DISABLED))\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=300
+    ).stdout
+    assert out.strip().splitlines()[-1] == "['latent_attn', 'latent_sparse_rows']"

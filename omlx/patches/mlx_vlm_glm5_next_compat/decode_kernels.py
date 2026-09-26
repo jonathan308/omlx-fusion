@@ -38,10 +38,19 @@ import mlx.core as mx
 # Successful fused dispatches by kernel family (graph-build time counts; used
 # by tests and profilers to confirm the fused paths engage).
 STATS: Counter = Counter()
-# Fused families switched off for A/B measurements (STATS keys, comma
-# separated, e.g. OMLX_GLM5_DECODE_DISABLE=latent_attn,router_rows); the
-# callers then take the reference path.
-DISABLED = set(filter(None, os.environ.get("OMLX_GLM5_DECODE_DISABLE", "").split(",")))
+# Fused families switched off (STATS keys); the callers then take the
+# reference path. OMLX_GLM5_DECODE_DISABLE (comma separated) replaces the
+# default set, e.g. "" enables everything, "router_rows" disables only that.
+# The latent attention kernels are exact but slower than the reference ops in
+# the model (one call in flight: 16x32x16 NAX chains of up to 128 dependent
+# ops at low occupancy), so they are off unless enabled.
+DEFAULT_DISABLED = frozenset({"latent_attn", "latent_sparse_rows"})
+_DISABLE_ENV = os.environ.get("OMLX_GLM5_DECODE_DISABLE")
+DISABLED = (
+    set(DEFAULT_DISABLED)
+    if _DISABLE_ENV is None
+    else set(filter(None, _DISABLE_ENV.split(",")))
+)
 
 _QMV_HEADER = r"""
 #include <metal_simdgroup>
