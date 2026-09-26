@@ -484,7 +484,7 @@ def test_small_model_decode_and_verify_logits_are_bitwise_reference():
     if not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
     used = _check_small_model()
-    assert _ALWAYS_FUSED <= used, used
+    assert _ALWAYS_FUSED | {"latent_sparse_rows"} <= used, used
 
 
 def test_small_model_dense_attention_is_bitwise_reference():
@@ -768,3 +768,29 @@ def test_latent_attention_dense_verify_is_bitwise_masked_sdpa(length, keys):
         q, kv, kv, scale=256**-0.5, mask="causal"
     )
     assert _mismatches(dk.latent_attention(q, kv, 256**-0.5, causal=True), causal) == 0
+
+
+@pytest.mark.parametrize("length", [2, 4, 5, 8])
+@pytest.mark.parametrize("width,cache_len", [(2051, 4100), (515, 3000), (64, 200)])
+def test_latent_attention_sparse_verify_is_bitwise_gathered_sdpa(length, width, cache_len):
+    from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
+
+    mx.random.seed(length * width)
+    q = (mx.random.normal((1, 64, length, 512)) * 0.6).astype(mx.bfloat16)
+    kv = (mx.random.normal((1, 1, cache_len, 512)) * 0.8).astype(mx.bfloat16)
+    sel = mx.random.randint(-1, cache_len + 3, (1, length, width)).astype(mx.int32)
+    clamped = mx.clip(sel, 0, cache_len - 1)
+    gathered = mx.take_along_axis(
+        mx.broadcast_to(kv[:, 0, None], (1, length, cache_len, 512)),
+        mx.broadcast_to(clamped[..., None], (1, length, width, 512)),
+        axis=2,
+    )
+    reference = mx.fast.scaled_dot_product_attention(
+        q.transpose(0, 2, 1, 3).reshape(length, 64, 1, 512),
+        gathered.reshape(length, 1, width, 512),
+        gathered.reshape(length, 1, width, 512),
+        scale=256**-0.5,
+        mask=(sel >= 0).reshape(length, 1, 1, width),
+    ).reshape(1, length, 64, 512).transpose(0, 2, 1, 3)
+    fused = dk.latent_attention_sparse_rows(q, kv, sel[0], 256**-0.5)
+    assert _mismatches(fused, reference) == 0

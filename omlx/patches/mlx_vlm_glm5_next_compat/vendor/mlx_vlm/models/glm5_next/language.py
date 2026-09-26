@@ -1053,13 +1053,22 @@ class Glm5NextSparseAttention(nn.Module):
         dim = kv_latent.shape[-1]
         selected = topk_indices[:, 0]
         topk = selected.shape[-1]
+        q_embedded = self.embed_q(q)
+        if _decode_kernels is not None and _DECODE_FUSION and B == 1:
+            # Same per-token gemv/softmax/gemv_t arithmetic, reading the
+            # selected latent rows in place for a chunk of heads at a time.
+            fused = _decode_kernels.latent_attention_sparse_rows(
+                q_embedded, kv_latent, selected[0], self.scale
+            )
+            if fused is not None:
+                return self.unembed_out(fused).transpose(0, 2, 1, 3).reshape(B, L, -1)
         clamped = mx.clip(selected, 0, Kv - 1)
         gathered = mx.take_along_axis(
             mx.broadcast_to(kv_latent[:, 0, None], (B, L, Kv, dim)),
             mx.broadcast_to(clamped[..., None], (B, L, topk, dim)),
             axis=2,
         )
-        q_latent = self.embed_q(q).transpose(0, 2, 1, 3).reshape(B * L, H, 1, dim)
+        q_latent = q_embedded.transpose(0, 2, 1, 3).reshape(B * L, H, 1, dim)
         gathered = gathered.reshape(B * L, 1, topk, dim)
         valid = (selected >= 0).reshape(B * L, 1, 1, topk)
         output = scaled_dot_product_attention(

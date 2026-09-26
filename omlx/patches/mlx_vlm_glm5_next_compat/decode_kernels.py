@@ -2371,3 +2371,207 @@ def latent_attention(
     )[0]
     STATS["latent_attn"] += 1
     return out.reshape(1, H, L, D)
+
+
+# Sparse verify blocks (2..8 tokens, each with its own selected keys): the
+# reference (_gathered_attention) gathers every token's rows and runs the SDPA
+# fallback with a batch of L * 64 one-row problems, i.e. MLX's batched gemv
+# for the scores (4 keys per simdgroup, 16 products per lane, 16/8/4/2/1
+# shuffle ladder) and gemv_t for the values (8 key groups x 4 lanes per
+# simdgroup, 4 simdgroups per 64 columns, 16/8/4 ladder). These kernels keep
+# each (token, head) reduction identical but load every selected key/value
+# row once for a chunk of HCH heads.
+_SPARSE_ROWS_SCORES_SOURCE = r"""
+  const int W = dims[0];
+  const int NKV = dims[1];
+  const uint lane = thread_index_in_simdgroup;
+  const int sg = int(simdgroup_index_in_threadgroup);
+  const int key0 = int(threadgroup_position_in_grid.x) * 16 + sg * 4;
+  const int h0 = int(threadgroup_position_in_grid.y) * HCH;
+  const int tok = int(threadgroup_position_in_grid.z);
+  const T sc = scale[0];
+  const device int* idx = indices + size_t(tok) * W;
+  // This lane's 4 dims per 128-wide block (4 blocks) of the 4 keys.
+  T kreg[4][16];
+  bool kok[4];
+  for (int tm = 0; tm < 4; tm++) {
+    const int key = key0 + tm;
+    kok[tm] = key < W;
+    int j = kok[tm] ? idx[key] : 0;
+    j = j < 0 ? 0 : (j > NKV - 1 ? NKV - 1 : j);
+    const device T* krow = kv + size_t(j) * D;
+    for (int i = 0; i < 4; i++) {
+      for (int tn = 0; tn < 4; tn++) {
+        kreg[tm][i * 4 + tn] = krow[i * 128 + int(lane) * 4 + tn];
+      }
+    }
+  }
+  for (int hh = 0; hh < HCH; hh++) {
+    const int h = h0 + hh;
+    const device T* qrow = q + (size_t(h) * LQ + tok) * D;   // q [H][L][D]
+    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int i = 0; i < 4; i++) {
+      float v_coeff[4];
+      for (int tn = 0; tn < 4; tn++) {
+        const T qv = qrow[i * 128 + int(lane) * 4 + tn];
+        const T qs = sc * qv;
+        v_coeff[tn] = static_cast<float>(qs);
+      }
+      for (int tm = 0; tm < 4; tm++) {
+        for (int tn = 0; tn < 4; tn++) {
+          result[tm] += kreg[tm][i * 4 + tn] * v_coeff[tn];
+        }
+      }
+    }
+    for (int tm = 0; tm < 4; tm++) {
+      for (ushort sn = 16; sn >= 1; sn >>= 1) {
+        result[tm] += simd_shuffle_down(result[tm], sn);
+      }
+    }
+    if (lane == 0) {
+      for (int tm = 0; tm < 4; tm++) {
+        if (kok[tm]) {
+          const int key = key0 + tm;
+          const T s = static_cast<T>(result[tm]);
+          out[(size_t(tok) * H + h) * W + key] =
+              idx[key] >= 0 ? s : as_type<T>(ushort(FINFO_MIN_BITS));
+        }
+      }
+    }
+  }
+"""
+
+_SPARSE_ROWS_VALUES_SOURCE = r"""
+  const int W = dims[0];
+  const int NKV = dims[1];
+  const uint lane = thread_index_in_simdgroup;
+  const int sgN = int(simdgroup_index_in_threadgroup);   // BN = 4
+  const int thrM = int(lane) / 4;
+  const int thrN = int(lane) % 4;
+  const int out_col = int(threadgroup_position_in_grid.x) * 64 + (sgN * 4 + thrN) * 4;
+  const int h0 = int(threadgroup_position_in_grid.y) * HCH;
+  const int tok = int(threadgroup_position_in_grid.z);
+  const device int* idx = indices + size_t(tok) * W;
+  float result[HCH][4];
+  for (int hh = 0; hh < HCH; hh++) {
+    for (int tn = 0; tn < 4; tn++) {
+      result[hh][tn] = 0.0f;
+    }
+  }
+  const int n_iter = W / 32;
+  int bm = thrM * 4;
+  for (int it = 0; it <= n_iter; it++) {
+    const bool leftover = it == n_iter;
+    T inter[4][4];
+    bool ok[4];
+    for (int tm = 0; tm < 4; tm++) {
+      ok[tm] = !leftover || (bm + tm < W);
+      int j = ok[tm] ? idx[bm + tm] : 0;
+      j = j < 0 ? 0 : (j > NKV - 1 ? NKV - 1 : j);
+      const device T* vrow = kv + size_t(j) * D + out_col;
+      for (int tn = 0; tn < 4; tn++) {
+        inter[tm][tn] = ok[tm] ? vrow[tn] : static_cast<T>(0.0f);
+      }
+    }
+    for (int hh = 0; hh < HCH; hh++) {
+      const device T* prow = probs + (size_t(tok) * H + h0 + hh) * W;
+      for (int tm = 0; tm < 4; tm++) {
+        if (!ok[tm]) {
+          break;
+        }
+        const float vc = static_cast<float>(prow[bm + tm]);
+        for (int tn = 0; tn < 4; tn++) {
+          result[hh][tn] += vc * inter[tm][tn];
+        }
+      }
+    }
+    bm += 32;
+  }
+  for (int hh = 0; hh < HCH; hh++) {
+    for (int tn = 0; tn < 4; tn++) {
+      for (ushort sm = 4; sm >= 1; sm >>= 1) {
+        result[hh][tn] += simd_shuffle_down(result[hh][tn], 4 * sm);
+      }
+    }
+    if (thrM == 0) {
+      device T* o = out + (size_t(tok) * H + h0 + hh) * D + out_col;
+      for (int tn = 0; tn < 4; tn++) {
+        o[tn] = static_cast<T>(result[hh][tn]);
+      }
+    }
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _sparse_rows_kernels():
+    scores = mx.fast.metal_kernel(
+        name="glm5_latent_sparse_rows_scores",
+        input_names=["q", "kv", "indices", "scale", "dims"],
+        output_names=["out"],
+        source=_SPARSE_ROWS_SCORES_SOURCE,
+    )
+    values = mx.fast.metal_kernel(
+        name="glm5_latent_sparse_rows_values",
+        input_names=["probs", "kv", "indices", "dims"],
+        output_names=["out"],
+        source=_SPARSE_ROWS_VALUES_SOURCE,
+    )
+    return scores, values
+
+
+def latent_attention_sparse_rows(
+    q: mx.array, keys: mx.array, indices: mx.array, scale: float, *, heads_per_tg: int = 8
+) -> Optional[mx.array]:
+    """``_gathered_attention``'s SDPA for 2..8 tokens with per-token selected
+    keys, bit-identical: ``q`` [1, H, L, D] (embed_q queries), ``keys``
+    [1, 1, NKV, D] latent cache, ``indices`` [L, W] (negative = masked,
+    rows clamped). Returns [1, H, L, D] or None."""
+    if q.ndim != 4 or q.shape[0] != 1 or keys.ndim != 4 or keys.shape[:2] != (1, 1):
+        return None
+    _, H, L, D = q.shape
+    NKV = keys.shape[2]
+    if keys.shape[3] != D or keys.dtype != q.dtype or q.dtype not in _FINFO_MIN_BITS:
+        return None
+    if indices.ndim != 2 or indices.shape[0] != L or not 2 <= L <= 8:
+        return None
+    W = indices.shape[1]
+    # gemv (scores): out W >= 4 rows, K = D < 16 * W, 128-wide blocks;
+    # gemv_t (values): in W < 8192, out D in [512, 2048) -> bn = 4, 64 cols.
+    if D != 512 or W < 16 or W > 4096 or H % heads_per_tg:
+        return None
+    k_scores, k_values = _sparse_rows_kernels()
+    q_rows = q.reshape(H * L, D)
+    kv = keys.reshape(NKV, D)
+    idx = indices.astype(mx.int32)
+    dims = mx.array([W, NKV], dtype=mx.int32)
+    fmin = _FINFO_MIN_BITS[q.dtype]
+    scores = k_scores(
+        inputs=[q_rows, kv, idx, mx.array([scale], dtype=q.dtype), dims],
+        template=[("T", q.dtype), ("D", D), ("H", H), ("LQ", L), ("HCH", heads_per_tg),
+                  ("FINFO_MIN_BITS", fmin)],
+        grid=(128 * (-(-W // 16)), H // heads_per_tg, L),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(L * H, W)],
+        output_dtypes=[q.dtype],
+    )[0]
+    _, k_softmax, _ = _latent_kernels(False, 0)
+    threads = ((-(-W // 4)) + 31) // 32 * 32
+    probs = k_softmax(
+        inputs=[scores, mx.array([W], dtype=mx.int32)],
+        template=[("T", q.dtype)],
+        grid=(threads * L * H, 1, 1),
+        threadgroup=(threads, 1, 1),
+        output_shapes=[(L * H, W)],
+        output_dtypes=[q.dtype],
+    )[0]
+    out = k_values(
+        inputs=[probs, kv, idx, dims],
+        template=[("T", q.dtype), ("D", D), ("H", H), ("HCH", heads_per_tg)],
+        grid=(128 * (D // 64), H // heads_per_tg, L),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(L * H, D)],
+        output_dtypes=[q.dtype],
+    )[0]
+    STATS["latent_sparse_rows"] += 1
+    return out.reshape(1, L, H, D).transpose(0, 2, 1, 3)
