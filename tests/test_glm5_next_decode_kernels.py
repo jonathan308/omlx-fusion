@@ -254,8 +254,11 @@ def test_decode_experts_are_bitwise_reference(length, shared_bits, monkeypatch):
     for trial in range(2):
         x = (mx.random.normal((1, length, 1024)) * (0.5 + trial)).astype(mx.bfloat16)
         indices, scores = moe.gate(x)
+        wide_before = _stats()["moe_shared_wide"]
         fused = moe._decode_experts(x, indices, scores)
         assert fused is not None
+        wide_used = _stats()["moe_shared_wide"] - wide_before
+        assert wide_used == (1 if shared_bits and length > 1 else 0)
         monkeypatch.setattr(language, "_DECODE_FUSION", False)
         reference = moe(x)
         compiled = mx.compile(moe)(x) if length == 1 else reference

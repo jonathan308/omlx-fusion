@@ -193,6 +193,88 @@ inline void glm_qmv_rows(
   }
 }
 
+// Verbatim copy of MLX quantized.h dequantize (U = float) for 4/5/6/8 bits.
+template <int N, int bits>
+inline void glm_dequantize(const device uint8_t* w, float scale, float bias, thread float* w_local) {
+  const float s = float(scale);
+  const float b = float(bias);
+  if (bits == 4) {
+    float sc[2] = {s, s / 16.0f};
+    for (int i = 0; i < (N / 2); i++) {
+      w_local[2 * i] = static_cast<float>(sc[0] * (w[i] & 0x0f) + b);
+      w_local[2 * i + 1] = static_cast<float>(sc[1] * (w[i] & 0xf0) + b);
+    }
+  } else if (bits == 5) {
+    for (int i = 0; i < (N / 8); i++) {
+      w_local += 8 * i;
+      w += 5 * i;
+      w_local[0] = static_cast<float>((w[0] & 0x1f) * s + b);
+      w_local[1] =
+          static_cast<float>((((w[0] & 0xe0) >> 5) + ((w[1] & 0x3) << 3)) * s + b);
+      w_local[2] = static_cast<float>(((w[1] & 0x7c) >> 2) * s + b);
+      w_local[3] =
+          static_cast<float>((((w[1] & 0x80) >> 7) + ((w[2] & 0xf) << 1)) * s + b);
+      w_local[4] =
+          static_cast<float>((((w[2] & 0xf0) >> 4) + ((w[3] & 0x1) << 4)) * s + b);
+      w_local[5] = static_cast<float>(((w[3] & 0x3e) >> 1) * s + b);
+      w_local[6] =
+          static_cast<float>((((w[3] & 0xc0) >> 6) + ((w[4] & 0x7) << 2)) * s + b);
+      w_local[7] = static_cast<float>(((w[4] & 0xf8) >> 3) * s + b);
+    }
+  } else if (bits == 6) {
+    for (int i = 0; i < (N / 4); i++) {
+      w_local += 4 * i;
+      w += 3 * i;
+      w_local[0] = static_cast<float>((w[0] & 0x3f) * s + b);
+      w_local[1] =
+          static_cast<float>((((w[0] >> 6) & 0x03) + ((w[1] & 0x0f) << 2)) * s + b);
+      w_local[2] =
+          static_cast<float>((((w[1] >> 4) & 0x0f) + ((w[2] & 0x03) << 4)) * s + b);
+      w_local[3] = static_cast<float>(((w[2] >> 2) & 0x3f) * s + b);
+    }
+  } else if (bits == 8) {
+    for (int i = 0; i < N; i++) {
+      w_local[i] = static_cast<float>(s * w[i] + b);
+    }
+  }
+}
+
+// MLX qmv_wide_impl (affine, k_lanes = 8) for one weight row and NV input
+// vectors: each lane reduces groups k_lane, k_lane + 8, ... in 8-value
+// sub-chunks; the caller applies the 4/2/1 shuffle-down ladder.
+template <typename T, int K, int GS, int BITS, int NV>
+inline void glm_qmv_wide_row(
+    const device uint8_t* wrow,
+    const device T* srow,
+    const device T* brow,
+    const device T* x,
+    int nv,
+    int k_lane,
+    thread float* result) {
+  constexpr int sub = 8;
+  constexpr int G = K / GS;
+  for (int g = k_lane; g < G; g += 8) {
+    float scale = srow[g];
+    float bias = brow[g];
+    for (int sc = 0; sc < GS / sub; sc++) {
+      const int k0 = g * GS + sc * sub;
+      const device uint8_t* wc = wrow + k0 * BITS / 8;
+      float w_dq[sub];
+      glm_dequantize<sub, BITS>(wc, scale, bias, w_dq);
+      for (int v = 0; v < NV; v++) {
+        if (v < nv) {
+          const device T* xc = x + v * K + k0;
+          float acc = 0;
+          for (int i = 0; i < sub; i++) {
+            acc += static_cast<float>(xc[i]) * w_dq[i];
+          }
+          result[v] += acc;
+        }
+      }
+    }
+  }
+}
+
 // Same expressions as MLX's Sigmoid / Minimum / Maximum functors.
 template <typename T>
 inline T glm_sigmoid(T x) {
@@ -234,12 +316,51 @@ _GATE_UP_SOURCE = r"""
   const uint simd_gid = simdgroup_index_in_threadgroup;
   const int tile = int(threadgroup_position_in_grid.y);
   const int z = int(threadgroup_position_in_grid.z);
+  const T lim = T(limit[0]);
+  const T neg_lim = T(-limit[0]);
+#if SHARED_WIDE
+  // Last z slice: the shared expert for all NTOK tokens with MLX's
+  // multi-row qmv_wide arithmetic (8 lanes per row, 4 rows per simdgroup).
+  if (z == NTOK * TOPK) {
+    const int k_lane = int(simd_lid) % 8;
+    const int row = (tile * NSG + int(simd_gid)) * 4 + int(simd_lid) / 8;
+    constexpr int WB = K * SBITS / 8;
+    constexpr int G = K / SGS;
+    float g_res[NTOK];
+    float u_res[NTOK];
+    for (int v = 0; v < NTOK; v++) {
+      g_res[v] = 0.0f;
+      u_res[v] = 0.0f;
+    }
+    glm_qmv_wide_row<T, K, SGS, SBITS, NTOK>(
+        (const device uint8_t*)sh_gate_w + size_t(row) * WB, sh_gate_s + row * G,
+        sh_gate_b + row * G, x, NTOK, k_lane, g_res);
+    glm_qmv_wide_row<T, K, SGS, SBITS, NTOK>(
+        (const device uint8_t*)sh_up_w + size_t(row) * WB, sh_up_s + row * G,
+        sh_up_b + row * G, x, NTOK, k_lane, u_res);
+    for (int v = 0; v < NTOK; v++) {
+      g_res[v] += simd_shuffle_down(g_res[v], 4);
+      g_res[v] += simd_shuffle_down(g_res[v], 2);
+      g_res[v] += simd_shuffle_down(g_res[v], 1);
+      u_res[v] += simd_shuffle_down(u_res[v], 4);
+      u_res[v] += simd_shuffle_down(u_res[v], 2);
+      u_res[v] += simd_shuffle_down(u_res[v], 1);
+    }
+    if (k_lane == 0) {
+      for (int v = 0; v < NTOK; v++) {
+        shared_out[size_t(v) * N + row] = glm_clamped_swiglu<T>(
+            static_cast<T>(g_res[v]), static_cast<T>(u_res[v]), lim, neg_lim);
+      }
+    }
+    return;
+  }
+  constexpr int RT = TOPK;
+#else
   constexpr int RT = TOPK + HAS_SHARED;
+#endif
   const int token = z / RT;
   const int r = z - token * RT;
   const int out_row = (tile * NSG + int(simd_gid)) * RPS;
-  const T lim = T(limit[0]);
-  const T neg_lim = T(-limit[0]);
   const device T* xr = x + token * K;
 
   float g_res[RPS] = {0};
@@ -346,16 +467,21 @@ def _source(body: str, **defines) -> str:
 
 
 @lru_cache(maxsize=None)
-def _gate_up_kernel(has_shared: bool):
+def _gate_up_kernel(has_shared: bool, shared_wide: bool = False):
     inputs = ["x", "indices", "limit", "gate_w", "gate_s", "gate_b", "up_w", "up_s", "up_b"]
-    if has_shared:
+    if has_shared or shared_wide:
         inputs += ["sh_gate_w", "sh_gate_s", "sh_gate_b", "sh_up_w", "sh_up_s", "sh_up_b"]
+    suffix = "_widesh" if shared_wide else ("_shared" if has_shared else "")
     return mx.fast.metal_kernel(
-        name=f"glm5_moe_gate_up_swiglu{'_shared' if has_shared else ''}",
+        name=f"glm5_moe_gate_up_swiglu{suffix}",
         input_names=inputs,
-        output_names=["out"],
+        output_names=["out", "shared_out"] if shared_wide else ["out"],
         header=_QMV_HEADER,
-        source=_source(_GATE_UP_SOURCE, HAS_SHARED=int(has_shared)),
+        source=_source(
+            _GATE_UP_SOURCE,
+            HAS_SHARED=int(has_shared and not shared_wide),
+            SHARED_WIDE=int(shared_wide),
+        ),
     )
 
 
@@ -412,11 +538,15 @@ def moe_gate_up_swiglu(
     *,
     rps: int = 4,
     nsg: int = 2,
-) -> Optional[mx.array]:
+    shared_wide: bool = False,
+):
     """Clamped-SwiGLU activations for every (token, routed expert[, shared]).
 
     ``x`` is [T, K] (one row per token), ``indices`` [T, TOPK].  Returns
     [T, TOPK (+1), N] in ``x.dtype`` or None when the shapes are not covered.
+    With ``shared_wide`` (2 <= T <= 8) the shared expert uses the multi-row
+    qmv_wide arithmetic the reference applies to T > 1 rows and the call
+    returns ``(routed [T, TOPK, N], shared [T, N])``.
     """
     parts = [_affine_parts(m) for m in (routed_gate, routed_up)]
     if any(p is None for p in parts) or x.ndim != 2 or indices.ndim != 2:
@@ -432,6 +562,8 @@ def moe_gate_up_swiglu(
     if not _qmv_fast_ok(rbits, rgs, N, K) or N % (rps * nsg):
         return None
     has_shared = shared_gate is not None
+    if shared_wide and (not has_shared or not 2 <= T <= 8 or rps != 4):
+        return None
     inputs = [x, indices, mx.array([limit], dtype=mx.float32), gw, gs, gb, uw, us, ub]
     template = [
         ("T", x.dtype), ("K", K), ("N", N), ("TOPK", topk), ("RBITS", rbits),
@@ -444,13 +576,31 @@ def moe_gate_up_swiglu(
         (sgw, sgs, sgb, sbits, sgsz), (suw, sus, sub, subits, susz) = sparts
         if (sbits, sgsz) != (subits, susz) or sgw.shape[0] != N or suw.shape[0] != N:
             return None
-        if sgs.dtype != x.dtype or sus.dtype != x.dtype or not _qmv_fast_ok(sbits, sgsz, N, K):
+        if sgs.dtype != x.dtype or sus.dtype != x.dtype:
+            return None
+        if shared_wide:
+            # qmv_wide: groups decoded in 8-value sub-chunks, 8 lanes per row.
+            if sbits not in (4, 5, 6, 8) or sgsz % 8 or K % sgsz or (K // sgsz) < 1:
+                return None
+        elif not _qmv_fast_ok(sbits, sgsz, N, K):
             return None
         inputs += [sgw, sgs, sgb, suw, sus, sub]
         template += [("SBITS", sbits), ("SGS", sgsz)]
-    rt = topk + int(has_shared)
-    kernel = _gate_up_kernel(has_shared)
+    kernel = _gate_up_kernel(has_shared, shared_wide)
     STATS["moe_gate_up"] += 1
+    if shared_wide:
+        template += [("NTOK", T)]
+        routed, shared = kernel(
+            inputs=inputs,
+            template=template,
+            grid=(32, (N // (rps * nsg)) * nsg, T * topk + 1),
+            threadgroup=(32, nsg, 1),
+            output_shapes=[(T, topk, N), (T, N)],
+            output_dtypes=[x.dtype, x.dtype],
+        )
+        STATS["moe_shared_wide"] += 1
+        return routed, shared
+    rt = topk + int(has_shared)
     return kernel(
         inputs=inputs,
         template=template,

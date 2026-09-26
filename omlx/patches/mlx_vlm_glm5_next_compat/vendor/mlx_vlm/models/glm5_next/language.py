@@ -1181,10 +1181,24 @@ class Glm5NextMoE(nn.Module):
                 return None
             y = dk.moe_down_combine(act, routes, weights, sw.down_proj, shared.down_proj)
         else:
-            act = dk.moe_gate_up_swiglu(x2, routes, limit, sw.gate_proj, sw.up_proj)
-            if act is None:
-                return None
-            shared_y = None if shared is None else shared(x).reshape(T, D)
+            fused = None
+            if shared is not None:
+                # One dispatch also computes the shared expert's gate/up with
+                # the multi-row qmv_wide arithmetic its own T > 1 call uses.
+                fused = dk.moe_gate_up_swiglu(
+                    x2, routes, limit, sw.gate_proj, sw.up_proj,
+                    shared.gate_proj, shared.up_proj, shared_wide=True,
+                )
+            if fused is not None:
+                act, shared_act = fused
+                shared_y = linear_forward(
+                    shared.down_proj, shared_act.reshape(1, T, -1)
+                ).reshape(T, D)
+            else:
+                act = dk.moe_gate_up_swiglu(x2, routes, limit, sw.gate_proj, sw.up_proj)
+                if act is None:
+                    return None
+                shared_y = None if shared is None else shared(x).reshape(T, D)
             y = dk.moe_down_combine(act, routes, weights, sw.down_proj, shared_y=shared_y)
         return None if y is None else y.reshape(x.shape)
 
