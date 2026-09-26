@@ -1431,8 +1431,12 @@ class TestMetalWiredLimit:
         # so the admin UI can still surface a warning.
         assert enforcer._metal_wired_limit_request == 42 * 1024**3
 
-    def test_start_skips_when_guard_disabled(self, mock_engine_pool):
-        """Guard off means we should not touch Metal limits either."""
+    def test_start_applies_resident_limit_when_guard_disabled(self, mock_engine_pool):
+        """Guard off still pins the resident wired limit once at start.
+
+        Without it every dropped BatchGenerator restored the limit to 0 and
+        the OS unwired the model between requests (perf/persistent-wired-limit).
+        """
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool,
             memory_guard_tier="balanced",
@@ -1443,7 +1447,7 @@ class TestMetalWiredLimit:
             patch.object(asyncio, "create_task", side_effect=_close_coro),
         ):
             enforcer.start()
-        mock_mx.set_wired_limit.assert_not_called()
+        mock_mx.set_wired_limit.assert_called_once()
 
 
 class TestSingleModelMemoryPressure:

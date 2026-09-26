@@ -218,6 +218,40 @@ def _wired_limit_suggestion_bytes(desired_bytes: int) -> int:
     return suggestion // mib * mib
 
 
+def _apply_resident_wired_limit() -> tuple[int, int | None]:
+    """Keep model memory wired for the process lifetime (guard off).
+
+    mlx-lm's BatchGenerator sets the wired limit to Apple's
+    max_recommended_working_set_size while it exists and restores the
+    previous limit in close(). oMLX drops and recreates batch generators
+    between requests, so with the prefill memory guard off the limit fell
+    back to 0 after every request: MLX empties its residency set, the OS
+    unwires the model, and the next request stalls on page residency
+    before large-weight kernels (measured on M5 Ultra: GLM-5.3-Flash
+    decode 0.6 tok/s unwired vs 39 tok/s wired, prefill GPU idle ~40%).
+
+    Apply the same value BatchGenerator uses, once, so that its close()
+    restores it instead of 0. This does not wire anything beyond what a
+    running generation already wires.
+    """
+    try:
+        target = int(mx.device_info().get("max_recommended_working_set_size", 0))
+    except Exception:  # noqa: BLE001
+        return 0, None
+    if target <= 0:
+        return 0, None
+    try:
+        previous = int(mx.set_wired_limit(target))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("mx.set_wired_limit(%s) failed: %s", _format_gb(target), exc)
+        return 0, None
+    if previous > target:
+        # An explicit, larger limit was already in place; keep it.
+        mx.set_wired_limit(previous)
+        return previous, previous
+    return target, previous
+
+
 def _apply_metal_wired_limit(desired_bytes: int) -> tuple[int, int | None]:
     """Try to raise Metal wired limit for this process to `desired_bytes`.
 
@@ -523,6 +557,15 @@ class ProcessMemoryEnforcer:
                     _format_gb(applied),
                     _format_gb(static_ceiling),
                     _format_gb(get_iogpu_wired_limit_bytes()),
+                )
+        else:
+            applied, previous = _apply_resident_wired_limit()
+            if applied > 0:
+                logger.info(
+                    "Metal wired limit kept at %s for loaded models "
+                    "(was %s; prefill memory guard off)",
+                    _format_gb(applied),
+                    _format_gb(previous or 0),
                 )
 
         self._task = asyncio.create_task(self._enforcement_loop())
