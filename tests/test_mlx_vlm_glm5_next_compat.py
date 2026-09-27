@@ -1748,3 +1748,42 @@ def test_kda_fused_prefill_survives_mtp_runtime_patch(monkeypatch):
 
     assert engaged == [70]
     assert mx.allclose(fused, reference, atol=3e-4, rtol=3e-4).item()
+
+
+@pytest.mark.parametrize("past_len", [0, 37])
+def test_dense_prefix_row_blocks_bitwise(monkeypatch, past_len):
+    """Causal row blocks of the dense-prefix attention reproduce the one-call
+    result bitwise (keys past a block's last row are masked for all of its
+    rows, so they only ever contribute exact zeros)."""
+    from mlx_vlm.models.glm5_next import language
+
+    mx.random.seed(7)
+    config = _tiny_config()
+    model = language.LanguageModel(config.text_config, config)
+    attention = model.model.layers[1].self_attn
+    heads = attention.num_heads
+    rows = 2100  # rows // 256 = 8: exercises 2, 3, 4 and 8 blocks
+    q = mx.random.normal((1, heads, rows, attention.q_head_dim)).astype(mx.bfloat16)
+    kv = mx.random.normal((1, 1, past_len + rows, attention.kv_lora_rank)).astype(mx.bfloat16)
+    total = past_len + rows
+    # The engine passes a boolean causal mask sliced out of a larger one.
+    full = mx.tril(mx.ones((total + 64, total + 64), dtype=mx.bool_), k=0)
+    mask = full[past_len:total, :total][None, None]
+
+    monkeypatch.setattr(language, "_DENSE_ROW_BLOCKS", 1)
+    ref = attention._dense_flat(q, kv, mask, rows, past_len)
+    outs = []
+    for blocks in (2, 3, 4, 8):
+        monkeypatch.setattr(language, "_DENSE_ROW_BLOCKS", blocks)
+        outs.append(attention._dense_flat(q, kv, mask, rows, past_len))
+    mx.eval(ref, outs)
+    for out in outs:
+        assert out.shape == ref.shape and out.dtype == ref.dtype
+        assert mx.array_equal(out, ref).item()
+    # Without an explicit mask the one-call "causal" path is kept.
+    monkeypatch.setattr(language, "_DENSE_ROW_BLOCKS", 4)
+    unmasked = attention._dense_flat(q, kv, None, rows, past_len)
+    monkeypatch.setattr(language, "_DENSE_ROW_BLOCKS", 1)
+    unmasked_ref = attention._dense_flat(q, kv, None, rows, past_len)
+    mx.eval(unmasked, unmasked_ref)
+    assert mx.array_equal(unmasked, unmasked_ref).item()
