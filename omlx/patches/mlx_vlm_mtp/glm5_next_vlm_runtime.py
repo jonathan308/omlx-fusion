@@ -21,7 +21,8 @@ Cache families, from ``LanguageModel.make_cache``:
   gated-delta recurrent state. Neither is trimmable, so a verify forward
   records each layer's block inputs and entry state in ``gdn_sink`` and
   ``rollback_speculative_cache`` replays the accepted prefix through the same
-  fused kernel.
+  kernel the forward ran: the fused decode/verify kernel
+  (``KdaStepCapture``) or the gated-delta kernel of the reference body.
 * sparse-attention layers use ``CacheList(KVCache(), PoolingCache(...))``.
   Both members trim, the pooling half through the cross-boundary undo log in
   ``deepseek_v4/cache_extras.py``, so rollback only trims them.
@@ -32,6 +33,7 @@ Apply this before ``mlx_vlm.utils.load`` so the patched ``__init__`` runs.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -48,6 +50,13 @@ _APPLIED = False
 # A depth-k chain verifies k+1 rows and PoolingCache only stashes an undo
 # log for updates of 8 rows or fewer.
 _MAX_CHAIN_DEPTH = 7
+
+# Verify forwards run the attention half-layer on the vendor's exact fused
+# decode/verify kernels (HC collapse + input norm, KDA layer body with a
+# replayable capture, one-token HC expand) like plain decode does; the FFN
+# half and the sparse attention already did. OMLX_GLM5_MTP_FUSED_VERIFY=0
+# keeps the reference ops there (same values, slower).
+_FUSED_VERIFY = os.environ.get("OMLX_GLM5_MTP_FUSED_VERIFY", "1").strip() != "0"
 
 # Source-side prefixes for the nextn MTP layer. glm5_next checkpoints use the
 # VLM-nested form; the other two are accepted so a text-only re-export or a
@@ -226,7 +235,10 @@ def _patch_linear_attention(g5_lang: Any) -> None:
     kernel, which is cheaper on the verify path than capturing per step.
 
     Replaces ``__call__`` rather than wrapping it because the recorded
-    tensors are locals of the stock body.
+    tensors are locals of the stock body. Like the vendor body it first
+    tries the fused decode/verify step, for plain decode and for verify
+    blocks alike; a verify block then records a ``KdaStepCapture`` (the
+    kernel's inputs and entry states) instead of the reference tuple.
 
     Follows the approach in Blaizzy/mlx-vlm#2044.
     """
@@ -239,6 +251,10 @@ def _patch_linear_attention(g5_lang: Any) -> None:
     gated_delta_update = g5_lang.gated_delta_update
 
     def __call__(self, inputs, mask=None, cache=None, gdn_sink=None):
+        if gdn_sink is None or (_FUSED_VERIFY and not _verify_qmm_may_route(self, inputs)):
+            fused = self._decode_step(inputs, mask, cache, capture=gdn_sink)
+            if fused is not None:
+                return fused
         B, S, _ = inputs.shape
         # Same fused KDA prefill route as the vendor body's gate. The verify
         # capture path needs the stock locals, so it never takes the shortcut.
@@ -334,6 +350,31 @@ def _patch_linear_attention(g5_lang: Any) -> None:
     cls._omlx_mtp_capture_patched = True
 
 
+def _verify_qmm_may_route(attn: Any, inputs: mx.array) -> bool:
+    """Whether the reference KDA body's input projections may take the
+    verify-shape qmm routes (``qwen35_verify_qmm``) for this block.
+
+    The batch generator arms those routes around every MTP verify forward;
+    they take ``QuantizedLinear`` calls of 3 or more rows (2-row, depth-1
+    blocks stay unrouted). The reference body makes such calls only for a
+    layer whose projections do not share one quantization (``_fused_in_proj``
+    then runs them one by one, e.g. GLM-5.3's layer 40 with a 5-bit v_proj),
+    while the fused step's grouped matmuls are never routed. Those blocks
+    keep the reference body, so the verify values do not depend on the path.
+    """
+    if (
+        getattr(attn, "_fused_ready", False)
+        or inputs.shape[0] * inputs.shape[1] < 3
+        or not getattr(nn.QuantizedLinear, "_omlx_verify_qmm_patched", False)
+    ):
+        return False
+    try:
+        from ..qwen35_verify_qmm import _is_armed
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(_is_armed())
+
+
 def _patch_decoder_layer(g5_lang: Any) -> None:
     """Thread ``gdn_sink`` from the model down to the KDA layers only."""
     cls = g5_lang.Glm5NextDecoderLayer
@@ -351,13 +392,29 @@ def _patch_decoder_layer(g5_lang: Any) -> None:
         # Capture recurrent state only in KDA layers. Both attention families
         # can compile the stateless FFN at the bounded MTP verify shapes.
         residual = x
-        xc, post, comb = self.attn_hc(x)
-        normed = self.input_layernorm(xc)
+        fused = None
+        if _FUSED_VERIFY:
+            kernels = getattr(g5_lang, "_decode_kernels", None)
+            if kernels is not None and getattr(g5_lang, "_DECODE_FUSION", False):
+                # Settle the eager sigmoid probe outside the compiled FFN
+                # block, which cannot run it (as the vendor call does).
+                kernels.eager_sigmoid_precise(mx.float32)
+            # Same values as attn_hc + input_layernorm (None: not covered).
+            fused = g5_lang._decode_hc_pre(self.attn_hc, self.input_layernorm, x)
+        if fused is None:
+            xc, post, comb = self.attn_hc(x)
+            normed = self.input_layernorm(xc)
+        else:
+            normed, post, comb = fused
         if self.is_linear:
             r = self.self_attn(normed, mask, cache, gdn_sink=gdn_sink)
         else:
             r = self.self_attn(normed, mask, cache)
-        x = g5_lang.hc_expand(r, residual, post, comb)
+        if _FUSED_VERIFY:
+            # One token: hc_expand in one exact dispatch.
+            x = g5_lang._decode_hc_expand(r, residual, post, comb)
+        else:
+            x = g5_lang.hc_expand(r, residual, post, comb)
         # Reuse the stock decode compiler. Larger prefill/batch shapes stay
         # eager to avoid compiling the full MoE at unbounded token counts.
         if (
@@ -365,6 +422,8 @@ def _patch_decoder_layer(g5_lang: Any) -> None:
             and x.shape[0] == 1
             and 1 <= x.shape[1] <= _MAX_CHAIN_DEPTH + 1
         ):
+            if _FUSED_VERIFY:
+                _check_verify_router(g5_lang, self, x)
             if self._ffn_c is None:
                 # The vendor's compile keeps the layer's weights out of the
                 # trace's constants (a leaked trace would pin them in memory).
@@ -379,6 +438,36 @@ def _patch_decoder_layer(g5_lang: Any) -> None:
 
     cls.__call__ = __call__
     cls._omlx_mtp_sink_patched = True
+
+
+# (block width, dtype) pairs whose fused verify router has been checked.
+_ROUTER_CHECKED: set = set()
+
+
+def _check_verify_router(g5_lang: Any, layer: Any, x: mx.array) -> None:
+    """Run the fused verify router's first-use check outside the compiled FFN.
+
+    ``decode_kernels.moe_router_rows`` compares the first call of each
+    configuration with the reference router, which takes an eager
+    evaluation; traced inside ``mx.compile`` it declines, and the compiled
+    FFN block then keeps the reference router at that width for good. One
+    eager router call per block width, on a fixed synthetic block (so it
+    neither waits for this forward nor draws random numbers), settles the
+    check first. The routes are the same either way.
+    """
+    gate = getattr(getattr(layer, "mlp", None), "gate", None)
+    width, dim = x.shape[1], x.shape[-1]
+    key = (width, x.dtype)
+    if (
+        gate is None
+        or not 2 <= width <= _MAX_CHAIN_DEPTH + 1
+        or key in _ROUTER_CHECKED
+        or not getattr(g5_lang, "_DECODE_FUSION", False)
+    ):
+        return
+    _ROUTER_CHECKED.add(key)
+    probe = mx.sin(mx.arange(width * dim, dtype=mx.float32) * 0.37) * 2.0
+    gate(probe.astype(x.dtype).reshape(1, width, dim))
 
 
 # ---------------------------------------------------------------------------
@@ -589,14 +678,18 @@ def _patch_language_model(g5_lang: Any) -> None:
         """Rewind every cache after a speculative round. Ported from PR #2044.
 
         KDA layers hold recurrent state with no trim semantics, so the
-        accepted prefix is replayed through the same fused kernel from the
-        stashed entry state, and their position is rewound through the
-        inverse advance. Sparse layers just trim: oMLX's own PoolingCache
-        carries a cross-boundary undo log, so unlike the upstream PR there is
-        no need to hand-roll the indexer pool rewind here. Every sparse layer
-        is checked before any layer is touched.
+        accepted prefix is replayed through the kernel the verify forward ran
+        (the fused decode/verify kernel for a ``KdaStepCapture``, else the
+        gated-delta kernel) from the stashed entry state, and their position
+        is rewound through the inverse advance. A fused block kept whole
+        already left its final states in the cache. Sparse layers just trim:
+        oMLX's own PoolingCache carries a cross-boundary undo log, so unlike
+        the upstream PR there is no need to hand-roll the indexer pool rewind
+        here. Every sparse layer is checked, and every recurrent state
+        rebuilt, before any layer is touched.
         """
         gated_delta_update = g5_lang.gated_delta_update
+        fused_capture = getattr(g5_lang, "KdaStepCapture", ())
 
         if isinstance(accepted, int):
             acc = [int(accepted)]
@@ -637,25 +730,39 @@ def _patch_language_model(g5_lang: Any) -> None:
                     f"undo {trim} rejected rows (first: {blocked[0]})"
                 )
 
+        # (conv_state, recurrent_state) per recurrent layer, or None when the
+        # cache already holds them.
+        restored = []
+        for entry in gdn_states[:n_recurrent] if n_recurrent else ():
+            if isinstance(entry, fused_capture):
+                if entry.width != int(block_size):
+                    raise RuntimeError(
+                        f"glm5_next rollback: {entry.width}-row KDA capture for a "
+                        f"{block_size}-row verify block"
+                    )
+                restored.append(None if n == entry.width else entry.replay(n))
+                continue
+            # The gate mask joined the capture tuple later; older callers
+            # can still hand over the 11-element form.
+            (q_, k_, v_, a_, b_, A_log_, dt_bias_, init_state,
+             conv_input, K, lb) = entry[:11]
+            gate_mask = entry[11] if len(entry) > 11 else None
+            _, state_n = gated_delta_update(
+                q_[:, :n], k_[:, :n], v_[:, :n], a_[:, :n], b_[:, :n],
+                A_log_, dt_bias_, state=init_state, lower_bound=lb,
+                mask=gate_mask[:, :n] if gate_mask is not None else None,
+            )
+            restored.append((conv_input[:, n : n + K - 1], state_n))
+
         gdn_idx = 0
         for c in caches:
             if c is None:
                 continue
             if _is_recurrent(c):
-                entry = gdn_states[gdn_idx]
-                # The gate mask joined the capture tuple later; older callers
-                # can still hand over the 11-element form.
-                (q_, k_, v_, a_, b_, A_log_, dt_bias_, init_state,
-                 conv_input, K, lb) = entry[:11]
-                gate_mask = entry[11] if len(entry) > 11 else None
+                states = restored[gdn_idx]
                 gdn_idx += 1
-                _, state_n = gated_delta_update(
-                    q_[:, :n], k_[:, :n], v_[:, :n], a_[:, :n], b_[:, :n],
-                    A_log_, dt_bias_, state=init_state, lower_bound=lb,
-                    mask=gate_mask[:, :n] if gate_mask is not None else None,
-                )
-                c[1] = state_n
-                c[0] = conv_input[:, n : n + K - 1]
+                if states is not None:
+                    c[0], c[1] = states
                 # The verify forward ran cache.advance(S) over the whole
                 # block. Restoring the state does not undo that, and unlike
                 # the sparse caches there is no trim() here to do it. These

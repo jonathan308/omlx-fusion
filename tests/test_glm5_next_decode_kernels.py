@@ -39,20 +39,6 @@ def _apply_glm5_next_compat():
     compat.apply_mlx_vlm_glm5_next_compat_patch()
 
 
-def _skip_under_mtp_runtime():
-    """Model-level fused decode checks need the vendor layer calls.
-
-    ``glm5_next_vlm_runtime.apply()`` (MTP checkpoints) replaces the layer
-    ``__call__`` methods process-wide and those bodies do not route the fused
-    decode kernels, so once an earlier test in the process applied it these
-    checks do not apply.
-    """
-    from omlx.patches.mlx_vlm_mtp import glm5_next_vlm_runtime
-
-    if getattr(glm5_next_vlm_runtime, "_APPLIED", False):
-        pytest.skip("glm5_next MTP runtime replaced the layer calls in this process")
-
-
 def _language():
     from mlx_vlm.models.glm5_next import language
 
@@ -743,7 +729,6 @@ _ALWAYS_FUSED = {
 
 
 def test_small_model_decode_and_verify_logits_are_bitwise_reference():
-    _skip_under_mtp_runtime()
     if not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
     used = _check_small_model()
@@ -753,7 +738,6 @@ def test_small_model_decode_and_verify_logits_are_bitwise_reference():
 def test_small_model_default_families_are_bitwise_reference(monkeypatch):
     """The production family set (fused latent attention off): one-token
     sparse steps gather the selected latent rows in one dispatch."""
-    _skip_under_mtp_runtime()
     if not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
     from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
@@ -766,7 +750,6 @@ def test_small_model_default_families_are_bitwise_reference(monkeypatch):
 
 
 def test_small_model_dense_attention_is_bitwise_reference():
-    _skip_under_mtp_runtime()
     from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
 
     used = _check_small_model(seed=43, prompt_len=300)
@@ -780,7 +763,6 @@ def test_small_model_dense_attention_is_bitwise_reference():
 def test_small_model_quantized_mla_is_bitwise_reference():
     """Quantized MLA projections (as in the checkpoint): unembed_out (K =
     kv_lora_rank) runs mla_head_qmv for one token; logits stay bitwise."""
-    _skip_under_mtp_runtime()
     used = _check_small_model(seed=47, prompt_len=300, quantize_mla=True)
     assert "mla_head_qmv" in used, used
 
@@ -807,8 +789,9 @@ def test_small_model_bitwise_reference_with_nax_tf32():
 
 
 def test_small_model_mtp_runtime_loop_defers_hc_bitwise():
-    """The MTP runtime's replacement model loop (plain decode) folds the HC
-    expands into the next layer like the vendor loop, bit for bit."""
+    """The MTP runtime's replacement model loop and KDA layer call (plain
+    decode) keep the fused paths, HC expands folded into the next layer
+    included, bit for bit."""
     if not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
     out = _run_with_tf32(
@@ -816,11 +799,13 @@ def test_small_model_mtp_runtime_loop_defers_hc_bitwise():
         "assert rt.apply()\n"
         "from mlx_vlm.models.glm5_next import language as g5\n"
         "assert g5.Glm5NextModel._omlx_mtp_call_patched\n"
+        "assert g5.Glm5NextLinearAttention._omlx_mtp_capture_patched\n"
         "from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk\n"
         "used = t._check_small_model(43, 300) | t._check_small_model()\n"
         "print(dk.nax_relaxed_fp32_matmul(), sorted(used))\n"
     )
     last = out.strip().splitlines()[-1]
+    assert "'kda'" in last and "'hc_mix'" in last, last
     if last.startswith("True"):
         assert "'hc_pre_fused'" in last and "'hc_post_mm'" in last, last
 
@@ -870,7 +855,6 @@ def _arrays_cache():
 
 @pytest.mark.parametrize("gate_bits", [8, 5])
 def test_kda_decode_step_is_bitwise_reference(gate_bits, monkeypatch):
-    _skip_under_mtp_runtime()
     language = _language()
     layer = _kda_layer(gate_bits=gate_bits, seed=gate_bits)
     fused_cache, reference_cache = _arrays_cache(), _arrays_cache()
@@ -920,7 +904,6 @@ def test_kda_decode_step_seed_sweep_is_bitwise_reference(seed, gate_bits, monkey
     wheel's precompiled kernels); several of these seeds differed in a few
     outputs (and then in the recurrent state) when the kernel always used
     the runtime-compiled exp."""
-    _skip_under_mtp_runtime()
     language = _language()
     layer = _kda_layer(seed=seed, gate_bits=gate_bits)
     fused_cache, reference_cache = _arrays_cache(), _arrays_cache()
@@ -947,7 +930,6 @@ def test_kda_decode_step_with_mixed_projection_bits(v_bits, monkeypatch):
     """GLM-5.3 layer 40 quantizes v_proj to 5 bits and q/k/gates to 8: the
     decode path runs one projection matmul per quantization instead of the
     reference layer body."""
-    _skip_under_mtp_runtime()
     language = _language()
     layer = _kda_layer(seed=20 + v_bits, v_bits=v_bits)
     fused_cache, reference_cache = _arrays_cache(), _arrays_cache()
@@ -972,7 +954,6 @@ def test_kda_decode_step_with_mixed_projection_bits(v_bits, monkeypatch):
 
 @pytest.mark.parametrize("width", [1, 4])
 def test_kda_decode_step_from_empty_cache(width, monkeypatch):
-    _skip_under_mtp_runtime()
     language = _language()
     layer = _kda_layer(seed=30 + width)
     x = (mx.random.normal((1, width, 1024)) * 0.7).astype(mx.bfloat16)
@@ -1571,7 +1552,6 @@ def test_upstream_kda_prefill_then_fused_decode_is_bitwise_reference(monkeypatch
     """Caches written by upstream's fused KDA prefill (glm53_kda_prework,
     >= 64-row chunks; the test prompts' 512-token chunks) feed the fused
     decode and verify paths exactly like the stock prefill's."""
-    _skip_under_mtp_runtime()
     try:
         from omlx.patches import glm53_kda_prework as prework
     except ImportError:
@@ -1592,7 +1572,6 @@ def test_upstream_kda_prefill_then_fused_decode_is_bitwise_reference(monkeypatch
 def test_decode_early_eval_only_schedules(every, monkeypatch):
     """One-token decode forwards evaluate every few layers while the graph is
     still being built; the logits and caches are those of the lazy forward."""
-    _skip_under_mtp_runtime()
     language = _language()
     model = _fused_shape_model(seed=45)
     prompt = mx.random.randint(0, 256, (1, 300)).astype(mx.int32)
