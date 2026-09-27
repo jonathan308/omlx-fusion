@@ -231,6 +231,28 @@ def _wired_limit_suggestion_bytes(desired_bytes: int) -> int:
     return suggestion // mib * mib
 
 
+_RESIDENT_WIRED_HEADROOM_MIN = 16 * 1024**3
+_RESIDENT_WIRED_HEADROOM_FRACTION = 0.10
+
+
+def _resident_wired_ceiling(target: int, memory_size: int) -> int:
+    """Clamp a resident wired limit so the OS keeps max(16 GiB, 10% of RAM).
+
+    On large-memory Macs Apple's recommended working set leaves only ~5% of
+    RAM unwired (243 GB of 256 GB on an M5 Ultra). A process that actually
+    wires that much starves the kernel's own allocations; on a 256 GB M5
+    Ultra this ended in a watchdog panic. The long-lived resident limit is
+    therefore kept below that edge.
+    """
+    if memory_size <= 0:
+        return target
+    headroom = max(
+        _RESIDENT_WIRED_HEADROOM_MIN,
+        int(memory_size * _RESIDENT_WIRED_HEADROOM_FRACTION),
+    )
+    return max(0, min(target, memory_size - headroom))
+
+
 def _apply_resident_wired_limit() -> tuple[int, int | None]:
     """Keep model memory wired for the process lifetime (guard off).
 
@@ -248,9 +270,12 @@ def _apply_resident_wired_limit() -> tuple[int, int | None]:
     running generation already wires.
     """
     try:
-        target = int(mx.device_info().get("max_recommended_working_set_size", 0))
+        info = mx.device_info()
+        target = int(info.get("max_recommended_working_set_size", 0))
+        memory_size = int(info.get("memory_size", 0) or 0)
     except Exception:  # noqa: BLE001
         return 0, None
+    target = _resident_wired_ceiling(target, memory_size)
     if target <= 0:
         return 0, None
     try:
