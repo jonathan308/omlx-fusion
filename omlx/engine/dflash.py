@@ -172,8 +172,6 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     is_gemma4 = model_type in ("gemma4", "gemma4_text", "gemma4_unified")
     is_laguna = model_type == "laguna"
     is_muse = model_type in ("muse_glimmer", "muse_glimmer_text")
-    if model_type == "glm5_next":
-        return False, "GLM-5.3 uses the native oMLX VLM engine"
     is_mimo = model_type in ("mimo_v2", "mimo_v2_flash")
     is_glm5 = model_type in ("glm5_next", "glm5_next_text")
     if not (is_qwen or is_gemma4 or is_laguna or is_muse or is_mimo or is_glm5):

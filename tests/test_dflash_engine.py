@@ -1018,14 +1018,6 @@ class TestDFlashCompatibility:
         compatible, reason = is_dflash_compatible(tmp_path)
         assert compatible is True
 
-    def test_glm5_uses_native_vlm_engine(self, tmp_path):
-        from omlx.engine.dflash import is_dflash_compatible
-
-        self._write_config(tmp_path, "glm5_next")
-        compatible, reason = is_dflash_compatible(tmp_path)
-        assert compatible is False
-        assert "native oMLX VLM engine" in reason
-
     def test_llama_is_incompatible(self, tmp_path):
         try:
             from omlx.engine.dflash import is_dflash_compatible
@@ -1297,7 +1289,9 @@ class TestDFlashGlm5EngineWiring:
         assert calls == [96, 41]
         assert synchronized == [True]
 
-    def test_load_with_wired_limit_only_owns_glm_targets(self, monkeypatch):
+    def test_load_with_wired_limit_owns_every_target(self, monkeypatch):
+        # Fusion owns the working-set limit for every DFlash target (DFlash
+        # bypasses BatchGenerator), not only for GLM-5.3 targets.
         from omlx.engine.dflash import DFlashEngine
 
         engine = DFlashEngine("target", "draft")
@@ -1311,7 +1305,8 @@ class TestDFlashGlm5EngineWiring:
 
         monkeypatch.setattr(engine, "_is_glm5_target", lambda: False)
         assert engine._load_with_wired_limit(lambda: "loaded") == "loaded"
-        assert events == []
+        assert events == ["acquire"]
+        events.clear()
 
         monkeypatch.setattr(engine, "_is_glm5_target", lambda: True)
         assert engine._load_with_wired_limit(lambda: "loaded") == "loaded"
