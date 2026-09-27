@@ -626,6 +626,52 @@ def test_kda_decode_step_is_bitwise_reference(gate_bits, monkeypatch):
         assert _mismatches(fused_cache[1], reference_cache[1]) == 0
 
 
+def test_eager_sigmoid_probe_reproduces_mx_sigmoid():
+    from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
+
+    for dtype in (mx.bfloat16, mx.float32):
+        precise = dk.eager_sigmoid_precise(dtype)
+        assert precise in (True, False), dtype
+        x = (mx.random.normal((4096,)) * 6).astype(dtype)
+        kernel = mx.fast.metal_kernel(
+            name="glm5_sigmoid_probe", input_names=["x"],
+            output_names=["default_out", "precise_out"],
+            header=dk._QMV_HEADER, source=dk._SIGMOID_PROBE_SOURCE,
+        )
+        default, exact = kernel(
+            inputs=[x], template=[("T", dtype)], grid=(x.size, 1, 1),
+            threadgroup=(256, 1, 1), output_shapes=[x.shape] * 2,
+            output_dtypes=[dtype] * 2,
+        )
+        assert _mismatches(exact if precise else default, mx.sigmoid(x)) == 0
+
+
+@pytest.mark.parametrize("seed", range(20, 30))
+def test_kda_decode_step_seed_sweep_is_bitwise_reference(seed, monkeypatch):
+    """The reference's beta and output-gate sigmoids are eager mx.sigmoid
+    kernels, whose exp differs between MLX builds (precise in the release
+    wheel's precompiled kernels); several of these seeds differed in a few
+    outputs (and then in the recurrent state) when the kernel always used
+    the runtime-compiled exp."""
+    _skip_under_mtp_runtime()
+    language = _language()
+    layer = _kda_layer(seed=seed)
+    fused_cache, reference_cache = _arrays_cache(), _arrays_cache()
+    prompt = (mx.random.normal((1, 12, 1024)) * 0.8).astype(mx.bfloat16)
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    for cache in (fused_cache, reference_cache):
+        mx.eval(layer(prompt, cache=cache))
+    for step, width in enumerate([1, 1, 4, 1, 8, 1, 1, 2, 1, 1]):
+        x = (mx.random.normal((1, width, 1024)) * (0.5 + step % 3)).astype(mx.bfloat16)
+        monkeypatch.setattr(language, "_DECODE_FUSION", False)
+        reference = layer(x, cache=reference_cache)
+        monkeypatch.setattr(language, "_DECODE_FUSION", True)
+        fused = layer(x, cache=fused_cache)
+        mx.eval(reference, fused, fused_cache.cache, reference_cache.cache)
+        assert _mismatches(fused, reference) == 0, f"step {step} width {width}"
+        assert _mismatches(fused_cache[1], reference_cache[1]) == 0
+
+
 @pytest.mark.parametrize("width", [1, 4])
 def test_kda_decode_step_from_empty_cache(width, monkeypatch):
     _skip_under_mtp_runtime()
@@ -662,12 +708,20 @@ def _router(experts=288, hidden=4096, seed=0):
     return gate
 
 
-@pytest.mark.parametrize("experts,hidden", [(288, 4096), (64, 512)])
-def test_router_is_bitwise_reference(experts, hidden, monkeypatch):
+@pytest.mark.parametrize("experts,hidden,bias", [(288, 4096, 0.0), (288, 4096, 14.0), (64, 512, 0.0)])
+def test_router_is_bitwise_reference(experts, hidden, bias, monkeypatch):
+    """One-token router vs group_expert_select, bitwise over many draws.
+
+    The reference takes the sigmoid with MLX's eager kernel (precise exp on
+    release wheels, where a runtime-compiled exp differs in the last bit for
+    a few percent of logits and so, after normalization, in ~5% of routes);
+    ``bias`` 14 is the checkpoint's e_score_correction_bias level.
+    """
     language = _language()
     gate = _router(experts, hidden, seed=experts)
-    for trial in range(12):
-        x = (mx.random.normal((1, 1, hidden)) * (0.3 + trial)).astype(mx.bfloat16)
+    gate.e_score_correction_bias = gate.e_score_correction_bias + bias
+    for trial in range(96):
+        x = (mx.random.normal((1, 1, hidden)) * (0.3 + trial % 6)).astype(mx.bfloat16)
         before = _stats()["router"]
         indices, scores = gate(x)
         assert _stats()["router"] == before + 1
@@ -676,18 +730,7 @@ def test_router_is_bitwise_reference(experts, hidden, monkeypatch):
         monkeypatch.setattr(language, "_DECODE_FUSION", True)
         assert indices.dtype == ref_indices.dtype and indices.shape == ref_indices.shape
         assert mx.array_equal(indices, ref_indices).item()
-        if (experts, hidden) == (288, 4096):
-            # GLM-5.3's shape: bitwise on the stock wheel and on source builds.
-            assert _mismatches(scores, ref_scores) == 0
-        else:
-            # Other shapes: the stock wheel's precompiled gemv may pick a
-            # different reduction variant than the one the kernel replays;
-            # allow that summation-order difference (<= 2 fp32 ulp).
-            np.testing.assert_array_max_ulp(
-                np.array(scores.astype(mx.float32)),
-                np.array(ref_scores.astype(mx.float32)),
-                maxulp=2,
-            )
+        assert _mismatches(scores, ref_scores) == 0, trial
 
 
 def test_router_breaks_exact_ties_like_argpartition(monkeypatch):

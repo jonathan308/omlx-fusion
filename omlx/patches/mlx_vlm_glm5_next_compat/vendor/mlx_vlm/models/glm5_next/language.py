@@ -1601,6 +1601,11 @@ class Glm5NextDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
+        if _decode_kernels is not None and _DECODE_FUSION:
+            # Settle (eagerly, once) how MLX's eager fp32 sigmoid evaluates;
+            # the fused router inside the compiled FFN block follows it and
+            # cannot probe while being traced.
+            _decode_kernels.eager_sigmoid_precise(mx.float32)
         residual = x
         fused = _decode_hc_pre(self.attn_hc, self.input_layernorm, x)
         if fused is None:

@@ -294,6 +294,15 @@ inline T glm_sigmoid(T x) {
   auto y = 1 / (1 + metal::exp(metal::abs(x)));
   return (x < 0) ? y : 1 - y;
 }
+// MLX's Sigmoid as its precompiled kernels evaluate it: the release metallib
+// is built with -fno-fast-math, so metal::exp is the precise exp there,
+// while runtime-compiled kernels (custom kernels, compiled graphs, JIT
+// builds) get the default one. See eager_sigmoid_precise().
+template <typename T>
+inline T glm_sigmoid_precise(T x) {
+  auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
+  return (x < 0) ? y : 1 - y;
+}
 template <typename T>
 inline T glm_minimum(T x, T y) {
   if (metal::isnan(x)) {
@@ -1240,6 +1249,56 @@ def dsa_expand_topk(
 # Each reference op is its own kernel there, so every intermediate is rounded
 # to its dtype here too and products are never contracted into the adds that
 # consumed them in a different kernel.
+_SIGMOID_PROBE_SOURCE = r"""
+  const uint i = thread_position_in_grid.x;
+  default_out[i] = glm_sigmoid<T>(x[i]);
+  precise_out[i] = glm_sigmoid_precise<T>(x[i]);
+"""
+
+_EAGER_SIGMOID: dict = {}
+
+
+def eager_sigmoid_precise(dtype) -> Optional[bool]:
+    """Whether the eager ``mx.sigmoid`` kernel for ``dtype`` evaluates exp
+    precisely (MLX's precompiled kernels, built with -fno-fast-math: the
+    release wheels) or like runtime-compiled kernels (source builds that
+    JIT their kernels). Decided once per dtype by comparing mx.sigmoid with
+    both expressions over a sweep of inputs; None when neither reproduces it
+    (or when first asked inside a function transformation)."""
+    if dtype in _EAGER_SIGMOID:
+        return _EAGER_SIGMOID[dtype]
+    try:
+        grid = mx.linspace(-24.0, 24.0, 1 << 16)
+        noise = mx.random.normal((1 << 16,), key=mx.random.key(7)) * 4.0
+        x = mx.concatenate([grid, noise]).astype(dtype)
+        kernel = mx.fast.metal_kernel(
+            name="glm5_sigmoid_probe",
+            input_names=["x"],
+            output_names=["default_out", "precise_out"],
+            header=_QMV_HEADER,
+            source=_SIGMOID_PROBE_SOURCE,
+        )
+        default, precise = kernel(
+            inputs=[x],
+            template=[("T", dtype)],
+            grid=(x.size, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[x.shape, x.shape],
+            output_dtypes=[dtype, dtype],
+        )
+        ref = mx.sigmoid(x)
+        view = {2: mx.uint16, 4: mx.uint32}[ref.dtype.size]
+        same_default = mx.array_equal(ref.view(view), default.view(view)).item()
+        same_precise = mx.array_equal(ref.view(view), precise.view(view)).item()
+    except Exception:  # traced (mx.compile / vmap): decide on an eager call
+        return None
+    result = True if same_precise and not same_default else (
+        False if same_default and not same_precise else None
+    )
+    _EAGER_SIGMOID[dtype] = result
+    return result
+
+
 _KDA_SOURCE = r"""
   constexpr int CK = 4;
   constexpr int NROW = CK - 1 + TOK;
@@ -1383,7 +1442,11 @@ _KDA_SOURCE = r"""
     gs[t][i] = metal::precise::exp(s4);
   }
   if (tid < uint(TOK)) {
+#if SIG_B_PRECISE
+    betas[tid] = glm_sigmoid_precise<T>(proj[tid * PROJ_W + OFF_B + h]);
+#else
     betas[tid] = glm_sigmoid<T>(proj[tid * PROJ_W + OFF_B + h]);
+#endif
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1450,7 +1513,11 @@ _KDA_SOURCE = r"""
       float wf = static_cast<float>(norm_w[c]);
       float wx = wf * xn;
       float gf = static_cast<float>(gates[t][c]);
+#if SIG_G_PRECISE
+      float gsg = glm_sigmoid_precise<float>(gf);
+#else
       float gsg = glm_sigmoid<float>(gf);
+#endif
       float o = wx * gsg;
       y[t * QKV + h * DK + c] = static_cast<T>(o);
     }
@@ -1459,7 +1526,13 @@ _KDA_SOURCE = r"""
 
 
 @lru_cache(maxsize=None)
-def _kda_kernel(has_conv_state: bool, has_state: bool, pre_ag: bool):
+def _kda_kernel(
+    has_conv_state: bool,
+    has_state: bool,
+    pre_ag: bool,
+    sig_b_precise: bool = False,
+    sig_g_precise: bool = False,
+):
     inputs = ["proj", "conv_w", "a_log", "dt_bias", "norm_w", "consts"]
     if has_conv_state:
         inputs.append("conv_state")
@@ -1470,7 +1543,10 @@ def _kda_kernel(has_conv_state: bool, has_state: bool, pre_ag: bool):
     else:
         inputs += ["fb_w", "fb_s", "fb_b", "gb_w", "gb_s", "gb_b"]
     return mx.fast.metal_kernel(
-        name=f"glm5_kda_decode_c{int(has_conv_state)}_s{int(has_state)}_p{int(pre_ag)}",
+        name=(
+            f"glm5_kda_decode_c{int(has_conv_state)}_s{int(has_state)}_p{int(pre_ag)}"
+            f"_b{int(sig_b_precise)}_g{int(sig_g_precise)}"
+        ),
         input_names=inputs,
         output_names=["y", "conv_state_out", "state_out"],
         header=_QMV_HEADER,
@@ -1479,6 +1555,8 @@ def _kda_kernel(has_conv_state: bool, has_state: bool, pre_ag: bool):
             HAS_CONV_STATE=int(has_conv_state),
             HAS_STATE=int(has_state),
             PRE_AG=int(pre_ag),
+            SIG_B_PRECISE=int(sig_b_precise),
+            SIG_G_PRECISE=int(sig_g_precise),
         ),
     )
 
@@ -1572,7 +1650,13 @@ def kda_decode_step(
     if state is not None:
         inputs.append(state)
     inputs += inputs_extra
-    kernel = _kda_kernel(conv_state is not None, state is not None, pre)
+    # beta = sigmoid(b) and the RMSNormGated gate are eager mx.sigmoid calls
+    # in the reference; reproduce whichever exp this MLX build's kernel uses.
+    sig_b = eager_sigmoid_precise(proj.dtype)
+    sig_g = eager_sigmoid_precise(mx.float32)
+    if sig_b is None or sig_g is None:
+        return None
+    kernel = _kda_kernel(conv_state is not None, state is not None, pre, sig_b, sig_g)
     STATS["kda"] += 1
     y, conv_out, state_out = kernel(
         inputs=inputs,
@@ -1643,7 +1727,11 @@ _ROUTER_LOGITS_SOURCE = r"""
   if (lane == 0) {
     for (int tm = 0; tm < RPS; tm++) {
       const int e = out_row + tm;
+#if SIG_PRECISE
+      float sgm = glm_sigmoid_precise<float>(result[tm]);
+#else
       float sgm = glm_sigmoid<float>(result[tm]);
+#endif
       float biased = sgm + bias[e];
       sig[size_t(tok) * E + e] = sgm;
       biased_out[size_t(tok) * E + e] = biased;
@@ -1723,14 +1811,21 @@ _ROUTER_SELECT_SOURCE = r"""
 
 
 @lru_cache(maxsize=None)
-def _router_logits_kernel():
+def _router_logits_kernel(sig_precise: bool = False):
     return mx.fast.metal_kernel(
-        name="glm5_router_logits_sigmoid",
+        name="glm5_router_logits_sigmoid" + ("_precise" if sig_precise else ""),
         input_names=["x", "w", "bias"],
         output_names=["sig", "biased_out"],
         header=_QMV_HEADER,
-        source=_ROUTER_LOGITS_SOURCE,
+        source=_source(_ROUTER_LOGITS_SOURCE, SIG_PRECISE=int(sig_precise)),
     )
+
+
+def _router_sigmoid_precise() -> Optional[bool]:
+    """The reference router (group_expert_select) takes the sigmoid of its
+    fp32 logits with MLX's eager Sigmoid kernel, whose exp is the precise
+    one on release wheels (see eager_sigmoid_precise); None while undecided."""
+    return eager_sigmoid_precise(mx.float32)
 
 
 @lru_cache(maxsize=None)
@@ -1776,8 +1871,11 @@ def moe_router(
         return None
     if not 1 <= top_k <= min(32, E) or E > 1024:
         return None
+    precise = _router_sigmoid_precise()
+    if precise is None:
+        return None
     rows_per_simd = 1
-    sig, biased = _router_logits_kernel()(
+    sig, biased = _router_logits_kernel(precise)(
         inputs=[x, weight, bias],
         template=[("T", x.dtype), ("K", K), ("E", E), ("ROWS_PER_SIMD", rows_per_simd)],
         grid=(128 * (E // (4 * rows_per_simd)), T, 1),
@@ -2053,7 +2151,11 @@ _ROUTER_NAX_SOURCE = r"""
           for (int q = 0; q < NPART; q++) {
             logit += parts[q][r][hh * 16 + c];
           }
+#if SIG_PRECISE
+          float sgm = glm_sigmoid_precise<float>(logit);
+#else
           float sgm = glm_sigmoid<float>(logit);
+#endif
           float biased = sgm + bias[e];
           sig[r * E + e] = sgm;
           biased_out[r * E + e] = biased;
@@ -2069,13 +2171,13 @@ _ROUTER_PREFETCH = int(os.environ.get("OMLX_GLM5_ROUTER_PREFETCH", "8"))
 
 
 @lru_cache(maxsize=None)
-def _router_nax_kernel():
+def _router_nax_kernel(sig_precise: bool = False):
     return mx.fast.metal_kernel(
-        name="glm5_router_logits_nax_splitk",
+        name="glm5_router_logits_nax_splitk" + ("_precise" if sig_precise else ""),
         input_names=["x", "w", "bias"],
         output_names=["sig", "biased_out"],
         header=_NAX_HEADER + _QMV_HEADER.replace("#include <metal_stdlib>\nusing namespace metal;\n", ""),
-        source=_ROUTER_NAX_SOURCE,
+        source=_source(_ROUTER_NAX_SOURCE, SIG_PRECISE=int(sig_precise)),
     )
 
 
@@ -2120,8 +2222,11 @@ def moe_router_rows(
         return None
     if not nax_relaxed_fp32_matmul():
         return None
+    precise = _router_sigmoid_precise()
+    if precise is None:
+        return None
     npart = K // part
-    sig, biased = _router_nax_kernel()(
+    sig, biased = _router_nax_kernel(precise)(
         inputs=[x, weight, bias],
         template=[("M", T), ("K", K), ("E", E), ("PART", part), ("NPART", npart),
                   ("G", _ROUTER_PREFETCH)],
