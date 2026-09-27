@@ -1288,3 +1288,43 @@ def test_upstream_kda_prefill_then_fused_decode_is_bitwise_reference(monkeypatch
     used = _check_small_model() | _check_small_model(43, 300)
     assert prework._GLM53_KDA_ENGAGED_LOGGED
     assert _ALWAYS_FUSED <= used, used
+
+
+@pytest.mark.parametrize("every", [1, 3])
+def test_decode_early_eval_only_schedules(every, monkeypatch):
+    """One-token decode forwards evaluate every few layers while the graph is
+    still being built; the logits and caches are those of the lazy forward."""
+    _skip_under_mtp_runtime()
+    language = _language()
+    model = _fused_shape_model(seed=45)
+    prompt = mx.random.randint(0, 256, (1, 300)).astype(mx.int32)
+    caches = []
+    for _ in range(2):
+        cache = model.make_cache()
+        mx.eval(model(prompt, cache=cache).logits)
+        caches.append(cache)
+    calls = []
+    real_async_eval = mx.async_eval
+
+    def counting_async_eval(*args):
+        calls.append(len(args))
+        return real_async_eval(*args)
+
+    token = mx.array([[17]], dtype=mx.int32)
+    for step in range(3):
+        monkeypatch.setattr(language, "_DECODE_EVAL_EVERY", 0)
+        lazy = model(token, cache=caches[0]).logits
+        mx.eval(lazy)
+        monkeypatch.setattr(language, "_DECODE_EVAL_EVERY", every)
+        monkeypatch.setattr(mx, "async_eval", counting_async_eval)
+        early = model(token, cache=caches[1]).logits
+        monkeypatch.setattr(mx, "async_eval", real_async_eval)
+        mx.eval(early)
+        assert _mismatches(early, lazy) == 0, f"step {step}"
+        token = mx.argmax(lazy[:, -1:], axis=-1).astype(mx.int32)
+    # 4 layers: evaluations after layers `every`, 2 * every, ... (not the last).
+    assert len(calls) == 3 * len(range(every, 4, every))
+    for a, b in zip(caches[0], caches[1]):
+        for x, y in zip(a.state, b.state):
+            if isinstance(x, mx.array):
+                assert _mismatches(x, y) == 0

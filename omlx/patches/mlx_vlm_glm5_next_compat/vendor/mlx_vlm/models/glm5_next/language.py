@@ -69,6 +69,16 @@ def _decode_fusion_default() -> bool:
 _DECODE_FUSION = _decode_fusion_default()
 _DECODE_BLOCK = 8
 
+# One-token decode forwards start evaluating every this many layers (0 = off).
+# A step is ~800 dependent dispatches whose Python graph build takes ~2.7 ms;
+# mlx keeps at most ~10 command buffers in flight and, with its default
+# per-buffer size budget (every expert or projection weight input counts in
+# full), a step commits ~170 buffers, so the GPU drains the previous step's
+# last few buffers long before the next graph is built and encoded (~1.3 ms
+# idle per token). Encoding the first layers while the later ones are being
+# built keeps it fed. The values computed are unchanged.
+_DECODE_EVAL_EVERY = max(0, int(os.environ.get("OMLX_GLM5_DECODE_EVAL_EVERY", "8") or 0))
+
 
 def _decode_hc_pre(connection, norm, x: mx.array):
     """HC collapse plus the branch's input RMSNorm for B == 1, L <= 8.
@@ -1497,13 +1507,20 @@ class Glm5NextModel(nn.Module):
         # Evaluate each layer and release cached buffers to bound prefill memory.
         # Keep decode lazy; the MTP replacement loop must use the same policy.
         prefill = h.shape[1] >= 256
+        # One-token decode: start encoding the step every few layers while the
+        # rest of the graph is still being built (scheduling only, see
+        # _DECODE_EVAL_EVERY).
+        eval_every = _DECODE_EVAL_EVERY if h.shape[1] == 1 else 0
+        n_layers = len(self.layers)
 
-        for layer, c in zip(self.layers, cache):
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
             h = layer(h, mask=mask, cache=c)
             if prefill:
                 mx.eval(h)
                 mx.clear_cache()
+            elif eval_every and (i + 1) % eval_every == 0 and i + 1 < n_layers:
+                mx.async_eval(h)
 
         h = h.mean(axis=2)
         return self.norm(h)

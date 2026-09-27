@@ -414,10 +414,15 @@ def _patch_model_call(g5_lang: Any) -> None:
         )
         h = mx.contiguous(h)
 
-        # This replaces Glm5NextModel.__call__; preserve its prefill memory policy.
+        # This replaces Glm5NextModel.__call__; preserve its prefill memory
+        # policy and its one-token decode early evaluation.
         prefill = h.shape[1] >= 256
+        eval_every = (
+            getattr(g5_lang, "_DECODE_EVAL_EVERY", 0) if h.shape[1] == 1 else 0
+        )
+        n_layers = len(self.layers)
 
-        for layer, c in zip(self.layers, cache):
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
             if gdn_sink is not None:
                 h = layer(h, mask=mask, cache=c, gdn_sink=gdn_sink)
@@ -426,6 +431,8 @@ def _patch_model_call(g5_lang: Any) -> None:
             if prefill:
                 mx.eval(h)
                 mx.clear_cache()
+            elif eval_every and (i + 1) % eval_every == 0 and i + 1 < n_layers:
+                mx.async_eval(h)
 
         # Collapse the mHC streams first: everything downstream (the final
         # norm, the lm_head, and the nextn head) consumes the ordinary
