@@ -2359,7 +2359,10 @@ def moe_router_logits(x: mx.array, weight: mx.array, bias: mx.array):
         return None
     if E < 16 or E >= 4096 or K >= 16 * E or K <= 64 or K % 128 or E % 16 or E > 1024:
         return None
-    sig, biased = _router_logits_kernel()(
+    precise = _router_sigmoid_precise()
+    if precise is None:
+        return None
+    sig, biased = _router_logits_kernel(precise)(
         inputs=[x, weight, bias],
         template=[("T", x.dtype), ("K", K), ("E", E), ("ROWS_PER_SIMD", 1)],
         grid=(128 * (E // 4), T, 1),
