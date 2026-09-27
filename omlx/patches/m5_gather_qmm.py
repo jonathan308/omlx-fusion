@@ -62,7 +62,11 @@ once; anything unsupported or failing keeps the stock handling above.
 ``fused_gate_up_activation`` lets a SwitchGLU forward whose fused ``[gate;
 up]`` sorted projection would take that route run its SwiGLU in the NAX
 kernel's epilogue instead of a separate elementwise pass (bit-identical;
-``OMLX_M5_GATHER_QMM_NAX_SWIGLU=0`` disables it).
+``OMLX_M5_GATHER_QMM_NAX_SWIGLU=0`` disables it). Given the token rows and
+the sorted row map (``sort_routes``), that kernel reads each routed token's
+row in place instead of from the ``[T * k, 1, K]`` copy that the sort
+would otherwise gather (bit-identical; ``OMLX_M5_GATHER_QMM_NAX_ROW_MAP=0``
+disables it).
 """
 
 from __future__ import annotations
@@ -365,7 +369,25 @@ def _swiglu_limit(activation):
     return _UNSUPPORTED
 
 
-def fused_gate_up_activation(proj, x, indices, activation):
+def sort_routes(x, indices):
+    """mlx-lm's ``_gather_sort`` without the gather.
+
+    Returns ``(x_tok, row_map, idx, inv_order)``: the token rows
+    ``x.flatten(0, -3)``, the sorted row -> token row map ``order // k``,
+    the sorted expert indices and the inverse order, computed by the same
+    ops, so ``x_tok[row_map]`` is exactly ``_gather_sort``'s sorted ``x``.
+    Callers keep that indexing lazy: it only runs when a consumer needs the
+    replicated ``[T * k, 1, K]`` rows (``fused_gate_up_activation`` with
+    ``token_rows`` reads them in place instead).
+    """
+    *_, M = indices.shape
+    indices = indices.flatten()
+    order = mx.argsort(indices)
+    inv_order = mx.argsort(order)
+    return x.flatten(0, -3), order // M, indices[order], inv_order
+
+
+def fused_gate_up_activation(proj, x, indices, activation, token_rows=None):
     """``activation(x_up, x_gate)`` of a fused ``[gate; up]`` projection in
     one kernel, or None.
 
@@ -380,6 +402,12 @@ def fused_gate_up_activation(proj, x, indices, activation):
     self-tested bit-identical to the unfused path) and only the ``[M, 1,
     N / 2]`` result is written. None otherwise: the caller runs the
     projection, the split and the activation itself.
+
+    ``token_rows`` = ``(x_tok, row_map)`` with ``x == x_tok[row_map]``
+    (``sort_routes``) lets the kernel read the sorted rows from the token
+    rows in place, so a lazy ``x`` is never materialised (bit-identical;
+    ``OMLX_M5_GATHER_QMM_NAX_ROW_MAP=0`` disables it). If the row-mapped
+    kernel declines, ``x`` is used as before.
     """
     limit = _swiglu_limit(activation)
     if limit is _UNSUPPORTED:
@@ -398,16 +426,22 @@ def fused_gate_up_activation(proj, x, indices, activation):
         return None
     if not _nax_rows_ok(x, w):
         return None
-    return _nax.sorted_gather_qmm_swiglu(
-        x,
-        w,
-        scales,
-        proj.get("biases"),
-        indices,
+    kw = dict(
         group_size=int(proj.group_size),
         bits=int(proj.bits),
         mode=getattr(proj, "mode", None) or "affine",
         limit=limit,
+    )
+    if token_rows is not None and _nax.row_map_enabled():
+        x_tok, row_map = token_rows
+        if isinstance(x_tok, mx.array) and isinstance(row_map, mx.array):
+            out = _nax.sorted_gather_qmm_swiglu(
+                x_tok, w, scales, proj.get("biases"), indices, row_map=row_map, **kw
+            )
+            if out is not None:
+                return out
+    return _nax.sorted_gather_qmm_swiglu(
+        x, w, scales, proj.get("biases"), indices, **kw
     )
 
 

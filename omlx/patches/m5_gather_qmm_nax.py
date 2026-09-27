@@ -64,13 +64,25 @@ functors in that dtype (the op sequence of the compiled kernel, compiled
 like it at runtime) and writes only ``[M, n]``: bit-identical, with one
 elementwise pass and the ``[M, 2 * n]`` write and read removed.
 
+With ``row_map`` it also reads its activation rows in place: the MoE sort
+copies every token's row once per selected expert (``x[order // k]``,
+``[T * k, 1, K]``, 0.4-0.5 GB per layer at 8192-token chunks) only to feed
+this matmul. The row-mapped variant takes the token rows ``[T, 1, K]`` and
+the sorted row -> token row map instead; each lane addresses its four
+activation rows through the map (offsets computed once per tile), so every
+fragment holds the values it would read from the copy and the tensor ops
+are unchanged: bit-identical, and the copy is never computed (callers keep
+it lazy, see ``m5_gather_qmm.sort_routes``).
+
 Supported: ``transpose=True``, rhs-indices only, ``x`` of shape
 ``[M, 1, K]`` with a flat sorted ``uint32`` index of length ``M``, bf16/fp16
 activations, affine 4/8-bit with group 32/64/128 (scales and biases in the
 activation dtype) and MXFP4 (group 32); the epilogue additionally needs
-``2 * n % 64 == 0``. Anything else returns None and the caller keeps the
+``2 * n % 64 == 0``, the row map a uint32 ``[M]`` map and fewer than 2**32
+token-row elements. Anything else returns None and the caller keeps the
 stock path. ``OMLX_M5_GATHER_QMM_NAX=0`` disables the module,
-``OMLX_M5_GATHER_QMM_NAX_SWIGLU=0`` only the epilogue;
+``OMLX_M5_GATHER_QMM_NAX_SWIGLU=0`` only the epilogue (and the row map),
+``OMLX_M5_GATHER_QMM_NAX_ROW_MAP=0`` only the row map;
 ``OMLX_M5_GATHER_QMM_NAX_PLAN=sched,bm,bk,gx,pad`` (e.g.
 ``seg,128,128,32,8192``) pins a configuration (testing).
 """
@@ -93,6 +105,7 @@ logger = logging.getLogger(__name__)
 _ENV_ENABLE = "OMLX_M5_GATHER_QMM_NAX"
 _ENV_PLAN = "OMLX_M5_GATHER_QMM_NAX_PLAN"
 _ENV_SWIGLU = "OMLX_M5_GATHER_QMM_NAX_SWIGLU"
+_ENV_ROW_MAP = "OMLX_M5_GATHER_QMM_NAX_ROW_MAP"
 
 # Output tile width and column simdgroups (fixed; the Metal source assumes
 # them). Tile heights are multiples of 32 rows (one row simdgroup each).
@@ -532,6 +545,123 @@ METAL_FUNC void sub_step(
   }
 }
 
+// Row-mapped activations (MAP): sorted row r of the product is token row
+// rmap[r] of x, read in place instead of from a replicated copy. a_off[i][h]
+// is this lane's element offset of activation row i * 16 + h * 8 + sc.y of
+// its simdgroup block (rmap[row] * K + sc.x; rows past the block point at
+// its last row), so lane values are exactly those NAXTile::load reads from
+// the copy.
+template <typename T, short R>
+METAL_FUNC void load_a_map(
+    thread NAXTile<T, R, kTK>& A,
+    const device T* xk,
+    const thread uint (&a_off)[kTM][2],
+    const short i0) {
+  STEEL_PRAGMA_UNROLL
+  for (short r = 0; r < R; r++) {
+    STEEL_PRAGMA_UNROLL
+    for (short h = 0; h < 2; h++) {
+      const device T* xp = xk + a_off[i0 + r][h];
+      STEEL_PRAGMA_UNROLL
+      for (short kk = 0; kk < kTK; kk++) {
+        const vec<T, 4> v = *(const device vec<T, 4>*)(xp + kk * 16);
+        STEEL_PRAGMA_UNROLL
+        for (short c = 0; c < 4; c++) {
+          A.frag_at(r, kk)[h * 4 + c] = v[c];
+        }
+      }
+    }
+  }
+}
+
+// sub_step with row-mapped activations (xk: the token rows advanced to this
+// sub-step's K offset): the same fragment values (rows past sgp_sm of a
+// partial block zero as load_safe makes them) and the same tensor ops in the
+// same order.
+template <typename T, typename WT, int BKP, bool FULL>
+METAL_FUNC void sub_step_map(
+    thread NAXTile<float, kTM, kTN>& Dtile,
+    const device T* xk,
+    const thread uint (&a_off)[kTM][2],
+    const threadgroup WT* ws,
+    const short sgp_sm) {
+  NAXTile<WT, kTN, kTK> Btile;
+  if constexpr (FULL) {
+    NAXTile<T, kTM, kTK> Atile;
+
+    volatile int compiler_barrier;
+
+    load_a_map<T, kTM>(Atile, xk, a_off, 0);
+    Btile.template load<WT, BKP, 1>(ws);
+
+    tile_matmad_nax(
+        Dtile,
+        Atile,
+        metal::bool_constant<false>{},
+        Btile,
+        metal::bool_constant<true>{});
+
+    (void)compiler_barrier;
+  } else {
+    const short2 sc = BaseNAXFrag::get_coord();
+    Btile.template load<WT, BKP, 1>(ws);
+    STEEL_PRAGMA_UNROLL
+    for (short mm = 0; mm < kTM; mm++) {
+      if (mm * 16 < sgp_sm) {
+        NAXTile<T, 1, kTK> Arow;
+        load_a_map<T, 1>(Arow, xk, a_off, mm);
+        STEEL_PRAGMA_UNROLL
+        for (short h = 0; h < 2; h++) {
+          if (mm * 16 + h * 8 + sc.y >= sgp_sm) {
+            STEEL_PRAGMA_UNROLL
+            for (short kk = 0; kk < kTK; kk++) {
+              STEEL_PRAGMA_UNROLL
+              for (short c = 0; c < 4; c++) {
+                Arow.frag_at(0, kk)[h * 4 + c] = T(0);
+              }
+            }
+          }
+        }
+        STEEL_PRAGMA_UNROLL
+        for (short nn = 0; nn < kTN; nn += 2) {
+          STEEL_PRAGMA_UNROLL
+          for (short kk = 0; kk < kTK; kk++) {
+            BaseNAXFrag::mma(
+                Dtile.frag_at(mm, nn),
+                Dtile.frag_at(mm, nn + 1),
+                Arow.frag_at(0, kk),
+                metal::bool_constant<false>{},
+                Btile.frag_at(nn, kk),
+                Btile.frag_at(nn + 1, kk),
+                metal::bool_constant<true>{});
+          }
+        }
+      }
+    }
+  }
+}
+
+// Element offsets of this lane's activation rows (see load_a_map) for the
+// simdgroup block starting at tile row m0 of a tile of tile_rows rows at
+// sorted row row_start.
+METAL_FUNC void map_rows(
+    thread uint (&a_off)[kTM][2],
+    const device uint32_t* rmap,
+    const int row_start,
+    const int tile_rows,
+    const int m0,
+    const int K) {
+  const short2 sc = BaseNAXFrag::get_coord();
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < kTM; i++) {
+    STEEL_PRAGMA_UNROLL
+    for (short h = 0; h < 2; h++) {
+      const int r = min(m0 + i * 16 + h * 8 + int(sc.y), tile_rows - 1);
+      a_off[i][h] = rmap[row_start + r] * uint(K) + uint(sc.x);
+    }
+  }
+}
+
 // seg: mlx's segmented sorted gather kernel (affine_gather_qmm_rhs_seg_nax /
 // fp_gather_qmm_rhs_seg_nax): one single-expert BM x kBN tile per
 // threadgroup, the weight tile of each BK-deep K step dequantized into
@@ -549,9 +679,11 @@ template <
     typename G,
     bool ALIGN_N,
     bool ALIGN_K,
-    int EPI = 0>
+    int EPI = 0,
+    bool MAP = false>
 METAL_FUNC void gather_seg(
     const device T* x,
+    const device uint32_t* rmap,
     const device uint8_t* w,
     thread Q& q,
     const uint4 desc,
@@ -589,7 +721,9 @@ METAL_FUNC void gather_seg(
   const bool loads = G::kLT == G::kThreads || sgid * 32 + lane < uint(G::kLT);
   const bool row_live = ALIGN_N || loader.row < tgp_bn;
 
-  x += size_t(row_start) * K;
+  if constexpr (!MAP) {
+    x += size_t(row_start) * K;
+  }
   y += size_t(row_start) * ldy + w_col;
 
   const short tm = kSM * short(sgid / kWN);
@@ -598,10 +732,15 @@ METAL_FUNC void gather_seg(
   const short sgp_sn =
       ALIGN_N ? kSN : short(min(int(kSN), max(0, N - (y_col + tn))));
   const bool sg_active = sgp_sm > 0;
+  uint a_off[kTM][2];
+  if constexpr (MAP) {
+    map_rows(a_off, rmap, row_start, rows, int(tm), K);
+  }
 
   NAXTile<float, kTM, kTN> Dtile;
   Dtile.clear();
-  const device T* xn = x + tm * K;
+  // MAP: xn walks K over the token rows; a_off selects each lane's rows.
+  const device T* xn = MAP ? x : x + tm * K;
   const threadgroup WT* ws = Ws + tn * BKP;
 
   dispatch_bool(sgp_sm == kSM, [&](auto kAlignedM) {
@@ -620,8 +759,13 @@ METAL_FUNC void gather_seg(
       STEEL_PRAGMA_NO_UNROLL
       for (int kk1 = 0; kk1 < G::kBK; kk1 += kSK) {
         if (sg_active) {
-          sub_step<T, WT, BKP, kAlignedM.value>(
-              Dtile, xn + kk1, ws + kk1, K, sgp_sm);
+          if constexpr (MAP) {
+            sub_step_map<T, WT, BKP, kAlignedM.value>(
+                Dtile, xn + kk1, a_off, ws + kk1, sgp_sm);
+          } else {
+            sub_step<T, WT, BKP, kAlignedM.value>(
+                Dtile, xn + kk1, ws + kk1, K, sgp_sm);
+          }
         }
       }
       xn += G::kBK;
@@ -642,8 +786,13 @@ METAL_FUNC void gather_seg(
       STEEL_PRAGMA_NO_UNROLL
       for (int kk1 = 0; kk1 < k_remain; kk1 += kSK) {
         if (sg_active) {
-          sub_step<T, WT, BKP, kAlignedM.value>(
-              Dtile, xn + kk1, ws + kk1, K, sgp_sm);
+          if constexpr (MAP) {
+            sub_step_map<T, WT, BKP, kAlignedM.value>(
+                Dtile, xn + kk1, a_off, ws + kk1, sgp_sm);
+          } else {
+            sub_step<T, WT, BKP, kAlignedM.value>(
+                Dtile, xn + kk1, ws + kk1, K, sgp_sm);
+          }
         }
       }
     }
@@ -669,9 +818,10 @@ METAL_FUNC void gather_seg(
 // stored) and 16-row fragments without rows of the tile are skipped.
 // Requires K % 64 == 0 and N % 64 == 0. EPI > 0: the activation epilogue
 // of gather_seg.
-template <typename T, typename Q, typename G, int EPI = 0>
+template <typename T, typename Q, typename G, int EPI = 0, bool MAP = false>
 METAL_FUNC void gather_db(
     const device T* x,
+    const device uint32_t* rmap,
     const device uint8_t* w,
     thread Q& q,
     const uint4 desc,
@@ -706,17 +856,24 @@ METAL_FUNC void gather_db(
 
   const int m0 = kSM * int(sgid / kWN);
   const int rows = min(int(kSM), tile_rows - m0);
-  const device T* xs =
-      x + size_t(row_start + max(0, min(m0, tile_rows - 1))) * K;
+  // MAP: x holds the token rows; offsets address them through rmap.
+  const device T* xs = MAP
+      ? x
+      : x + size_t(row_start + max(0, min(m0, tile_rows - 1))) * K;
 
   const short2 sc = BaseNAXFrag::get_coord();
-  int x_off[kTM][2];
+  metal::conditional_t<MAP, uint, int> x_off[kTM][2];
   STEEL_PRAGMA_UNROLL
   for (short i = 0; i < kTM; i++) {
     STEEL_PRAGMA_UNROLL
     for (short h = 0; h < 2; h++) {
       const int r = min(int(i * 16 + sc.y + h * 8), max(rows, 1) - 1);
-      x_off[i][h] = r * K + sc.x;
+      if constexpr (MAP) {
+        x_off[i][h] = rmap[row_start + min(m0 + r, tile_rows - 1)] * uint(K) +
+            uint(sc.x);
+      } else {
+        x_off[i][h] = r * K + sc.x;
+      }
     }
   }
   const short m_frags = rows > 0 ? short((rows + 15) / 16) : short(0);
@@ -848,12 +1005,12 @@ _MM_SOURCE_TMPL = """
     {q_init}
     if constexpr (SCHED == 1) {{
         omlx_gqmm::gather_db<T, Q, G>(
-            x, (const device uint8_t*)w, q, desc, y_col, y, params[0],
+            x, tiles, (const device uint8_t*)w, q, desc, y_col, y, params[0],
             params[1], Ws, simdgroup_index_in_threadgroup,
             thread_index_in_simdgroup);
     }} else {{
         omlx_gqmm::gather_seg<T, Q, G, ALIGN_N, ALIGN_K>(
-            x, (const device uint8_t*)w, q, desc, y_col, y, params[0],
+            x, tiles, (const device uint8_t*)w, q, desc, y_col, y, params[0],
             params[1], Ws, simdgroup_index_in_threadgroup,
             thread_index_in_simdgroup);
     }}
@@ -953,27 +1110,39 @@ _ACT_SOURCE_TMPL = """
     {q_init}
     const T limit = lim[0];
     if constexpr (SCHED == 1) {{
-        omlx_gqmm::gather_db<T, Q, G, EPI>(
-            x, (const device uint8_t*)w, q, desc, y_col, y, params[0],
+        omlx_gqmm::gather_db<T, Q, G, EPI, {mapped}>(
+            x, {rmap}, (const device uint8_t*)w, q, desc, y_col, y, params[0],
             params[1], Ws, simdgroup_index_in_threadgroup,
             thread_index_in_simdgroup, limit);
     }} else {{
-        omlx_gqmm::gather_seg<T, Q, G, true, ALIGN_K, EPI>(
-            x, (const device uint8_t*)w, q, desc, y_col, y, params[0],
+        omlx_gqmm::gather_seg<T, Q, G, true, ALIGN_K, EPI, {mapped}>(
+            x, {rmap}, (const device uint8_t*)w, q, desc, y_col, y, params[0],
             params[1], Ws, simdgroup_index_in_threadgroup,
             thread_index_in_simdgroup, limit);
     }}
 """
 
-_AFFINE_ACT_SOURCE = _ACT_SOURCE_TMPL.format(
-    q_type="using Q = omlx_gqmm::AffineQ<T, GS, BITS>;",
-    q_init="Q q{scales, biases};",
-)
 
-_FP_ACT_SOURCE = _ACT_SOURCE_TMPL.format(
-    q_type="using Q = omlx_gqmm::Mxfp4Q<GS>;",
-    q_init="Q q{scales};",
+def _act_source(q_type: str, q_init: str, mapped: bool) -> str:
+    # Mapped kernels read the sorted rows through the ``rmap`` input; the
+    # others pass ``tiles`` as the (unread) row map.
+    return _ACT_SOURCE_TMPL.format(
+        q_type=q_type,
+        q_init=q_init,
+        mapped="true" if mapped else "false",
+        rmap="rmap" if mapped else "tiles",
+    )
+
+
+_AFFINE_Q = (
+    "using Q = omlx_gqmm::AffineQ<T, GS, BITS>;",
+    "Q q{scales, biases};",
 )
+_FP_Q = ("using Q = omlx_gqmm::Mxfp4Q<GS>;", "Q q{scales};")
+_AFFINE_ACT_SOURCE = _act_source(*_AFFINE_Q, mapped=False)
+_FP_ACT_SOURCE = _act_source(*_FP_Q, mapped=False)
+_AFFINE_ACT_MAP_SOURCE = _act_source(*_AFFINE_Q, mapped=True)
+_FP_ACT_MAP_SOURCE = _act_source(*_FP_Q, mapped=True)
 
 # Epilogue kinds (the kernel's EPI): silu(gate) * up, and the clamped form.
 _EPI_SWIGLU = 1
@@ -1035,8 +1204,17 @@ def swiglu_enabled() -> bool:
     }
 
 
+def row_map_enabled() -> bool:
+    """False when ``OMLX_M5_GATHER_QMM_NAX_ROW_MAP`` (or the epilogue) is off:
+    gate/up callers then materialise the sorted rows as before."""
+    return swiglu_enabled() and os.environ.get(
+        _ENV_ROW_MAP, "1"
+    ).strip().lower() not in {"0", "false", "off"}
+
+
 def _get_act_kernel(kind: str):
-    """Build (once) the ``affine_act`` or ``fp_act`` kernel object."""
+    """Build (once) the ``affine_act`` or ``fp_act`` kernel object, or its
+    row-mapped variant (``*_act_map``: sorted rows read through ``rmap``)."""
     global _act_header_failed
     kernel = _kernels.get(kind)
     if kernel is not None or _act_header_failed:
@@ -1055,39 +1233,26 @@ def _get_act_kernel(kind: str):
             )
             return None
         header = mlx_src + _MM_HEADER + _ACT_HEADER
-        if kind == "affine_act":
-            kernel = mx.fast.metal_kernel(
-                name="omlx_gqmm_affine_swiglu",
-                input_names=[
-                    "x",
-                    "w",
-                    "scales",
-                    "biases",
-                    "tiles",
-                    "tile_count",
-                    "params",
-                    "lim",
-                ],
-                output_names=["y"],
-                header=header,
-                source=_AFFINE_ACT_SOURCE,
-            )
-        else:
-            kernel = mx.fast.metal_kernel(
-                name="omlx_gqmm_mxfp4_swiglu",
-                input_names=[
-                    "x",
-                    "w",
-                    "scales",
-                    "tiles",
-                    "tile_count",
-                    "params",
-                    "lim",
-                ],
-                output_names=["y"],
-                header=header,
-                source=_FP_ACT_SOURCE,
-            )
+        mapped = kind.endswith("_map")
+        affine = kind.startswith("affine")
+        inputs = ["x", "w", "scales"] + (["biases"] if affine else [])
+        inputs += ["tiles", "tile_count", "params", "lim"]
+        if mapped:
+            inputs.append("rmap")
+        source = {
+            (True, False): _AFFINE_ACT_SOURCE,
+            (False, False): _FP_ACT_SOURCE,
+            (True, True): _AFFINE_ACT_MAP_SOURCE,
+            (False, True): _FP_ACT_MAP_SOURCE,
+        }[(affine, mapped)]
+        kernel = mx.fast.metal_kernel(
+            name=("omlx_gqmm_affine_swiglu" if affine else "omlx_gqmm_mxfp4_swiglu")
+            + ("_map" if mapped else ""),
+            input_names=inputs,
+            output_names=["y"],
+            header=header,
+            source=source,
+        )
         _kernels[kind] = kernel
         return kernel
 
@@ -1096,7 +1261,7 @@ def _get_kernel(kind: str):
     """Build (once) the ``scan``, ``affine`` or ``fp`` kernel object (and
     the ``*_act`` epilogue variants)."""
     global _header_failed
-    if kind.endswith("_act"):
+    if kind.endswith("_act") or kind.endswith("_act_map"):
         return _get_act_kernel(kind)
     kernel = _kernels.get(kind)
     if kernel is not None or _header_failed:
@@ -1211,15 +1376,30 @@ def supports(
     group_size: int,
     bits: int,
     mode: str,
+    row_map: Optional[mx.array] = None,
 ) -> bool:
-    """True when ``sorted_gather_qmm`` handles this call (layout/dtypes)."""
+    """True when ``sorted_gather_qmm`` handles this call (layout/dtypes).
+
+    With ``row_map`` (uint32 ``[M]``, sorted row -> row of ``x``) the rows
+    are read through the map and ``x`` may have any row count (32-bit
+    element offsets: fewer than 2**32 elements)."""
     if x.dtype not in (mx.bfloat16, mx.float16):
         return False
     if x.ndim != 3 or x.shape[1] != 1 or indices.ndim != 1:
         return False
-    M, K = int(x.shape[0]), int(x.shape[2])
+    M, K = int(indices.shape[0]), int(x.shape[2])
+    if row_map is None:
+        if int(x.shape[0]) != M:
+            return False
+    elif (
+        row_map.ndim != 1
+        or int(row_map.shape[0]) != M
+        or row_map.dtype != mx.uint32
+        or int(x.shape[0]) * K >= 2**32
+    ):
+        return False
     # Fewer than 8 indices would be bound as a constant buffer.
-    if M < 8 or indices.shape[0] != M or indices.dtype != mx.uint32:
+    if M < 8 or indices.dtype != mx.uint32:
         return False
     if w.ndim != 3 or w.dtype != mx.uint32:
         return False
@@ -1260,16 +1440,22 @@ def _launch(
     stream,
     epi=0,
     limit=None,
+    row_map=None,
 ):
     """Tile pre-pass + matmul. ``epi`` > 0 runs the activation epilogue on
     the ``[gate; up]`` rows of ``w`` (``N % 64 == 0``) and returns
-    ``[M, 1, N / 2]``."""
+    ``[M, 1, N / 2]``; with it, ``row_map`` reads the sorted rows as
+    ``x[row_map]`` in place."""
     scan = _get_kernel("scan")
     kind = "affine" if mode == "affine" else "fp"
-    mm = _get_kernel(f"{kind}_act" if epi else kind)
+    if row_map is not None and not epi:
+        return None
+    mm = _get_kernel(
+        (f"{kind}_act" + ("_map" if row_map is not None else "")) if epi else kind
+    )
     if scan is None or mm is None:
         return None
-    M, K = int(x.shape[0]), int(x.shape[2])
+    M, K = int(indices.shape[0]), int(x.shape[2])
     E, N = int(w.shape[0]), int(w.shape[1])
     bm = plan.bm
     max_tiles = (M + bm - 1) // bm + min(E, M)
@@ -1296,6 +1482,8 @@ def _launch(
         bound = 0.0 if limit is None else limit
         inputs.append(mx.array(bound, dtype=x.dtype).reshape(1))
         template.append(("EPI", int(epi)))
+        if row_map is not None:
+            inputs.append(row_map)
     else:
         template.append(("ALIGN_N", N % _BN == 0))
     template += [
@@ -1431,6 +1619,8 @@ def _describe(key: tuple) -> str:
     if len(key) > 7:
         limit = key[8]
         epi = " + silu(gate) * up" if limit is None else f" + clamped SwiGLU {limit:g}"
+        if len(key) > 9:
+            epi += ", row map"
     return (
         f"{str(dtype).rsplit('.', 1)[-1]} {mode} {bits}-bit gs{group_size} "
         f"({plan.describe()}{'' if align_n else ', ragged N'}"
@@ -1514,6 +1704,54 @@ def _self_test_act(key: tuple) -> Optional[bool]:
     return ok
 
 
+def _self_test_act_map(key: tuple) -> Optional[bool]:
+    """Run one row-mapped activation-epilogue instantiation on a canary: a
+    scrambled, repeating row map over a smaller token array must reproduce
+    the unmapped epilogue on the materialised rows ``x[row_map]`` bitwise
+    (the same configuration's unmapped instantiation is itself checked
+    against the unfused path). None: could not be evaluated here."""
+    dtype, mode, bits, group_size, plan, _, align_k, epi, limit, _ = key
+    K = _canary_k(plan, align_k)
+    try:
+        M = sum(_CANARY_COUNTS)
+        T = M // 3
+        tok_scale = mx.power(10.0, mx.linspace(-1.0, 1.2, T)).reshape(T, 1, 1)
+        wq, scales, biases, _, _, idx = _canary_problem(
+            dtype, mode, bits, group_size, 2 * _BN, K
+        )
+        x_tok = (
+            mx.random.normal((T, 1, K), key=mx.random.key(0x70C)) * tok_scale
+        ).astype(dtype)
+        row_map = ((mx.arange(M, dtype=mx.uint32) * 7 + 3) % T).astype(mx.uint32)
+        out = _launch(
+            x_tok, wq, scales, biases, idx, group_size, bits, mode, plan, None,
+            epi=epi, limit=limit, row_map=row_map,
+        )
+        ref = _launch(
+            x_tok[row_map], wq, scales, biases, idx, group_size, bits, mode,
+            plan, None, epi=epi, limit=limit,
+        )
+        if out is None or ref is None:
+            return False
+        ok = _bits_equal(out, ref)
+    except Exception as e:  # noqa: BLE001
+        if "transformation" in str(e):
+            return None
+        logger.warning(
+            "NAX gate/up row-map self-test raised for %s: %s", _describe(key), e
+        )
+        return False
+    if ok:
+        logger.info("NAX gate/up activation epilogue armed for %s", _describe(key))
+    else:
+        logger.warning(
+            "NAX gate/up row map disabled for %s: canary not bit-identical to "
+            "the materialised rows",
+            _describe(key),
+        )
+    return ok
+
+
 def _checked(key: tuple, test) -> bool:
     """The cached self-test verdict for ``key`` (running ``test`` once)."""
     ok = _verified.get(key)
@@ -1581,6 +1819,7 @@ def sorted_gather_qmm_swiglu(
     stream=None,
     plan: Optional[Plan] = None,
     verify: bool = True,
+    row_map: Optional[mx.array] = None,
 ) -> Optional[mx.array]:
     """The SwiGLU of a fused gate/up projection for sorted rows, in one kernel.
 
@@ -1597,15 +1836,25 @@ def sorted_gather_qmm_swiglu(
     ``reference_activation`` on a canary (and the plain kernel its own
     self-test) before it is used.
 
+    With ``row_map`` (uint32 ``[M]``) the sorted rows are ``x[row_map]``
+    (``x`` holds the token rows, ``[T, 1, K]``), read in place instead of
+    from a replicated ``[M, 1, K]`` copy: the same tiles, values and tensor
+    ops, so the output is bit-identical to passing ``x[row_map]`` (checked
+    per instantiation on a scrambled canary map). Needs
+    ``row_map_enabled()``.
+
     Returns None when disabled (``OMLX_M5_GATHER_QMM_NAX_SWIGLU=0`` or the
-    module switch), unsupported (``supports``, or ``2 * n % 64 != 0``), or
-    not verified; the caller then keeps the unfused path.
+    module switch; with ``row_map`` also ``OMLX_M5_GATHER_QMM_NAX_ROW_MAP=0``),
+    unsupported (``supports``, or ``2 * n % 64 != 0``), or not verified;
+    the caller then keeps the unfused path (materialising ``x[row_map]``).
     """
+    if row_map is not None and not row_map_enabled():
+        return None
     if not swiglu_enabled() or not supports(
-        x, w, scales, biases, indices, group_size, bits, mode
+        x, w, scales, biases, indices, group_size, bits, mode, row_map
     ):
         return None
-    M, K = int(x.shape[0]), int(x.shape[2])
+    M, K = int(indices.shape[0]), int(x.shape[2])
     E, N = int(w.shape[0]), int(w.shape[1])
     if N % _BN:
         # Every 64-column tile pairs 32 gate with 32 up columns.
@@ -1626,7 +1875,11 @@ def sorted_gather_qmm_swiglu(
             key + (epi, limit), _self_test_act
         ):
             return None
+        if row_map is not None and not _checked(
+            key + (epi, limit, "map"), _self_test_act_map
+        ):
+            return None
     return _launch(
         x, w, scales, biases, indices, group_size, bits, mode, plan, stream,
-        epi=epi, limit=limit,
+        epi=epi, limit=limit, row_map=row_map,
     )
