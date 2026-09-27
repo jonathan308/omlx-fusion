@@ -4497,6 +4497,61 @@ class TestSchedulerArraysCacheBlockAlignment:
             scheduler.shutdown()
 
     @pytest.mark.parametrize(
+        ("nax_sparse_mla", "env", "expected"),
+        [
+            (True, None, 4096),
+            (False, None, 0),
+            (True, "0", 0),
+            (True, "8192", 8192),
+            (False, "4096", 4096),
+        ],
+    )
+    def test_glm5_next_nax_host_prefill_step(
+        self, mock_tokenizer, tmp_path, monkeypatch, nax_sparse_mla, env, expected
+    ):
+        """On NAX hosts GLM-5.3 takes 4096-token chunks (and blocks) when the
+        tensor-unit sparse MLA path is available; OMLX_GLM5_PREFILL_STEP
+        overrides the step (0 keeps the default)."""
+        import sys
+
+        if env is None:
+            monkeypatch.delenv("OMLX_GLM5_PREFILL_STEP", raising=False)
+        else:
+            monkeypatch.setenv("OMLX_GLM5_PREFILL_STEP", env)
+        fake = SimpleNamespace(nax_sparse_mla_available=lambda: nax_sparse_mla)
+        with (
+            patch.dict(
+                sys.modules, {"omlx.patches.glm_moe_dsa.sparse_mla_nax": fake}
+            ),
+            patch("omlx.settings.get_system_memory", return_value=256 * 1024**3),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                return_value=True,
+            ),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                return_value=True,
+            ),
+        ):
+            scheduler = Scheduler(
+                model=self._hybrid_model(model_type="glm5_next"),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        try:
+            step = expected or 2048
+            assert scheduler._qwen35_prefill_floor == expected
+            assert scheduler._prefill_step_size_for_progress(0, 16384) == step
+            assert scheduler.config.paged_cache_block_size == step
+        finally:
+            scheduler.shutdown()
+
+    @pytest.mark.parametrize(
         ("native_available", "symbol_available"),
         [(False, False), (True, False)],
     )

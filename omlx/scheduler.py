@@ -557,6 +557,41 @@ class _CacheFreshnessWait:
     deadline_s: float
 
 
+# GLM-5.3 prefill chunk on NAX (M5) hosts that run the DSA sparse attention
+# on the tensor units: its cost per query no longer depends on the chunk, so
+# a wider chunk only feeds the 288-expert MoE more rows per expert (M5 Ultra:
+# +3-6% at 4096; 8192 adds another 1-6% but ~10 GB more peak activations).
+_GLM5_NAX_PREFILL_STEP = 4096
+
+
+def _glm5_next_nax_prefill_step() -> int:
+    """Prefill floor for GLM-5.3 on NAX hosts (0 keeps the default step).
+
+    Needs the tensor-unit sparse MLA path; the paged-cache block follows the
+    floor. OMLX_GLM5_PREFILL_STEP overrides it (0 keeps the default step,
+    e.g. 8192 for more throughput at a larger activation peak).
+    """
+    raw = os.environ.get("OMLX_GLM5_PREFILL_STEP", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid OMLX_GLM5_PREFILL_STEP=%r", raw)
+    try:
+        from .custom_kernels.nax import is_nax_available
+        from .patches.glm_moe_dsa.sparse_mla_nax import nax_sparse_mla_available
+        from .settings import get_system_memory
+    except ImportError:
+        return 0
+    if (
+        is_nax_available()
+        and nax_sparse_mla_available()
+        and get_system_memory() >= 64 * 1024**3
+    ):
+        return _GLM5_NAX_PREFILL_STEP
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Monkey-patch GenerationBatch._step to feed grammar processors the token
 # that was sampled from their bitmask.  In the pipelined _step(), logits
@@ -3285,6 +3320,9 @@ class Scheduler:
                     "glm_dsa_sparse_mla_attention"
                 ):
                     return 0
+                glm_step = _glm5_next_nax_prefill_step()
+                if glm_step:
+                    return glm_step
             if is_qwen35 or is_qwen4 or is_glm5_next:
                 from .custom_kernels.nax import is_nax_available
                 from .settings import get_system_memory
