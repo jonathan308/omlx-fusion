@@ -886,12 +886,22 @@ class Model(nn.Module):
                 )
             else:
                 layer.mlp.sharding_group = group
-                shard_inplace(
-                    layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
-                )
-                shard_inplace(
-                    layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
-                )
+                if "gate_up_proj" in layer.mlp.switch_mlp:
+                    # [gate; up] rows: shard each half so every rank keeps
+                    # its own [gate_r; up_r] and the split stays aligned.
+                    shard_inplace(
+                        layer.mlp.switch_mlp.gate_up_proj,
+                        "all-to-sharded",
+                        segments=2,
+                        group=group,
+                    )
+                else:
+                    shard_inplace(
+                        layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
+                    )
+                    shard_inplace(
+                        layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
+                    )
                 shard_inplace(
                     layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
                 )

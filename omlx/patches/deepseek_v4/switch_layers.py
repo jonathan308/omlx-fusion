@@ -115,6 +115,21 @@ def _sort_threshold(*projections) -> int:
     return 64
 
 
+def has_native_block_kernels(projection) -> bool:
+    """Whether ``projection``'s format has native block/pair gather kernels.
+
+    MXFP4 (4-bit, group 32) and affine 2/3-bit group-64 experts can run gate
+    and up through the native pair kernels; every other format runs them as
+    stock ``gather_qmm`` calls.
+    """
+    if not isinstance(projection, QuantizedSwitchLinear):
+        return False
+    mode, bits, group_size = projection.mode, projection.bits, projection.group_size
+    return (mode == "mxfp4" and bits == 4 and group_size == 32) or (
+        mode == "affine" and bits in (2, 3) and group_size == 64
+    )
+
+
 def _gather_sort(x, indices):
     *_, M = indices.shape
     indices = indices.flatten()
@@ -492,6 +507,9 @@ class SwitchGLU(nn.Module):
     def _can_use_mxfp4_full_decode(self, x, indices, scores) -> bool:
         if not _DEEPSEEK_MXFP4_FULL_DECODE or self.training or scores is None:
             return False
+        if "gate_up_proj" in self:
+            # The fused kernel reads the separate gate and up projections.
+            return False
         if x.ndim < 2 or indices.ndim < 1 or indices.shape[-1] != 6:
             return False
         tokens = indices.size // 6
@@ -652,6 +670,9 @@ class SwitchGLU(nn.Module):
     ) -> bool:
         """Preflight exact DS4F M5 rank-1 4/8 or 5/8 BF16 contracts."""
 
+        if "gate_up_proj" in self:
+            # The block kernels read the separate gate and up projections.
+            return False
         tp_contract = getattr(self, "_omlx_dsv4f_moe_tp", None)
 
         def reject(reason: str) -> bool:
@@ -753,6 +774,11 @@ class SwitchGLU(nn.Module):
             and glm_fast.ds4_projection_nax_device_available()
         )
         return eligible if eligible else reject("device or native artifact")
+    def projections(self) -> tuple:
+        """Expert projections in call order: gate/up (or fused), then down."""
+        if "gate_up_proj" in self:
+            return (self.gate_up_proj, self.down_proj)
+        return (self.up_proj, self.gate_proj, self.down_proj)
 
     def __call__(self, x, indices, scores=None, weighted_sum=False) -> mx.array:
         if self._can_use_mxfp4_full_decode(x, indices, scores):
@@ -782,10 +808,10 @@ class SwitchGLU(nn.Module):
         request_shape = tuple(x.shape)
         x = mx.expand_dims(x, (-2, -3))
         original_dtype = x.dtype
+        projections = self.projections()
+        fused_gate_up = len(projections) == 2
 
-        do_sort = indices.size >= _sort_threshold(
-            self.gate_proj, self.up_proj, self.down_proj
-        )
+        do_sort = indices.size >= _sort_threshold(*projections)
         idx = indices
         inv_order = None
         if do_sort:
@@ -795,7 +821,6 @@ class SwitchGLU(nn.Module):
 
         block_plan = None
         native_kinds = None
-        projections = (self.up_proj, self.gate_proj, self.down_proj)
         use_f16_moe = original_dtype == mx.bfloat16 and all(
             isinstance(p, QuantizedSwitchLinear)
             and p._has_affine_metadata_dtype(mx.float16)
@@ -822,7 +847,7 @@ class SwitchGLU(nn.Module):
                 block_bm, block_variant = _block_config(idx.size, block_kind)
                 block_meta, block_count = _build_mxfp4_blocks(
                     idx,
-                    self.up_proj.num_experts,
+                    self.down_proj.num_experts,
                     block_bm,
                 )
                 block_plan = (block_meta, block_count, block_variant)
@@ -846,7 +871,8 @@ class SwitchGLU(nn.Module):
             )
 
         use_pair_proj = (
-            block_plan is not None
+            not fused_gate_up
+            and block_plan is not None
             and native_kinds is not None
             and native_kinds[0] == "mxfp4"
             and native_kinds[1] == "mxfp4"
@@ -855,7 +881,8 @@ class SwitchGLU(nn.Module):
             and self.up_proj.num_experts == self.gate_proj.num_experts
         )
         use_affine_pair_proj = (
-            block_plan is not None
+            not fused_gate_up
+            and block_plan is not None
             and native_kinds is not None
             and native_kinds[0] == "affine"
             and native_kinds[1] == "affine"
@@ -901,6 +928,13 @@ class SwitchGLU(nn.Module):
                 block_meta,
                 block_count,
             )
+        elif fused_gate_up:
+            # One gather_qmm over the [gate; up] expert rows; each output
+            # column is the same K-reduction as in the separate calls.
+            x_gate_up = self.gate_up_proj(
+                x, idx, sorted_indices=do_sort, block_plan=block_plan
+            )
+            x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
         elif use_pair_proj:
             block_meta, block_count, block_variant = _unpack_mxfp4_block_plan(
                 block_plan
@@ -1001,7 +1035,7 @@ class SwitchGLU(nn.Module):
             if (
                 block_plan is not None
                 and native_kinds is not None
-                and native_kinds[2] == "affine"
+                and native_kinds[-1] == "affine"
                 and isinstance(self.down_proj, QuantizedSwitchLinear)
                 and x.dtype != self.down_proj["scales"].dtype
                 and self.down_proj["scales"].dtype in (mx.float16, mx.bfloat16)
