@@ -155,6 +155,62 @@ def _decode_hc_expand(x: mx.array, residual: mx.array, post, comb) -> mx.array:
     return hc_expand(x, residual, post, comb)
 
 
+class _HCDeferred:
+    """A one-token half-layer output whose HC expand is still pending:
+    ``h = hc_expand(y, residual, post, comb)``.
+
+    The next half-layer's ``_decode_hc_pre_deferred`` recomputes h exactly
+    while it loads it (and stores it, the next residual) instead of a
+    separate expand dispatch; ``materialize`` runs the expand itself. ``mm``
+    is hc_expand_one's NAX comb product of ``residual`` ([HC * D] fp32).
+    """
+
+    __slots__ = ("y", "residual", "post", "comb", "mm")
+
+    def __init__(self, y, residual, post, comb, mm):
+        self.y = y
+        self.residual = residual
+        self.post = post
+        self.comb = comb
+        self.mm = mm
+
+    def arrays(self) -> list:
+        return [self.y, self.residual, self.post, self.comb, self.mm]
+
+    def materialize(self) -> mx.array:
+        return _decode_hc_expand(self.y, self.residual, self.post, self.comb)
+
+
+def _hc_defer_ok(connection, norm, dtype, width: int) -> bool:
+    return (
+        _decode_kernels is not None
+        and _DECODE_FUSION
+        and not connection.training
+        and _decode_kernels.hc_defer_supported(connection, norm, dtype, width)
+    )
+
+
+def _decode_hc_pre_deferred(connection, norm, x):
+    """One-token HC pre of ``x`` ([1, 1, HC, D] or an ``_HCDeferred``).
+
+    Returns ``(branch input, h, post, comb, mm)``: the normalized branch
+    input and h (this half-layer's residual) from one ``hc_pre_fused``
+    dispatch, and post/comb/mm from ``hc_post_mm``, which only the next
+    half-layer reads. The branch input depends on that kernel without reading
+    it, so it is scheduled first and runs beside the branch's first kernel.
+    The values are those of ``_decode_hc_pre`` and ``_decode_hc_expand``.
+    """
+    dk = _decode_kernels
+    if isinstance(x, _HCDeferred):
+        xn, mixes, h = dk.hc_pre_fused(connection, norm, deferred=(x.y, x.mm, x.post))
+    else:
+        xn, mixes, _ = dk.hc_pre_fused(connection, norm, x=x)
+        h = x
+    post, comb, mm = dk.hc_post_mm(connection, mixes, h)
+    xn = mx.depends(xn, [post])
+    return xn, h, post, comb, mm
+
+
 def glm5_next_cast_predicate(key: str) -> bool:
     """Keep numerically sensitive GLM-5.3 parameters in FP32."""
     return not (
@@ -1570,18 +1626,29 @@ class Glm5NextDecoderLayer(nn.Module):
         self.ffn_hc = HyperConnection(config)
         self.compile_ffn = True
         self._ffn_c = None
+        self._ffn_dc = None
 
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        defer: bool = False,
     ) -> mx.array:
         if _decode_kernels is not None and _DECODE_FUSION:
             # Settle (eagerly, once) how MLX's eager fp32 sigmoid evaluates;
             # the fused router inside the compiled FFN block follows it and
             # cannot probe while being traced.
             _decode_kernels.eager_sigmoid_precise(mx.float32)
+        # One-token decode can leave this layer's last HC expand to the next
+        # layer's fused HC pre (``defer``: returns an _HCDeferred); an
+        # _HCDeferred input is always accepted.
+        if defer or isinstance(x, _HCDeferred):
+            out = self._decode_deferred(x, mask, cache)
+            if out is not None:
+                return out if defer else out.materialize()
+            if isinstance(x, _HCDeferred):
+                x = x.materialize()
         residual = x
         fused = _decode_hc_pre(self.attn_hc, self.input_layernorm, x)
         if fused is None:
@@ -1612,6 +1679,38 @@ class Glm5NextDecoderLayer(nn.Module):
             xn, post, comb = fused
         m = self.mlp(xn)
         return _decode_hc_expand(m, residual, post, comb)
+
+    def _decode_deferred(self, x, mask, cache) -> Optional[_HCDeferred]:
+        """The one-token layer with both HC pres from ``_decode_hc_pre_deferred``
+        (each folding in the previous expand); None when not covered."""
+        if isinstance(x, _HCDeferred):
+            dtype, width = x.y.dtype, x.y.shape[-1]
+        elif x.ndim == 4 and x.shape[:2] == (1, 1):
+            dtype, width = x.dtype, x.shape[-1]
+        else:
+            return None
+        if not (
+            _hc_defer_ok(self.attn_hc, self.input_layernorm, dtype, width)
+            and _hc_defer_ok(self.ffn_hc, self.post_attention_layernorm, dtype, width)
+        ):
+            return None
+        xn, h, post, comb, mm = _decode_hc_pre_deferred(
+            self.attn_hc, self.input_layernorm, x
+        )
+        r = self.self_attn(xn, mask, cache)
+        if self.compile_ffn:
+            if self._ffn_dc is None:
+                self._ffn_dc = mx.compile(self._ffn_block_deferred)
+            return _HCDeferred(*self._ffn_dc(r, h, post, comb, mm))
+        return _HCDeferred(*self._ffn_block_deferred(r, h, post, comb, mm))
+
+    def _ffn_block_deferred(self, y, residual, post, comb, mm):
+        xn, h, post, comb, mm = _decode_hc_pre_deferred(
+            self.ffn_hc,
+            self.post_attention_layernorm,
+            _HCDeferred(y, residual, post, comb, mm),
+        )
+        return self.mlp(xn), h, post, comb, mm
 
 
 class Glm5NextModel(nn.Module):
@@ -1658,15 +1757,21 @@ class Glm5NextModel(nn.Module):
         # _DECODE_EVAL_EVERY).
         eval_every = _DECODE_EVAL_EVERY if h.shape[1] == 1 else 0
         n_layers = len(self.layers)
+        # One token: each layer's last HC expand runs inside the next layer's
+        # first HC pre (see _decode_hc_pre_deferred); the last one here.
+        defer = h.shape[:2] == (1, 1)
 
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
-            h = layer(h, mask=mask, cache=c)
+            if defer:
+                h = layer(h, mask=mask, cache=c, defer=i + 1 < n_layers)
+            else:
+                h = layer(h, mask=mask, cache=c)
             if prefill:
                 mx.eval(h)
                 mx.clear_cache()
             elif eval_every and (i + 1) % eval_every == 0 and i + 1 < n_layers:
-                mx.async_eval(h)
+                mx.async_eval(h.arrays() if isinstance(h, _HCDeferred) else h)
 
         h = h.mean(axis=2)
         return self.norm(h)

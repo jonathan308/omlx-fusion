@@ -7,7 +7,10 @@ encode time. The kernels here fuse chains of them while reproducing the
 stock MLX arithmetic bit for bit:
 
 * hyper-connections: ``hc_mix`` (fp32 RMS + mix GEMV), ``hc_expand_one``
-  (the one-token NAX relaxed-precision comb product + epilogue);
+  (the one-token NAX relaxed-precision comb product + epilogue), and for one
+  token ``hc_pre_fused`` (mix + collapse + RMSNorm in one dispatch, with the
+  previous expand's epilogue folded in) plus ``hc_post_mm`` (post, sinkhorn
+  comb and the comb product, off the dependent chain);
 * MoE: ``moe_router`` (logits GEMV + sigmoid/bias, top-k select with the
   stable-sort tie order), ``moe_gate_up_swiglu`` and ``moe_down_combine``
   (routed + shared experts, clamped SwiGLU, routing-weighted sum);
@@ -2527,6 +2530,438 @@ def hc_expand_one(
         output_shapes=[residual.shape],
         output_dtypes=[x.dtype],
     )[0]
+
+
+# ---------------------------------------------------------------------------
+# One-token HC pre in one dispatch, with the previous expand folded in
+# ---------------------------------------------------------------------------
+#
+# A half-layer's HC chain is hc_expand (previous branch) -> hc_mix ->
+# exact_hc_norm -> branch: three dependent dispatches, all latency bound.
+# The branch input only needs mix rows 0..HC-1 (the pre weights), so
+# ``hc_pre_fused`` computes the mix rows HC at a time per 1024-thread
+# threadgroup (hc_mix's multi-row layout) and threadgroup 0, which owns the
+# pre rows, finishes exact_hc_norm's collapse and RMSNorm itself. The post
+# and comb rows only feed the next expand: ``hc_post_mm`` (sinkhorn plus the
+# NAX comb product of hc_expand_one) runs beside the branch, and the next
+# ``hc_pre_fused`` applies hc_expand_one's epilogue to the branch output as it
+# loads h (threadgroup 0 also stores h, the next residual). Every value is
+# computed with the reference kernels' arithmetic and order.
+_HC_PRE_HEADER = r"""
+#include <metal_simdgroup>
+#include <metal_stdlib>
+using namespace metal;
+
+// hc_expand_one's epilogue for element e = r * D + col of h.
+template <typename T, int D, typename YPtr, typename MPtr, typename PPtr>
+inline T glm_hc_expand_value(YPtr y, MPtr mm, PPtr post, int e) {
+  const int r = e / D;
+  const int col = e - r * D;
+  volatile float prod = post[r] * static_cast<float>(y[col]);
+  float sum = prod + mm[e];
+  return static_cast<T>(sum);
+}
+"""
+
+_HC_PRE_SOURCE = r"""
+  const uint lid = thread_position_in_threadgroup.x;
+  const uint simd_lid = thread_index_in_simdgroup;
+  const uint simd_gid = simdgroup_index_in_threadgroup;
+  const int tile = int(threadgroup_position_in_grid.x);
+  constexpr int KSZ = HC * D;
+  constexpr int CH = KSZ / 4096;  // rms_looped reads per thread, 4 values each
+  constexpr int D4 = D / 4;
+  static_assert(KSZ % 4096 == 0 && D4 <= 1024 && D % 4 == 0, "hc_pre_fused shape");
+  constexpr float HC_EPS = HC_EPS_INT * 1e-9;
+  constexpr float NORM_EPS = NORM_EPS_INT * 1e-9;
+  using T4 = vec<T, 4>;
+#if DEFERRED
+#define HVAL(e) glm_hc_expand_value<T, D>(y, mm, post, (e))
+#else
+#define HVAL(e) x[(e)]
+#endif
+
+  // This thread's h values in rms_looped order.
+  T hv[CH][4];
+  for (int c = 0; c < CH; c++) {
+    for (int i = 0; i < 4; i++) {
+      hv[c][i] = HVAL(c * 4096 + int(lid) * 4 + i);
+    }
+  }
+#if DEFERRED
+  if (tile == 0) {
+    for (int c = 0; c < CH; c++) {
+      for (int i = 0; i < 4; i++) {
+        h_out[c * 4096 + int(lid) * 4 + i] = hv[c][i];
+      }
+    }
+  }
+#endif
+
+  // --- hc_mix: rms_looped (lsize = 1024, N_READS = 4) ---
+  threadgroup float local_inv_mean[1];
+  threadgroup float local_sums[32];
+  float acc = 0;
+  for (int c = 0; c < CH; c++) {
+    for (int i = 0; i < 4; i++) {
+      float xi = static_cast<float>(hv[c][i]);
+      acc += xi * xi;
+    }
+  }
+  acc = simd_sum(acc);
+  if (simd_gid == 0) {
+    local_sums[simd_lid] = 0;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_lid == 0) {
+    local_sums[simd_gid] = acc;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    acc = simd_sum(local_sums[simd_lid]);
+    if (simd_lid == 0) {
+      local_inv_mean[0] = metal::precise::rsqrt(acc / KSZ + eps[0]);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = local_inv_mean[0];
+
+  // --- hc_mix gemv: 8 simdgroups per row, 4 rows per threadgroup ---
+  const int slot = int(simd_gid) / 8;
+  const int sgN = int(simd_gid) % 8;
+  const int row = tile * 4 + slot;
+  threadgroup float partial[4][8];
+  threadgroup float row_total[4];
+  float result = 0;
+  {
+    const device float* mrow = fn + size_t(row) * KSZ;
+    int bn = (32 * sgN + int(simd_lid)) * 4;
+    for (int i = 0; i < KSZ / 1024; ++i) {
+      float v_coeff[4];
+      float inter[4];
+      for (int tn = 0; tn < 4; tn++) {
+        v_coeff[tn] = static_cast<float>(HVAL(bn + tn)) * inv;
+      }
+      for (int tn = 0; tn < 4; tn++) {
+        inter[tn] = mrow[bn + tn];
+      }
+      for (int tn = 0; tn < 4; tn++) {
+        result += inter[tn] * v_coeff[tn];
+      }
+      bn += 1024;
+    }
+    for (ushort sn = 16; sn >= 1; sn >>= 1) {
+      result += simd_shuffle_down(result, sn);
+    }
+  }
+  if (simd_lid == 0) {
+    partial[slot][sgN] = result;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sgN == 0 && simd_lid == 0) {
+    float total = partial[slot][0];
+    for (int s = 1; s < 8; s++) {
+      total += partial[slot][s];
+    }
+    mixes[row] = total;
+    row_total[slot] = total;
+  }
+  if (tile != 0) {
+    return;
+  }
+
+  // --- threadgroup 0 (the pre rows): exact_hc_norm's collapse + RMSNorm ---
+  threadgroup float pre_shared[HC];
+  threadgroup float norm_inv[1];
+  threadgroup float norm_sums[32];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    const float pre_scale = scale[0];
+    const uint llane = metal::min(simd_lid, (uint)(HC - 1));
+    float pre_z = row_total[llane] * pre_scale + base[llane];
+    float pre_v = 1.0f / (1.0f + metal::fast::exp(-pre_z)) + HC_EPS;
+    if (simd_lid < (uint)HC) {
+      pre_shared[simd_lid] = pre_v;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  T4 rounded = T4(0);
+  float accum = 0.0f;
+  if (int(lid) < D4) {
+    T4 xs[HC];
+    for (int r = 0; r < HC; r++) {
+      if (D == 4096) {
+        // Same elements as this thread's rms_looped reads.
+        xs[r] = T4(hv[r][0], hv[r][1], hv[r][2], hv[r][3]);
+      } else {
+        const int e = r * D + int(lid) * 4;
+        xs[r] = T4(HVAL(e), HVAL(e + 1), HVAL(e + 2), HVAL(e + 3));
+      }
+    }
+    float4 collapsed = fma(
+        float4(pre_shared[0]), float4(xs[0]),
+        fma(
+            float4(pre_shared[1]), float4(xs[1]),
+            fma(
+                float4(pre_shared[2]), float4(xs[2]),
+                float4(pre_shared[3]) * float4(xs[3]))));
+    rounded = T4(collapsed);
+    float4 rounded_float = float4(rounded);
+    accum += rounded_float.x * rounded_float.x;
+    accum += rounded_float.y * rounded_float.y;
+    accum += rounded_float.z * rounded_float.z;
+    accum += rounded_float.w * rounded_float.w;
+  }
+  accum = simd_sum(accum);
+  if (simd_lid == 0) {
+    norm_sums[simd_gid] = accum;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    accum = simd_sum(norm_sums[simd_lid]);
+    if (simd_lid == 0) {
+      norm_inv[0] = metal::precise::rsqrt(accum / D + NORM_EPS);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (int(lid) < D4) {
+    float ninv = norm_inv[0];
+    const device T4* weights = (const device T4*)norm_weight;
+    T4 scaled = T4(float4(rounded) * ninv);
+    T4 weight = weights[lid];
+    ((device T4*)normalized)[lid] = T4(
+        weight.x * scaled.x,
+        weight.y * scaled.y,
+        weight.z * scaled.z,
+        weight.w * scaled.w);
+  }
+#undef HVAL
+"""
+
+# exact_hc_norm's post/sinkhorn code, defined before the MPP include (so it
+# compiles exactly as in that kernel), then hc_expand_one's NAX comb product.
+_HC_POST_HEADER = r"""
+#include <metal_simdgroup>
+#include <metal_stdlib>
+using namespace metal;
+
+template <int HC, int ITERS, int HC_EPS_INT, typename MixPtr, typename BasePtr>
+inline void glm_hc_post_comb(
+    MixPtr mix, const float post_scale, const float comb_scale, BasePtr base,
+    uint lane, thread float& post_v, thread float4& result) {
+  constexpr int BASE_OFF = 2 * HC;
+  constexpr float HC_EPS = HC_EPS_INT * 1e-9;
+  const float active = lane < (uint)HC ? 1.0f : 0.0f;
+  const uint llane = metal::min(lane, (uint)(HC - 1));
+
+  float post_z = mix[HC + llane] * post_scale + base[HC + llane];
+  post_v = 2.0f / (1.0f + metal::fast::exp(-post_z));
+
+  float4 value =
+      (float4(mix[BASE_OFF + llane * HC], mix[BASE_OFF + llane * HC + 1],
+              mix[BASE_OFF + llane * HC + 2], mix[BASE_OFF + llane * HC + 3]) * comb_scale +
+       float4(base[BASE_OFF + llane * HC], base[BASE_OFF + llane * HC + 1],
+              base[BASE_OFF + llane * HC + 2], base[BASE_OFF + llane * HC + 3])) * active;
+  float row_max = metal::max(
+      metal::max(value.x, value.y), metal::max(value.z, value.w));
+  float4 exponent = metal::fast::exp(value - row_max) * active;
+  result = exponent *
+          (1.0f /
+           (exponent.x + exponent.y + exponent.z + exponent.w + HC_EPS)) +
+      HC_EPS * active;
+  float4 column_inv = 1.0f /
+      (float4(
+           simd_sum(result.x), simd_sum(result.y),
+           simd_sum(result.z), simd_sum(result.w)) +
+       HC_EPS);
+  result *= column_inv;
+  for (int iter = 1; iter < ITERS; ++iter) {
+    result *=
+        (1.0f / (result.x + result.y + result.z + result.w + HC_EPS)) *
+        active;
+    column_inv = 1.0f /
+        (float4(
+             simd_sum(result.x), simd_sum(result.y),
+             simd_sum(result.z), simd_sum(result.w)) +
+         HC_EPS);
+    result *= column_inv;
+  }
+}
+
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace mpp::tensor_ops;
+"""
+
+_HC_POST_SOURCE = r"""
+  const ushort lane = thread_index_in_simdgroup;
+  const uint sg = simdgroup_index_in_threadgroup;
+  static_assert(HC == 4, "one float4 comb row per lane");
+  threadgroup float4 comb_rows[HC];
+  if (sg == 0) {
+    float post_v;
+    float4 res;
+    glm_hc_post_comb<HC, ITERS, HC_EPS_INT>(mixes, scale[1], scale[2], base, uint(lane), post_v, res);
+    if (lane < HC) {
+      comb_rows[lane] = res;
+      if (threadgroup_position_in_grid.x == 0) {
+        post_out[lane] = post_v;
+        *(device float4*)(comb_out + lane * HC) = res;
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const int tile = int(threadgroup_position_in_grid.x) * SIMDS + int(sg);
+  if (tile * 32 >= D) {
+    return;
+  }
+  const threadgroup float* comb = (const threadgroup float*)comb_rows;
+  const short qid = lane >> 2;
+  const short fm = ((qid & 4) | ((lane >> 1) & 3));
+  const short fn = ((qid & 2) | (lane & 1)) * 4;
+  constexpr auto desc = matmul2d_descriptor(
+      16, 32, 16, false, false, true, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  auto ct_a = op.template get_left_input_cooperative_tensor<float, float, float>();
+  auto ct_b = op.template get_right_input_cooperative_tensor<float, float, float>();
+  auto ct_c = op.template get_destination_cooperative_tensor<
+      metal::remove_addrspace_t<decltype(ct_a)>,
+      metal::remove_addrspace_t<decltype(ct_b)>,
+      float>();
+  for (short i = 0; i < 8; i++) {
+    const short r = fm + (i >> 2) * 8;
+    const short c = fn + (i & 3);
+    // A = comb^T (rows: output stream, cols: source stream), zero padded.
+    ct_a[i] = (r < HC && c < HC) ? comb[c * HC + r] : 0.0f;
+    ct_b[i] = (r < HC) ? static_cast<float>(residual[r * D + tile * 32 + c]) : 0.0f;
+    ct_b[8 + i] = (r < HC) ? static_cast<float>(residual[r * D + tile * 32 + 16 + c]) : 0.0f;
+    ct_c[i] = 0.0f;
+    ct_c[8 + i] = 0.0f;
+  }
+  op.run(ct_a, ct_b, ct_c);
+  for (short i = 0; i < 8; i++) {
+    const short r = fm + (i >> 2) * 8;
+    const short c = fn + (i & 3);
+    if (r < HC) {
+      for (short hh = 0; hh < 2; hh++) {
+        const int col = tile * 32 + hh * 16 + c;
+        mm[r * D + col] = ct_c[hh * 8 + i];
+      }
+    }
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _hc_pre_fused_kernel(deferred: bool):
+    inputs = ["y", "mm", "post"] if deferred else ["x"]
+    inputs += ["fn", "eps", "scale", "base", "norm_weight"]
+    outputs = ["normalized", "mixes"] + (["h_out"] if deferred else [])
+    return mx.fast.metal_kernel(
+        name="glm5_hc_pre_fused" + ("_deferred" if deferred else ""),
+        input_names=inputs,
+        output_names=outputs,
+        header=_HC_PRE_HEADER,
+        source=_source(_HC_PRE_SOURCE, DEFERRED=int(deferred)),
+    )
+
+
+@lru_cache(maxsize=None)
+def _hc_post_mm_kernel():
+    return mx.fast.metal_kernel(
+        name="glm5_hc_post_comb_mm",
+        input_names=["mixes", "scale", "base", "residual"],
+        output_names=["post_out", "comb_out", "mm"],
+        header=_HC_POST_HEADER,
+        source=_HC_POST_SOURCE,
+    )
+
+
+def hc_defer_supported(connection, norm, dtype, width: int) -> bool:
+    """Whether ``hc_pre_fused`` / ``hc_post_mm`` cover this connection (one
+    token, hidden ``width``, activations of ``dtype``): the shapes of the
+    replicated hc_mix / exact_hc_norm / hc_expand_one configurations."""
+    if "hc_defer" in DISABLED or "hc_mix" in DISABLED or "hc_expand" in DISABLED:
+        return False
+    if dtype not in (mx.bfloat16, mx.float16) or connection.hc_mult != 4:
+        return False
+    fn = connection.fn
+    mix = (2 + 4) * 4
+    if fn.dtype != mx.float32 or fn.shape != (mix, 4 * width):
+        return False
+    if width % 1024 or width > 4096 or norm.weight.shape != (width,) or norm.weight.dtype != dtype:
+        return False
+    if connection.scale.shape != (3,) or connection.base.shape != (mix,):
+        return False
+    if connection.scale.dtype != mx.float32 or connection.base.dtype != mx.float32:
+        return False
+    return nax_relaxed_fp32_matmul()
+
+
+def hc_pre_fused(connection, norm, x=None, deferred=None):
+    """One-token ``hc_mix`` + ``exact_hc_norm`` (the normalized branch input
+    only) in one dispatch.
+
+    ``x`` [1, 1, HC, D] is the layer input, or ``deferred = (y, mm, post)``
+    the previous half-layer's branch output [1, 1, D], ``hc_post_mm``'s comb
+    product [HC * D] fp32 and post weights [1, 1, HC] fp32, from which h =
+    ``hc_expand_one(y, residual, post, comb)`` is recomputed exactly. Returns
+    ``(normalized [1, 1, D], mixes [1, 1, 24] fp32, h [1, 1, HC, D] or None
+    for ``x``)``; the caller checks ``hc_defer_supported`` first.
+    """
+    if deferred is not None:
+        y, mm, post = deferred
+        dtype, D = y.dtype, y.shape[-1]
+        if y.shape != (1, 1, D) or mm.shape != (4 * D,) or post.shape != (1, 1, 4):
+            return None
+        inputs = [y, mm, post]
+    else:
+        dtype, D = x.dtype, x.shape[-1]
+        if x.shape != (1, 1, 4, D):
+            return None
+        inputs = [x]
+    mix = connection.fn.shape[0]
+    inputs += [
+        connection.fn, mx.array([connection.norm_eps], dtype=mx.float32),
+        connection.scale, connection.base, norm.weight,
+    ]
+    STATS["hc_pre_fused"] += 1
+    outs = _hc_pre_fused_kernel(deferred is not None)(
+        inputs=inputs,
+        template=[
+            ("T", dtype), ("HC", 4), ("D", D),
+            ("HC_EPS_INT", round(connection.hc_eps / 1e-9)),
+            ("NORM_EPS_INT", round(norm.eps / 1e-9)),
+        ],
+        grid=(1024 * (mix // 4), 1, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(1, 1, D), (1, 1, mix)] + ([(1, 1, 4, D)] if deferred is not None else []),
+        output_dtypes=[dtype, mx.float32] + ([dtype] if deferred is not None else []),
+    )
+    return outs[0], outs[1], (outs[2] if deferred is not None else None)
+
+
+def hc_post_mm(connection, mixes: mx.array, residual: mx.array):
+    """The post weights, sinkhorn comb [1, 1, HC, HC] (fp32, as exact_hc_norm)
+    and hc_expand_one's NAX comb product ``mm`` [HC * D] fp32 of ``residual``
+    [1, 1, HC, D] for one token."""
+    D = residual.shape[-1]
+    simds = 8
+    tiles = D // 32
+    STATS["hc_post_mm"] += 1
+    return tuple(
+        _hc_post_mm_kernel()(
+            inputs=[mixes, connection.scale, connection.base, residual],
+            template=[
+                ("T", residual.dtype), ("HC", 4), ("D", D),
+                ("ITERS", int(connection.sinkhorn_iters)),
+                ("HC_EPS_INT", round(connection.hc_eps / 1e-9)), ("SIMDS", simds),
+            ],
+            grid=(32 * simds * ((tiles + simds - 1) // simds), 1, 1),
+            threadgroup=(32 * simds, 1, 1),
+            output_shapes=[(1, 1, 4), (1, 1, 4, 4), (4 * D,)],
+            output_dtypes=[mx.float32, mx.float32, mx.float32],
+        )
+    )
 
 
 # Multi-row (verify block) router logits. The reference x @ W.T for

@@ -241,6 +241,77 @@ def test_one_token_hc_expand_is_bitwise_reference_with_nax_tf32():
     assert "checked" in out
 
 
+def _check_hc_deferred_chain(hidden):
+    """Chained one-token HC pres with each expand folded into the next
+    (``_decode_hc_pre_deferred``) against the reference HyperConnection,
+    RMSNorm and hc_expand; returns the number of checked half-layers."""
+    from mlx_vlm.models.deepseek_v4.hyper_connection import hc_expand
+
+    from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
+
+    language = _language()
+    checked = 0
+    for seed in range(6):
+        layers = [_hyper_connection(hidden, seed=100 * seed + i) for i in range(4)]
+        mx.random.seed(seed)
+        h_ref = (mx.random.normal((1, 1, 4, hidden)) * (1 + seed)).astype(mx.bfloat16)
+        x = h_ref
+        for step, (hc, norm) in enumerate(layers):
+            if seed % 2:
+                hc.base = hc.base * 10  # sharper sinkhorn / sigmoid inputs
+            assert dk.hc_defer_supported(hc, norm, mx.bfloat16, hidden)
+            collapsed, post, comb = hc(h_ref)
+            reference = norm(collapsed)
+            before = _stats()["hc_pre_fused"]
+            xn, h, f_post, f_comb, mm = language._decode_hc_pre_deferred(hc, norm, x)
+            assert _stats()["hc_pre_fused"] == before + 1
+            assert _mismatches(h, h_ref) == 0, (seed, step)
+            assert _mismatches(xn, reference) == 0, (seed, step)
+            assert _mismatches(f_post, post) == 0, (seed, step)
+            assert _mismatches(f_comb, comb) == 0, (seed, step)
+            y = (mx.random.normal((1, 1, hidden)) * (0.5 + step)).astype(mx.bfloat16)
+            h_ref = hc_expand(y, h_ref, post, comb)
+            x = language._HCDeferred(y, h, f_post, f_comb, mm)
+            checked += 1
+        assert _mismatches(x.materialize(), h_ref) == 0
+    return checked
+
+
+def test_hc_deferred_chain_declines_without_nax_tf32():
+    from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
+
+    if dk.nax_relaxed_fp32_matmul():
+        pytest.skip("TF32 NAX matmuls are enabled in this session")
+    hc, norm = _hyper_connection(1024)
+    assert not dk.hc_defer_supported(hc, norm, mx.bfloat16, 1024)
+
+
+def test_hc_deferred_chain_is_bitwise_reference_with_nax_tf32():
+    out = _run_with_tf32(
+        "from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk\n"
+        "if dk.nax_relaxed_fp32_matmul():\n"
+        "    for hidden in (4096, 1024, 2048):\n"
+        "        assert t._check_hc_deferred_chain(hidden) == 24\n"
+        "    print('checked')\n"
+        "else:\n"
+        "    print('no-nax')\n"
+    )
+    if "no-nax" in out:
+        pytest.skip("this GPU runs fp32 GEMMs without NAX")
+    assert "checked" in out
+
+
+def test_hc_defer_declines_uncovered_connections():
+    from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
+
+    hc, norm = _hyper_connection(1024)
+    assert not dk.hc_defer_supported(hc, norm, mx.float32, 1024)
+    hc3, norm3 = _hyper_connection(768)
+    assert not dk.hc_defer_supported(hc3, norm3, mx.bfloat16, 768)
+    dk.DISABLED.add("hc_defer")
+    assert not dk.hc_defer_supported(hc, norm, mx.bfloat16, 1024)
+
+
 def test_decode_hc_pre_declines_uncovered_inputs():
     language = _language()
     hc, norm = _hyper_connection(1024)
@@ -641,7 +712,7 @@ def test_small_model_bitwise_reference_with_nax_tf32():
     assert _ALWAYS_FUSED <= used, used
     from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
 
-    for family in ("hc_expand", "router_rows"):
+    for family in ("hc_expand", "router_rows", "hc_pre_fused", "hc_post_mm"):
         if family in used:
             continue
         # Only acceptable where MLX itself would not use NAX relaxed fp32.
@@ -650,6 +721,25 @@ def test_small_model_bitwise_reference_with_nax_tf32():
             "print(dk.nax_relaxed_fp32_matmul())\n"
         ).strip().endswith("True")
     del dk
+
+
+def test_small_model_mtp_runtime_loop_defers_hc_bitwise():
+    """The MTP runtime's replacement model loop (plain decode) folds the HC
+    expands into the next layer like the vendor loop, bit for bit."""
+    if not _native_indexer_available():
+        pytest.skip("GLM DSA native indexer extension is not built")
+    out = _run_with_tf32(
+        "from omlx.patches.mlx_vlm_mtp import glm5_next_vlm_runtime as rt\n"
+        "assert rt.apply()\n"
+        "from mlx_vlm.models.glm5_next import language as g5\n"
+        "assert g5.Glm5NextModel._omlx_mtp_call_patched\n"
+        "from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk\n"
+        "used = t._check_small_model(43, 300) | t._check_small_model()\n"
+        "print(dk.nax_relaxed_fp32_matmul(), sorted(used))\n"
+    )
+    last = out.strip().splitlines()[-1]
+    if last.startswith("True"):
+        assert "'hc_pre_fused'" in last and "'hc_post_mm'" in last, last
 
 
 # ---------------------------------------------------------------------------
