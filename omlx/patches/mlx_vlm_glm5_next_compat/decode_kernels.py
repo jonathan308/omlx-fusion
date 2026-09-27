@@ -1727,7 +1727,11 @@ _ROUTER_LOGITS_SOURCE = r"""
   if (lane == 0) {
     for (int tm = 0; tm < RPS; tm++) {
       const int e = out_row + tm;
+#if SIG_PRECISE
+      float sgm = glm_sigmoid_precise<float>(result[tm]);
+#else
       float sgm = glm_sigmoid<float>(result[tm]);
+#endif
       float biased = sgm + bias[e];
       sig[size_t(tok) * E + e] = sgm;
       biased_out[size_t(tok) * E + e] = biased;
@@ -1807,14 +1811,21 @@ _ROUTER_SELECT_SOURCE = r"""
 
 
 @lru_cache(maxsize=None)
-def _router_logits_kernel():
+def _router_logits_kernel(sig_precise: bool = False):
     return mx.fast.metal_kernel(
-        name="glm5_router_logits_sigmoid",
+        name="glm5_router_logits_sigmoid" + ("_precise" if sig_precise else ""),
         input_names=["x", "w", "bias"],
         output_names=["sig", "biased_out"],
         header=_QMV_HEADER,
-        source=_ROUTER_LOGITS_SOURCE,
+        source=_source(_ROUTER_LOGITS_SOURCE, SIG_PRECISE=int(sig_precise)),
     )
+
+
+def _router_sigmoid_precise() -> Optional[bool]:
+    """The reference router (group_expert_select) takes the sigmoid of its
+    fp32 logits with MLX's eager Sigmoid kernel, whose exp is the precise
+    one on release wheels (see eager_sigmoid_precise); None while undecided."""
+    return eager_sigmoid_precise(mx.float32)
 
 
 @lru_cache(maxsize=None)
@@ -1860,8 +1871,11 @@ def moe_router(
         return None
     if not 1 <= top_k <= min(32, E) or E > 1024:
         return None
+    precise = _router_sigmoid_precise()
+    if precise is None:
+        return None
     rows_per_simd = 1
-    sig, biased = _router_logits_kernel()(
+    sig, biased = _router_logits_kernel(precise)(
         inputs=[x, weight, bias],
         template=[("T", x.dtype), ("K", K), ("E", E), ("ROWS_PER_SIMD", rows_per_simd)],
         grid=(128 * (E // (4 * rows_per_simd)), T, 1),
@@ -2137,7 +2151,11 @@ _ROUTER_NAX_SOURCE = r"""
           for (int q = 0; q < NPART; q++) {
             logit += parts[q][r][hh * 16 + c];
           }
+#if SIG_PRECISE
+          float sgm = glm_sigmoid_precise<float>(logit);
+#else
           float sgm = glm_sigmoid<float>(logit);
+#endif
           float biased = sgm + bias[e];
           sig[r * E + e] = sgm;
           biased_out[r * E + e] = biased;
@@ -2153,13 +2171,13 @@ _ROUTER_PREFETCH = int(os.environ.get("OMLX_GLM5_ROUTER_PREFETCH", "8"))
 
 
 @lru_cache(maxsize=None)
-def _router_nax_kernel():
+def _router_nax_kernel(sig_precise: bool = False):
     return mx.fast.metal_kernel(
-        name="glm5_router_logits_nax_splitk",
+        name="glm5_router_logits_nax_splitk" + ("_precise" if sig_precise else ""),
         input_names=["x", "w", "bias"],
         output_names=["sig", "biased_out"],
         header=_NAX_HEADER + _QMV_HEADER.replace("#include <metal_stdlib>\nusing namespace metal;\n", ""),
-        source=_ROUTER_NAX_SOURCE,
+        source=_source(_ROUTER_NAX_SOURCE, SIG_PRECISE=int(sig_precise)),
     )
 
 
@@ -2204,8 +2222,11 @@ def moe_router_rows(
         return None
     if not nax_relaxed_fp32_matmul():
         return None
+    precise = _router_sigmoid_precise()
+    if precise is None:
+        return None
     npart = K // part
-    sig, biased = _router_nax_kernel()(
+    sig, biased = _router_nax_kernel(precise)(
         inputs=[x, weight, bias],
         template=[("M", T), ("K", K), ("E", E), ("PART", part), ("NPART", npart),
                   ("G", _ROUTER_PREFETCH)],
