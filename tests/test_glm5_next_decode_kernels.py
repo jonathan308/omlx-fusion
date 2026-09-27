@@ -346,6 +346,31 @@ def test_one_token_moe_selects_routes_inside_gate_up(seed, monkeypatch):
         assert _mismatches(fused, reference) == 0
 
 
+@pytest.mark.parametrize("bits", [8, 4])
+def test_one_token_dense_mlp_gate_up_is_bitwise_reference(bits, monkeypatch):
+    """GLM-5.3's dense MLP layers: gate/up + clamped SwiGLU in one dispatch
+    for one token, bitwise like the eager and the compiled reference."""
+    language = _language()
+    cfg = SimpleNamespace(hidden_size=1024, intermediate_size=2048, swiglu_limit=10.0)
+    mlp = language.Glm5NextMLP(cfg)
+    mlp.gate_proj = _quantized_linear(2048, 1024, bits)
+    mlp.up_proj = _quantized_linear(2048, 1024, bits)
+    mlp.down_proj = _quantized_linear(1024, 2048, bits)
+    mlp.eval()
+    mx.eval(mlp.parameters())
+    for trial in range(4):
+        x = (mx.random.normal((1, 1, 1024)) * (0.5 + 3 * trial)).astype(mx.bfloat16)
+        before = _stats()["mlp_gate_up"]
+        fused = mlp(x)
+        assert _stats()["mlp_gate_up"] == before + 1
+        monkeypatch.setattr(language, "_DECODE_FUSION", False)
+        reference = mlp(x)
+        compiled = mx.compile(mlp)(x)
+        monkeypatch.setattr(language, "_DECODE_FUSION", True)
+        assert _mismatches(fused, reference) == 0
+        assert _mismatches(fused, compiled) == 0
+
+
 def test_decode_experts_leave_sorted_route_counts_to_switch_glu():
     moe = _moe()
     x = mx.random.normal((1, 8, 1024)).astype(mx.bfloat16)  # 64 routes -> sorted

@@ -1299,6 +1299,19 @@ class Glm5NextMLP(nn.Module):
         self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
+        if (
+            _decode_kernels is not None
+            and _DECODE_FUSION
+            and self.limit is not None
+            and x.ndim == 3
+            and x.shape[:2] == (1, 1)
+        ):
+            # One token: gate/up + clamped SwiGLU in one exact dispatch.
+            act = _decode_kernels.mlp_gate_up_swiglu(
+                x.reshape(1, -1), self.gate_proj, self.up_proj, self.limit
+            )
+            if act is not None:
+                return linear_forward(self.down_proj, act.reshape(1, 1, -1))
         gate = linear_forward(self.gate_proj, x)
         up = linear_forward(self.up_proj, x)
         if self.limit is not None:

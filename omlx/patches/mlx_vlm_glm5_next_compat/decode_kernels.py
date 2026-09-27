@@ -554,6 +554,40 @@ def _shared_gate_up_kernel():
     )
 
 
+def mlp_gate_up_swiglu(x: mx.array, gate, up, limit: float) -> Optional[mx.array]:
+    """One token of Glm5NextMLP's gate/up projections and clamped SwiGLU in
+    one dispatch (the shared-expert gate/up kernel): ``silu(min(gate(x),
+    limit)) * clip(up(x), -limit, limit)`` for ``x`` [1, K], each projection
+    row with the one-row qmv_fast arithmetic. Returns [1, N] or None."""
+    if "mlp_gate_up" in DISABLED or x.ndim != 2 or x.shape[0] != 1:
+        return None
+    if x.dtype not in (mx.bfloat16, mx.float16):
+        return None
+    parts = [_affine_parts(m) for m in (gate, up)]
+    if any(p is None for p in parts):
+        return None
+    (gw, gs, gb, bits, gsz), (uw, us, ub, ubits, usz) = parts
+    K = x.shape[1]
+    N = gw.shape[0]
+    if (bits, gsz) != (ubits, usz) or gw.ndim != 2 or gw.shape != uw.shape:
+        return None
+    if gw.shape[1] * 32 // bits != K or gs.dtype != x.dtype or us.dtype != x.dtype:
+        return None
+    rps, nsg = 4, 2
+    if not _qmv_fast_ok(bits, gsz, N, K) or N % (rps * nsg):
+        return None
+    STATS["mlp_gate_up"] += 1
+    return _shared_gate_up_kernel()(
+        inputs=[x, mx.array([limit], dtype=mx.float32), gw, gs, gb, uw, us, ub],
+        template=[("T", x.dtype), ("K", K), ("N", N), ("SBITS", bits), ("SGS", gsz),
+                  ("RPS", rps), ("NSG", nsg)],
+        grid=(32, (N // (rps * nsg)) * nsg, 1),
+        threadgroup=(32, nsg, 1),
+        output_shapes=[(1, N)],
+        output_dtypes=[x.dtype],
+    )[0]
+
+
 # Fused routed down projection + routing-weighted sum (+ shared expert down
 # projection and residual-free add), reproducing
 #   y = (down(act) * scores[..., None]).sum(-2).astype(T) + shared_down(act_s)
