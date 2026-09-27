@@ -385,6 +385,50 @@ def recurrent_kimi_delta(
     return out, state
 
 
+class KdaStepCapture:
+    """A fused KDA verify block, kept so a speculative rollback is exact.
+
+    Holds the block's ``kda_decode_step`` inputs (the fused input projection
+    ``proj`` and, when the gate projections ran outside the kernel, their
+    rows ``a_pre``/``gate_pre``) and the layer's entry conv/recurrent states.
+    Each kernel row depends only on the rows before it (causal short conv,
+    per-row l2norm and gate projections, sequential delta rule), so
+    ``replay(n)`` over the first ``n`` rows returns bit for bit the states
+    the block held after row ``n``.
+    """
+
+    __slots__ = ("layer", "proj", "conv_state", "state", "a_pre", "gate_pre")
+
+    def __init__(self, layer, proj, conv_state, state, a_pre=None, gate_pre=None):
+        self.layer = layer
+        self.proj = proj
+        self.conv_state = conv_state
+        self.state = state
+        self.a_pre = a_pre
+        self.gate_pre = gate_pre
+
+    @property
+    def width(self) -> int:
+        return int(self.proj.shape[1])
+
+    def replay(self, n: int):
+        """``(conv_state, recurrent_state)`` after the first ``n`` rows."""
+        n = int(n)
+        if not 1 <= n <= self.width:
+            raise ValueError(f"KDA replay of {n} rows from a {self.width}-row block")
+
+        def rows(a):
+            return None if a is None else a[:, :n]
+
+        result = self.layer._kda_kernel_step(
+            rows(self.proj), self.conv_state, self.state,
+            rows(self.a_pre), rows(self.gate_pre),
+        )
+        if result is None:
+            raise RuntimeError("fused KDA kernel declined a captured verify block")
+        return result[1], result[2]
+
+
 class Glm5NextLinearAttention(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -542,13 +586,17 @@ class Glm5NextLinearAttention(nn.Module):
         ]
         return mx.concatenate([outs[g][..., a:b] for g, a, b in runs], axis=-1)
 
-    def _decode_step(self, inputs, mask, cache):
+    def _decode_step(self, inputs, mask, cache, capture=None):
         """Fused layer body for one sequence and S <= 8 tokens (bit-identical).
 
         One kernel (``decode_kernels.kda_decode_step``) replaces the conv,
         SiLU, l2norm, gate projections, delta rule and RMSNormGated ops
         between the fused input projection and o_proj. Returns None when the
         layer or inputs are not covered.
+
+        ``capture`` (a list, for speculative verify blocks) receives a
+        ``KdaStepCapture`` of the block's kernel inputs and entry states, from
+        which ``KdaStepCapture.replay`` rebuilds the caches after any prefix.
         """
         B, S, _ = inputs.shape
         fg = self.forget_gate
@@ -589,13 +637,29 @@ class Glm5NextLinearAttention(nn.Module):
         if not (isinstance(f_b, nn.QuantizedLinear) and bits <= in_kernel and len(bits) == 1):
             a_pre = linear_forward(f_b, proj[..., v_end:fa_end])
             gate_pre = linear_forward(g_b, proj[..., fa_end:ga_end])
-        result = _decode_kernels.kda_decode_step(
+        conv_in, state_in = cache[0], cache[1]
+        result = self._kda_kernel_step(proj, conv_in, state_in, a_pre, gate_pre)
+        if result is None:
+            return None
+        y, conv_state, state = result
+        if capture is not None:
+            capture.append(KdaStepCapture(self, proj, conv_in, state_in, a_pre, gate_pre))
+        cache[0] = conv_state
+        cache[1] = state
+        cache.advance(S)
+        return linear_forward(self.o_proj, y)
+
+    def _kda_kernel_step(self, proj, conv_state, state, a_pre, gate_pre):
+        """``decode_kernels.kda_decode_step`` for this layer: (y, conv, state)."""
+        fg = self.forget_gate
+        _, _, v_end, fa_end, ga_end = self._split_pts
+        return _decode_kernels.kda_decode_step(
             proj,
-            cache[0],
+            conv_state,
             self.conv1d.weight,
             fg.A_log,
             fg.dt_bias,
-            cache[1],
+            state,
             self.o_norm.weight,
             heads=self.num_heads,
             head_dim=self.head_dim,
@@ -606,18 +670,11 @@ class Glm5NextLinearAttention(nn.Module):
             l2_eps=1e-6,
             norm_eps=self.o_norm.eps,
             lower_bound=fg.safe_gate_lower_bound,
-            f_b=f_b,
-            g_b=g_b,
+            f_b=fg.f_b_proj,
+            g_b=self.g_b_proj,
             a_pre=a_pre,
             gate_pre=gate_pre,
         )
-        if result is None:
-            return None
-        y, conv_state, state = result
-        cache[0] = conv_state
-        cache[1] = state
-        cache.advance(S)
-        return linear_forward(self.o_proj, y)
 
     def __call__(
         self,
