@@ -7,7 +7,10 @@ encode time. The kernels here fuse chains of them while reproducing the
 stock MLX arithmetic bit for bit:
 
 * hyper-connections: ``hc_mix`` (fp32 RMS + mix GEMV), ``hc_expand_one``
-  (the one-token NAX relaxed-precision comb product + epilogue);
+  (the one-token NAX relaxed-precision comb product + epilogue), and for one
+  token ``hc_pre_fused`` (mix + collapse + RMSNorm in one dispatch, with the
+  previous expand's epilogue folded in) plus ``hc_post_mm`` (post, sinkhorn
+  comb and the comb product, off the dependent chain);
 * MoE: ``moe_router`` (logits GEMV + sigmoid/bias, top-k select with the
   stable-sort tie order), ``moe_gate_up_swiglu`` and ``moe_down_combine``
   (routed + shared experts, clamped SwiGLU, routing-weighted sum);
@@ -43,8 +46,12 @@ STATS: Counter = Counter()
 # default set, e.g. "" enables everything, "router_rows" disables only that.
 # The latent attention kernels are exact but slower than the reference ops in
 # the model (one call in flight: 16x32x16 NAX chains of up to 128 dependent
-# ops at low occupancy), so they are off unless enabled.
-DEFAULT_DISABLED = frozenset({"latent_attn", "latent_sparse_rows"})
+# ops at low occupancy), so they are off unless enabled. So is the one-token
+# shared expert in its own dispatch beside the router logits
+# (moe_shared_split): on its own it streams its 18 MB at ~0.65 TB/s next to
+# the router and the HC post kernel, and the model decodes 0.25-0.3 ms per
+# token faster with it inside the routed gate/up kernel.
+DEFAULT_DISABLED = frozenset({"latent_attn", "latent_sparse_rows", "moe_shared_split"})
 _DISABLE_ENV = os.environ.get("OMLX_GLM5_DECODE_DISABLE")
 DISABLED = (
     set(DEFAULT_DISABLED)
@@ -318,6 +325,59 @@ inline T glm_maximum(T x, T y) {
   return x > y ? x : y;
 }
 
+// The router's top-k selection (the select kernel's loop, one simdgroup):
+// argpartition order of the biased scores, i.e. descending values with ties
+// to the lower expert index and NaNs last (lowest index first). Every lane
+// ends with the same picked[].
+template <int E, int TOPK, typename P>
+inline void glm_router_topk(P bz, uint lane, thread int* picked) {
+  constexpr int PER = (E + 31) / 32;
+  float vals[PER];
+  bool taken[PER];
+  for (int j = 0; j < PER; j++) {
+    const int e = j * 32 + int(lane);
+    vals[j] = e < E ? bz[e] : -INFINITY;
+    taken[j] = e >= E;
+  }
+  for (int r = 0; r < TOPK; r++) {
+    float best = -INFINITY;
+    int best_e = 0x7fffffff;
+    for (int j = 0; j < PER; j++) {
+      const int e = j * 32 + int(lane);
+      if (!taken[j] && !isnan(vals[j]) &&
+          (best_e == 0x7fffffff || vals[j] > best || (vals[j] == best && e < best_e))) {
+        best = vals[j];
+        best_e = e;
+      }
+    }
+    for (ushort off = 16; off >= 1; off >>= 1) {
+      float ob = simd_shuffle_xor(best, off);
+      int oe = simd_shuffle_xor(best_e, off);
+      const bool other_better = oe != 0x7fffffff &&
+          (best_e == 0x7fffffff || ob > best || (ob == best && oe < best_e));
+      if (other_better) {
+        best = ob;
+        best_e = oe;
+      }
+    }
+    if (best_e == 0x7fffffff) {
+      for (int j = 0; j < PER; j++) {
+        const int e = j * 32 + int(lane);
+        if (!taken[j] && e < best_e) {
+          best_e = e;
+        }
+      }
+      for (ushort off = 16; off >= 1; off >>= 1) {
+        best_e = min(best_e, simd_shuffle_xor(best_e, off));
+      }
+    }
+    picked[r] = best_e;
+    if ((best_e % 32) == int(lane)) {
+      taken[best_e / 32] = true;
+    }
+  }
+}
+
 // Glm5NextClampedSwiGLU / Glm5NextMLP epilogue on bfloat16 projections:
 //   silu(minimum(gate, limit)) * minimum(maximum(up, -limit), limit)
 template <typename T>
@@ -395,7 +455,30 @@ _GATE_UP_SOURCE = r"""
   float g_res[RPS] = {0};
   float u_res[RPS] = {0};
   if (r < TOPK) {
+#if SELECT
+    // One token: this simdgroup replays the router's selection on the
+    // biased sigmoid scores (no separate select dispatch); slot 0 / tile 0
+    // publishes the routes and routing weights for the down kernel.
+    int picked[TOPK];
+    glm_router_topk<NE, TOPK>(sel_biased, simd_lid, picked);
+    const int expert = picked[r];
+    if (z == 0 && tile == 0 && simd_gid == 0 && simd_lid == 0) {
+      float total = 0.0f;
+      float gathered[TOPK];
+      for (int q = 0; q < TOPK; q++) {
+        gathered[q] = sel_sig[picked[q]];
+        total = gathered[q] + total;
+      }
+      for (int q = 0; q < TOPK; q++) {
+        float qv = SEL_NORM ? gathered[q] / total : gathered[q];
+        float sv = qv * sel_scaling[0];
+        sel_indices[q] = uint(picked[q]);
+        sel_scores[q] = sv;
+      }
+    }
+#else
     const int expert = int(indices[token * TOPK + r]);
+#endif
     constexpr int WB = K * RBITS / 8;   // bytes per weight row
     constexpr int G = K / RGS;          // groups per row
     // ESTRIDE rows per expert; a fused [gate; up] tensor (ESTRIDE = 2N) is
@@ -432,6 +515,86 @@ _GATE_UP_SOURCE = r"""
 """
 
 
+# One token's shared-expert gate/up with the clamped SwiGLU: the shared slot
+# of the fused gate/up kernel as its own dispatch. It does not depend on the
+# router, so it runs concurrently with the router logits kernel (no barrier
+# between them) and hides that kernel's latency under its weight stream.
+_SHARED_GATE_UP_SOURCE = r"""
+  const uint simd_lid = thread_index_in_simdgroup;
+  const uint simd_gid = simdgroup_index_in_threadgroup;
+  const int tile = int(threadgroup_position_in_grid.y);
+  const T lim = T(limit[0]);
+  const T neg_lim = T(-limit[0]);
+  const int out_row = (tile * NSG + int(simd_gid)) * RPS;
+  float g_res[RPS] = {0};
+  float u_res[RPS] = {0};
+  {
+    constexpr int WB = K * SBITS / 8;
+    constexpr int G = K / SGS;
+    const size_t row0 = size_t(out_row);
+    glm_qmv_rows<T, K, SGS, SBITS, RPS>(
+        (const device uint8_t*)sh_gate_w + row0 * WB, sh_gate_s + row0 * G,
+        sh_gate_b + row0 * G, x, simd_lid, g_res);
+    glm_qmv_rows<T, K, SGS, SBITS, RPS>(
+        (const device uint8_t*)sh_up_w + row0 * WB, sh_up_s + row0 * G,
+        sh_up_b + row0 * G, x, simd_lid, u_res);
+  }
+  device T* o = out + out_row;
+  for (int row = 0; row < RPS; row++) {
+    float gv = simd_sum(g_res[row]);
+    float uv = simd_sum(u_res[row]);
+    if (simd_lid == 0) {
+      o[row] = glm_clamped_swiglu<T>(static_cast<T>(gv), static_cast<T>(uv), lim, neg_lim);
+    }
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _shared_gate_up_kernel():
+    return mx.fast.metal_kernel(
+        name="glm5_moe_shared_gate_up_swiglu",
+        input_names=["x", "limit", "sh_gate_w", "sh_gate_s", "sh_gate_b", "sh_up_w", "sh_up_s", "sh_up_b"],
+        output_names=["out"],
+        header=_QMV_HEADER,
+        source=_SHARED_GATE_UP_SOURCE,
+    )
+
+
+def mlp_gate_up_swiglu(x: mx.array, gate, up, limit: float) -> Optional[mx.array]:
+    """One token of Glm5NextMLP's gate/up projections and clamped SwiGLU in
+    one dispatch (the shared-expert gate/up kernel): ``silu(min(gate(x),
+    limit)) * clip(up(x), -limit, limit)`` for ``x`` [1, K], each projection
+    row with the one-row qmv_fast arithmetic. Returns [1, N] or None."""
+    if "mlp_gate_up" in DISABLED or x.ndim != 2 or x.shape[0] != 1:
+        return None
+    if x.dtype not in (mx.bfloat16, mx.float16):
+        return None
+    parts = [_affine_parts(m) for m in (gate, up)]
+    if any(p is None for p in parts):
+        return None
+    (gw, gs, gb, bits, gsz), (uw, us, ub, ubits, usz) = parts
+    K = x.shape[1]
+    N = gw.shape[0]
+    if (bits, gsz) != (ubits, usz) or gw.ndim != 2 or gw.shape != uw.shape:
+        return None
+    if gw.shape[1] * 32 // bits != K or gs.dtype != x.dtype or us.dtype != x.dtype:
+        return None
+    rps, nsg = 4, 2
+    if not _qmv_fast_ok(bits, gsz, N, K) or N % (rps * nsg):
+        return None
+    STATS["mlp_gate_up"] += 1
+    return _shared_gate_up_kernel()(
+        inputs=[x, mx.array([limit], dtype=mx.float32), gw, gs, gb, uw, us, ub],
+        template=[("T", x.dtype), ("K", K), ("N", N), ("SBITS", bits), ("SGS", gsz),
+                  ("RPS", rps), ("NSG", nsg)],
+        grid=(32, (N // (rps * nsg)) * nsg, 1),
+        threadgroup=(32, nsg, 1),
+        output_shapes=[(1, N)],
+        output_dtypes=[x.dtype],
+    )[0]
+
+
 # Fused routed down projection + routing-weighted sum (+ shared expert down
 # projection and residual-free add), reproducing
 #   y = (down(act) * scores[..., None]).sum(-2).astype(T) + shared_down(act_s)
@@ -446,7 +609,9 @@ _DOWN_SOURCE = r"""
   const int tile = int(threadgroup_position_in_grid.y);
   const int token = int(threadgroup_position_in_grid.z);
 #endif
-  constexpr int RT = TOPK + HAS_SHARED;
+  // Activation slots per token: the routed ones, then the shared expert's
+  // unless it comes from its own input (SH_SEP).
+  constexpr int RT = TOPK + HAS_SHARED * (1 - SH_SEP);
   const int out_row = (tile * NSG + int(simd_gid)) * RPS;
 
   float acc[RPS] = {0};
@@ -474,10 +639,14 @@ _DOWN_SOURCE = r"""
     constexpr int SWB = K * SBITS / 8;
     constexpr int SG = K / SGS;
     const size_t row0 = size_t(out_row);
+#if SH_SEP
+    const device T* sh_x = sh_act + size_t(token) * K;
+#else
+    const device T* sh_x = act + (size_t(token) * RT + TOPK) * K;
+#endif
     glm_qmv_rows<T, K, SGS, SBITS, RPS>(
         (const device uint8_t*)sh_down_w + row0 * SWB, sh_down_s + row0 * SG,
-        sh_down_b + row0 * SG, act + (size_t(token) * RT + TOPK) * K,
-        simd_lid, sres);
+        sh_down_b + row0 * SG, sh_x, simd_lid, sres);
   }
 #endif
 #if SHARED_WIDE_DOWN
@@ -533,34 +702,53 @@ def _source(body: str, **defines) -> str:
 
 
 @lru_cache(maxsize=None)
-def _gate_up_kernel(has_shared: bool, shared_wide: bool = False, slot_major: bool = False):
-    inputs = ["x", "indices", "limit", "gate_w", "gate_s", "gate_b", "up_w", "up_s", "up_b"]
+def _gate_up_kernel(
+    has_shared: bool,
+    shared_wide: bool = False,
+    slot_major: bool = False,
+    select: bool = False,
+):
+    routes = ["sel_sig", "sel_biased", "sel_scaling"] if select else ["indices"]
+    inputs = ["x"] + routes + ["limit", "gate_w", "gate_s", "gate_b", "up_w", "up_s", "up_b"]
     if has_shared or shared_wide:
         inputs += ["sh_gate_w", "sh_gate_s", "sh_gate_b", "sh_up_w", "sh_up_s", "sh_up_b"]
+    if select and not has_shared:
+        # The shared expert's own gate/up output: read by nothing here, it
+        # orders that dispatch (and the router's) before this one.
+        inputs += ["after_shared"]
     suffix = "_widesh" if shared_wide else ("_shared" if has_shared else "")
     suffix += "_sm" if slot_major else ""
+    suffix += "_select" if select else ""
+    outputs = ["out", "shared_out"] if shared_wide else ["out"]
+    if select:
+        outputs += ["sel_indices", "sel_scores"]
     return mx.fast.metal_kernel(
         name=f"glm5_moe_gate_up_swiglu{suffix}",
         input_names=inputs,
-        output_names=["out", "shared_out"] if shared_wide else ["out"],
+        output_names=outputs,
         header=_QMV_HEADER,
         source=_source(
             _GATE_UP_SOURCE,
             HAS_SHARED=int(has_shared and not shared_wide),
             SHARED_WIDE=int(shared_wide),
             SLOT_MAJOR=int(slot_major),
+            SELECT=int(select),
         ),
     )
 
 
 @lru_cache(maxsize=None)
 def _down_kernel(
-    has_shared: bool, add_shared_y: bool, slot_major: bool = False, shared_wide: bool = False
+    has_shared: bool,
+    add_shared_y: bool,
+    slot_major: bool = False,
+    shared_wide: bool = False,
+    shared_sep: bool = False,
 ):
     inputs = ["act", "indices", "scores", "down_w", "down_s", "down_b"]
     if has_shared:
         inputs += ["sh_down_w", "sh_down_s", "sh_down_b"]
-        if shared_wide:
+        if shared_wide or shared_sep:
             inputs += ["sh_act"]
     elif add_shared_y:
         inputs += ["shared_y"]
@@ -568,6 +756,7 @@ def _down_kernel(
         "_shared" if has_shared else ("_add" if add_shared_y else "")
     )
     suffix += "_sm" if slot_major else ""
+    suffix += "_shsep" if shared_sep else ""
     return mx.fast.metal_kernel(
         name=f"glm5_moe_down_combine{suffix}",
         input_names=inputs,
@@ -579,6 +768,7 @@ def _down_kernel(
             ADD_SHARED_Y=int(add_shared_y and not has_shared),
             SLOT_MAJOR=int(slot_major),
             SHARED_WIDE_DOWN=int(shared_wide),
+            SH_SEP=int(shared_sep and not shared_wide),
         ),
     )
 
@@ -616,6 +806,8 @@ def moe_gate_up_swiglu(
     rps: int = 4,
     nsg: int = 2,
     shared_wide: bool = False,
+    select=None,
+    split_shared: bool = False,
 ):
     """Clamped-SwiGLU activations for every (token, routed expert[, shared]).
 
@@ -626,9 +818,29 @@ def moe_gate_up_swiglu(
     returns ``(routed [T, TOPK, N], shared [T, N])``. ``routed_up=None``
     means ``routed_gate`` is a fused ``gate_up_proj`` ([E, 2N, *]: gate rows
     then up rows per expert, as the MoE gate/up fusion lays them out).
+
+    ``select = (sig, biased, top_k, scaling, norm_topk_prob)`` (one token,
+    the ``moe_router_logits`` outputs) replaces ``indices``: every routed
+    threadgroup replays the router's top-k selection, and the call returns
+    ``(act, indices [1, top_k] uint32, scores [1, top_k] fp32)`` like
+    ``moe_router`` + this kernel, or None when not covered. With
+    ``split_shared`` too, the shared expert runs as its own dispatch first
+    (independent of the router, so it overlaps the router logits kernel)
+    and the call returns ``(act [1, top_k, N], shared_act [1, N], indices,
+    scores)`` for ``moe_down_combine(..., shared_act_sep=shared_act)``.
     """
     if "moe_gate_up" in DISABLED:
         return None
+    if select is not None:
+        if "router_select_fused" in DISABLED or shared_wide or x.ndim != 2 or x.shape[0] != 1:
+            return None
+        sig, biased, sel_topk, sel_scaling, sel_norm = select
+        E_r = sig.shape[-1]
+        if sig.shape != (1, E_r) or biased.shape != (1, E_r) or not 1 <= sel_topk <= 32:
+            return None
+        if sig.dtype != mx.float32 or biased.dtype != mx.float32 or E_r > 1024:
+            return None
+        indices = mx.zeros((1, sel_topk), dtype=mx.uint32)  # shape only
     fused_gu = routed_up is None
     parts = [_affine_parts(m) for m in ((routed_gate,) if fused_gu else (routed_gate, routed_up))]
     if any(p is None for p in parts) or x.ndim != 2 or indices.ndim != 2:
@@ -654,11 +866,17 @@ def moe_gate_up_swiglu(
     has_shared = shared_gate is not None
     if shared_wide and (not has_shared or not 2 <= T <= 8 or rps != 4):
         return None
-    inputs = [x, indices, mx.array([limit], dtype=mx.float32), gw, gs, gb, uw, us, ub]
+    if select is not None:
+        routes = [sig, biased, mx.array([sel_scaling], dtype=mx.float32)]
+    else:
+        routes = [indices]
+    inputs = [x] + routes + [mx.array([limit], dtype=mx.float32), gw, gs, gb, uw, us, ub]
     template = [
         ("T", x.dtype), ("K", K), ("N", N), ("TOPK", topk), ("RBITS", rbits),
         ("RGS", rgs), ("RPS", rps), ("NSG", nsg), ("ESTRIDE", estride), ("UP_OFF", up_off),
     ]
+    if select is not None:
+        template += [("NE", E_r), ("SEL_NORM", int(bool(sel_norm) and sel_topk > 1))]
     if has_shared:
         sparts = [_affine_parts(m) for m in (shared_gate, shared_up)]
         if any(p is None for p in sparts):
@@ -679,7 +897,31 @@ def moe_gate_up_swiglu(
     if shared_wide and "moe_shared_wide" in DISABLED:
         return None
     slot_major = _slot_major(T)
-    kernel = _gate_up_kernel(has_shared, shared_wide, slot_major)
+    if split_shared and select is not None and has_shared and "moe_shared_split" not in DISABLED:
+        tiles = N // (rps * nsg)
+        limit_arr = inputs[len(routes) + 1]
+        act_sh = _shared_gate_up_kernel()(
+            inputs=[x, limit_arr] + inputs[-6:],
+            template=[("T", x.dtype), ("K", K), ("N", N), ("SBITS", sbits), ("SGS", sgsz),
+                      ("RPS", rps), ("NSG", nsg)],
+            grid=(32, tiles * nsg, 1),
+            threadgroup=(32, nsg, 1),
+            output_shapes=[(1, N)],
+            output_dtypes=[x.dtype],
+        )[0]
+        STATS["moe_gate_up"] += 1
+        STATS["router_select_fused"] += 1
+        STATS["moe_shared_split"] += 1
+        act, sel_indices, sel_scores = _gate_up_kernel(False, False, False, True)(
+            inputs=inputs[:-6] + [act_sh],
+            template=[t for t in template if t[0] not in ("SBITS", "SGS")],
+            grid=(32, tiles * nsg, topk),
+            threadgroup=(32, nsg, 1),
+            output_shapes=[(1, topk, N), (1, topk), (1, topk)],
+            output_dtypes=[x.dtype, mx.uint32, mx.float32],
+        )
+        return act, act_sh, sel_indices, sel_scores
+    kernel = _gate_up_kernel(has_shared, shared_wide, slot_major, select is not None)
     STATS["moe_gate_up"] += 1
     tiles = N // (rps * nsg)
     slots = T * topk + 1 if shared_wide else T * (topk + int(has_shared))
@@ -697,6 +939,17 @@ def moe_gate_up_swiglu(
         STATS["moe_shared_wide"] += 1
         return routed, shared
     rt = topk + int(has_shared)
+    if select is not None:
+        STATS["router_select_fused"] += 1
+        act, sel_indices, sel_scores = kernel(
+            inputs=inputs,
+            template=template,
+            grid=grid,
+            threadgroup=(32, nsg, 1),
+            output_shapes=[(T, rt, N), (1, topk), (1, topk)],
+            output_dtypes=[x.dtype, mx.uint32, mx.float32],
+        )
+        return act, sel_indices, sel_scores
     return kernel(
         inputs=inputs,
         template=template,
@@ -721,6 +974,7 @@ def moe_down_combine(
     shared_y: Optional[mx.array] = None,
     *,
     shared_act: Optional[mx.array] = None,
+    shared_act_sep: Optional[mx.array] = None,
     rps: int = 4,
     nsg: int = 2,
 ) -> Optional[mx.array]:
@@ -731,7 +985,9 @@ def moe_down_combine(
     last activation slot (``shared_down``), from ``shared_act`` [T, K] (the
     ``shared_wide`` gate/up output, with the multi-row qmv_wide arithmetic)
     or added from a precomputed ``shared_y`` [T, N].  Returns [T, N] in
-    ``act.dtype``.
+    ``act.dtype``. ``shared_act_sep`` [T, K] is the shared expert's one-token
+    activation from its own gate/up dispatch (``act`` then has only the
+    routed slots); the arithmetic is the in-``act`` shared slot's.
     """
     if "moe_down" in DISABLED:
         return None
@@ -748,7 +1004,10 @@ def moe_down_combine(
         return None
     if shared_wide and ("moe_shared_wide" in DISABLED or not 2 <= T <= 8):
         return None
-    if rt != topk + int(has_shared and not shared_wide) or ds.dtype != act.dtype:
+    shared_sep = shared_act_sep is not None
+    if shared_sep and (not has_shared or shared_wide or shared_y is not None):
+        return None
+    if rt != topk + int(has_shared and not shared_wide and not shared_sep) or ds.dtype != act.dtype:
         return None
     if not _qmv_fast_ok(rbits, rgs, N, K) or N % (rps * nsg):
         return None
@@ -771,14 +1030,17 @@ def moe_down_combine(
                 return None
         elif not _qmv_fast_ok(sbits, sgsz, N, K):
             return None
+        if shared_sep and (shared_act_sep.shape != (T, K) or shared_act_sep.dtype != act.dtype):
+            return None
         inputs += [sdw, sds, sdb] + ([shared_act] if shared_wide else [])
+        inputs += [shared_act_sep] if shared_sep else []
         template += [("SBITS", sbits), ("SGS", sgsz)]
     elif shared_y is not None:
         if shared_y.shape != (T, N) or shared_y.dtype != act.dtype:
             return None
         inputs.append(shared_y)
     slot_major = _slot_major(T)
-    kernel = _down_kernel(has_shared, shared_y is not None, slot_major, shared_wide)
+    kernel = _down_kernel(has_shared, shared_y is not None, slot_major, shared_wide, shared_sep)
     STATS["moe_down"] += 1
     if shared_wide:
         STATS["moe_down_shared_wide"] += 1
@@ -1065,16 +1327,21 @@ _DSA_SCORES_SOURCE = r"""
 
   for (int hh = 0; hh < HEADS / NSG; hh++) {
     const int h = int(sg) * (HEADS / NSG) + hh;
-    simdgroup_matrix<float, 8, 8> c = simdgroup_matrix<float, 8, 8>(0.0f);
+    // This head's query fragments, loaded ahead of the (accumulator
+    // dependent) MMA chain; the chain itself is unchanged.
+    float2 av[DIM / 8];
     for (int kb = 0; kb < DIM / 8; kb++) {
-      float2 av = float2(0.0f);
+      av[kb] = float2(0.0f);
       if (fm < L) {
         const device T* qr = q + (size_t(fm) * HEADS + h) * DIM + kb * 8 + fn;
-        av[0] = static_cast<float>(qr[0]);
-        av[1] = static_cast<float>(qr[1]);
+        av[kb][0] = static_cast<float>(qr[0]);
+        av[kb][1] = static_cast<float>(qr[1]);
       }
+    }
+    simdgroup_matrix<float, 8, 8> c = simdgroup_matrix<float, 8, 8>(0.0f);
+    for (int kb = 0; kb < DIM / 8; kb++) {
       simdgroup_matrix<float, 8, 8> a;
-      reinterpret_cast<thread float2&>(a.thread_elements()) = av;
+      reinterpret_cast<thread float2&>(a.thread_elements()) = av[kb];
       simdgroup_multiply_accumulate(c, a, bfrag[kb], c);
     }
     float2 cv = reinterpret_cast<thread float2&>(c.thread_elements());
@@ -1157,6 +1424,140 @@ def dsa_decode_scores(
     )[0]
 
 
+# Top-k of the indexer's pooled-block scores for decode/verify rows (at most
+# 2048 blocks): the native radix-select kernel's output, which is a function
+# of the scores alone (keys of the 16-bit ordered score bits; strictly
+# greater keys in index order, then threshold ties in index order), found
+# with a threadgroup bitonic sort of (key, index) instead of two histogram
+# passes over contended threadgroup atomics and two serial bin scans.
+_DSA_TOPK_SOURCE = r"""
+  // One threadgroup (1024 threads) per score row; P <= 2048 scores.
+  const uint tid = thread_position_in_threadgroup.x;
+  const int row = int(threadgroup_position_in_grid.y);
+  const int P = int(dims[0]);
+  const device T* rs = scores + size_t(row) * P;
+  device uint* ro = out + size_t(row) * TOPK;
+  threadgroup uint sorted[2048];
+  threadgroup uint part_g[32];
+  threadgroup uint part_t[32];
+  threadgroup uint tkey[1];
+  const uint lane = tid % 32;
+  const uint sg = tid / 32;
+
+  // Composite sort keys: ordered 16-bit score key, then lower index first.
+  for (uint i = tid; i < 2048u; i += 1024u) {
+    uint v = 0u;
+    if (int(i) < P) {
+      const ushort bits = as_type<ushort>(rs[i]);
+      const uint key = (bits & 0x8000) ? uint((~bits) & 0xffff) : uint(bits | 0x8000);
+      v = (key << 16) | (0xffffu - i);
+    }
+    sorted[i] = v;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // Bitonic sort, descending.
+  for (uint k = 2u; k <= 2048u; k <<= 1) {
+    for (uint j = k >> 1; j > 0u; j >>= 1) {
+      const uint i = ((tid / j) * 2u * j) + (tid % j);
+      const uint p = i + j;
+      const uint a = sorted[i];
+      const uint b = sorted[p];
+      const bool desc = (i & k) == 0u;
+      if ((a < b) == desc) {
+        sorted[i] = b;
+        sorted[p] = a;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+  if (tid == 0) {
+    tkey[0] = sorted[TOPK - 1] >> 16;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint threshold_key = tkey[0];
+
+  // Deterministic output (as the native kernel): strictly greater keys in
+  // index order fill [0, n_greater), threshold ties in index order the rest.
+  const int seg = (P + 1023) / 1024;
+  const int s0 = int(tid) * seg;
+  const int s1 = metal::min(s0 + seg, P);
+  uint local_g = 0, local_t = 0;
+  for (int i = s0; i < s1; ++i) {
+    const ushort bits = as_type<ushort>(rs[i]);
+    const uint key = (bits & 0x8000) ? uint((~bits) & 0xffff) : uint(bits | 0x8000);
+    local_g += key > threshold_key ? 1u : 0u;
+    local_t += key == threshold_key ? 1u : 0u;
+  }
+  const uint pre_g = metal::simd_prefix_exclusive_sum(local_g);
+  const uint pre_t = metal::simd_prefix_exclusive_sum(local_t);
+  if (lane == 31) {
+    part_g[sg] = pre_g + local_g;
+    part_t[sg] = pre_t + local_t;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0) {
+    const uint pg = part_g[lane];
+    const uint pt = part_t[lane];
+    const uint eg = metal::simd_prefix_exclusive_sum(pg);
+    const uint et = metal::simd_prefix_exclusive_sum(pt);
+    part_g[lane] = eg;
+    part_t[lane] = et;
+    if (lane == 31) {
+      tkey[0] = eg + pg;   // total strictly greater
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint n_greater = tkey[0];
+  uint pos_g = part_g[sg] + pre_g;
+  uint pos_t = n_greater + part_t[sg] + pre_t;
+  if (local_g > 0 || (local_t > 0 && pos_t < uint(TOPK))) {
+    for (int j = s0; j < s1; ++j) {
+      const ushort bits = as_type<ushort>(rs[j]);
+      const uint key = (bits & 0x8000) ? uint((~bits) & 0xffff) : uint(bits | 0x8000);
+      if (key > threshold_key) {
+        ro[pos_g++] = uint(j);
+      } else if (key == threshold_key) {
+        if (pos_t < uint(TOPK)) {
+          ro[pos_t++] = uint(j);
+        }
+      }
+    }
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _dsa_topk_kernel():
+    return mx.fast.metal_kernel(
+        name="glm5_dsa_topk_rows",
+        input_names=["scores", "dims"],
+        output_names=["out"],
+        source=_DSA_TOPK_SOURCE,
+    )
+
+
+def dsa_topk_rows(scores: mx.array, topk: int) -> Optional[mx.array]:
+    """``omlx_glm_kernels.dsa_topk_indices(scores[:, None], topk)[:, 0]``
+    (non-bucketed, no causal prefix) for ``scores`` [1, L, P] with L <= 8 and
+    topk <= P <= 2048. Returns [1, L, topk] uint32 or None."""
+    if "dsa_topk" in DISABLED:
+        return None
+    if scores.ndim != 3 or scores.shape[0] != 1 or not 1 <= scores.shape[1] <= 8:
+        return None
+    _, L, P = scores.shape
+    if not 1 <= topk <= P <= 2048 or scores.dtype not in (mx.bfloat16, mx.float16):
+        return None
+    STATS["dsa_topk"] += 1
+    return _dsa_topk_kernel()(
+        inputs=[scores, mx.array([P], dtype=mx.int32)],
+        template=[("T", scores.dtype), ("TOPK", topk)],
+        grid=(1024, L, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(1, L, topk)],
+        output_dtypes=[mx.uint32],
+    )[0]
+
+
 # Expands the selected pooled blocks into token indices exactly like
 # Glm5NextIndexer.__call__ (validity, kpool expansion, left padding, the
 # always-selected tail window and the -1 padding up to the output width).
@@ -1224,6 +1625,68 @@ def dsa_expand_topk(
         output_shapes=[(1, 1, L, output_width)],
         output_dtypes=[mx.int32],
     )[0]
+
+
+# One-token sparse attention: the selected latent rows and their validity in
+# one dispatch instead of clip (maximum, minimum), take_along_axis and >= 0.
+_DSA_GATHER_SOURCE = r"""
+  const int j = int(threadgroup_position_in_grid.y) * ROWS + int(simdgroup_index_in_threadgroup);
+  if (j >= W) {
+    return;
+  }
+  const uint lane = thread_index_in_simdgroup;
+  const int kv_len = int(kv_shape[2]);
+  const int raw = idx[j];
+  const int r = metal::min(metal::max(raw, 0), kv_len - 1);
+  // 16-byte copies of the row.
+  constexpr int NV = D * int(sizeof(T)) / 16;
+  const device uint4* src = (const device uint4*)(kv + size_t(r) * D);
+  device uint4* dst = (device uint4*)(out + size_t(j) * D);
+  for (int c = int(lane); c < NV; c += 32) {
+    dst[c] = src[c];
+  }
+  if (lane == 0) {
+    valid[j] = raw >= 0;
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _dsa_gather_kernel():
+    return mx.fast.metal_kernel(
+        name="glm5_dsa_gather_selected",
+        input_names=["kv", "idx"],
+        output_names=["out", "valid"],
+        source=_DSA_GATHER_SOURCE,
+    )
+
+
+def dsa_gather_selected(kv_latent: mx.array, indices: mx.array):
+    """``kv_latent`` [1, 1, Kv, D] rows at ``indices`` [1, 1, W] (int32, -1 =
+    unused) clamped to [0, Kv - 1], and ``indices >= 0``: the one-token
+    sparse attention's ``take_along_axis(kv_latent, clip(indices))`` and
+    selection mask ([1, 1, 1, W] bool). None when not covered."""
+    if "dsa_gather" in DISABLED:
+        return None
+    if kv_latent.ndim != 4 or kv_latent.shape[:2] != (1, 1) or indices.ndim != 3:
+        return None
+    if indices.shape[:2] != (1, 1) or indices.dtype != mx.int32:
+        return None
+    D = kv_latent.shape[3]
+    W = indices.shape[2]
+    if kv_latent.shape[2] < 1 or D % 8 or kv_latent.dtype not in (mx.bfloat16, mx.float16):
+        return None
+    rows = 8
+    STATS["dsa_gather"] += 1
+    out, valid = _dsa_gather_kernel()(
+        inputs=[kv_latent, indices],
+        template=[("T", kv_latent.dtype), ("D", D), ("W", W), ("ROWS", rows)],
+        grid=(32, rows * ((W + rows - 1) // rows), 1),
+        threadgroup=(32, rows, 1),
+        output_shapes=[(1, 1, W, D), (1, 1, 1, W)],
+        output_dtypes=[kv_latent.dtype, mx.bool_],
+    )
+    return out, valid
 
 
 # ---------------------------------------------------------------------------
@@ -1367,6 +1830,42 @@ _KDA_SOURCE = r"""
     const int i = e % DK;
     as_[t][i] = a_pre[t * QKV + h * DK + i];
     gates[t][i] = gate_pre[t * QKV + h * DK + i];
+  }
+#elif GATE5
+  // One token, 5-bit K = 128 rows: MLX's qmv (qmv_impl): lanes 0..15 load
+  // 8 values each (load_vector_safe / qdot_safe with N = 8, i.e. load_vector
+  // / qdot), lanes 16..31 add nothing, one simd_sum per row.
+  {
+    static_assert(TOK == 1 && DK == 128, "5-bit gate rows: one token");
+    constexpr int WBYTES = 128 * 5 / 8;           // 80 bytes per weight row
+    constexpr int G = 128 / GS;                   // groups per row
+    for (int rr = 0; rr < (2 * DK) / 32; rr++) {
+      const int q = int(sg) * ((2 * DK) / 32) + rr;
+      const int which = q / DK;
+      const int i = q % DK;
+      const int row = h * DK + i;
+      float result = 0;
+      if (lane < 16u) {
+        const device T* xin = proj + (which == 0 ? OFF_FA : OFF_GA) + int(lane) * 8;
+        float x_thread[8];
+        float sum = glm_load_vector<T, 8, 5>(xin, x_thread);
+        const device uint8_t* wl = (const device uint8_t*)(which == 0 ? fb_w : gb_w)
+            + size_t(row) * WBYTES + int(lane) * 5;
+        const device T* sl = (which == 0 ? fb_s : gb_s) + row * G + int(lane) / (GS / 8);
+        const device T* bl = (which == 0 ? fb_b : gb_b) + row * G + int(lane) / (GS / 8);
+        const float s = sl[0];
+        const float b = bl[0];
+        result += glm_qdot<8, 5>(wl, x_thread, s, b, sum);
+      }
+      result = simd_sum(result);
+      if (lane == 0) {
+        if (which == 0) {
+          as_[0][i] = static_cast<T>(result);
+        } else {
+          gates[0][i] = static_cast<T>(result);
+        }
+      }
+    }
   }
 #else
   {
@@ -1532,6 +2031,7 @@ def _kda_kernel(
     pre_ag: bool,
     sig_b_precise: bool = False,
     sig_g_precise: bool = False,
+    gate5: bool = False,
 ):
     inputs = ["proj", "conv_w", "a_log", "dt_bias", "norm_w", "consts"]
     if has_conv_state:
@@ -1545,7 +2045,7 @@ def _kda_kernel(
     return mx.fast.metal_kernel(
         name=(
             f"glm5_kda_decode_c{int(has_conv_state)}_s{int(has_state)}_p{int(pre_ag)}"
-            f"_b{int(sig_b_precise)}_g{int(sig_g_precise)}"
+            f"_b{int(sig_b_precise)}_g{int(sig_g_precise)}{'_q5' if gate5 else ''}"
         ),
         input_names=inputs,
         output_names=["y", "conv_state_out", "state_out"],
@@ -1557,6 +2057,7 @@ def _kda_kernel(
             PRE_AG=int(pre_ag),
             SIG_B_PRECISE=int(sig_b_precise),
             SIG_G_PRECISE=int(sig_g_precise),
+            GATE5=int(gate5),
         ),
     )
 
@@ -1633,7 +2134,11 @@ def kda_decode_step(
         if any(p is None for p in parts):
             return None
         (fw, fs, fbias, fbits, fgs), (gw, gs_, gbias, gbits, ggs) = parts
-        if (fbits, fgs) != (gbits, ggs) or fbits not in (4, 8) or fgs not in (32, 64, 128):
+        if (fbits, fgs) != (gbits, ggs) or fgs not in (32, 64, 128):
+            return None
+        # 4/8 bits: MLX's qmv_quad (any token count). 5 bits: the one-row
+        # qmv (more rows take qmv_wide, which is not replayed).
+        if fbits not in (4, 8) and not (fbits == 5 and T == 1):
             return None
         if fw.shape != (qkv, 128 * fbits // 32) or gw.shape != fw.shape:
             return None
@@ -1656,8 +2161,11 @@ def kda_decode_step(
     sig_g = eager_sigmoid_precise(mx.float32)
     if sig_b is None or sig_g is None:
         return None
-    kernel = _kda_kernel(conv_state is not None, state is not None, pre, sig_b, sig_g)
+    gate5 = not pre and dict(template)["BITS"] == 5
+    kernel = _kda_kernel(conv_state is not None, state is not None, pre, sig_b, sig_g, gate5)
     STATS["kda"] += 1
+    if gate5:
+        STATS["kda_gate5"] += 1
     y, conv_out, state_out = kernel(
         inputs=inputs,
         template=template,
@@ -1836,6 +2344,38 @@ def _router_select_kernel():
         output_names=["indices", "scores"],
         source=_ROUTER_SELECT_SOURCE,
     )
+
+
+def moe_router_logits(x: mx.array, weight: mx.array, bias: mx.array):
+    """The router logits kernel alone: ``(sigmoid(x @ W.T), sigmoid + bias)``
+    [T, E] fp32 with ``moe_router``'s arithmetic, or None when not covered."""
+    if "router" in DISABLED or "router_select_fused" in DISABLED:
+        return None
+    if x.ndim != 2 or weight.ndim != 2 or bias.ndim != 1:
+        return None
+    T, K = x.shape
+    E = weight.shape[0]
+    if weight.shape[1] != K or bias.shape[0] != E:
+        return None
+    if weight.dtype != mx.float32 or bias.dtype != mx.float32:
+        return None
+    if x.dtype not in (mx.bfloat16, mx.float16, mx.float32):
+        return None
+    if E < 16 or E >= 4096 or K >= 16 * E or K <= 64 or K % 128 or E % 16 or E > 1024:
+        return None
+    precise = _router_sigmoid_precise()
+    if precise is None:
+        return None
+    sig, biased = _router_logits_kernel(precise)(
+        inputs=[x, weight, bias],
+        template=[("T", x.dtype), ("K", K), ("E", E), ("ROWS_PER_SIMD", 1)],
+        grid=(128 * (E // 4), T, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(T, E), (T, E)],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    STATS["router"] += 1
+    return sig, biased
 
 
 def moe_router(
@@ -2057,6 +2597,537 @@ def hc_expand_one(
         grid=(32 * simds * ((tiles + simds - 1) // simds), 1, 1),
         threadgroup=(32 * simds, 1, 1),
         output_shapes=[residual.shape],
+        output_dtypes=[x.dtype],
+    )[0]
+
+
+# ---------------------------------------------------------------------------
+# One-token HC pre in one dispatch, with the previous expand folded in
+# ---------------------------------------------------------------------------
+#
+# A half-layer's HC chain is hc_expand (previous branch) -> hc_mix ->
+# exact_hc_norm -> branch: three dependent dispatches, all latency bound.
+# The branch input only needs mix rows 0..HC-1 (the pre weights), so
+# ``hc_pre_fused`` computes the mix rows HC at a time per 1024-thread
+# threadgroup (hc_mix's multi-row layout) and threadgroup 0, which owns the
+# pre rows, finishes exact_hc_norm's collapse and RMSNorm itself. The post
+# and comb rows only feed the next expand: ``hc_post_mm`` (sinkhorn plus the
+# NAX comb product of hc_expand_one) runs beside the branch, and the next
+# ``hc_pre_fused`` applies hc_expand_one's epilogue to the branch output as it
+# loads h (threadgroup 0 also stores h, the next residual). Every value is
+# computed with the reference kernels' arithmetic and order.
+_HC_PRE_HEADER = r"""
+#include <metal_simdgroup>
+#include <metal_stdlib>
+using namespace metal;
+
+// hc_expand_one's epilogue for element e = r * D + col of h.
+template <typename T, int D, typename YPtr, typename MPtr, typename PPtr>
+inline T glm_hc_expand_value(YPtr y, MPtr mm, PPtr post, int e) {
+  const int r = e / D;
+  const int col = e - r * D;
+  volatile float prod = post[r] * static_cast<float>(y[col]);
+  float sum = prod + mm[e];
+  return static_cast<T>(sum);
+}
+"""
+
+_HC_PRE_SOURCE = r"""
+  const uint lid = thread_position_in_threadgroup.x;
+  const uint simd_lid = thread_index_in_simdgroup;
+  const uint simd_gid = simdgroup_index_in_threadgroup;
+  const int tile = int(threadgroup_position_in_grid.x);
+  constexpr int KSZ = HC * D;
+  constexpr int CH = KSZ / 4096;  // rms_looped reads per thread, 4 values each
+  constexpr int D4 = D / 4;
+  static_assert(KSZ % 4096 == 0 && D4 <= 1024 && D % 4 == 0, "hc_pre_fused shape");
+  constexpr float HC_EPS = HC_EPS_INT * 1e-9;
+  constexpr float NORM_EPS = NORM_EPS_INT * 1e-9;
+  using T4 = vec<T, 4>;
+#if DEFERRED
+#define HVAL(e) glm_hc_expand_value<T, D>(y, mm, post, (e))
+#else
+#define HVAL(e) x[(e)]
+#endif
+
+  // This thread's h values in rms_looped order.
+  T hv[CH][4];
+  for (int c = 0; c < CH; c++) {
+    for (int i = 0; i < 4; i++) {
+      hv[c][i] = HVAL(c * 4096 + int(lid) * 4 + i);
+    }
+  }
+#if DEFERRED
+  if (tile == 0) {
+    for (int c = 0; c < CH; c++) {
+      for (int i = 0; i < 4; i++) {
+        h_out[c * 4096 + int(lid) * 4 + i] = hv[c][i];
+      }
+    }
+  }
+#endif
+
+  // --- hc_mix: rms_looped (lsize = 1024, N_READS = 4) ---
+  threadgroup float local_inv_mean[1];
+  threadgroup float local_sums[32];
+  float acc = 0;
+  for (int c = 0; c < CH; c++) {
+    for (int i = 0; i < 4; i++) {
+      float xi = static_cast<float>(hv[c][i]);
+      acc += xi * xi;
+    }
+  }
+  acc = simd_sum(acc);
+  if (simd_gid == 0) {
+    local_sums[simd_lid] = 0;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_lid == 0) {
+    local_sums[simd_gid] = acc;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    acc = simd_sum(local_sums[simd_lid]);
+    if (simd_lid == 0) {
+      local_inv_mean[0] = metal::precise::rsqrt(acc / KSZ + eps[0]);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = local_inv_mean[0];
+
+  // --- hc_mix gemv: 8 simdgroups per row, 4 rows per threadgroup ---
+  const int slot = int(simd_gid) / 8;
+  const int sgN = int(simd_gid) % 8;
+  const int row = tile * 4 + slot;
+  threadgroup float partial[4][8];
+  threadgroup float row_total[4];
+  float result = 0;
+  {
+    const device float* mrow = fn + size_t(row) * KSZ;
+    int bn = (32 * sgN + int(simd_lid)) * 4;
+    for (int i = 0; i < KSZ / 1024; ++i) {
+      float v_coeff[4];
+      float inter[4];
+      for (int tn = 0; tn < 4; tn++) {
+        v_coeff[tn] = static_cast<float>(HVAL(bn + tn)) * inv;
+      }
+      for (int tn = 0; tn < 4; tn++) {
+        inter[tn] = mrow[bn + tn];
+      }
+      for (int tn = 0; tn < 4; tn++) {
+        result += inter[tn] * v_coeff[tn];
+      }
+      bn += 1024;
+    }
+    for (ushort sn = 16; sn >= 1; sn >>= 1) {
+      result += simd_shuffle_down(result, sn);
+    }
+  }
+  if (simd_lid == 0) {
+    partial[slot][sgN] = result;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sgN == 0 && simd_lid == 0) {
+    float total = partial[slot][0];
+    for (int s = 1; s < 8; s++) {
+      total += partial[slot][s];
+    }
+    mixes[row] = total;
+    row_total[slot] = total;
+  }
+  if (tile != 0) {
+    return;
+  }
+
+  // --- threadgroup 0 (the pre rows): exact_hc_norm's collapse + RMSNorm ---
+  threadgroup float pre_shared[HC];
+  threadgroup float norm_inv[1];
+  threadgroup float norm_sums[32];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    const float pre_scale = scale[0];
+    const uint llane = metal::min(simd_lid, (uint)(HC - 1));
+    float pre_z = row_total[llane] * pre_scale + base[llane];
+    float pre_v = 1.0f / (1.0f + metal::fast::exp(-pre_z)) + HC_EPS;
+    if (simd_lid < (uint)HC) {
+      pre_shared[simd_lid] = pre_v;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  T4 rounded = T4(0);
+  float accum = 0.0f;
+  if (int(lid) < D4) {
+    T4 xs[HC];
+    for (int r = 0; r < HC; r++) {
+      if (D == 4096) {
+        // Same elements as this thread's rms_looped reads.
+        xs[r] = T4(hv[r][0], hv[r][1], hv[r][2], hv[r][3]);
+      } else {
+        const int e = r * D + int(lid) * 4;
+        xs[r] = T4(HVAL(e), HVAL(e + 1), HVAL(e + 2), HVAL(e + 3));
+      }
+    }
+    float4 collapsed = fma(
+        float4(pre_shared[0]), float4(xs[0]),
+        fma(
+            float4(pre_shared[1]), float4(xs[1]),
+            fma(
+                float4(pre_shared[2]), float4(xs[2]),
+                float4(pre_shared[3]) * float4(xs[3]))));
+    rounded = T4(collapsed);
+    float4 rounded_float = float4(rounded);
+    accum += rounded_float.x * rounded_float.x;
+    accum += rounded_float.y * rounded_float.y;
+    accum += rounded_float.z * rounded_float.z;
+    accum += rounded_float.w * rounded_float.w;
+  }
+  accum = simd_sum(accum);
+  if (simd_lid == 0) {
+    norm_sums[simd_gid] = accum;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    accum = simd_sum(norm_sums[simd_lid]);
+    if (simd_lid == 0) {
+      norm_inv[0] = metal::precise::rsqrt(accum / D + NORM_EPS);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (int(lid) < D4) {
+    float ninv = norm_inv[0];
+    const device T4* weights = (const device T4*)norm_weight;
+    T4 scaled = T4(float4(rounded) * ninv);
+    T4 weight = weights[lid];
+    ((device T4*)normalized)[lid] = T4(
+        weight.x * scaled.x,
+        weight.y * scaled.y,
+        weight.z * scaled.z,
+        weight.w * scaled.w);
+  }
+#undef HVAL
+"""
+
+# exact_hc_norm's post/sinkhorn code, defined before the MPP include (so it
+# compiles exactly as in that kernel), then hc_expand_one's NAX comb product.
+_HC_POST_HEADER = r"""
+#include <metal_simdgroup>
+#include <metal_stdlib>
+using namespace metal;
+
+template <int HC, int ITERS, int HC_EPS_INT, typename MixPtr, typename BasePtr>
+inline void glm_hc_post_comb(
+    MixPtr mix, const float post_scale, const float comb_scale, BasePtr base,
+    uint lane, thread float& post_v, thread float4& result) {
+  constexpr int BASE_OFF = 2 * HC;
+  constexpr float HC_EPS = HC_EPS_INT * 1e-9;
+  const float active = lane < (uint)HC ? 1.0f : 0.0f;
+  const uint llane = metal::min(lane, (uint)(HC - 1));
+
+  float post_z = mix[HC + llane] * post_scale + base[HC + llane];
+  post_v = 2.0f / (1.0f + metal::fast::exp(-post_z));
+
+  float4 value =
+      (float4(mix[BASE_OFF + llane * HC], mix[BASE_OFF + llane * HC + 1],
+              mix[BASE_OFF + llane * HC + 2], mix[BASE_OFF + llane * HC + 3]) * comb_scale +
+       float4(base[BASE_OFF + llane * HC], base[BASE_OFF + llane * HC + 1],
+              base[BASE_OFF + llane * HC + 2], base[BASE_OFF + llane * HC + 3])) * active;
+  float row_max = metal::max(
+      metal::max(value.x, value.y), metal::max(value.z, value.w));
+  float4 exponent = metal::fast::exp(value - row_max) * active;
+  result = exponent *
+          (1.0f /
+           (exponent.x + exponent.y + exponent.z + exponent.w + HC_EPS)) +
+      HC_EPS * active;
+  float4 column_inv = 1.0f /
+      (float4(
+           simd_sum(result.x), simd_sum(result.y),
+           simd_sum(result.z), simd_sum(result.w)) +
+       HC_EPS);
+  result *= column_inv;
+  for (int iter = 1; iter < ITERS; ++iter) {
+    result *=
+        (1.0f / (result.x + result.y + result.z + result.w + HC_EPS)) *
+        active;
+    column_inv = 1.0f /
+        (float4(
+             simd_sum(result.x), simd_sum(result.y),
+             simd_sum(result.z), simd_sum(result.w)) +
+         HC_EPS);
+    result *= column_inv;
+  }
+}
+
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace mpp::tensor_ops;
+"""
+
+_HC_POST_SOURCE = r"""
+  const ushort lane = thread_index_in_simdgroup;
+  const uint sg = simdgroup_index_in_threadgroup;
+  static_assert(HC == 4, "one float4 comb row per lane");
+  threadgroup float4 comb_rows[HC];
+  if (sg == 0) {
+    float post_v;
+    float4 res;
+    glm_hc_post_comb<HC, ITERS, HC_EPS_INT>(mixes, scale[1], scale[2], base, uint(lane), post_v, res);
+    if (lane < HC) {
+      comb_rows[lane] = res;
+      if (threadgroup_position_in_grid.x == 0) {
+        post_out[lane] = post_v;
+        *(device float4*)(comb_out + lane * HC) = res;
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const int tile = int(threadgroup_position_in_grid.x) * SIMDS + int(sg);
+  if (tile * 32 >= D) {
+    return;
+  }
+  const threadgroup float* comb = (const threadgroup float*)comb_rows;
+  const short qid = lane >> 2;
+  const short fm = ((qid & 4) | ((lane >> 1) & 3));
+  const short fn = ((qid & 2) | (lane & 1)) * 4;
+  constexpr auto desc = matmul2d_descriptor(
+      16, 32, 16, false, false, true, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  auto ct_a = op.template get_left_input_cooperative_tensor<float, float, float>();
+  auto ct_b = op.template get_right_input_cooperative_tensor<float, float, float>();
+  auto ct_c = op.template get_destination_cooperative_tensor<
+      metal::remove_addrspace_t<decltype(ct_a)>,
+      metal::remove_addrspace_t<decltype(ct_b)>,
+      float>();
+  for (short i = 0; i < 8; i++) {
+    const short r = fm + (i >> 2) * 8;
+    const short c = fn + (i & 3);
+    // A = comb^T (rows: output stream, cols: source stream), zero padded.
+    ct_a[i] = (r < HC && c < HC) ? comb[c * HC + r] : 0.0f;
+    ct_b[i] = (r < HC) ? static_cast<float>(residual[r * D + tile * 32 + c]) : 0.0f;
+    ct_b[8 + i] = (r < HC) ? static_cast<float>(residual[r * D + tile * 32 + 16 + c]) : 0.0f;
+    ct_c[i] = 0.0f;
+    ct_c[8 + i] = 0.0f;
+  }
+  op.run(ct_a, ct_b, ct_c);
+  for (short i = 0; i < 8; i++) {
+    const short r = fm + (i >> 2) * 8;
+    const short c = fn + (i & 3);
+    if (r < HC) {
+      for (short hh = 0; hh < 2; hh++) {
+        const int col = tile * 32 + hh * 16 + c;
+        mm[r * D + col] = ct_c[hh * 8 + i];
+      }
+    }
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _hc_pre_fused_kernel(deferred: bool):
+    inputs = ["y", "mm", "post"] if deferred else ["x"]
+    inputs += ["fn", "eps", "scale", "base", "norm_weight"]
+    outputs = ["normalized", "mixes"] + (["h_out"] if deferred else [])
+    return mx.fast.metal_kernel(
+        name="glm5_hc_pre_fused" + ("_deferred" if deferred else ""),
+        input_names=inputs,
+        output_names=outputs,
+        header=_HC_PRE_HEADER,
+        source=_source(_HC_PRE_SOURCE, DEFERRED=int(deferred)),
+    )
+
+
+@lru_cache(maxsize=None)
+def _hc_post_mm_kernel():
+    return mx.fast.metal_kernel(
+        name="glm5_hc_post_comb_mm",
+        input_names=["mixes", "scale", "base", "residual"],
+        output_names=["post_out", "comb_out", "mm"],
+        header=_HC_POST_HEADER,
+        source=_HC_POST_SOURCE,
+    )
+
+
+def hc_defer_supported(connection, norm, dtype, width: int) -> bool:
+    """Whether ``hc_pre_fused`` / ``hc_post_mm`` cover this connection (one
+    token, hidden ``width``, activations of ``dtype``): the shapes of the
+    replicated hc_mix / exact_hc_norm / hc_expand_one configurations."""
+    if "hc_defer" in DISABLED or "hc_mix" in DISABLED or "hc_expand" in DISABLED:
+        return False
+    if dtype not in (mx.bfloat16, mx.float16) or connection.hc_mult != 4:
+        return False
+    fn = connection.fn
+    mix = (2 + 4) * 4
+    if fn.dtype != mx.float32 or fn.shape != (mix, 4 * width):
+        return False
+    if width % 1024 or width > 4096 or norm.weight.shape != (width,) or norm.weight.dtype != dtype:
+        return False
+    if connection.scale.shape != (3,) or connection.base.shape != (mix,):
+        return False
+    if connection.scale.dtype != mx.float32 or connection.base.dtype != mx.float32:
+        return False
+    return nax_relaxed_fp32_matmul()
+
+
+def hc_pre_fused(connection, norm, x=None, deferred=None):
+    """One-token ``hc_mix`` + ``exact_hc_norm`` (the normalized branch input
+    only) in one dispatch.
+
+    ``x`` [1, 1, HC, D] is the layer input, or ``deferred = (y, mm, post)``
+    the previous half-layer's branch output [1, 1, D], ``hc_post_mm``'s comb
+    product [HC * D] fp32 and post weights [1, 1, HC] fp32, from which h =
+    ``hc_expand_one(y, residual, post, comb)`` is recomputed exactly. Returns
+    ``(normalized [1, 1, D], mixes [1, 1, 24] fp32, h [1, 1, HC, D] or None
+    for ``x``)``; the caller checks ``hc_defer_supported`` first.
+    """
+    if deferred is not None:
+        y, mm, post = deferred
+        dtype, D = y.dtype, y.shape[-1]
+        if y.shape != (1, 1, D) or mm.shape != (4 * D,) or post.shape != (1, 1, 4):
+            return None
+        inputs = [y, mm, post]
+    else:
+        dtype, D = x.dtype, x.shape[-1]
+        if x.shape != (1, 1, 4, D):
+            return None
+        inputs = [x]
+    mix = connection.fn.shape[0]
+    inputs += [
+        connection.fn, mx.array([connection.norm_eps], dtype=mx.float32),
+        connection.scale, connection.base, norm.weight,
+    ]
+    STATS["hc_pre_fused"] += 1
+    outs = _hc_pre_fused_kernel(deferred is not None)(
+        inputs=inputs,
+        template=[
+            ("T", dtype), ("HC", 4), ("D", D),
+            ("HC_EPS_INT", round(connection.hc_eps / 1e-9)),
+            ("NORM_EPS_INT", round(norm.eps / 1e-9)),
+        ],
+        grid=(1024 * (mix // 4), 1, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(1, 1, D), (1, 1, mix)] + ([(1, 1, 4, D)] if deferred is not None else []),
+        output_dtypes=[dtype, mx.float32] + ([dtype] if deferred is not None else []),
+    )
+    return outs[0], outs[1], (outs[2] if deferred is not None else None)
+
+
+def hc_post_mm(connection, mixes: mx.array, residual: mx.array):
+    """The post weights, sinkhorn comb [1, 1, HC, HC] (fp32, as exact_hc_norm)
+    and hc_expand_one's NAX comb product ``mm`` [HC * D] fp32 of ``residual``
+    [1, 1, HC, D] for one token."""
+    D = residual.shape[-1]
+    simds = 8
+    tiles = D // 32
+    STATS["hc_post_mm"] += 1
+    return tuple(
+        _hc_post_mm_kernel()(
+            inputs=[mixes, connection.scale, connection.base, residual],
+            template=[
+                ("T", residual.dtype), ("HC", 4), ("D", D),
+                ("ITERS", int(connection.sinkhorn_iters)),
+                ("HC_EPS_INT", round(connection.hc_eps / 1e-9)), ("SIMDS", simds),
+            ],
+            grid=(32 * simds * ((tiles + simds - 1) // simds), 1, 1),
+            threadgroup=(32 * simds, 1, 1),
+            output_shapes=[(1, 1, 4), (1, 1, 4, 4), (4 * D,)],
+            output_dtypes=[mx.float32, mx.float32, mx.float32],
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# MLA per-head projections (embed_q / unembed_out) for one token
+# ---------------------------------------------------------------------------
+#
+# ``QuantizedMultiLinear`` runs a batched qmv: one 64-thread threadgroup per
+# 8 rows of one head (4096 tiny threadgroups for 64 heads x 512 rows), well
+# below the weight-streaming rate. The same per-row arithmetic (qmv_fast's
+# lane mapping, or qmv's single tail block when K is one qmv block) with NSG
+# simdgroups x 4 rows per threadgroup.
+_MH_QMV_SOURCE = r"""
+  const uint lane = thread_index_in_simdgroup;
+  const int sg = int(simdgroup_index_in_threadgroup);
+  const int h = int(threadgroup_position_in_grid.z);
+  const int r0 = (int(threadgroup_position_in_grid.y) * NSG + sg) * 4;
+  constexpr int WB = K * glm_bytes_per_pack<BITS>() / glm_pack_factor<BITS>();
+  constexpr int G = K / GS;
+  const device uint8_t* wh = (const device uint8_t*)w + (size_t(h) * N + r0) * WB;
+  const device T* sh = scales + (size_t(h) * N + r0) * G;
+  const device T* bh = biases + (size_t(h) * N + r0) * G;
+  const device T* xh = x + size_t(h) * K;
+  float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#if FAST
+  glm_qmv_rows<T, K, GS, BITS, 4>(wh, sh, bh, xh, lane, result);
+#else
+  {
+    // qmv_impl when K is exactly one block: every lane's values arrive in
+    // the tail (load_vector_safe / qdot_safe with a full remainder).
+    constexpr int VPT = glm_pack_factor<BITS>();
+    static_assert(K == VPT * 32, "one qmv block");
+    float x_thread[VPT];
+    float sum = glm_load_vector<T, VPT, BITS>(xh + lane * VPT, x_thread);
+    for (int row = 0; row < 4; row++) {
+      const device uint8_t* wl = wh + row * WB + lane * glm_bytes_per_pack<BITS>();
+      const float sc = sh[row * G + int(lane) / (GS / VPT)];
+      const float bi = bh[row * G + int(lane) / (GS / VPT)];
+      result[row] += glm_qdot<VPT, BITS>(wl, x_thread, sc, bi, sum);
+    }
+  }
+#endif
+  for (int r = 0; r < 4; r++) {
+    float v = simd_sum(result[r]);
+    if (lane == 0) {
+      y[size_t(h) * N + r0 + r] = static_cast<T>(v);
+    }
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _mh_qmv_kernel(fast: bool):
+    return mx.fast.metal_kernel(
+        name="glm5_mla_head_qmv" + ("_fast" if fast else "_block"),
+        input_names=["x", "w", "scales", "biases"],
+        output_names=["y"],
+        header=_QMV_HEADER,
+        source=_source(_MH_QMV_SOURCE, FAST=int(fast)),
+    )
+
+
+def mla_head_qmv(x: mx.array, layer, nsg: int = 8) -> Optional[mx.array]:
+    """``layer(x)`` (a ``QuantizedMultiLinear``, transpose=True) for one token:
+    ``x`` [1, H, 1, K] -> [1, H, 1, N], or None when not covered."""
+    if "mla_head_qmv" in DISABLED:
+        return None
+    if getattr(layer, "mode", "affine") != "affine" or layer.get("biases") is None:
+        return None
+    w, s, b = layer["weight"], layer["scales"], layer["biases"]
+    bits, gs = layer.bits, layer.group_size
+    if x.ndim != 4 or x.shape[0] != 1 or x.shape[2] != 1 or w.ndim != 3:
+        return None
+    H, K = x.shape[1], x.shape[3]
+    N = w.shape[1]
+    if w.shape[0] != H or s.shape != (H, N, K // gs) or b.shape != s.shape:
+        return None
+    if bits not in (4, 5, 6, 8) or K % gs or gs not in (32, 64, 128):
+        return None
+    if K in (64, 128) and bits in (4, 8):
+        return None  # MLX routes these to qmv_quad
+    if x.dtype not in (mx.bfloat16, mx.float16) or s.dtype != x.dtype or b.dtype != x.dtype:
+        return None
+    pack = {5: 8, 6: 4}.get(bits, 32 // bits)
+    fast = N % 8 == 0 and K % (pack * 2 * 32) == 0
+    if not fast and not (K == pack * 32 and N >= 8 and gs % pack == 0):
+        return None
+    if N % (4 * nsg):
+        nsg = 2
+        if N % 8:
+            return None
+    STATS["mla_head_qmv"] += 1
+    return _mh_qmv_kernel(fast)(
+        inputs=[x.reshape(H, K), w, s, b],
+        template=[("T", x.dtype), ("K", K), ("N", N), ("BITS", bits), ("GS", gs), ("NSG", nsg)],
+        grid=(32, (N // (4 * nsg)) * nsg, H),
+        threadgroup=(32, nsg, 1),
+        output_shapes=[(1, H, 1, N)],
         output_dtypes=[x.dtype],
     )[0]
 
