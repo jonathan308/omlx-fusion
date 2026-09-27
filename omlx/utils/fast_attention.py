@@ -32,7 +32,7 @@ from typing import Optional
 
 import mlx.core as mx
 
-from omlx.utils.nax_attention import nax_mixed_head_dim_attention
+from omlx.utils.nax_attention import nax_mixed_head_dim_attention, uses_key_passes
 
 # Kill switch for A/B comparisons: OMLX_FAST_ATTENTION=0 keeps MLX's default
 # SDPA routing everywhere.
@@ -106,7 +106,10 @@ def mixed_head_dim_sdpa(
     Four exact routes, best first:
 
     * MLX builds whose fused kernel takes the mixed head dims natively
-      (NAX kernel with a separate value head dim) are called directly.
+      (NAX kernel with a separate value head dim) are called directly,
+      except for long key ranges: the oMLX JIT kernel below runs those in
+      several key-range dispatches that keep the K/V stream on chip (same
+      arithmetic; its head-dim split variant only reorders the fp32 sums).
     * Otherwise, on NAX (M5) GPUs, the same NAX kernel runs as an oMLX JIT
       kernel (``nax_mixed_head_dim_attention``, 192/128 head dims).
     * Otherwise, on NAX GPUs, Q/K/V are zero-padded to 256 so the
@@ -126,7 +129,14 @@ def mixed_head_dim_sdpa(
         or not (mask is None or isinstance(mask, str) or mask.dtype == mx.bool_)
     ):
         return None
-    if _native_mixed_dims_supported(qk_dim, v_dim):
+    native = _native_mixed_dims_supported(qk_dim, v_dim)
+    if not native or uses_key_passes(queries, keys):
+        out = nax_mixed_head_dim_attention(
+            queries, keys, values, scale=scale, mask=mask, sinks=sinks
+        )
+        if out is not None:
+            return out
+    if native:
         return mx.fast.scaled_dot_product_attention(
             queries,
             keys,
@@ -136,11 +146,6 @@ def mixed_head_dim_sdpa(
             sinks=sinks,
             force_fused=True,
         )
-    out = nax_mixed_head_dim_attention(
-        queries, keys, values, scale=scale, mask=mask, sinks=sinks
-    )
-    if out is not None:
-        return out
     if qk_dim in (96, 128, 192) and qk_dim not in (64, 96, 128):
         # No NAX kernel for this width: pad to the 256-wide split kernel.
         width = 256

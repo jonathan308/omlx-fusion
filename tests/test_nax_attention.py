@@ -147,6 +147,123 @@ def test_strided_inputs_are_read_in_place():
     assert mx.array_equal(got, want).item()
 
 
+# (B, H, Hk, qL, kL, mask, sinks, dtype) for the key-range pass tests: causal
+# chunks at the end of a longer context (the prefill layout), unaligned tails,
+# a first chunk (qL == kL, early query blocks end before later passes start),
+# bool masks, sinks, fp16 and a batch.
+_PASS_CASES = [
+    (1, 8, 2, 200, 1300, "causal", False, mx.bfloat16),
+    (1, 8, 2, 256, 256, "causal", False, mx.bfloat16),
+    (1, 16, 1, 1031, 1031, "causal", True, mx.bfloat16),
+    (1, 8, 4, 64, 2000, "causal", False, mx.float16),
+    (2, 8, 2, 300, 700, "array", True, mx.bfloat16),
+    (1, 8, 2, 128, 1000, None, False, mx.bfloat16),
+]
+
+
+@requires_nax
+@pytest.mark.parametrize("case", _PASS_CASES)
+@pytest.mark.parametrize("n_pass", [2, 3, 7])
+@pytest.mark.parametrize("dsplit", [0, 2])
+def test_key_range_passes_are_bit_identical(case, n_pass, dsplit):
+    """Splitting the key range over dispatches resumes the exact fp32 state
+    (for the one-simdgroup and the head-dim split kernel alike)."""
+    B, H, Hk, qL, kL, mask_kind, has_sinks, dtype = case
+    pass_keys = kL // n_pass
+    q, k, v = _inputs(B, H, Hk, qL, kL, dtype, seed=qL + kL + n_pass)
+    mask = mask_kind
+    if mask_kind == "array":
+        mask = mx.random.uniform(shape=(B, 1, qL, kL)) > 0.3
+        mask[..., 0] = True
+        mask = mx.broadcast_to(mask, (B, H, qL, kL))
+    sinks = (2 * mx.random.normal((H,))).astype(dtype) if has_sinks else None
+    scale = 192**-0.5
+    one = nax_attention._run(
+        q, k, v, scale, mask, sinks, pass_keys=0, dsplit=dsplit
+    )
+    edges = nax_attention._pass_edges(B * H, (kL + 31) // 32, pass_keys, 0)
+    assert len(edges) == n_pass + 1  # really several dispatches
+    many = nax_attention._run(
+        q, k, v, scale, mask, sinks, pass_keys=pass_keys, min_groups=0, dsplit=dsplit
+    )
+    assert mx.array_equal(one, many).item()
+    ref = _reference(q, k, v, scale, mask, sinks)
+    assert _max_err(many, ref) < (1e-2 if dtype == mx.bfloat16 else 2e-3)
+
+
+def test_pass_edges():
+    f = nax_attention._pass_edges
+    assert f(8192, 2048, 8192) == [0, 256, 512, 768, 1024, 1280, 1536, 1792, 2048]
+    assert f(8192, 256, 8192) == [0, 256]  # one slice of keys: one dispatch
+    assert f(8192, 2048, 0) == [0, 2048]  # disabled
+    # few threadgroups (a short query tail) run in one wave: one dispatch
+    assert f(128, 32768, 8192) == [0, 32768]
+    edges = f(4096, 1000, 8192)
+    assert edges[0] == 0 and edges[-1] == 1000
+    assert all(b > a for a, b in zip(edges, edges[1:]))
+
+
+@requires_nax
+def test_register_resident_queries_are_bit_identical(monkeypatch):
+    q, k, v = _inputs(1, 8, 2, 1031, 1500, seed=11)
+    scale = 192**-0.5
+    run = nax_attention._run
+    monkeypatch.setattr(nax_attention, "_QREG", True)
+    resident = run(q, k, v, scale, "causal", None, pass_keys=0, dsplit=0)
+    monkeypatch.setattr(nax_attention, "_QREG", False)
+    reloaded = run(q, k, v, scale, "causal", None, pass_keys=0, dsplit=0)
+    assert mx.array_equal(resident, reloaded).item()
+
+
+def _ulps(out, ref):
+    """Max |out - ref| in bf16 ULPs of ref (|ref| >= 2^-10 only)."""
+    o, r = out.astype(mx.float32), ref.astype(mx.float32)
+    big = mx.abs(r) >= 2.0**-10
+    e = mx.floor(mx.log2(mx.maximum(mx.abs(r), 2.0**-126)))
+    return mx.where(big, mx.abs(o - r) / mx.power(2.0, e - 7), 0).max().item()
+
+
+@requires_nax
+@pytest.mark.parametrize("case", _PASS_CASES)
+def test_head_dim_split_changes_only_summation_order(case):
+    """Q @ K.T as two 96-dim fp32 partial sums: last-bit differences only."""
+    B, H, Hk, qL, kL, mask_kind, has_sinks, dtype = case
+    q, k, v = _inputs(B, H, Hk, qL, kL, dtype, seed=qL * 3 + kL)
+    mask = mask_kind
+    if mask_kind == "array":
+        mask = mx.random.uniform(shape=(B, 1, qL, kL)) > 0.3
+        mask[..., 0] = True
+    sinks = (2 * mx.random.normal((H,))).astype(dtype) if has_sinks else None
+    scale = 192**-0.5
+    run = nax_attention._run
+    one_sg = run(q, k, v, scale, mask, sinks, pass_keys=0, dsplit=0)
+    split = run(q, k, v, scale, mask, sinks, pass_keys=0, dsplit=2)
+    assert mx.mean((split == one_sg).astype(mx.float32)).item() > 0.98
+    assert _ulps(split, one_sg) <= 2
+    ref = _reference(q, k, v, scale, mask, sinks)
+    tol = 1e-2 if dtype == mx.bfloat16 else 2e-3
+    assert _max_err(split, ref) < tol
+
+
+@requires_nax
+def test_head_dim_split_only_for_passes_by_default(monkeypatch):
+    q, k, v = _inputs(1, 8, 2, 200, 1300, seed=12)
+    scale = 192**-0.5
+    seen = []
+    real = nax_attention._run_edges
+
+    def spy(*args):
+        seen.append((len(args[6]) - 1, args[7]))
+        return real(*args)
+
+    monkeypatch.setattr(nax_attention, "_run_edges", spy)
+    monkeypatch.setattr(nax_attention, "_DSPLIT", 1)
+    nax_attention._run(q, k, v, scale, "causal", None, pass_keys=0)
+    nax_attention._run(q, k, v, scale, "causal", None, pass_keys=400, min_groups=0)
+    assert seen[0] == (1, 1)  # one dispatch: one simdgroup per row block
+    assert seen[-1] == (3, 2)  # passes: head-dim split
+
+
 @requires_nax
 def test_output_rows_follow_sdpa_layout():
     """The [B, H, L, V] result reshapes to [B, L, H * V] like MLX's SDPA."""
@@ -198,7 +315,7 @@ def test_failed_self_check_disables_route(monkeypatch):
         raise RuntimeError("Unable to build metal library from source")
 
     monkeypatch.setattr(nax_attention, "_nax_available", lambda: True)
-    monkeypatch.setattr(nax_attention, "_run", boom)
+    monkeypatch.setattr(nax_attention, "_run_edges", boom)
     nax_attention._self_check_passed.cache_clear()
     try:
         q, k, v = _inputs(1, 4, 2, 64, 64)
@@ -222,6 +339,44 @@ def test_mixed_head_dim_sdpa_prefers_native_then_jit(monkeypatch):
     monkeypatch.setattr(fast_attention, "nax_mixed_head_dim_attention", spy)
     out = fast_attention.mixed_head_dim_sdpa(q, k, v, scale=192**-0.5, mask="causal")
     assert calls and out is not None and _max_err(out, ref) < 1e-2
+
+
+@requires_nax
+def test_mixed_head_dim_sdpa_splits_long_keys_even_with_native(monkeypatch):
+    """With MLX's native 192/128 kernel present, long key ranges still take
+    the key-range passes (bit-identical, faster); short ones stay native."""
+    q, k, v = _inputs(1, 8, 2, 300, 1100, seed=8)
+    monkeypatch.setattr(
+        fast_attention, "_native_mixed_dims_supported", lambda *a: True
+    )
+    calls = []
+    real = fast_attention.nax_mixed_head_dim_attention
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(fast_attention, "nax_mixed_head_dim_attention", spy)
+    monkeypatch.setattr(nax_attention, "_PASS_KEYS", 256)
+    monkeypatch.setattr(nax_attention, "_PASS_MIN_GROUPS", 1)
+    assert nax_attention.uses_key_passes(q, k)
+    out = fast_attention.mixed_head_dim_sdpa(q, k, v, scale=192**-0.5, mask="causal")
+    assert calls and out is not None
+    edges = nax_attention._pass_edges(8 * 5, (1100 + 31) // 32, 256)
+    assert len(edges) > 2
+    same = nax_attention._run_edges(
+        q, k, v, 192**-0.5, "causal", None, [0, edges[-1]], 2
+    )
+    assert mx.array_equal(out, same).item()
+
+    calls.clear()
+    monkeypatch.setattr(nax_attention, "_PASS_KEYS", 0)
+    assert not nax_attention.uses_key_passes(q, k)
+    monkeypatch.setattr(
+        fast_attention, "_native_mixed_dims_supported", lambda *a: False
+    )
+    fast_attention.mixed_head_dim_sdpa(q, k, v, scale=192**-0.5, mask="causal")
+    assert calls  # no native kernel: the JIT kernel still runs (one dispatch)
 
 
 @requires_nax
