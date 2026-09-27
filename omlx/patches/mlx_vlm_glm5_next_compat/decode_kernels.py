@@ -46,8 +46,12 @@ STATS: Counter = Counter()
 # default set, e.g. "" enables everything, "router_rows" disables only that.
 # The latent attention kernels are exact but slower than the reference ops in
 # the model (one call in flight: 16x32x16 NAX chains of up to 128 dependent
-# ops at low occupancy), so they are off unless enabled.
-DEFAULT_DISABLED = frozenset({"latent_attn", "latent_sparse_rows"})
+# ops at low occupancy), so they are off unless enabled. So is the one-token
+# shared expert in its own dispatch beside the router logits
+# (moe_shared_split): on its own it streams its 18 MB at ~0.65 TB/s next to
+# the router and the HC post kernel, and the model decodes 0.25-0.3 ms per
+# token faster with it inside the routed gate/up kernel.
+DEFAULT_DISABLED = frozenset({"latent_attn", "latent_sparse_rows", "moe_shared_split"})
 _DISABLE_ENV = os.environ.get("OMLX_GLM5_DECODE_DISABLE")
 DISABLED = (
     set(DEFAULT_DISABLED)

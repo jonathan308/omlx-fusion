@@ -761,6 +761,8 @@ def test_small_model_default_families_are_bitwise_reference(monkeypatch):
     monkeypatch.setattr(dk, "DISABLED", set(dk.DEFAULT_DISABLED))
     used = _check_small_model()
     assert "dsa_gather" in used and "latent_attn" not in used, used
+    # The routed gate/up kernel selects the routes and keeps the shared expert.
+    assert "router_select_fused" in used and "moe_shared_split" not in used, used
 
 
 def test_small_model_dense_attention_is_bitwise_reference():
@@ -1536,7 +1538,7 @@ def test_latent_attention_kernels_are_off_by_default():
     out = subprocess.run(
         [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=300
     ).stdout
-    assert out.strip().splitlines()[-1] == "['latent_attn', 'latent_sparse_rows']"
+    assert out.strip().splitlines()[-1] == "['latent_attn', 'latent_sparse_rows', 'moe_shared_split']"
 
 
 def test_router_rows_first_use_check_inside_compile_uses_reference():
