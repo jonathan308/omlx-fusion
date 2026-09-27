@@ -983,6 +983,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._target_model = target_bundle.model
         self._tokenizer_obj = target_bundle.tokenizer
         self._target_ops = target_bundle.target_ops
+        try:
+            from ..patches import decode_cbuf_budget
+
+            decode_cbuf_budget.apply_target_ops(self._target_ops)
+        except Exception:  # noqa: BLE001
+            logger.debug("decode command-buffer budget not applied", exc_info=True)
         target_meta = target_bundle.meta
         if hasattr(self._target_ops, "prefill_chunk_size"):
             # Adapters that chunk cold prefill themselves follow the runtime's
