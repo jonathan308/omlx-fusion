@@ -3,11 +3,11 @@
 DFlash engine for block diffusion speculative decoding.
 
 This engine wraps dflash-mlx (>= 0.1.5) to provide faster decoding on Apple
-Silicon for Qwen, Gemma4, Laguna, and Muse Glimmer model families. By
-default it serves all requests through dflash; setting
-``model_settings.dflash_max_ctx`` opts into
-evicting the dflash models and delegating long-context requests to omlx's
-BatchedEngine/VLMBatchedEngine (paged cache, SSD cache, continuous batching).
+Silicon for Qwen, Gemma4, Laguna, Muse Glimmer, MiMo V2, and GLM-5.3 model
+families. By default it serves all requests through dflash; setting
+``model_settings.dflash_max_ctx`` opts into evicting the dflash models and
+delegating long-context requests to omlx's BatchedEngine/VLMBatchedEngine
+(paged cache, SSD cache, continuous batching).
 """
 
 import asyncio
@@ -127,8 +127,8 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     """Decide whether ``model_path`` can run on the current dflash backend.
 
     DFlash 0.1.10+omlx.7 registers QwenGdnTargetOps, Gemma4TargetOps, and
-    MuseGlimmerTargetOps; oMLX adds Laguna and MiMo V2 target/draft adapters.
-    The top-level ``model_type`` is the canonical
+    MuseGlimmerTargetOps; oMLX adds Laguna, MiMo V2, and GLM-5.3 target/draft
+    adapters. The top-level ``model_type`` is the canonical
     discriminator: Gemma4 multimodal
     configs use ``gemma4`` at the top, while MTP-only variants (e.g. the
     Gemma4 ``-assistant`` checkpoint) declare ``gemma4_assistant`` even
@@ -148,6 +148,11 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     Meta named its DFlash drafter ``-assistant`` — drafter routing keys
     on ``config_model_type == "muse_glimmer_assistant"``, not on oMLX's
     historical "-assistant means MTP" name convention.
+
+    ``glm5_next`` (GLM-5.3-Flash, served through mlx-vlm; the nested
+    ``text_config.model_type`` is ``glm5_next_text``) is accepted through
+    oMLX's own target adapter (``omlx.patches.dflash_glm5``) paired with the
+    published ``incoai/GLM-5.3-Flash-DFlash2`` drafter.
 
     Returns:
         (is_compatible, reason). ``reason`` is empty when compatible.
@@ -170,9 +175,10 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     if model_type == "glm5_next":
         return False, "GLM-5.3 uses the native oMLX VLM engine"
     is_mimo = model_type in ("mimo_v2", "mimo_v2_flash")
-    if not (is_qwen or is_gemma4 or is_laguna or is_muse or is_mimo):
+    is_glm5 = model_type in ("glm5_next", "glm5_next_text")
+    if not (is_qwen or is_gemma4 or is_laguna or is_muse or is_mimo or is_glm5):
         return False, (
-            f"DFlash supports only Qwen, Gemma4, Laguna, MiMo V2, and "
+            f"DFlash supports only Qwen, Gemma4, Laguna, MiMo V2, GLM-5.3, and "
             f"Muse Glimmer "
             f"models (model_type='{cfg.get('model_type', '')}')"
         )
@@ -353,6 +359,24 @@ def check_draft_target_precision_pairing(
         "This may reduce acceptance and make speculative decoding slower. "
         "Use a target/draft pair recommended by the checkpoint's model card."
     )
+
+
+def _adapter_prefill_chunk(target_ops, runtime_step: int) -> int:
+    """Cold-prefill chunk for a target adapter that chunks prefill itself.
+
+    GLM-5.3 follows the batched scheduler's NAX prefill floor when that
+    exists (wider chunks once the tensor-unit sparse MLA makes the attention
+    cost chunk-independent), so DFlash prefill runs the same chunks as the
+    batched engine.
+    """
+    step = int(runtime_step or 0)
+    if getattr(target_ops, "backend_name", "") == "glm5_next":
+        try:
+            from ..scheduler import _glm5_next_nax_prefill_step
+        except ImportError:
+            return step
+        step = max(step, int(_glm5_next_nax_prefill_step() or 0))
+    return step
 
 
 class _DFlashPrefillGuard:
@@ -580,34 +604,13 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
     @property
     def supports_tool_calling(self) -> bool:
-        """Expose the GLM native tool dialect on the DFlash lane."""
-        return bool(
-            self._model_type_str == "glm5_next"
-            and getattr(self._tokenizer_obj, "has_tool_calling", False)
-            and getattr(self._tokenizer_obj, "tool_parser", None) is not None
-        )
+        """Tool calling is prompt-driven plus output parsing on this lane."""
+        return bool(getattr(self._tokenizer_obj, "has_tool_calling", False))
 
-    def _install_glm_tool_parser(self) -> None:
-        """Install mlx-lm's GLM47 parser on both DFlash tokenizer copies."""
-        if self._model_type_str != "glm5_next":
-            return
-        try:
-            from mlx_lm.tool_parsers.glm47 import (
-                parse_tool_call,
-                tool_call_end,
-                tool_call_start,
-            )
-        except ImportError as exc:
-            logger.warning("GLM tool parser unavailable on DFlash lane: %s", exc)
-            return
-        for tokenizer in (self._tokenizer_obj, self._executor_tokenizer):
-            if tokenizer is None:
-                continue
-            tokenizer.has_tool_calling = True
-            tokenizer.tool_call_start = tool_call_start
-            tokenizer.tool_call_end = tool_call_end
-            tokenizer.tool_parser = parse_tool_call
-        logger.info("GLM DFlash tool calling enabled: parser=glm47")
+    def _is_glm5_target(self) -> bool:
+        from ..patches.dflash_glm5 import is_glm5_dflash_target
+
+        return is_glm5_dflash_target(self._model_name)
 
     def _acquire_wired_limit(self) -> None:
         """Mirror BatchGenerator's recommended working-set wired limit."""
@@ -659,6 +662,53 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         return bool(
             await loop.run_in_executor(get_mlx_executor(), self._restore_wired_limit)
         )
+
+    def _install_glm_tool_parser(self) -> None:
+        """Enable GLM's native tool dialect on both DFlash tokenizer copies.
+
+        ``VLMBatchedEngine._inject_tool_calling`` infers ``glm47`` from the
+        chat template and sets the same attributes on mlx-vlm's
+        TokenizerWrapper; the DFlash lane loads GLM through the same wrapper,
+        so it mirrors that wiring here.
+        """
+        from ..patches.dflash_glm5 import is_glm5_model_type
+
+        if not is_glm5_model_type(self._model_type_str):
+            return
+        try:
+            from mlx_lm.tool_parsers.glm47 import (
+                parse_tool_call,
+                tool_call_end,
+                tool_call_start,
+            )
+        except ImportError as exc:
+            logger.warning("GLM tool parser unavailable on DFlash lane: %s", exc)
+            return
+        tokenizers = [
+            tokenizer
+            for tokenizer in (self._tokenizer_obj, self._executor_tokenizer)
+            if tokenizer is not None
+        ]
+        if not tokenizers:
+            return
+        try:
+            vocab = tokenizers[0].get_vocab()
+        except Exception:
+            vocab = None
+        if vocab is not None and (
+            tool_call_start not in vocab or tool_call_end not in vocab
+        ):
+            logger.warning(
+                "GLM tool parser markers missing from the tokenizer vocab; "
+                "tool calling stays disabled on the DFlash lane"
+            )
+            return
+        for tokenizer in tokenizers:
+            tokenizer.has_tool_calling = True
+            tokenizer.tool_call_start = tool_call_start
+            tokenizer.tool_call_end = tool_call_end
+            tokenizer.tool_parser = parse_tool_call
+        logger.info("DFlash tool calling enabled: parser=glm47")
 
     @staticmethod
     def _build_quant_spec(
@@ -791,11 +841,18 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
             # Register oMLX's target and drafter specializations before
             # load_target_bundle resolves either architecture.
+            from ..patches.dflash_glm5 import (
+                install_dflash_glm5_backend,
+                is_glm5_dflash_target,
+                load_glm5_target_bundle,
+                validate_glm5_dflash_pair,
+            )
             from ..patches.dflash_laguna import install_dflash_laguna_backend
             from ..patches.dflash_mimo_v2 import install_dflash_mimo_v2_backend
 
             install_dflash_laguna_backend()
             install_dflash_mimo_v2_backend()
+            install_dflash_glm5_backend()
 
             # Wrap dflash's hook installers so we can revert the class-level
             # __call__ patches when this engine stops. Without this, a later
@@ -806,13 +863,26 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
             install_dflash_lifecycle_wrap()
 
-            target_bundle = load_target_bundle(
-                self._model_name,
-                quantize_kv_cache=bool(
-                    getattr(runtime_context.runtime, "quantize_kv_cache", False)
-                ),
-                verify_config=getattr(runtime_context, "verify", None),
+            quantize_kv_cache = bool(
+                getattr(runtime_context.runtime, "quantize_kv_cache", False)
             )
+            if is_glm5_dflash_target(self._model_name):
+                # GLM-5.3 has no mlx-lm module: load it through mlx-vlm like
+                # VLMBatchedEngine does and wrap it in dflash's bundle type.
+                target_bundle = load_glm5_target_bundle(
+                    self._model_name,
+                    quantize_kv_cache=quantize_kv_cache,
+                    verify_config=getattr(runtime_context, "verify", None),
+                    trust_remote_code=bool(
+                        getattr(self._model_settings, "trust_remote_code", False)
+                    ),
+                )
+            else:
+                target_bundle = load_target_bundle(
+                    self._model_name,
+                    quantize_kv_cache=quantize_kv_cache,
+                    verify_config=getattr(runtime_context, "verify", None),
+                )
 
             # Keep DFlash targets on the same post-load MoE fast path as the
             # regular batched engine.  Laguna uses mlx-lm's SwitchGLU for its
@@ -859,6 +929,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 draft_meta,
                 self._draft_model_path,
             )
+            # No-op for other targets; rejects a GLM target paired with a
+            # non-DFlash2 drafter or mismatched geometry before generation.
+            validate_glm5_dflash_pair(target_bundle.model, draft, draft_meta)
             bind_draft_to_target(
                 draft,
                 target_bundle.model,
@@ -887,7 +960,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         ):
             # Do not advertise or initialize an inert cache. GLM-5.3's DSA
             # layers use CacheList(KVCache, PoolingCache), which the pinned
-            # dflash snapshot codec cannot serialize yet.
+            # dflash snapshot codec cannot serialize.
             logger.warning(
                 "DFlash prefix snapshots are not supported by target backend %s; "
                 "disabling DFlash L1/L2 cache for this load",
@@ -901,6 +974,16 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._tokenizer_obj = target_bundle.tokenizer
         self._target_ops = target_bundle.target_ops
         target_meta = target_bundle.meta
+        if hasattr(self._target_ops, "prefill_chunk_size"):
+            # Adapters that chunk cold prefill themselves follow the runtime's
+            # prefill_step_size (GLM-5.3: the runtime only chunks
+            # snapshot-capable targets).
+            step = _adapter_prefill_chunk(
+                self._target_ops,
+                int(getattr(runtime_context.runtime, "prefill_step_size", 0) or 0),
+            )
+            if step > 0:
+                self._target_ops.prefill_chunk_size = step
 
         # Deep-copy tokenizer for executor-thread usage (dflash generation).
         # The original self._tokenizer_obj stays for event-loop operations
@@ -914,7 +997,6 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             self._model_type_str = config.get("model_type")
         elif hasattr(config, "model_type"):
             self._model_type_str = config.model_type
-
         self._install_glm_tool_parser()
 
         self._pairing_warning = check_draft_target_precision_pairing(

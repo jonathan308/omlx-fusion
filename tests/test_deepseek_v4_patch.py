@@ -2261,16 +2261,19 @@ class TestPoolingCacheTrimRollback:
         )
 
     def test_untrimmable_when_no_undo_after_prompt(self, applied_patch):
-        """Prompt-sized updates (L > 8) don't stash an undo log; a trim at
-        a pool boundary right after one must report not-trimmable instead
-        of corrupting state. (Updates up to L == 8 keep an undo so depth-k
-        MTP verify windows can roll back.)"""
+        """Prompt-sized updates (L > POOLING_UNDO_MAX_TOKENS) don't stash an
+        undo log; a trim at a pool boundary right after one must report
+        not-trimmable instead of corrupting state. (Updates up to the bound
+        keep an undo so depth-k MTP / DFlash verify windows can roll back.)"""
         from mlx_lm.models.cache import PoolingCache
 
+        from omlx.patches.deepseek_v4.cache_extras import POOLING_UNDO_MAX_TOKENS
+
         cache = PoolingCache(4)
+        width = POOLING_UNDO_MAX_TOKENS + 4  # one window past the bound
         self._push(
             cache,
-            self._tok([float(v) for v in range(1, 13)]),  # L = 12 > 8
+            self._tok([float(v) for v in range(1, width + 1)]),
             0,
         )
         assert cache.remainder == 0
