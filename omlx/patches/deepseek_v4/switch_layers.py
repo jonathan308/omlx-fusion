@@ -15,7 +15,7 @@ import mlx.nn as nn
 from mlx_lm.models.activations import swiglu
 from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 from omlx.custom_kernels.nax import is_nax_available
-from omlx.patches.m5_gather_qmm import fused_gate_up_activation
+from omlx.patches.m5_gather_qmm import fused_gate_up_activation, sort_routes
 
 _DEEPSEEK_MXFP4_SMALL_BLOCK_BM = 16
 _DEEPSEEK_MXFP4_SMALL_BLOCK_VARIANT = 1
@@ -83,12 +83,15 @@ def has_native_block_kernels(projection) -> bool:
     )
 
 
+def _sort_rows(x, indices):
+    """``_gather_sort`` without the gather: the token rows, the sorted row ->
+    token row map, the sorted indices and the inverse order (same ops)."""
+    return sort_routes(x, indices)
+
+
 def _gather_sort(x, indices):
-    *_, M = indices.shape
-    indices = indices.flatten()
-    order = mx.argsort(indices)
-    inv_order = mx.argsort(order)
-    return x.flatten(0, -3)[order // M], indices[order], inv_order
+    x, row_map, indices, inv_order = _sort_rows(x, indices)
+    return x[row_map], indices, inv_order
 
 
 def _scatter_unsort(x, inv_order, shape=None):
@@ -463,8 +466,13 @@ class SwitchGLU(nn.Module):
         do_sort = indices.size >= _sort_threshold(*projections)
         idx = indices
         inv_order = None
+        token_rows = None
         if do_sort:
-            x, idx, inv_order = _gather_sort(x, indices)
+            # The replicated rows x_tok[row_map] stay lazy: never computed
+            # when the fused gate/up kernel reads the token rows in place.
+            x_tok, row_map, idx, inv_order = _sort_rows(x, indices)
+            x = x_tok[row_map]
+            token_rows = (x_tok, row_map)
         if self.training:
             idx = mx.stop_gradient(idx)
 
@@ -503,6 +511,8 @@ class SwitchGLU(nn.Module):
 
         if use_f16_moe:
             x = x.astype(mx.float16)
+            if token_rows is not None:
+                token_rows = (token_rows[0].astype(mx.float16), token_rows[1])
 
         use_pair_proj = (
             not fused_gate_up
@@ -539,7 +549,7 @@ class SwitchGLU(nn.Module):
                 # activation in the [gate; up] matmul's epilogue
                 # (bit-identical; None keeps the path below).
                 x_act = fused_gate_up_activation(
-                    self.gate_up_proj, x, idx, self.activation
+                    self.gate_up_proj, x, idx, self.activation, token_rows=token_rows
                 )
             if x_act is None:
                 # One gather_qmm over the [gate; up] expert rows; each output
