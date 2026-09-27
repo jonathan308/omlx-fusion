@@ -1623,6 +1623,68 @@ def dsa_expand_topk(
     )[0]
 
 
+# One-token sparse attention: the selected latent rows and their validity in
+# one dispatch instead of clip (maximum, minimum), take_along_axis and >= 0.
+_DSA_GATHER_SOURCE = r"""
+  const int j = int(threadgroup_position_in_grid.y) * ROWS + int(simdgroup_index_in_threadgroup);
+  if (j >= W) {
+    return;
+  }
+  const uint lane = thread_index_in_simdgroup;
+  const int kv_len = int(kv_shape[2]);
+  const int raw = idx[j];
+  const int r = metal::min(metal::max(raw, 0), kv_len - 1);
+  // 16-byte copies of the row.
+  constexpr int NV = D * int(sizeof(T)) / 16;
+  const device uint4* src = (const device uint4*)(kv + size_t(r) * D);
+  device uint4* dst = (device uint4*)(out + size_t(j) * D);
+  for (int c = int(lane); c < NV; c += 32) {
+    dst[c] = src[c];
+  }
+  if (lane == 0) {
+    valid[j] = raw >= 0;
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _dsa_gather_kernel():
+    return mx.fast.metal_kernel(
+        name="glm5_dsa_gather_selected",
+        input_names=["kv", "idx"],
+        output_names=["out", "valid"],
+        source=_DSA_GATHER_SOURCE,
+    )
+
+
+def dsa_gather_selected(kv_latent: mx.array, indices: mx.array):
+    """``kv_latent`` [1, 1, Kv, D] rows at ``indices`` [1, 1, W] (int32, -1 =
+    unused) clamped to [0, Kv - 1], and ``indices >= 0``: the one-token
+    sparse attention's ``take_along_axis(kv_latent, clip(indices))`` and
+    selection mask ([1, 1, 1, W] bool). None when not covered."""
+    if "dsa_gather" in DISABLED:
+        return None
+    if kv_latent.ndim != 4 or kv_latent.shape[:2] != (1, 1) or indices.ndim != 3:
+        return None
+    if indices.shape[:2] != (1, 1) or indices.dtype != mx.int32:
+        return None
+    D = kv_latent.shape[3]
+    W = indices.shape[2]
+    if kv_latent.shape[2] < 1 or D % 8 or kv_latent.dtype not in (mx.bfloat16, mx.float16):
+        return None
+    rows = 8
+    STATS["dsa_gather"] += 1
+    out, valid = _dsa_gather_kernel()(
+        inputs=[kv_latent, indices],
+        template=[("T", kv_latent.dtype), ("D", D), ("W", W), ("ROWS", rows)],
+        grid=(32, rows * ((W + rows - 1) // rows), 1),
+        threadgroup=(32, rows, 1),
+        output_shapes=[(1, 1, W, D), (1, 1, 1, W)],
+        output_dtypes=[kv_latent.dtype, mx.bool_],
+    )
+    return out, valid
+
+
 # ---------------------------------------------------------------------------
 # KDA (linear attention) decode/verify step
 # ---------------------------------------------------------------------------

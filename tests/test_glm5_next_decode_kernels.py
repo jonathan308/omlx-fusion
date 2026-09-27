@@ -477,6 +477,28 @@ def test_mla_head_qmv_declines_qmv_quad_shapes():
     assert dk.mla_head_qmv(mx.zeros((1, 8, 1, 256), mx.bfloat16), MultiLinear(256, 512, 8)) is None
 
 
+@pytest.mark.parametrize("kv_len", [1, 300, 4099])
+@pytest.mark.parametrize("width", [1, 7, 2051])
+def test_dsa_gather_selected_is_bitwise_reference(kv_len, width):
+    """The one-token sparse attention's clipped take_along_axis and mask."""
+    from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
+
+    mx.random.seed(kv_len + width)
+    cache = (mx.random.normal((1, 1, kv_len + 64, 512)) * 3).astype(mx.bfloat16)
+    kv = cache[:, :, :kv_len, :]
+    idx = mx.random.randint(-3, kv_len + 3, (1, 1, 1, width)).astype(mx.int32)
+    idx = mx.where(idx >= kv_len, -1, idx)
+    clamped = mx.clip(idx[:, :, 0, :], 0, kv_len - 1)[..., None]
+    reference = mx.take_along_axis(
+        kv, mx.broadcast_to(clamped, clamped.shape[:-1] + (512,)), axis=2
+    )
+    reference_mask = (idx >= 0)[:, :, 0, :][:, :, None, :]
+    out, valid = dk.dsa_gather_selected(kv, idx[:, :, 0, :])
+    assert _mismatches(out, reference) == 0
+    assert valid.dtype == mx.bool_ and valid.shape == reference_mask.shape
+    assert mx.array_equal(valid, reference_mask).item()
+
+
 def test_decode_experts_leave_sorted_route_counts_to_switch_glu():
     moe = _moe()
     x = mx.random.normal((1, 8, 1024)).astype(mx.bfloat16)  # 64 routes -> sorted
@@ -726,6 +748,19 @@ def test_small_model_decode_and_verify_logits_are_bitwise_reference():
         pytest.skip("GLM DSA native indexer extension is not built")
     used = _check_small_model()
     assert _ALWAYS_FUSED | {"latent_sparse_rows"} <= used, used
+
+
+def test_small_model_default_families_are_bitwise_reference(monkeypatch):
+    """The production family set (fused latent attention off): one-token
+    sparse steps gather the selected latent rows in one dispatch."""
+    _skip_under_mtp_runtime()
+    if not _native_indexer_available():
+        pytest.skip("GLM DSA native indexer extension is not built")
+    from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
+
+    monkeypatch.setattr(dk, "DISABLED", set(dk.DEFAULT_DISABLED))
+    used = _check_small_model()
+    assert "dsa_gather" in used and "latent_attn" not in used, used
 
 
 def test_small_model_dense_attention_is_bitwise_reference():

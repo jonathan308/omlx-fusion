@@ -1109,8 +1109,15 @@ class Glm5NextSparseAttention(nn.Module):
                 fused_attn = self._decode_latent(
                     q_latent, kv_latent, None, cache, indices=topk_indices[0, 0, 0]
                 )
+            gathered = None
+            if fused_attn is None and L == 1 and mask is None and _decode_kernels is not None and _DECODE_FUSION:
+                gathered = _decode_kernels.dsa_gather_selected(
+                    kv_latent, topk_indices[:, :, 0, :]
+                )
             if fused_attn is not None:
                 pass
+            elif gathered is not None:
+                kv_latent, attn_mask = gathered
             elif L == 1:
                 clamped = mx.clip(topk_indices[:, :, 0, :], 0, Kv - 1)
                 idx = clamped[..., None]
