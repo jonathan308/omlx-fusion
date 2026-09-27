@@ -507,7 +507,7 @@ class SwitchGLU(nn.Module):
     def _can_use_mxfp4_full_decode(self, x, indices, scores) -> bool:
         if not _DEEPSEEK_MXFP4_FULL_DECODE or self.training or scores is None:
             return False
-        if "gate_up_proj" in self:
+        if getattr(self, "gate_up_proj", None) is not None:
             # The fused kernel reads the separate gate and up projections.
             return False
         if x.ndim < 2 or indices.ndim < 1 or indices.shape[-1] != 6:
@@ -670,7 +670,7 @@ class SwitchGLU(nn.Module):
     ) -> bool:
         """Preflight exact DS4F M5 rank-1 4/8 or 5/8 BF16 contracts."""
 
-        if "gate_up_proj" in self:
+        if getattr(self, "gate_up_proj", None) is not None:
             # The block kernels read the separate gate and up projections.
             return False
         tp_contract = getattr(self, "_omlx_dsv4f_moe_tp", None)
