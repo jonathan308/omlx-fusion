@@ -470,6 +470,20 @@ class MiMoV2Model(PipelineMixin, nn.Module):
         pipeline_rank = self.pipeline_rank
         pipeline_size = self.pipeline_size
 
+        # Decode / short verify forwards: same math, fewer dispatches.
+        from omlx.patches.mimo_v2 import decode_fast as _decode_fast
+
+        fast = (
+            _decode_fast.run_layers(self, h, cache, full_mask, swa_mask)
+            if pipeline_size == 1
+            else None
+        )
+        if fast is not None:
+            h, normed = fast
+            if return_hidden:
+                return normed, h
+            return normed
+
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, pipeline_rank + 1)
 
