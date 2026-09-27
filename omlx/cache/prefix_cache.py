@@ -36,6 +36,7 @@ from .paged_cache import (
     PagedCacheManager,
     compute_block_hash,
     compute_chain_hashes,
+    compute_prefix_block_hashes,
     resolve_block_extra_keys,
 )
 from .paged_ssd_cache import (
@@ -1897,13 +1898,17 @@ class BlockAwarePrefixCache(CacheManager):
                 continue
             parent_hash = full_blocks[-1].block_hash if full_blocks else None
             max_terminal = min(block_size, len(tokens) - start)
+            # Every candidate terminal length in one incremental hashing pass;
+            # hashing each length from scratch cost O(block_size**2) per probed
+            # start (~0.9 s for a cold 16k prompt at 8192-token blocks).
+            terminal_hashes = compute_prefix_block_hashes(
+                parent_hash,
+                tokens[start : start + max_terminal],
+                extra_keys=(_EXACT_PREFIX_TERMINAL_KEY,),
+                model_name=self.paged_cache.model_name,
+            )
             for terminal_count in range(max_terminal, 0, -1):
-                terminal_hash = compute_block_hash(
-                    parent_hash,
-                    tokens[start : start + terminal_count],
-                    extra_keys=(_EXACT_PREFIX_TERMINAL_KEY,),
-                    model_name=self.paged_cache.model_name,
-                )
+                terminal_hash = terminal_hashes[terminal_count - 1]
                 terminal = self._lookup_or_register_exact_block(
                     terminal_hash,
                     terminal_count,

@@ -19,6 +19,7 @@ from omlx.cache.paged_cache import (
     FreeKVCacheBlockQueue,
     PagedCacheManager,
     compute_block_hash,
+    compute_prefix_block_hashes,
     resolve_block_extra_keys,
 )
 
@@ -327,6 +328,38 @@ class TestFreeKVCacheBlockQueue:
         all_free = queue.get_all_free_blocks()
         assert len(all_free) == 5
         assert [b.block_id for b in all_free] == [0, 1, 2, 3, 4]
+
+
+class TestComputePrefixBlockHashes:
+    """compute_prefix_block_hashes equals compute_block_hash on every prefix."""
+
+    @pytest.mark.parametrize("parent", [None, compute_block_hash(None, [9, 8, 7])])
+    @pytest.mark.parametrize("extra_keys", [None, ("specprefill-static-exact-v1",)])
+    @pytest.mark.parametrize("model_name", [None, "test-model"])
+    @pytest.mark.parametrize(
+        "tokens",
+        [[], [7], [0, 1], [151643, 5, 88, 0, 42], list(range(1000, 1300))],
+    )
+    def test_every_prefix_matches(self, parent, extra_keys, model_name, tokens):
+        hashes = compute_prefix_block_hashes(
+            parent, tokens, extra_keys=extra_keys, model_name=model_name
+        )
+        assert len(hashes) == len(tokens)
+        for count in range(1, len(tokens) + 1):
+            assert hashes[count - 1] == compute_block_hash(
+                parent,
+                tokens[:count],
+                extra_keys=extra_keys,
+                model_name=model_name,
+            )
+
+    def test_numpy_token_ids_match(self):
+        """Element reprs are hashed exactly as str(tuple(...)) renders them."""
+        np = pytest.importorskip("numpy")
+        tokens = list(np.arange(5, 12, dtype=np.int64))
+        hashes = compute_prefix_block_hashes(None, tokens)
+        for count in range(1, len(tokens) + 1):
+            assert hashes[count - 1] == compute_block_hash(None, tokens[:count])
 
 
 class TestBlockHashToBlockMap:

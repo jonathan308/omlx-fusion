@@ -64,6 +64,7 @@ class TestBlockAwarePrefixCache:
         num_layers: int = 1,
         hot_cache_max_bytes: int = 0,
         hot_cache_only: bool = False,
+        block_size: int = 4,
     ) -> tuple[BlockAwarePrefixCache, PagedCacheManager, PagedSSDCacheManager]:
         ssd_manager = PagedSSDCacheManager(
             cache_dir=cache_directory,
@@ -72,10 +73,10 @@ class TestBlockAwarePrefixCache:
             hot_cache_only=hot_cache_only,
             expected_model_name="test-model",
             expected_num_layers=num_layers,
-            expected_block_size=4,
+            expected_block_size=block_size,
         )
         paged_manager = PagedCacheManager(
-            block_size=4,
+            block_size=block_size,
             max_blocks=100,
             model_name="test-model",
             initial_blocks=100,
@@ -322,6 +323,66 @@ class TestBlockAwarePrefixCache:
                 )
                 is None
             )
+        finally:
+            restarted_ssd_manager.close()
+
+    def test_exact_terminal_restore_searches_every_length_of_a_wide_block(
+        self, tmp_path
+    ):
+        """A 50-token exact terminal inside a 64-token block is found again.
+
+        The restore probes every terminal length of the block (longest first)
+        against one incremental hashing pass; the stored length must match and
+        a prompt that diverges inside the terminal must not.
+        """
+        import mlx.core as mx
+
+        cache_directory = tmp_path / "wide-exact-terminal"
+        tokens = [1000 + i for i in range(50)]
+        keys = mx.arange(50, dtype=mx.float32).reshape(1, 1, 50, 1)
+        values = (keys + 10).astype(mx.float32)
+        extracted_cache = [
+            {
+                "state": (keys, values),
+                "meta_state": (50,),
+                "class_name": "KVCache",
+                "cache_type": "KVCache",
+            }
+        ]
+        first_prefix_cache, _, first_ssd_manager = self._make_ssd_prefix_cache(
+            cache_directory, block_size=64
+        )
+        stored_table = first_prefix_cache.store_exact_prefix(
+            "wide-static-prefix", tokens, extracted_cache
+        )
+        assert stored_table is not None
+        assert stored_table.num_tokens == len(tokens)
+        first_ssd_manager.close()
+
+        restarted_prefix_cache, _, restarted_ssd_manager = self._make_ssd_prefix_cache(
+            cache_directory, block_size=64
+        )
+        try:
+            restored, matched = restarted_prefix_cache.restore_exact_terminal_prefix(
+                "wide-extended-prefix",
+                [*tokens, *range(5000, 5030)],
+                promote_to_hot_cache=False,
+            )
+            assert restored is not None
+            assert matched == len(tokens)
+            restored_keys, _ = restored[0].state[:2]
+            assert mx.array_equal(restored_keys, keys).item()
+
+            diverged = [*tokens[:40], 7, *tokens[41:], 5000]
+            missing, missing_tokens = (
+                restarted_prefix_cache.restore_exact_terminal_prefix(
+                    "wide-diverged-prefix",
+                    diverged,
+                    promote_to_hot_cache=False,
+                )
+            )
+            assert missing is None
+            assert missing_tokens == 0
         finally:
             restarted_ssd_manager.close()
 

@@ -125,6 +125,40 @@ def compute_block_hash(
     return BlockHash(hasher.digest())
 
 
+def compute_prefix_block_hashes(
+    parent_hash: Optional[BlockHash],
+    token_ids: List[int],
+    extra_keys: Optional[Tuple[Any, ...]] = None,
+    model_name: Optional[str] = None,
+) -> List[BlockHash]:
+    """``compute_block_hash`` of every prefix ``token_ids[:k]``, k = 1..len.
+
+    SHA-256 is streaming: ``str(tuple(prefix))`` is ``"("`` plus the element
+    reprs joined by ``", "``, closed by ``",)"`` for one element and ``")"``
+    otherwise, so the hasher state after each element is copied and finished
+    instead of rehashing every prefix from scratch. Entry ``k - 1`` equals
+    ``compute_block_hash(parent_hash, token_ids[:k], extra_keys, model_name)``
+    bit for bit, at O(len) instead of O(len**2) hashing.
+    """
+    hasher = hashlib.sha256()
+    if model_name:
+        hasher.update(model_name.encode("utf-8"))
+    if parent_hash:
+        hasher.update(parent_hash)
+    else:
+        hasher.update(b"omlx-root")
+    extra = bytes(str(extra_keys), "utf-8") if extra_keys else b""
+    hashes: List[BlockHash] = []
+    for count, token in enumerate(token_ids, 1):
+        hasher.update(bytes(("(" if count == 1 else ", ") + repr(token), "utf-8"))
+        finished = hasher.copy()
+        finished.update(b",)" if count == 1 else b")")
+        if extra:
+            finished.update(extra)
+        hashes.append(BlockHash(finished.digest()))
+    return hashes
+
+
 def compute_chain_hashes(
     token_ids: list[int],
     block_size: int,
