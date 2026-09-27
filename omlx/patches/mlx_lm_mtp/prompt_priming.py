@@ -922,6 +922,78 @@ def capture_eligible(host: Any, cache: Optional[List[Any]]) -> bool:
     return True
 
 
+# A later prefill chunk of at least 2 tokens re-primes a tail-only head from
+# scratch (see _capture_single); one token of margin covers timelines whose
+# prompt count includes the token the first decode step forwards.
+_TAIL_SUPERSEDED_MIN_REMAINING = 3
+
+
+def tail_hidden_rows(host: Any, inputs: Any) -> Optional[int]:
+    """Rows of the trunk hidden a tail-only head's capture of this chunk reads.
+
+    A chunk longer than the head's tail restarts the head context and folds
+    only its last ``tail`` (hidden, next token) pairs plus the pending row,
+    so the backbone may compute the hidden for those ``tail + 1`` rows only.
+    Returns None whenever the capture could read more (batched rows, a
+    deferred-history context, short chunks).
+    """
+    tail = getattr(host, "_omlx_mtp_prime_tail", None)
+    if not tail or inputs is None or getattr(inputs, "ndim", 0) != 2:
+        return None
+    if int(inputs.shape[0]) != 1 or int(inputs.shape[1]) <= int(tail) + 1:
+        return None
+    if _PREFILL_SCOPE.get() is not None or _DECODE_SCOPE.get() is not None:
+        return None
+    ctx = getattr(host, _CTX_ATTR, None)
+    if ctx is not None and (
+        getattr(ctx, "deferred_pairs", None) is not None
+        or getattr(ctx, "window_exceeded", False)
+    ):
+        return None
+    if prime_window():
+        return None
+    return int(tail) + 1
+
+
+def claim_superseded_tail_chunk(host: Any, inputs: Any, cache: Optional[List[Any]]) -> bool:
+    """Whether a tail-only head's capture of this prefill chunk is wasted.
+
+    Heads that prime only the prompt's tail (``_omlx_mtp_prime_tail``) restart
+    their context on every multi-token prefill chunk, so only the last
+    chunk's capture survives. Capturing an earlier chunk still makes the
+    backbone produce the final hidden state for all of its rows (the last
+    decoder layer's attention output and MoE, which a prefill chunk otherwise
+    never evaluates). Returns True, after accounting for the chunk in the
+    batched prefill scope, when at least ``_TAIL_SUPERSEDED_MIN_REMAINING``
+    prompt tokens remain after this chunk for every row; the caller then
+    skips the capture and the hidden state. Anything unknown returns False.
+    """
+    tail = getattr(host, "_omlx_mtp_prime_tail", None)
+    if not tail or inputs is None or getattr(inputs, "ndim", 0) != 2:
+        return False
+    rows, count = int(inputs.shape[0]), int(inputs.shape[1])
+    prefill = _PREFILL_SCOPE.get()
+    if prefill is not None and prefill["host"] is host:
+        if len(prefill["uids"]) != rows:
+            return False
+        remaining = min(
+            length - prefill["consumed"] - count for length in prefill["lengths"]
+        )
+        if remaining < _TAIL_SUPERSEDED_MIN_REMAINING:
+            return False
+        prefill["consumed"] += count
+        return True
+    if rows != 1 or _DECODE_SCOPE.get() is not None:
+        return False
+    plan = _find_plan(host)
+    anchor = _anchor(cache)
+    offset = anchor.offset if anchor is not None else None
+    if plan is None or offset is None:
+        return False
+    remaining = len(plan.prompt_tokens) - (int(offset) + count)
+    return remaining >= _TAIL_SUPERSEDED_MIN_REMAINING + 1
+
+
 @dataclass
 class _OwnedPriming:
     requests: dict = field(default_factory=dict)
@@ -1404,6 +1476,11 @@ def maybe_capture(host, inputs, normed, cache):
                     inputs[row : row + 1, :valid],
                     normed[row : row + 1, :valid],
                     [SimpleNamespace(offset=offset)],
+                    # A row this scope prefilled from offset 0 (its skipped
+                    # chunks are its own; see _tail_restart_on_own_prefix).
+                    own_prefix=(
+                        int(offsets[row]) == 0 if prefill is not None else None
+                    ),
                 )
                 state.uids[uid] = _slot(host)
         finally:
@@ -1546,8 +1623,34 @@ def _flush_deferred_history(model, ctx, chunk_size=512):
     ctx.deferred_pairs = []
 
 
+def _tail_restart_on_own_prefix(
+    host: Any, plan: Optional[_PrimePlan], seq_start: int, own_prefix: Optional[bool]
+) -> bool:
+    """Whether a tail-only head may start a timeline at ``seq_start`` > 0.
+
+    claim_superseded_tail_chunk skips the capture of prefill chunks whose
+    tail a later chunk replaces, so a cold prompt's last chunk arrives with
+    no context. A tail-only head (``_omlx_mtp_prime_tail``) restarts from
+    every multi-token chunk after the first, discarding what earlier chunks
+    folded, so starting it on that chunk as a restart gives the head state
+    of capturing every chunk. Only a timeline this request prefilled from
+    offset 0 qualifies (``own_prefix`` from the batched scope's row offset,
+    else the scheduler plan's zero cached prefix); a restored prefix-cache
+    hit keeps Fusion's fail-closed start.
+    """
+    if seq_start <= 0 or not getattr(host, "_omlx_mtp_prime_tail", None):
+        return False
+    if own_prefix is not None:
+        return bool(own_prefix)
+    return plan is not None and int(plan.cached_tokens) == 0
+
+
 def _capture_single(
-    host: Any, inputs: Any, normed: Any, cache: Optional[List[Any]]
+    host: Any,
+    inputs: Any,
+    normed: Any,
+    cache: Optional[List[Any]],
+    own_prefix: Optional[bool] = None,
 ) -> None:
     """Fold this forward's (hidden, next_token) pairs into the priming cache.
 
@@ -1646,6 +1749,7 @@ def _capture_single(
         # durable history and verifies every draft.
         restored_suffix = offset_after != seq_len
         suffix_local = qwen4_suffix_capable
+        tail_restart = False
         if suffix_local:
             if not (
                 _text_only_suffix_plan(host, plan)
@@ -1662,8 +1766,12 @@ def _capture_single(
             # Fusion intentionally keeps generic/DS4 partial-history capture
             # fail-closed.  Only the explicitly tagged Qwen4 target can prove
             # that its absolute target history and local verified-drafter
-            # history are safe to advance on separate timelines.
-            return
+            # history are safe to advance on separate timelines.  A tail-only
+            # head whose earlier chunks of this prompt were superseded starts
+            # here as the restart it would have taken anyway.
+            if not _tail_restart_on_own_prefix(host, plan, seq_start, own_prefix):
+                return
+            tail_restart = True
         if not suffix_local and seq_len <= 1:
             # A lone decode step cannot start a prompt timeline.
             return
@@ -1699,6 +1807,11 @@ def _capture_single(
             return
         if suffix_local and mtp_cache_offset(ctx.mtp_cache) != 0:
             return
+        if tail_restart:
+            # Same state as the restart below (which a chunk no longer than
+            # the tail would not take on a fresh context): only this chunk's
+            # pairs, never published as a boundary snapshot.
+            ctx.tail_only = True
         setattr(host, _CTX_ATTR, ctx)
 
     tail = getattr(host, "_omlx_mtp_prime_tail", None)

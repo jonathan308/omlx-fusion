@@ -15,7 +15,7 @@ side into one Metal dispatch:
 Both kernels mirror the stock rounding sites so the fused path is
 bit-compatible with the unfused stock path (fp32 L2 sums, a single cast
 back to the activation dtype, bf16-domain conv/SiLU). The recurrence runs
-on the blocked kernel in ``glm53_kda_recurrence`` (forget gate computed
+on the kernels in ``glm53_kda_recurrence`` (forget gate computed
 in-kernel; same math up to fp32 summation order), falling back to the stock
 ``gated_delta_update`` when the gate is not the fp32 safe-gate form.
 

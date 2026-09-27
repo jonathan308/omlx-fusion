@@ -69,22 +69,124 @@ def test_recurrence_matches_stock_kernel_and_fp32_reference(cfg):
     assert mx.allclose(y, y_ref, rtol=1e-2, atol=1e-3).item()
 
 
-def test_recurrence_chunked_equals_one_shot():
-    from omlx.patches.glm53_kda_recurrence import kda_recurrence
+@pytest.mark.parametrize("threadgroups", [None, 7])
+def test_recurrence_chunked_equals_one_shot(threadgroups):
+    from omlx.patches.glm53_kda_recurrence import PerCoreConfig, kda_recurrence
 
+    cfg = PerCoreConfig(threadgroups=threadgroups)
     q, k, v, a, beta, a_log, dt_bias, state = _inputs(1, 100, 2, 7)
-    y_full, s_full = kda_recurrence(q, k, v, a, beta, a_log, dt_bias, -5.0, state)
+    y_full, s_full = kda_recurrence(
+        q, k, v, a, beta, a_log, dt_bias, -5.0, state, config=cfg
+    )
     ys, s = [], state
     for lo, hi in [(0, 13), (13, 64), (64, 100)]:
         y, s = kda_recurrence(
             q[:, lo:hi], k[:, lo:hi], v[:, lo:hi], a[:, lo:hi], beta[:, lo:hi],
-            a_log, dt_bias, -5.0, s,
+            a_log, dt_bias, -5.0, s, config=cfg,
         )
         ys.append(y)
     y_chunks = mx.concatenate(ys, axis=1)
     mx.eval(y_full, s_full, y_chunks, s)
     assert mx.array_equal(y_full, y_chunks).item()
     assert mx.array_equal(s_full, s).item()
+
+
+@pytest.mark.parametrize(
+    "B,T,H,threadgroups",
+    [
+        (1, 45, 4, 5),  # 102/104-row ranges: most threadgroups span two heads
+        (2, 37, 3, 4),  # batch > 1, 96-row ranges
+        (1, 25, 2, 2),  # one head per threadgroup, tail-only blocks
+        (1, 61, 5, 6),  # ragged ranges (106/108 rows), full + tail blocks
+        (1, 1, 4, 5),  # single token
+        (1, 30, 64, 80),  # GLM-5.3 head count, one range per M5 Ultra core
+        (1, 30, 64, None),  # default: one range per GPU core
+    ],
+)
+def test_percore_recurrence_is_bitwise_the_blocked_kernel(B, T, H, threadgroups):
+    """Same per-row arithmetic and summation order -> identical bits."""
+    from omlx.patches.glm53_kda_recurrence import (
+        PerCoreConfig,
+        RecurrenceConfig,
+        _percore_threadgroups,
+        gpu_core_count,
+        kda_recurrence,
+    )
+
+    if threadgroups is None and not gpu_core_count():
+        pytest.skip("GPU core count unavailable; the per-core kernel falls back")
+    cfg = PerCoreConfig(threadgroups=threadgroups)
+    ntg = _percore_threadgroups(H * 128, cfg)
+    assert ntg is not None
+    _skip_unless_launchable(cfg, H, ntg)
+    q, k, v, a, beta, a_log, dt_bias, state = _inputs(B, T, H, 11 + T)
+    y, s = kda_recurrence(q, k, v, a, beta, a_log, dt_bias, -5.0, state, config=cfg)
+    y_b, s_b = kda_recurrence(
+        q, k, v, a, beta, a_log, dt_bias, -5.0, state, config=RecurrenceConfig()
+    )
+    mx.eval(y, s, y_b, s_b)
+    assert y.dtype == mx.bfloat16 and s.dtype == mx.float32
+    assert mx.array_equal(y, y_b).item()
+    assert mx.array_equal(s, s_b).item()
+
+
+def _skip_unless_launchable(cfg, H, ntg):
+    from omlx.patches.glm53_kda_recurrence import _percore_launchable
+
+    max_rows = 2 * -(-(H * 128 // 2) // ntg)
+    if not _percore_launchable(cfg.tb, max_rows, mx.bfloat16, 128, 128, H, ntg):
+        pytest.skip(
+            f"this GPU cannot launch the per-core kernel with {max_rows * 8} threads"
+            " per threadgroup; the blocked kernel runs instead"
+        )
+
+
+def test_percore_recurrence_matches_stock_kernel_and_fp32_reference():
+    from omlx.patches.glm53_kda_recurrence import (
+        PerCoreConfig,
+        _percore_threadgroups,
+        kda_recurrence,
+    )
+
+    B, T, H = 2, 45, 2
+    cfg = PerCoreConfig(threadgroups=3)
+    _skip_unless_launchable(cfg, H, _percore_threadgroups(H * 128, cfg))
+    q, k, v, a, beta, a_log, dt_bias, state = _inputs(B, T, H, 5)
+    y_ker, s_ker = _stock(q, k, v, a, beta, a_log, dt_bias, state)
+    y_ref, s_ref = _stock(q, k, v, a, beta, a_log, dt_bias, state, ops=True)
+    y, s = kda_recurrence(q, k, v, a, beta, a_log, dt_bias, -5.0, state, config=cfg)
+    mx.eval(y_ker, s_ker, y_ref, s_ref, y, s)
+    assert mx.allclose(s, s_ker, rtol=1e-5, atol=1e-6).item()
+    assert mx.allclose(s, s_ref, rtol=1e-4, atol=1e-5).item()
+    assert mx.allclose(y, y_ker, rtol=1e-2, atol=1e-3).item()
+    assert mx.allclose(y, y_ref, rtol=1e-2, atol=1e-3).item()
+
+
+def test_percore_recurrence_falls_back_to_blocked(monkeypatch):
+    from omlx.patches import glm53_kda_recurrence as R
+
+    # More than 128 rows per threadgroup (would span three heads): blocked kernel.
+    assert R._percore_threadgroups(5 * 128, R.PerCoreConfig(threadgroups=3)) is None
+    # One range per core only while a core gets at most 128 rows.
+    monkeypatch.setattr(R, "gpu_core_count", lambda: 80)
+    assert R._percore_threadgroups(64 * 128, R.PerCoreConfig()) == 80
+    monkeypatch.setattr(R, "gpu_core_count", lambda: 40)
+    assert R._percore_threadgroups(64 * 128, R.PerCoreConfig()) is None
+    # Unknown core count, fp32 activations: blocked kernel, same bits.
+    monkeypatch.setattr(R, "gpu_core_count", lambda: None)
+    assert R._percore_threadgroups(64 * 128, R.PerCoreConfig()) is None
+    q, k, v, a, beta, a_log, dt_bias, state = _inputs(1, 20, 3, 2)
+    real = R._blocked
+    for args in [(q, k, v), tuple(x.astype(mx.float32) for x in (q, k, v))]:
+        launched = []
+        monkeypatch.setattr(
+            R, "_blocked", lambda *xs: launched.append(1) or real(*xs)
+        )
+        y, s = R.kda_recurrence(*args, a, beta, a_log, dt_bias, -5.0, state)
+        y_b, s_b = real(*args, a, beta, a_log, dt_bias, -5.0, state, R.DEFAULT_CONFIG)
+        mx.eval(y, s, y_b, s_b)
+        assert launched == [1]
+        assert mx.array_equal(y, y_b).item() and mx.array_equal(s, s_b).item()
 
 
 def _attention(num_heads=4, hidden=256, seed=0, bits=None):
@@ -309,3 +411,21 @@ def test_prework_reads_qkv_in_place_from_the_fused_projection():
     for a, b in zip(wide, packed):
         assert a.shape == b.shape
         assert mx.array_equal(a, b).item()
+
+
+def test_percore_recurrence_falls_back_when_the_launch_is_rejected(monkeypatch):
+    """A GPU that rejects the per-core threadgroup size keeps the blocked kernel."""
+    import omlx.patches.glm53_kda_recurrence as rec
+
+    monkeypatch.setattr(rec, "_percore_launchable", lambda *a: False)
+    B, T, H = 1, 30, 2
+    q, k, v, a, beta, a_log, dt_bias, state = _inputs(B, T, H, 3)
+    y, s = rec.kda_recurrence(
+        q, k, v, a, beta, a_log, dt_bias, -5.0, state,
+        config=rec.PerCoreConfig(threadgroups=3),
+    )
+    y_b, s_b = rec.kda_recurrence(
+        q, k, v, a, beta, a_log, dt_bias, -5.0, state, config=rec.RecurrenceConfig()
+    )
+    mx.eval(y, s, y_b, s_b)
+    assert mx.array_equal(y, y_b).item() and mx.array_equal(s, s_b).item()

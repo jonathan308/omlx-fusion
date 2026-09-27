@@ -2313,7 +2313,12 @@ class TestLifecycle:
     @pytest.mark.asyncio
     async def test_get_status_when_running(self, enforcer):
         """Test get_status reflects running state."""
-        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+        # The usage read is max(active, phys_footprint): pin the footprint so
+        # the real pytest process (GBs after earlier kernel tests) cannot win.
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch("omlx.process_memory_enforcer.get_phys_footprint", return_value=0),
+        ):
             mock_mx.get_active_memory.return_value = 5 * 1024**3
             enforcer.start()
             status = enforcer.get_status()

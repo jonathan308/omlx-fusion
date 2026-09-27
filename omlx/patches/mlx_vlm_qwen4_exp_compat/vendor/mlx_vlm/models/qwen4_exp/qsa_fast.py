@@ -372,7 +372,7 @@ def _nax_sparse_gqa_attention(
     *,
     q_offset: int,
 ) -> mx.array | None:
-    """Tensor-unit QSA over per-tile unions of the selected blocks, or None.
+    """Tensor-unit QSA (one query per threadgroup over its own blocks), or None.
 
     Same contract and geometry as :func:`_native_sparse_gqa_attention`
     (bf16 only); a compile or dispatch failure disables it for the process.

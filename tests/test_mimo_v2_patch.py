@@ -1003,3 +1003,277 @@ def test_prompt_priming_folds_the_prompt_into_the_mimo_heads():
     model(mx.array([list(range(1, 41))]), cache=cache)
     assert prompt_priming.prime_ctx_stats(model) == 16
     prompt_priming.drop_ctx(model)
+
+
+def test_tail_priming_skips_chunks_a_later_chunk_replaces(monkeypatch):
+    """Only the last prefill chunk's tail reaches MiMo's heads; earlier chunks
+    skip the capture (no hidden state requested), and the primed head cache is
+    identical to capturing every chunk."""
+    mimo_v2 = _load_patch_module()
+    from omlx.patches.mlx_lm_mtp import prompt_priming, set_mtp_active
+
+    set_mtp_active(True)
+    try:
+        model = mimo_v2.Model(mimo_v2.ModelArgs.from_dict(_minimal_config(num_nextn_predict_layers=1)))
+    finally:
+        set_mtp_active(False)
+    prompt = list(range(1, 81))
+    chunks = [prompt[:40], prompt[40:79]]  # the last prompt token is decoded
+
+    def prime(skip):
+        if not skip:
+            monkeypatch.setattr(
+                prompt_priming, "claim_superseded_tail_chunk", lambda *a: False
+            )
+        requested = []
+        inner_call = type(model.model).__call__
+
+        def spy(self, inputs, cache=None, input_embeddings=None, return_hidden=False, **kw):
+            requested.append(return_hidden)
+            return inner_call(self, inputs, cache, input_embeddings, return_hidden=return_hidden, **kw)
+
+        monkeypatch.setattr(type(model.model), "__call__", spy)
+        prompt_priming.drop_ctx(model)
+        setattr(
+            model,
+            prompt_priming._PLAN_ATTR,
+            prompt_priming._PrimePlan(
+                request_id="r",
+                prompt_tokens=tuple(prompt),
+                # Fusion's plan records the scheduler's cached prefix (a fresh
+                # prompt here, as the scheduler passes it).
+                cached_tokens=0,
+                block_size=0,
+                prefix_cache=None,
+            ),
+        )
+        cache = model.make_cache()
+        for chunk in chunks:
+            model(mx.array([chunk]), cache=cache)
+        ctx = prompt_priming._find_ctx(model)
+        state = [
+            a
+            for c in ctx.mtp_cache
+            for sub in (getattr(c, "caches", None) or (c,))
+            for a in (getattr(sub, "keys", None), getattr(sub, "values", None))
+            if a is not None
+        ]
+        mx.eval(state, ctx.pending_hidden)
+        stats = prompt_priming.prime_ctx_stats(model)
+        prompt_priming.drop_ctx(model)
+        monkeypatch.undo()
+        return requested, stats, state, ctx.pending_hidden
+
+    req_skip, stats_skip, state_skip, pending_skip = prime(skip=True)
+    req_all, stats_all, state_all, pending_all = prime(skip=False)
+    assert req_skip == [False, True]
+    assert req_all == [True, True]
+    assert stats_skip == stats_all == 16
+    assert len(state_skip) == len(state_all) > 0
+    for a, b in zip(state_skip, state_all):
+        assert a.shape == b.shape and mx.array_equal(a, b).item()
+    assert mx.array_equal(pending_skip, pending_all).item()
+
+
+# Fusion starts no generic head timeline on a restored prompt suffix; the
+# tests below cover the tail-only exception that lets MiMo's last prefill
+# chunk start after claim_superseded_tail_chunk skipped the earlier ones.
+
+
+def _mimo_tail_model():
+    mimo_v2 = _load_patch_module()
+    from omlx.patches.mlx_lm_mtp import set_mtp_active
+
+    set_mtp_active(True)
+    try:
+        model = mimo_v2.Model(
+            mimo_v2.ModelArgs.from_dict(_minimal_config(num_nextn_predict_layers=1))
+        )
+    finally:
+        set_mtp_active(False)
+    mx.eval(model.parameters())
+    return model
+
+
+def _mimo_head_state(ctx):
+    state = [
+        a
+        for c in ctx.mtp_cache
+        for sub in (getattr(c, "caches", None) or (c,))
+        for a in (getattr(sub, "keys", None), getattr(sub, "values", None))
+        if a is not None
+    ]
+    mx.eval(state, ctx.pending_hidden)
+    return state
+
+
+def _set_mimo_plan(prompt_priming, model, prompt, cached_tokens):
+    prompt_priming.drop_ctx(model)
+    setattr(
+        model,
+        prompt_priming._PLAN_ATTR,
+        prompt_priming._PrimePlan(
+            request_id="r",
+            prompt_tokens=tuple(prompt),
+            cached_tokens=cached_tokens,
+            block_size=0,
+            prefix_cache=None,
+        ),
+    )
+
+
+def _assert_same_head(a, b):
+    (folded_a, state_a, pending_a), (folded_b, state_b, pending_b) = a, b
+    assert folded_a == folded_b
+    assert len(state_a) == len(state_b) > 0
+    for x, y in zip(state_a, state_b):
+        assert x.shape == y.shape and mx.array_equal(x, y).item()
+    assert mx.array_equal(pending_a, pending_b).item()
+
+
+def test_fusion_short_last_chunk_after_a_superseded_chunk_primes_like_every_chunk(
+    monkeypatch,
+):
+    """A last chunk no longer than the head tail starts the tail-only context
+    itself (a fresh context would not take the restart) and keeps exactly
+    the pairs the every-chunk capture's restart keeps."""
+    from omlx.patches.mlx_lm_mtp import prompt_priming
+
+    model = _mimo_tail_model()
+    tail = int(model._omlx_mtp_prime_tail)
+    prompt = [(3 * i + 2) % 60 + 1 for i in range(40 + tail // 2 + 1)]
+    chunks = [prompt[:40], prompt[40:-1]]  # the last prompt token is decoded
+
+    def prime(skip):
+        if not skip:
+            monkeypatch.setattr(
+                prompt_priming, "claim_superseded_tail_chunk", lambda *a: False
+            )
+        _set_mimo_plan(prompt_priming, model, prompt, 0)
+        cache = model.make_cache()
+        for chunk in chunks:
+            model(mx.array([chunk]), cache=cache)
+        ctx = prompt_priming._find_ctx(model)
+        assert ctx is not None and ctx.tail_only
+        out = (ctx.folded, _mimo_head_state(ctx), ctx.pending_hidden)
+        prompt_priming.drop_ctx(model)
+        monkeypatch.undo()
+        return out
+
+    skipped = prime(skip=True)
+    assert skipped[0] == len(chunks[-1]) - 1
+    _assert_same_head(skipped, prime(skip=False))
+
+
+def test_fusion_restored_prefix_keeps_the_fail_closed_start():
+    """A prefix restored from the prefix cache (the plan records it, no head
+    context exists) still starts no head timeline; a cold prompt's own
+    superseded prefix does."""
+    from omlx.patches.mlx_lm_mtp import prompt_priming
+
+    model = _mimo_tail_model()
+    tail = int(model._omlx_mtp_prime_tail)
+    prompt = [(3 * i + 2) % 60 + 1 for i in range(81)]
+    for cached_tokens, primed in ((40, False), (0, True)):
+        cache = model.make_cache()
+        # The backbone cache holds the first 40 tokens; no head context does.
+        model.model(mx.array([prompt[:40]]), cache)
+        _set_mimo_plan(prompt_priming, model, prompt, cached_tokens)
+        model(mx.array([prompt[40:80]]), cache=cache)
+        ctx = prompt_priming._find_ctx(model)
+        if primed:
+            assert ctx is not None and ctx.tail_only and ctx.folded == tail
+        else:
+            assert ctx is None
+        prompt_priming.drop_ctx(model)
+
+
+def test_fusion_batched_prefill_scope_primes_a_superseded_row(monkeypatch):
+    """In the batched prefill scope a row prefilled from offset 0 whose first
+    chunk was superseded primes like the every-chunk capture."""
+    from omlx.patches.mlx_lm_mtp import prompt_priming
+
+    model = _mimo_tail_model()
+    prompt = [(5 * i + 3) % 60 + 1 for i in range(81)]
+    uid = 7
+
+    def prime(skip):
+        if not skip:
+            monkeypatch.setattr(
+                prompt_priming, "claim_superseded_tail_chunk", lambda *a: False
+            )
+        prompt_priming.drop_ctx(model)
+        prompt_priming.release_uids(model, [uid])
+        cache = model.make_cache()
+        with prompt_priming.prefill_scope(model, [uid], [prompt[:80]], cache):
+            for chunk in (prompt[:40], prompt[40:80]):
+                model(mx.array([chunk]), cache=cache)
+        _, state = prompt_priming._owned(model)
+        ctx, _ = state.uids[uid]
+        assert ctx is not None and ctx.tail_only
+        out = (ctx.folded, _mimo_head_state(ctx), ctx.pending_hidden)
+        prompt_priming.release_uids(model, [uid])
+        monkeypatch.undo()
+        return out
+
+    _assert_same_head(prime(skip=True), prime(skip=False))
+
+
+def test_tail_priming_computes_the_last_layer_for_the_tail_rows_only(monkeypatch):
+    """With a tail-only head, a long prefill chunk computes the last (full
+    attention) layer's outputs for the tail rows only; the backbone cache and
+    the primed head state match the full-width forward."""
+    mimo_v2 = _load_patch_module()
+    from omlx.patches.mlx_lm_mtp import prompt_priming, set_mtp_active
+
+    config = _minimal_config(num_nextn_predict_layers=1)
+    set_mtp_active(True)
+    try:
+        model = mimo_v2.Model(mimo_v2.ModelArgs.from_dict(config))
+    finally:
+        set_mtp_active(False)
+    if model.model.layers[-1].is_sliding_window:
+        import pytest
+
+        pytest.skip("minimal config ends with a sliding-window layer")
+    mx.eval(model.parameters())
+    prompt = [(5 * i + 1) % 64 + 1 for i in range(41)]
+
+    def prime(tail_rows):
+        monkeypatch.setattr(prompt_priming, "tail_hidden_rows", lambda *a: tail_rows)
+        seen = []
+        inner_call = type(model.model).__call__
+
+        def spy(self, inputs, cache=None, input_embeddings=None, return_hidden=False, hidden_tail=None):
+            seen.append(hidden_tail)
+            return inner_call(self, inputs, cache, input_embeddings, return_hidden=return_hidden, hidden_tail=hidden_tail)
+
+        monkeypatch.setattr(type(model.model), "__call__", spy)
+        prompt_priming.drop_ctx(model)
+        cache = model.make_cache()
+        model(mx.array([prompt[:40]]), cache=cache)
+        ctx = prompt_priming._find_ctx(model)
+        head = [
+            a
+            for c in ctx.mtp_cache
+            for sub in (getattr(c, "caches", None) or (c,))
+            for a in (getattr(sub, "keys", None), getattr(sub, "values", None))
+            if a is not None
+        ]
+        trunk = [a for c in cache for a in (c.keys, c.values) if a is not None]
+        mx.eval(head, trunk, ctx.pending_hidden)
+        stats = prompt_priming.prime_ctx_stats(model)
+        prompt_priming.drop_ctx(model)
+        monkeypatch.undo()
+        return seen, stats, head, trunk, ctx.pending_hidden
+
+    seen_t, stats_t, head_t, trunk_t, pend_t = prime(model._omlx_mtp_prime_tail + 1)
+    seen_f, stats_f, head_f, trunk_f, pend_f = prime(None)
+    assert seen_t == [model._omlx_mtp_prime_tail + 1] and seen_f == [None]
+    assert stats_t == stats_f == model._omlx_mtp_prime_tail
+    for a, b in zip(trunk_t, trunk_f):
+        assert mx.array_equal(a, b).item()
+    assert len(head_t) == len(head_f) > 0
+    for a, b in zip(head_t + [pend_t], head_f + [pend_f]):
+        assert a.shape == b.shape
+        assert mx.allclose(a, b, atol=1e-2, rtol=1e-2).item()

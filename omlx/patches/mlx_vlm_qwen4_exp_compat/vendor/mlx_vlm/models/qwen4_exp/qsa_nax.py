@@ -1,27 +1,35 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tensor-unit (NAX) QSA main attention over per-tile unions of selected blocks.
+"""Tensor-unit (NAX) QSA main attention, one query per threadgroup.
 
 Qwen4-Exp QSA lets every query attend its own top-512 four-token key blocks
-plus the zero-to-three token causal tail. The direct native kernel runs one
-(query, KV head) per threadgroup: every query re-streams its 2,051 K/V rows and
-the 12 grouped heads (padded to 16) run on the classic fp32 simdgroup MMA
-(~12-14 TFLOPS).
+plus the zero-to-three token causal tail. Each threadgroup here is one
+(query, KV head): its 12 grouped heads are the rows of one 16-row tensor-unit
+tile (4 rows idle) and two simdgroups split the head dim (MLX
+attention_nax_dsplit organization: each owns 128 of the 256 dims of Q K^T and
+of P V, and they add their partial scores through threadgroup memory). The
+threadgroup walks the query's ascending selection list 8 blocks (32 keys) per
+step, then its tail block, so every step is exactly the query's own keys: no
+block unions, no per-row masks (only tail tokens past the query and the slots
+past the list are -inf).
 
-Consecutive queries select heavily overlapping blocks (real prompts: the union
-of 4 consecutive queries is 1.1x-1.9x one query's 512 blocks). This path groups
-``TILE`` = 4 consecutive queries, builds the ascending union of their selected
-blocks (plus their tail blocks) with a per-block bitmask of which queries
-selected it, and runs one tensor-unit flash-attention pass per (tile, KV head)
-over the union, so all 48 query rows share every gathered K/V row. Every
-(query, key) pair outside the query's own QSA key set is masked to exactly
-``-inf`` before the online softmax, so each query attends exactly its key set.
+(The previous organization grouped 4 queries per threadgroup over the union
+of their blocks: adjacent queries share 60-80% of their blocks, but the
+4-query union grows from 1.3x of 513 blocks at 8K context to 2x at 64K, all
+of it masked work.)
 
-Numerics: scores are bf16 x bf16 products accumulated in fp32 and the online
-softmax runs in fp32, as in the native kernel. The tensor unit truncates a
-float operand to tf32, so ``P @ V`` takes the fp32 probabilities as two fp16
-pieces, hi = fp16(P) and lo = fp16(P - hi), whose sum is P within 2^-24
-absolute (the size of P's own fp32 rounding); the softmax denominator uses the
-fp32 P. Only the fp32 summation grouping differs from the native kernel.
+Throughput: the key loop is latency bound, so the kernel keeps its register
+and threadgroup-memory footprint small for occupancy: Q is re-read from
+device memory (L1) each step instead of held in registers, S and O live in
+persistent tensor-unit cooperative tensors (no per-MMA operand copies),
+tensor ops are 16x32x32 (Q K^T over 32 head dims; P V with the fp16 hi and lo
+pieces of P packed along K), and O is only rescaled when a row max changed.
+
+Numerics (unchanged): scores are bf16 x bf16 products accumulated in fp32 and
+the online softmax runs in fp32. The tensor unit truncates a float operand to
+tf32, so ``P @ V`` takes the fp32 probabilities as two fp16 pieces, hi =
+fp16(P) and lo = fp16(P - hi), whose sum is P within 2^-24 absolute (the size
+of P's own fp32 rounding); the softmax denominator uses the fp32 P. Only the
+fp32 summation grouping differs from the native kernel.
 """
 
 from __future__ import annotations
@@ -31,27 +39,19 @@ import os
 
 import mlx.core as mx
 
-# Queries per tile (12 heads each: 4 -> 48 rows = 3 NAX row groups).
-TILE = 4
 # How P (fp32 probabilities) enters the P @ V tensor-unit MMA (see module doc):
 #   "half2" (default): fp16 hi + fp16 lo pieces, |error| <= 2^-24 per probability.
-#   "bf16x3": three bf16 pieces (8+8+8 mantissa bits), fp32-exact for normal P,
-#             ~1.5x slower.
+#   "bf16x3": three bf16 pieces (8+8+8 mantissa bits), fp32-exact for normal P;
+#             slower (three 16x32x16 P V ops per fragment instead of one 16x32x32).
 PV_MODE = os.environ.get("OMLX_QWEN4_QSA_NAX_PV", "half2")
 _PV_MODES = {
     "half2": (mx.float16, 2),
     "bf16x3": (mx.bfloat16, 3),
 }
-KEY_FRAGS = 2  # 16-key fragments per step: 32 keys = 8 union blocks
 GQA = 12
 HEAD_DIM = 256
 COMPRESS = 4
 TOPK = 512
-# Union builder window: one bit per (query, block) for 32 * UNION_WORDS blocks
-# (16384 blocks = 64K tokens) per pass.
-UNION_WORDS = 512
-UNION_THREADS = 256
-
 
 
 def enabled() -> bool:
@@ -70,323 +70,176 @@ def nax_available() -> bool:
         return False
 
 
-_UNION_BITS_SOURCE = r"""
-    // One threadgroup per tile of TILE consecutive queries. Per window of
-    // 32 * NWORDS blocks: set bit b of plane t for every valid block query t
-    // selected (plane TILE holds the tail blocks), then compact the OR of the
-    // planes in ascending block order with a popcount prefix sum.
-    constexpr int NT = UNION_THREADS;
-    constexpr int NW = NWORDS;
-    constexpr int WPT = (NW + NT - 1) / NT;  // words per thread
-    constexpr int NP = TILE + 1;
-    threadgroup atomic_uint planes[NP * NW];
-    threadgroup int wsum[NT / 32];
-
-    const int tile = int(threadgroup_position_in_grid.x);
-    const int tid = int(thread_position_in_threadgroup.x);
-    const uint lane = thread_index_in_simdgroup;
-    const uint sgi = simdgroup_index_in_threadgroup;
-    const int Lq = params[0];
-    const int q_offset = params[1];
-    const int umax = params[2];
-    const int t0 = tile * TILE;
-    const int tvalid = min(TILE, Lq - t0);
-    const int p_last = q_offset + t0 + tvalid - 1;
-    const int hi = (p_last + 1) >> 2;  // largest tail block
-
-    device int* out_blk = ublk + size_t(tile) * umax;
-    device uint* out_bits = ubits + size_t(tile) * umax;
-    int base = 0;
-    for (int w0 = 0; w0 <= hi; w0 += 32 * NW) {
-        for (int i = tid; i < NP * NW; i += NT) {
-            atomic_store_explicit(&planes[i], 0u, memory_order_relaxed);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int e = tid; e < tvalid * TOPK; e += NT) {
-            const int t = e / TOPK;
-            const int i = e - t * TOPK;
-            const int p = q_offset + t0 + t;
-            const int complete = (p + 1) >> 2;
-            if (i < min(TOPK, complete)) {
-                const int b = sel[size_t(t0 + t) * TOPK + i] - w0;
-                if (b >= 0 && b < 32 * NW) {
-                    atomic_fetch_or_explicit(&planes[t * NW + (b >> 5)], 1u << (b & 31), memory_order_relaxed);
-                }
-            }
-        }
-        if (tid < tvalid) {
-            const int p = q_offset + t0 + tid;
-            const int complete = (p + 1) >> 2;
-            const int b = complete - w0;
-            if ((complete << 2) <= p && b >= 0 && b < 32 * NW) {
-                atomic_fetch_or_explicit(&planes[TILE * NW + (b >> 5)], 1u << (b & 31), memory_order_relaxed);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        uint words[WPT];
-        int c = 0;
-        for (int j = 0; j < WPT; ++j) {
-            const int w = tid * WPT + j;
-            uint u = 0u;
-            if (w < NW) {
-                for (int t = 0; t < NP; ++t) {
-                    u |= atomic_load_explicit(&planes[t * NW + w], memory_order_relaxed);
-                }
-            }
-            words[j] = u;
-            c += popcount(u);
-        }
-        // Exclusive prefix over threads: simdgroup scan + one pass over sums.
-        const int incl = simd_prefix_inclusive_sum(c);
-        if (lane == 31) wsum[sgi] = incl;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        int before = 0, total = 0;
-        for (uint g = 0; g < NT / 32; ++g) {
-            const int v = wsum[g];
-            before += g < sgi ? v : 0;
-            total += v;
-        }
-        int pos = base + before + incl - c;
-        for (int j = 0; j < WPT; ++j) {
-            uint u = words[j];
-            const int w = tid * WPT + j;
-            while (u != 0u) {
-                const int bit = ctz(u);
-                u &= u - 1u;
-                uint qbits = 0u;
-                for (int t = 0; t < TILE; ++t) {
-                    qbits |= ((atomic_load_explicit(&planes[t * NW + w], memory_order_relaxed) >> bit) & 1u) << t;
-                }
-                out_blk[pos] = w0 + w * 32 + bit;
-                out_bits[pos] = qbits;
-                ++pos;
-            }
-        }
-        base += total;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (tid == 0) {
-        ucount[tile] = base;
-    }
-"""
-
-
 _ATTN_HEADER = r"""
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
 #define UNROLL _Pragma("clang loop unroll(full)")
-
-// 16x32x16 simdgroup tensor-unit MMA on MLX's NAX fragment layout: each lane
-// holds rows (fm, fm + 8) x columns (fn .. fn + 3) of a 16x16 fragment.
-template <typename CT, typename AT, typename BT, bool TA, bool TB>
-METAL_FUNC void nax_mma_n2(
-    thread vec<CT, 8>& c0,
-    thread vec<CT, 8>& c1,
-    thread const vec<AT, 8>& a,
-    thread const vec<BT, 8>& b0,
-    thread const vec<BT, 8>& b1) {
-  constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-      16, 32, 16, TA, TB, true,
-      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
-  mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-  auto ct_a = op.template get_left_input_cooperative_tensor<AT, BT, CT>();
-  auto ct_b = op.template get_right_input_cooperative_tensor<AT, BT, CT>();
-  auto ct_c = op.template get_destination_cooperative_tensor<
-      metal::remove_addrspace_t<decltype(ct_a)>,
-      metal::remove_addrspace_t<decltype(ct_b)>, CT>();
-  UNROLL for (short i = 0; i < 8; ++i) {
-    ct_a[i] = a[i];
-    ct_b[i] = b0[i];
-    ct_b[8 + i] = b1[i];
-    ct_c[i] = c0[i];
-    ct_c[8 + i] = c1[i];
-  }
-  op.run(ct_a, ct_b, ct_c);
-  UNROLL for (short i = 0; i < 8; ++i) {
-    c0[i] = ct_c[i];
-    c1[i] = ct_c[8 + i];
-  }
-}
 """
 
 _ATTN_SOURCE = r"""
-    // Grid: (tile, kv head). 2 * NG simdgroups: row group rg = sg / 2 owns 16
-    // query rows (two heads x TILE queries, head-major), half dh = sg % 2 owns
-    // 128 of the 256 head dims (MLX attention_nax_dsplit organization).
+    // Grid: (query, KV head); 2 simdgroups: sg = which 128-dim half of D.
+    // Tensor-unit fragments (MLX NAX layout): each lane holds rows (fm, fm + 8)
+    // x columns (fn .. fn + 3) of a 16x16 fragment. Rows are the 12 heads of
+    // the query (rows 12..15 idle); columns of S are keys.
     constexpr int D = 256;
-    constexpr int TDH = 8;      // 16-wide dim fragments per half
-    constexpr int NG = (TILE * GQA) / 16;
-    static_assert((TILE * GQA) % 16 == 0, "TILE * 12 rows must fill 16-row groups");
+    constexpr int TDH = 8;      // 16-wide head-dim fragments per half
+    constexpr int SB = 8;       // blocks (4 tokens each) per step: 32 keys
+    constexpr int PV_K = PV_TERMS == 2 ? 32 : 16;
+    threadgroup float xchg[2][8 * 32];
 
-    // Score exchange between the two D halves of a row group. (A double-
-    // buffered single-barrier exchange measured 5-8% slower: the second
-    // barrier keeps the three row groups' K/V loads in step for L1 reuse.)
-    threadgroup float xchg[NG][2][TK * 8 * 32];
-
-    const int tile = int(threadgroup_position_in_grid.x);
+    const int tq = int(threadgroup_position_in_grid.x);
     const int kvh = int(threadgroup_position_in_grid.y);
-    const ushort sg = simdgroup_index_in_threadgroup;
+    const ushort dh = simdgroup_index_in_threadgroup;
     const ushort lane = thread_index_in_simdgroup;
-    const short rg = sg >> 1;
-    const short dh = sg & 1;
     const short qid = lane >> 2;
     const short fm = (qid & 4) | ((lane >> 1) & 3);
     const short fn = ((qid & 2) | (lane & 1)) * 4;
 
-    const int Lq = params[0];
-    const int q_offset = params[1];
-    const int umax = params[2];
-    const int kL = params[3];
+    const int q_offset = params[0];
+    const int kL = params[1];
     const float scale2 = scale[0] * 1.44269504089f;
-
-    // Rows are head-major (row = head * TILE + query): this lane's rows
-    // rg * 16 + fm + 8 i share query t and belong to heads hh0, hh0 + 8 / TILE.
-    const int t = (rg * 16 + fm) % TILE;
-    const int hh0 = (rg * 16 + fm) / TILE;
-    const int tq = tile * TILE + t;
-    const bool row_ok = tq < Lq;
     const int p = q_offset + tq;
-    const int tail_lo = ((p + 1) >> 2) << 2;
-    const uint qbit = 1u << t;
-    const int h0 = kvh * GQA + hh0;
-    const int h1 = h0 + 8 / TILE;
+    const int complete = (p + 1) >> 2;
+    const int nsel = min(TOPK, complete);        // valid selected blocks
+    const int ntail = p + 1 - (complete << 2);   // 0..3 tail tokens
+    const int U = nsel + (ntail > 0 ? 1 : 0);    // blocks: selection, then tail
+    const int nsteps = (U + SB - 1) / SB;
+    const bool r1_ok = fm + 8 < GQA;             // row fm + 8 is a real head
+    const int h0 = kvh * GQA + fm;
+    const int h1 = kvh * GQA + (r1_ok ? fm + 8 : fm);
 
-    // Strides (elements): q [1, H, Lq, D], k/v [1, KVH, kL, D]; the last dim
-    // is contiguous and rows are 16-byte aligned. Head dims are permuted per
-    // lane: fragment pair (2j, 2j + 1) covers the 8 contiguous dims
-    // 32 j + 2 fn .. + 7 (the first four in fragment 2j) of Q/K and of V/O, so
-    // one 16-byte load feeds both fragments. Q and K share the permutation
-    // (only the QK^T summation order changes); O undoes V's at the store.
+    // Strides (elements): q [1, H, Lq, D], k/v [1, KVH, kL, D]; the last dim is
+    // contiguous and rows are 16-byte aligned. Head dims are permuted per lane:
+    // fragment pair (2j, 2j + 1) covers the 8 contiguous dims 32 j + 2 fn .. + 7
+    // (the first four in fragment 2j) of Q/K and of V/O, so one 16-byte load
+    // feeds both fragments. Q and K share the permutation (only the Q K^T
+    // summation order changes); O undoes V's at the store.
     const int64_t sqh = q_strides[1], sql = q_strides[2];
-    const int64_t skl = k_strides[2], svl = v_strides[2];
+    const uint skl = uint(k_strides[2]), svl = uint(v_strides[2]);
     const short fcol = 2 * fn;
     const device bfloat* kb = (const device bfloat*)k + kvh * k_strides[1] + dh * 128 + fcol;
     const device bfloat* vb = (const device bfloat*)v + kvh * v_strides[1] + dh * 128 + fcol;
+    const device bfloat* qp0 = (const device bfloat*)q + h0 * sqh + tq * sql + dh * 128 + fcol;
+    const device bfloat* qp1 = (const device bfloat*)q + h1 * sqh + tq * sql + dh * 128 + fcol;
+    const device int* blk = sel + size_t(tq) * TOPK;
 
-    // Resident Q half: 8 fragments.
-    vec<bfloat, 8> qf[TDH];
-    {
-      const int tqc = row_ok ? tq : 0;
-      const device bfloat* q0 = (const device bfloat*)q + h0 * sqh + tqc * sql + dh * 128 + fcol;
-      const device bfloat* q1 = (const device bfloat*)q + h1 * sqh + tqc * sql + dh * 128 + fcol;
-      UNROLL for (short jj = 0; jj < TDH / 2; ++jj) {
-        const vec<bfloat, 8> a = row_ok ? *(const device vec<bfloat, 8>*)(q0 + 32 * jj) : vec<bfloat, 8>(0);
-        const vec<bfloat, 8> b = row_ok ? *(const device vec<bfloat, 8>*)(q1 + 32 * jj) : vec<bfloat, 8>(0);
-        UNROLL for (short j = 0; j < 4; ++j) {
-          qf[2 * jj][j] = a[j];
-          qf[2 * jj][4 + j] = b[j];
-          qf[2 * jj + 1][j] = a[4 + j];
-          qf[2 * jj + 1][4 + j] = b[4 + j];
-        }
-      }
-
-    }
-
-    vec<float, 8> of[TDH];
-    UNROLL for (short id = 0; id < TDH; ++id) {
-      of[id] = vec<float, 8>(0.0f);
+    constexpr auto qk_desc = mpp::tensor_ops::matmul2d_descriptor(
+        16, 32, 32, false, true, true, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<qk_desc, metal::execution_simdgroup> qk_op;
+    constexpr auto pv_desc = mpp::tensor_ops::matmul2d_descriptor(
+        16, 32, PV_K, false, false, true, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<pv_desc, metal::execution_simdgroup> pv_op;
+    // Cooperative tensors: element 8 c + i is element i of the c-th 16x16
+    // fragment along K (left) / along (K, N) (right) / along N (destination).
+    auto qa_ct = qk_op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto kb_ct = qk_op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+    using qa_t = metal::remove_addrspace_t<decltype(qa_ct)>;
+    using kb_t = metal::remove_addrspace_t<decltype(kb_ct)>;
+    auto pa_ct = pv_op.template get_left_input_cooperative_tensor<PT, bfloat, float>();
+    auto vb_ct = pv_op.template get_right_input_cooperative_tensor<PT, bfloat, float>();
+    using pa_t = metal::remove_addrspace_t<decltype(pa_ct)>;
+    using vb_t = metal::remove_addrspace_t<decltype(vb_ct)>;
+    // O over this half of D: of<j> holds dim fragments (2 j, 2 j + 1).
+    auto of0 = pv_op.template get_destination_cooperative_tensor<pa_t, vb_t, float>();
+    auto of1 = pv_op.template get_destination_cooperative_tensor<pa_t, vb_t, float>();
+    auto of2 = pv_op.template get_destination_cooperative_tensor<pa_t, vb_t, float>();
+    auto of3 = pv_op.template get_destination_cooperative_tensor<pa_t, vb_t, float>();
+    UNROLL for (short i = 0; i < 16; ++i) {
+      of0[i] = 0.0f;
+      of1[i] = 0.0f;
+      of2[i] = 0.0f;
+      of3[i] = 0.0f;
     }
     float max_s[2] = {-FLT_MAX, -FLT_MAX};
     float sum_s[2] = {0.0f, 0.0f};
 
-    const int U = ucount[tile];
-    const device int* blk = ublk + size_t(tile) * umax;
-    const device uint* bits = ubits + size_t(tile) * umax;
-    constexpr int SB = 4 * TK;  // union blocks (4 tokens each) per step
-    const int nsteps = (U + SB - 1) / SB;
-
-    // Union metadata of a step, prefetched one step ahead: the block of each
-    // key row this lane loads (keys 16 f + fm + 8 i -> slot (16 f + fm + 8 i) / 4)
-    // and the block + selection bits of each S column group (slot 4 f + fn / 4).
-    int nrow_b[2 * TK];
-    int ncol_b[TK];
-    uint ncol_bits[TK];
+    // Step metadata, prefetched one step ahead: the block of each key row this
+    // lane loads (keys 16 (r / 2) + fm + 8 (r % 2) -> slot key / 4) and the
+    // number of visible tokens of this lane's S column block (slot 4 f + fn / 4).
+    auto blk_at = [&](int u) -> int { return u < nsel ? blk[u] : complete; };
+    int nrow_b[4];
+    int ncol_n[2];
     auto fetch = [&](int u0) {
-      UNROLL for (short r = 0; r < 2 * TK; ++r) {
+      UNROLL for (short r = 0; r < 4; ++r) {
         const int u = u0 + ((16 * (r >> 1) + fm + 8 * (r & 1)) >> 2);
-        nrow_b[r] = u < U ? blk[u] : 0;
+        nrow_b[r] = u < U ? blk_at(u) : 0;
       }
-      UNROLL for (short f = 0; f < TK; ++f) {
+      UNROLL for (short f = 0; f < 2; ++f) {
         const int u = u0 + 4 * f + (fn >> 2);
-        ncol_b[f] = u < U ? blk[u] : -1;
-        ncol_bits[f] = u < U ? bits[u] : 0u;
+        ncol_n[f] = u < nsel ? 4 : (u < U ? ntail : 0);
       }
     };
     fetch(0);
 
     for (int step = 0; step < nsteps; ++step) {
-      const device bfloat* kr[2 * TK];
-      const device bfloat* vr[2 * TK];
-      UNROLL for (short r = 0; r < 2 * TK; ++r) {
-        // The last tail block can extend up to three rows past kL: those keys
-        // are masked, but P = 0 must never meet unwritten V (0 * NaN = NaN),
-        // so they re-read the last valid row instead.
-        const int row = min(nrow_b[r] * 4 + (fm & 3), kL - 1);
-        kr[r] = kb + row * skl;
-        vr[r] = vb + row * svl;
+      // The tail block can extend up to three rows past kL: those keys are
+      // masked, but P = 0 must never meet unwritten V (0 * NaN = NaN), so
+      // they re-read the last valid row instead.
+      uint krow[4];
+      UNROLL for (short r = 0; r < 4; ++r) {
+        krow[r] = uint(min(nrow_b[r] * 4 + (fm & 3), kL - 1));
       }
-      int col_b[TK];
-      uint col_bits[TK];
-      UNROLL for (short f = 0; f < TK; ++f) {
-        col_b[f] = ncol_b[f];
-        col_bits[f] = ncol_bits[f];
+      int nvis[2];
+      UNROLL for (short f = 0; f < 2; ++f) {
+        nvis[f] = ncol_n[f];
       }
       if (step + 1 < nsteps) {
         fetch((step + 1) * SB);
       }
-      // S = Q K^T over this half of D.
-      vec<float, 8> s[TK];
-      UNROLL for (short f = 0; f < TK; ++f) {
-        s[f] = vec<float, 8>(0.0f);
+
+      // S = Q K^T over this half of D: one 16x32x32 op per 32 head dims.
+      auto s_ct = qk_op.template get_destination_cooperative_tensor<qa_t, kb_t, float>();
+      UNROLL for (short i = 0; i < 16; ++i) {
+        s_ct[i] = 0.0f;
       }
       UNROLL for (short jj = 0; jj < TDH / 2; ++jj) {
-        UNROLL for (short f = 0; f < TK; f += 2) {
-          const vec<bfloat, 8> a0 = *(const device vec<bfloat, 8>*)(kr[2 * f] + 32 * jj);
-          const vec<bfloat, 8> a1 = *(const device vec<bfloat, 8>*)(kr[2 * f + 1] + 32 * jj);
-          const vec<bfloat, 8> a2 = *(const device vec<bfloat, 8>*)(kr[2 * f + 2] + 32 * jj);
-          const vec<bfloat, 8> a3 = *(const device vec<bfloat, 8>*)(kr[2 * f + 3] + 32 * jj);
-          vec<bfloat, 8> k0e, k1e, k0o, k1o;
-          UNROLL for (short j = 0; j < 4; ++j) {
-            k0e[j] = a0[j];
-            k0e[4 + j] = a1[j];
-            k1e[j] = a2[j];
-            k1e[4 + j] = a3[j];
-            k0o[j] = a0[4 + j];
-            k0o[4 + j] = a1[4 + j];
-            k1o[j] = a2[4 + j];
-            k1o[4 + j] = a3[4 + j];
-          }
-          nax_mma_n2<float, bfloat, bfloat, false, true>(s[f], s[f + 1], qf[2 * jj], k0e, k1e);
-          nax_mma_n2<float, bfloat, bfloat, false, true>(s[f], s[f + 1], qf[2 * jj + 1], k0o, k1o);
+        const vec<bfloat, 8> qa = *(const device vec<bfloat, 8>*)(qp0 + 32 * jj);
+        const vec<bfloat, 8> qb = r1_ok ? *(const device vec<bfloat, 8>*)(qp1 + 32 * jj) : vec<bfloat, 8>(0);
+        const vec<bfloat, 8> a0 = *(const device vec<bfloat, 8>*)(kb + (krow[0] * skl + 32 * jj));
+        const vec<bfloat, 8> a1 = *(const device vec<bfloat, 8>*)(kb + (krow[1] * skl + 32 * jj));
+        const vec<bfloat, 8> a2 = *(const device vec<bfloat, 8>*)(kb + (krow[2] * skl + 32 * jj));
+        const vec<bfloat, 8> a3 = *(const device vec<bfloat, 8>*)(kb + (krow[3] * skl + 32 * jj));
+        UNROLL for (short j = 0; j < 4; ++j) {
+          qa_ct[j] = qa[j];
+          qa_ct[4 + j] = qb[j];
+          qa_ct[8 + j] = qa[4 + j];
+          qa_ct[12 + j] = qb[4 + j];
+          kb_ct[j] = a0[j];
+          kb_ct[4 + j] = a1[j];
+          kb_ct[8 + j] = a2[j];
+          kb_ct[12 + j] = a3[j];
+          kb_ct[16 + j] = a0[4 + j];
+          kb_ct[20 + j] = a1[4 + j];
+          kb_ct[24 + j] = a2[4 + j];
+          kb_ct[28 + j] = a3[4 + j];
         }
+        qk_op.run(qa_ct, kb_ct, s_ct);
+      }
+      vec<float, 8> s[2];
+      UNROLL for (short i = 0; i < 8; ++i) {
+        s[0][i] = s_ct[i];
+        s[1][i] = s_ct[8 + i];
       }
 
-      // Exchange partial sums with the other half of D.
-      {
-        threadgroup float* mine = xchg[rg][dh];
-        const threadgroup float* peer = xchg[rg][1 - dh];
-        const short o = lane * 8 * TK;
-        UNROLL for (short f = 0; f < TK; ++f) {
-          UNROLL for (short i = 0; i < 8; ++i) {
-            mine[o + 8 * f + i] = s[f][i];
-          }
+      // Add the other half's partial scores, one 16-key fragment at a time.
+      UNROLL for (short f = 0; f < 2; ++f) {
+        threadgroup float* mine = xchg[dh];
+        const threadgroup float* peer = xchg[1 - dh];
+        UNROLL for (short i = 0; i < 8; ++i) {
+          mine[lane * 8 + i] = s[f][i];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        UNROLL for (short f = 0; f < TK; ++f) {
-          UNROLL for (short i = 0; i < 8; ++i) {
-            s[f][i] += peer[o + 8 * f + i];
-          }
+        UNROLL for (short i = 0; i < 8; ++i) {
+          s[f][i] += peer[lane * 8 + i];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
       }
-      // Scale and mask: this lane's columns fn..fn+3 of fragment f are the
-      // four tokens of union slot 4 f + fn / 4 of the step.
-      UNROLL for (short f = 0; f < TK; ++f) {
-        const bool in_u = col_b[f] >= 0 && row_ok;
-        const bool selected = in_u && (col_bits[f] & qbit) != 0u;
+
+      // Scale and mask: this lane's columns fn..fn+3 of fragment f are the four
+      // tokens of one block; the first nvis of them are visible.
+      UNROLL for (short f = 0; f < 2; ++f) {
         UNROLL for (short j = 0; j < 4; ++j) {
-          const int tok = col_b[f] * 4 + j;
-          const bool ok = selected || (in_u && tok >= tail_lo && tok <= p);
+          const bool ok = j < nvis[f];
           s[f][j] = ok ? s[f][j] * scale2 : -INFINITY;
           s[f][4 + j] = ok ? s[f][4 + j] * scale2 : -INFINITY;
         }
@@ -395,14 +248,14 @@ _ATTN_SOURCE = r"""
       float factor[2];
       UNROLL for (short i = 0; i < 2; ++i) {
         float m = -INFINITY;
-        UNROLL for (short f = 0; f < TK; ++f) {
+        UNROLL for (short f = 0; f < 2; ++f) {
           m = max(m, max(max(s[f][4 * i], s[f][4 * i + 1]), max(s[f][4 * i + 2], s[f][4 * i + 3])));
         }
         m = max(m, simd_shuffle_xor(m, ushort(1)));
         m = max(m, simd_shuffle_xor(m, ushort(8)));
         const float new_max = max(max_s[i], m);
         float rs = 0.0f;
-        UNROLL for (short f = 0; f < TK; ++f) {
+        UNROLL for (short f = 0; f < 2; ++f) {
           UNROLL for (short j = 0; j < 4; ++j) {
             s[f][4 * i + j] = fast::exp2(s[f][4 * i + j] - new_max);
             rs += s[f][4 * i + j];
@@ -414,113 +267,114 @@ _ATTN_SOURCE = r"""
         max_s[i] = new_max;
         sum_s[i] = sum_s[i] * factor[i] + rs;
       }
-      UNROLL for (short id = 0; id < TDH; ++id) {
-        UNROLL for (short j = 0; j < 4; ++j) {
-          of[id][j] *= factor[0];
-          of[id][4 + j] *= factor[1];
+      // O *= factor (exact no-op when every factor of the simdgroup is 1).
+      if (simd_any(factor[0] != 1.0f || factor[1] != 1.0f)) {
+        UNROLL for (short h = 0; h < 2; ++h) {
+          UNROLL for (short j = 0; j < 4; ++j) {
+            of0[8 * h + j] *= factor[0];
+            of0[8 * h + 4 + j] *= factor[1];
+            of1[8 * h + j] *= factor[0];
+            of1[8 * h + 4 + j] *= factor[1];
+            of2[8 * h + j] *= factor[0];
+            of2[8 * h + 4 + j] *= factor[1];
+            of3[8 * h + j] *= factor[0];
+            of3[8 * h + 4 + j] *= factor[1];
+          }
         }
       }
       // O += P V over this half of D (V fragments are [16 keys x 16 dims]).
-      // The tensor unit takes P as PV_TERMS pieces of type PT whose sum is P
-      // (see PV_MODE in the Python module).
-      vec<PT, 8> ph[TK][PV_TERMS];
-      UNROLL for (short f = 0; f < TK; ++f) {
-        vec<float, 8> rest = s[f];
-        UNROLL for (short tt = 0; tt < PV_TERMS; ++tt) {
-          UNROLL for (short i = 0; i < 8; ++i) {
-            const PT piece = PT(rest[i]);
-            ph[f][tt][i] = piece;
-            rest[i] -= float(piece);
+      // The tensor unit takes P as PV_TERMS pieces of type PT whose sum is P;
+      // two pieces are packed along K into one 16x32x32 op.
+      UNROLL for (short f = 0; f < 2; ++f) {
+        vec<PT, 8> pc[PV_TERMS];
+        {
+          vec<float, 8> rest = s[f];
+          UNROLL for (short tt = 0; tt < PV_TERMS; ++tt) {
+            UNROLL for (short i = 0; i < 8; ++i) {
+              const PT piece = PT(rest[i]);
+              pc[tt][i] = piece;
+              rest[i] -= float(piece);
+            }
           }
         }
-      }
-      UNROLL for (short id = 0; id < TDH; id += 2) {
-        UNROLL for (short f = 0; f < TK; ++f) {
-          vec<bfloat, 8> v0, v1;
-          const vec<bfloat, 8> ra = *(const device vec<bfloat, 8>*)(vr[f * 2] + 16 * id);
-          const vec<bfloat, 8> rb = *(const device vec<bfloat, 8>*)(vr[f * 2 + 1] + 16 * id);
+        UNROLL for (short id = 0; id < TDH; id += 2) {
+          const vec<bfloat, 8> ra = *(const device vec<bfloat, 8>*)(vb + (krow[2 * f] * svl + 16 * id));
+          const vec<bfloat, 8> rb = *(const device vec<bfloat, 8>*)(vb + (krow[2 * f + 1] * svl + 16 * id));
           UNROLL for (short j = 0; j < 4; ++j) {
-            v0[j] = ra[j];
-            v0[4 + j] = rb[j];
-            v1[j] = ra[4 + j];
-            v1[4 + j] = rb[4 + j];
+            vb_ct[j] = ra[j];
+            vb_ct[4 + j] = rb[j];
+            vb_ct[8 + j] = ra[4 + j];
+            vb_ct[12 + j] = rb[4 + j];
+            if (PV_K == 32) {
+              vb_ct[16 + j] = ra[j];
+              vb_ct[20 + j] = rb[j];
+              vb_ct[24 + j] = ra[4 + j];
+              vb_ct[28 + j] = rb[4 + j];
+            }
           }
-
-          UNROLL for (short tt = 0; tt < PV_TERMS; ++tt) {
-            nax_mma_n2<float, PT, bfloat, false, false>(
-                of[id], of[id + 1], ph[f][tt], v0, v1);
+          UNROLL for (short tt = 0; tt < PV_TERMS; tt += PV_K / 16) {
+            UNROLL for (short i = 0; i < 8; ++i) {
+              pa_ct[i] = pc[tt][i];
+              if (PV_K == 32) {
+                pa_ct[8 + i] = pc[tt + 1][i];
+              }
+            }
+            if (id == 0) {
+              pv_op.run(pa_ct, vb_ct, of0);
+            } else if (id == 2) {
+              pv_op.run(pa_ct, vb_ct, of1);
+            } else if (id == 4) {
+              pv_op.run(pa_ct, vb_ct, of2);
+            } else {
+              pv_op.run(pa_ct, vb_ct, of3);
+            }
           }
         }
       }
     }
 
-    if (row_ok) {
-      const float r0 = 1.0f / sum_s[0];
-      const float r1 = 1.0f / sum_s[1];
-      device bfloat* o0 = (device bfloat*)out + (size_t(tq) * (2 * GQA) + h0) * D + dh * 128 + fcol;
-      device bfloat* o1 = (device bfloat*)out + (size_t(tq) * (2 * GQA) + h1) * D + dh * 128 + fcol;
+    UNROLL for (short i = 0; i < 2; ++i) {
+      if (i == 1 && !r1_ok) {
+        continue;
+      }
+      const float rr = 1.0f / sum_s[i];
+      device bfloat* o = (device bfloat*)out + (size_t(tq) * (2 * GQA) + (i == 0 ? h0 : h1)) * D + dh * 128 + fcol;
       UNROLL for (short jj = 0; jj < TDH / 2; ++jj) {
-        vec<bfloat, 8> w0, w1;
+        vec<bfloat, 8> w;
         UNROLL for (short j = 0; j < 4; ++j) {
-          w0[j] = bfloat(of[2 * jj][j] * r0);
-          w0[4 + j] = bfloat(of[2 * jj + 1][j] * r0);
-          w1[j] = bfloat(of[2 * jj][4 + j] * r1);
-          w1[4 + j] = bfloat(of[2 * jj + 1][4 + j] * r1);
+          float e0, e1;
+          if (jj == 0) {
+            e0 = of0[4 * i + j];
+            e1 = of0[8 + 4 * i + j];
+          } else if (jj == 1) {
+            e0 = of1[4 * i + j];
+            e1 = of1[8 + 4 * i + j];
+          } else if (jj == 2) {
+            e0 = of2[4 * i + j];
+            e1 = of2[8 + 4 * i + j];
+          } else {
+            e0 = of3[4 * i + j];
+            e1 = of3[8 + 4 * i + j];
+          }
+          w[j] = bfloat(e0 * rr);
+          w[4 + j] = bfloat(e1 * rr);
         }
-        *(device vec<bfloat, 8>*)(o0 + 32 * jj) = w0;
-        *(device vec<bfloat, 8>*)(o1 + 32 * jj) = w1;
+        *(device vec<bfloat, 8>*)(o + 32 * jj) = w;
       }
     }
 """
 
 
 @functools.lru_cache(maxsize=None)
-def _union_bits_kernel():
-    return mx.fast.metal_kernel(
-        name="omlx_qwen4_qsa_tile_union_bits",
-        input_names=["sel", "params"],
-        output_names=["ublk", "ubits", "ucount"],
-        source=_UNION_BITS_SOURCE,
-    )
-
-
-@functools.lru_cache(maxsize=None)
 def _attn_kernel():
     return mx.fast.metal_kernel(
-        name="omlx_qwen4_qsa_tile_nax_attention",
-        input_names=["q", "k", "v", "ublk", "ubits", "ucount", "params", "scale"],
+        name="omlx_qwen4_qsa_nax_query_attention",
+        input_names=["q", "k", "v", "sel", "params", "scale"],
         output_names=["out"],
         source=_ATTN_SOURCE,
         header=_ATTN_HEADER,
         ensure_row_contiguous=False,
     )
-
-
-def tile_union(selected_blocks: mx.array, q_offset: int):
-    """Chronological per-tile block unions: (blocks, bits, counts, umax)."""
-
-    sel = selected_blocks.reshape(-1, TOPK)
-    if sel.dtype != mx.int32:
-        sel = sel.astype(mx.int32)
-    lq = sel.shape[0]
-    n_tiles = (lq + TILE - 1) // TILE
-    last = q_offset + lq - 1
-    umax = min(TILE * (TOPK + 1), (last + 1) // COMPRESS + 1)
-    params = mx.array([lq, q_offset, umax], dtype=mx.int32)
-    ublk, ubits, ucount = _union_bits_kernel()(
-        inputs=[sel, params],
-        template=[
-            ("TILE", TILE),
-            ("TOPK", TOPK),
-            ("NWORDS", UNION_WORDS),
-            ("UNION_THREADS", UNION_THREADS),
-        ],
-        grid=(n_tiles * UNION_THREADS, 1, 1),
-        threadgroup=(UNION_THREADS, 1, 1),
-        output_shapes=[(n_tiles, umax), (n_tiles, umax), (n_tiles,)],
-        output_dtypes=[mx.int32, mx.uint32, mx.int32],
-    )
-    return ublk, ubits, ucount, umax
 
 
 def sparse_gqa_attention(
@@ -545,30 +399,29 @@ def sparse_gqa_attention(
     kl = keys.shape[2]
     if scale is None:
         scale = HEAD_DIM**-0.5
-    ublk, ubits, ucount, umax = tile_union(selected_blocks, q_offset)
-    n_tiles = (lq + TILE - 1) // TILE
-    ng = (TILE * GQA) // 16
-    params = mx.array([lq, q_offset, umax, kl], dtype=mx.int32)
+    sel = selected_blocks.reshape(lq, TOPK)
+    if sel.dtype != mx.int32:
+        sel = sel.astype(mx.int32)
+    sel = mx.contiguous(sel)
+    pt, terms = _PV_MODES[PV_MODE]
+    params = mx.array([q_offset, kl], dtype=mx.int32)
     (out,) = _attn_kernel()(
         inputs=[
             queries,
             keys,
             values,
-            ublk,
-            ubits,
-            ucount,
+            sel,
             params,
             mx.array([scale], dtype=mx.float32),
         ],
         template=[
-            ("TILE", TILE),
             ("GQA", GQA),
-            ("PT", _PV_MODES[PV_MODE][0]),
-            ("PV_TERMS", _PV_MODES[PV_MODE][1]),
-            ("TK", KEY_FRAGS),
+            ("TOPK", TOPK),
+            ("PT", pt),
+            ("PV_TERMS", terms),
         ],
-        grid=(n_tiles * ng * 2 * 32, keys.shape[1], 1),
-        threadgroup=(ng * 2 * 32, 1, 1),
+        grid=(lq * 64, keys.shape[1], 1),
+        threadgroup=(64, 1, 1),
         output_shapes=[(1, lq, 2 * GQA, HEAD_DIM)],
         output_dtypes=[queries.dtype],
     )

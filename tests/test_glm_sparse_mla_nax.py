@@ -267,3 +267,123 @@ def test_pv_modes_match_fp32_reference(mode, monkeypatch):
     err = mx.abs(out - ref).mean().item()
     err_native = mx.abs(native - ref).mean().item()
     assert err <= 1.05 * err_native
+
+
+def _realistic_inputs(L, K, H=64, dtype=mx.bfloat16, seed=0, topk_blocks=512):
+    """Indexer-like top-k rows: 4-token blocks (sinks, a drifting scattered
+    set, the most recent blocks) in ascending order, then the 3 causal tail
+    slots; unused slots (-1) sort last."""
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    mx.random.seed(seed)
+    q = mx.random.normal((1, H, L, 512)).astype(dtype)
+    kv = mx.random.normal((1, 1, K, 512)).astype(dtype)
+    topk = 4 * topk_blocks + 3
+    idx = np.full((L, topk), -1, dtype=np.int32)
+    cur = None
+    for i in range(L):
+        p = K - L + i
+        nb = (p + 1) // 4
+        if nb <= topk_blocks:
+            blocks = np.arange(nb)
+        else:
+            hi = nb - topk_blocks // 8
+            n_rand = topk_blocks - topk_blocks // 8 - 4
+            if cur is None:
+                cur = rng.choice(np.arange(4, hi), n_rand, replace=False)
+            cur = cur[(cur < hi) & (rng.random(cur.size) >= 0.05)]
+            if cur.size < n_rand:
+                pool = np.setdiff1d(np.arange(4, hi), cur)
+                cur = np.concatenate([cur, rng.choice(pool, n_rand - cur.size, replace=False)])
+            blocks = np.sort(np.concatenate([np.arange(4), cur, np.arange(hi, nb)]))
+        rows = (blocks[:, None] * 4 + np.arange(4)[None]).reshape(-1)
+        idx[i, : rows.size] = rows
+        tc = (p + 1) % 4
+        for j in range(3):
+            idx[i, topk - 3 + j] = p + 1 - tc + j if j < tc else -1
+    return q, kv, mx.array(idx)[None, None]
+
+
+def _kernel_output(monkeypatch, impl, q, kv, idx, scale):
+    monkeypatch.setattr(sparse_mla_nax, "_PV_MODE", "half2")
+    monkeypatch.setattr(sparse_mla_nax, "_IMPL", impl)
+    monkeypatch.setattr(sparse_mla_nax, "_KERNEL", None)
+    out = sparse_mla_nax.sparse_mla_attention_nax(q, kv, idx, scale)
+    mx.eval(out)
+    return out
+
+
+def _ulp_distance(a, b):
+    import numpy as np
+
+    ai = np.array(a.view(mx.uint16)).astype(np.int32)
+    bi = np.array(b.view(mx.uint16)).astype(np.int32)
+    ai = np.where(ai & 0x8000, -(ai & 0x7FFF), ai & 0x7FFF)
+    bi = np.where(bi & 0x8000, -(bi & 0x7FFF), bi & 0x7FFF)
+    return np.abs(ai - bi)
+
+
+@pytest.mark.parametrize(
+    "L,K,dtype",
+    [(256, 8192, mx.bfloat16), (97, 3000, mx.bfloat16), (64, 4096, mx.float16)],
+)
+def test_v2_matches_h2_kernel(L, K, dtype, monkeypatch):
+    """The default (v2) kernel reproduces the h2 kernel: same scores, maxima,
+    probability pieces and P x V sums; only the order in which the four
+    quarter row sums of a tile enter the denominator differs, which moves a
+    few outputs by one ulp."""
+    import numpy as np
+
+    q, kv, idx = _realistic_inputs(L, K, dtype=dtype, seed=L)
+    scale = 256**-0.5
+    h2 = _kernel_output(monkeypatch, "h2", q, kv, idx, scale)
+    v2 = _kernel_output(monkeypatch, "v2", q, kv, idx, scale)
+    assert v2.shape == h2.shape and v2.dtype == h2.dtype
+    d = _ulp_distance(v2, h2)
+    assert (d == 0).mean() >= 0.999
+    # every difference is one ulp of the value (tiny outputs aside)
+    ref32 = np.array(h2.astype(mx.float32))
+    big = np.abs(ref32) >= np.abs(ref32).max(axis=-1, keepdims=True) * 2.0**-10
+    assert d[big].max() <= 1
+    ref = _reference(q, kv, idx, scale)
+    e_v2 = mx.abs(v2.astype(mx.float32) - ref).mean().item()
+    e_h2 = mx.abs(h2.astype(mx.float32) - ref).mean().item()
+    assert e_v2 <= e_h2 * 1.001 + 1e-9
+
+
+def test_dead_tiles_and_ragged_topk(monkeypatch):
+    """Whole unused 128-slot tiles in the middle and at the end, and top-k
+    widths that are not multiples of the tile or fragment sizes."""
+    import numpy as np
+
+    scale = 256**-0.5
+    for topk in (17, 100, 129, 400, 2051):
+        q, kv, idx = _inputs(48, 3000, topk, seed=topk)
+        a = np.array(idx)
+        if topk > 256:
+            a[..., 128:256] = -1  # a dead tile in the middle
+        a[..., ::5, max(0, topk - 70):] = -1  # dead tail tiles for some rows
+        a[0, 0, :, 0] = 3000 - 48 + np.arange(48)  # keep one usable slot per row
+        idx = mx.array(a)
+        out = _kernel_output(monkeypatch, "v2", q, kv, idx, scale)
+        ref = _reference(q, kv, idx, scale)
+        err = mx.abs(out.astype(mx.float32) - ref)
+        assert mx.all(err <= mx.abs(ref) * 2.0**-8 + 1e-3).item(), topk
+        h2 = _kernel_output(monkeypatch, "h2", q, kv, idx, scale)
+        o32 = np.array(h2.astype(mx.float32))
+        big = np.abs(o32) >= np.abs(o32).max(axis=-1, keepdims=True) * 2.0**-10
+        assert _ulp_distance(out, h2)[big].max() <= 1, topk
+
+
+def test_v2_deterministic_many_threadgroups(monkeypatch):
+    """Many threadgroups in flight, realistic index rows: every run must be
+    bit-identical (a software-pipelined variant with in-flight loads into
+    dead registers was not)."""
+    q, kv, idx = _realistic_inputs(1024, 8192, seed=11)
+    scale = 256**-0.5
+    first = _kernel_output(monkeypatch, "v2", q, kv, idx, scale)
+    for _ in range(8):
+        out = sparse_mla_nax.sparse_mla_attention_nax(q, kv, idx, scale)
+        mx.eval(out)
+        assert mx.array_equal(out, first).item()

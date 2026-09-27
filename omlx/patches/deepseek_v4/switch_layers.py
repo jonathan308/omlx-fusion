@@ -19,6 +19,7 @@ from omlx.custom_kernels.nax import is_nax_available
 from omlx.patches.deepseek_v4.decode_consistency import (
     is_armed as is_dspark_verify_armed,
 )
+from omlx.patches.m5_gather_qmm import fused_gate_up_activation, sort_routes
 
 _DEEPSEEK_MXFP4_SMALL_BLOCK_BM = 16
 _DEEPSEEK_MXFP4_SMALL_BLOCK_VARIANT = 1
@@ -130,12 +131,15 @@ def has_native_block_kernels(projection) -> bool:
     )
 
 
+def _sort_rows(x, indices):
+    """``_gather_sort`` without the gather: the token rows, the sorted row ->
+    token row map, the sorted indices and the inverse order (same ops)."""
+    return sort_routes(x, indices)
+
+
 def _gather_sort(x, indices):
-    *_, M = indices.shape
-    indices = indices.flatten()
-    order = mx.argsort(indices)
-    inv_order = mx.argsort(order)
-    return x.flatten(0, -3)[order // M], indices[order], inv_order
+    x, row_map, indices, inv_order = _sort_rows(x, indices)
+    return x[row_map], indices, inv_order
 
 
 def _scatter_unsort(x, inv_order, shape=None):
@@ -814,8 +818,13 @@ class SwitchGLU(nn.Module):
         do_sort = indices.size >= _sort_threshold(*projections)
         idx = indices
         inv_order = None
+        token_rows = None
         if do_sort:
-            x, idx, inv_order = _gather_sort(x, indices)
+            # The replicated rows x_tok[row_map] stay lazy: never computed
+            # when the fused gate/up kernel reads the token rows in place.
+            x_tok, row_map, idx, inv_order = _sort_rows(x, indices)
+            x = x_tok[row_map]
+            token_rows = (x_tok, row_map)
         if self.training:
             idx = mx.stop_gradient(idx)
 
@@ -861,6 +870,8 @@ class SwitchGLU(nn.Module):
         )
         if use_f16_moe and not use_nax_blocks_prefill:
             x = x.astype(mx.float16)
+            if token_rows is not None:
+                token_rows = (token_rows[0].astype(mx.float16), token_rows[1])
 
         nax_block_plan = None
         if use_nax_blocks_prefill:
@@ -901,6 +912,7 @@ class SwitchGLU(nn.Module):
             use_f16_moe,
             block_plan,
         )
+        x_act = None
         if use_nax_blocks_prefill:
             global _DEEPSEEK_MXFP4_NAX_BLOCKS_LOGGED
             if not _DEEPSEEK_MXFP4_NAX_BLOCKS_LOGGED:
@@ -929,12 +941,26 @@ class SwitchGLU(nn.Module):
                 block_count,
             )
         elif fused_gate_up:
-            # One gather_qmm over the [gate; up] expert rows; each output
-            # column is the same K-reduction as in the separate calls.
-            x_gate_up = self.gate_up_proj(
-                x, idx, sorted_indices=do_sort, block_plan=block_plan
-            )
-            x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+            if (
+                do_sort
+                and block_plan is None
+                and not self.training
+                and isinstance(self.gate_up_proj, QuantizedSwitchLinear)
+                and self.gate_up_proj._native_block_kind(x, do_sort) is None
+            ):
+                # Sorted prefill on M5 (stock gather_qmm route): the
+                # activation in the [gate; up] matmul's epilogue
+                # (bit-identical; None keeps the path below).
+                x_act = fused_gate_up_activation(
+                    self.gate_up_proj, x, idx, self.activation, token_rows=token_rows
+                )
+            if x_act is None:
+                # One gather_qmm over the [gate; up] expert rows; each output
+                # column is the same K-reduction as in the separate calls.
+                x_gate_up = self.gate_up_proj(
+                    x, idx, sorted_indices=do_sort, block_plan=block_plan
+                )
+                x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
         elif use_pair_proj:
             block_meta, block_count, block_variant = _unpack_mxfp4_block_plan(
                 block_plan
@@ -1031,7 +1057,7 @@ class SwitchGLU(nn.Module):
                 block_variant,
             )
         else:
-            x = self.activation(x_up, x_gate)
+            x = self.activation(x_up, x_gate) if x_act is None else x_act
             if (
                 block_plan is not None
                 and native_kinds is not None

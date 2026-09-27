@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tensor-unit Qwen4 QSA main attention over per-tile block unions."""
+"""Tensor-unit Qwen4 QSA main attention (one query per threadgroup)."""
 
 from __future__ import annotations
 
@@ -62,47 +62,14 @@ def _reference(q, k, v, sel, q_offset):
     return out
 
 
-def _union_reference(sel, q_offset):
-    lq = sel.shape[0]
-    tiles = []
-    for t0 in range(0, lq, qsa_nax.TILE):
-        marks = {}
-        for t in range(t0, min(t0 + qsa_nax.TILE, lq)):
-            p = q_offset + t
-            complete = (p + 1) // 4
-            for b in sel[t, : min(512, complete)].tolist():
-                marks[b] = marks.get(b, 0) | (1 << (t - t0))
-            if complete * 4 <= p:
-                marks.setdefault(complete, 0)
-        tiles.append(sorted(marks.items()))
-    return tiles
-
-
-@needs_nax
-@pytest.mark.parametrize(
-    ("lq", "q_offset"),
-    # 70000 / 200001 span several 16384-block windows of the union builder.
-    [(37, 2100), (29, 0), (21, 21000), (19, 70000), (9, 200001)],
-)
-def test_tile_union_matches_python_reference(lq, q_offset):
-    rng = np.random.default_rng(lq + q_offset)
-    sel = _selections(rng, lq, q_offset)
-    ublk, ubits, ucount, _ = qsa_nax.tile_union(mx.array(sel)[None], q_offset)
-    mx.eval(ublk, ubits, ucount)
-    ublk, ubits, ucount = np.array(ublk), np.array(ubits), np.array(ucount)
-    for tile, expected in enumerate(_union_reference(sel, q_offset)):
-        count = int(ucount[tile])
-        assert count == len(expected)
-        got = list(zip(ublk[tile, :count].tolist(), ubits[tile, :count].tolist()))
-        assert got == expected
-
-
 @needs_nax
 @needs_native
 @pytest.mark.parametrize("pv_mode", ["half2", "bf16x3"])
 @pytest.mark.parametrize(
     ("lq", "q_offset", "prefix"),
-    [(37, 2100, 5), (33, 0, 0), (19, 8171, 3)],
+    # Consecutive queries cycle through all four tail lengths (0..3 tokens);
+    # (33, 0) has selections shorter than 512 blocks; (6, 70000) is long context.
+    [(37, 2100, 5), (33, 0, 0), (19, 8171, 3), (6, 70000, 1)],
 )
 def test_nax_attention_matches_native_and_fp64_reference(
     monkeypatch, pv_mode, lq, q_offset, prefix

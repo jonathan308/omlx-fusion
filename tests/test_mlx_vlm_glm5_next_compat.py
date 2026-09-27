@@ -1235,7 +1235,8 @@ def test_prefill_pipelines_layers_with_bounded_inflight(monkeypatch):
     layer is queued with ``mx.async_eval`` and the host only waits for the
     layer queued before it, so at most two layers are in flight. The
     allocator cache is still released after each completed layer (layer-
-    specific buffer sizes would otherwise accumulate in the pool).
+    specific buffer sizes would otherwise accumulate in the pool). With
+    ``lazy_last`` the last layer's output is left for the caller.
     """
     import mlx_vlm.models.glm5_next.language as lang
     from omlx.utils import layer_pipeline
@@ -1268,19 +1269,21 @@ def test_prefill_pipelines_layers_with_bounded_inflight(monkeypatch):
 
     ids = mx.zeros((1, 256), dtype=mx.int32)
     out = model(ids)
-    real_eval(out)
-    assert len(queued) >= text.num_hidden_layers, (
-        f"prefill width must queue every layer, got {len(queued)} async_eval"
-        f" calls for {text.num_hidden_layers} layers"
+    # The last layer's output stays lazy (a prefill chunk only needs its
+    # cache update); every earlier layer is queued, waited for and released.
+    assert len(queued) >= text.num_hidden_layers - 1, (
+        "prefill width must queue every layer but the last, got"
+        f" {len(queued)} async_eval calls for {text.num_hidden_layers} layers"
     )
     assert len(waited) >= text.num_hidden_layers - 1, (
         "prefill must wait on the previous layer (bounded in-flight depth),"
         f" got {len(waited)} waits for {text.num_hidden_layers} layers"
     )
-    assert len(clears) >= text.num_hidden_layers, (
+    assert len(clears) >= text.num_hidden_layers - 1, (
         "prefill must release the allocator pool after each completed layer,"
         f" got {len(clears)} clears for {text.num_hidden_layers} layers"
     )
+    real_eval(out)
 
     queued.clear()
     waited.clear()
@@ -1292,6 +1295,55 @@ def test_prefill_pipelines_layers_with_bounded_inflight(monkeypatch):
         "decode width must stay lazy (no per-layer eval)"
     )
     assert not clears, "decode width must not clear the pool per layer"
+
+
+def test_prefill_leaves_the_last_layer_output_lazy():
+    """A prefill chunk evaluates every layer but the last through the pipeline
+    (the chunk only needs the last layer's cache update); the caches and the
+    output are identical to a forward whose output is read right away."""
+    import mlx_vlm.models.glm5_next.language as lang
+
+    text = _tiny_config().text_config
+    lm = lang.LanguageModel(text)
+    mx.eval(lm.parameters())
+    ids = mx.array([[(7 * i + 3) % text.vocab_size for i in range(256)]], dtype=mx.int32)
+
+    def flat_state(cache):
+        arrays = []
+        for c in cache:
+            for part in getattr(c, "caches", None) or (c,):
+                state = part.state
+                for a in state if isinstance(state, (list, tuple)) else (state,):
+                    if isinstance(a, mx.array):
+                        arrays.append(a)
+        return arrays
+
+    queued = []
+    real_async_eval = mx.async_eval
+
+    def spy(*arrays):
+        queued.append(len(arrays))
+        return real_async_eval(*arrays)
+
+    lang.mx.async_eval = spy
+    try:
+        cache_a = lm.make_cache()
+        out_a = lm.model(ids, cache=cache_a)
+        mx.eval(flat_state(cache_a))
+    finally:
+        lang.mx.async_eval = real_async_eval
+    assert len(queued) == text.num_hidden_layers - 1
+    mx.eval(out_a)
+
+    cache_b = lm.make_cache()
+    out_b = lm.model(ids, cache=cache_b)
+    mx.eval(out_b, flat_state(cache_b))
+    assert mx.array_equal(out_a, out_b).item()
+    state_a, state_b = flat_state(cache_a), flat_state(cache_b)
+    assert len(state_a) == len(state_b) > 0
+    for a, b in zip(state_a, state_b):
+        assert a.shape == b.shape and mx.array_equal(a, b).item()
+
 
 def test_patch_overrides_site_packages_glm5_next_copy():
     """The vendor module must replace an already imported upstream module."""
@@ -1696,3 +1748,42 @@ def test_kda_fused_prefill_survives_mtp_runtime_patch(monkeypatch):
 
     assert engaged == [70]
     assert mx.allclose(fused, reference, atol=3e-4, rtol=3e-4).item()
+
+
+@pytest.mark.parametrize("past_len", [0, 37])
+def test_dense_prefix_row_blocks_bitwise(monkeypatch, past_len):
+    """Causal row blocks of the dense-prefix attention reproduce the one-call
+    result bitwise (keys past a block's last row are masked for all of its
+    rows, so they only ever contribute exact zeros)."""
+    from mlx_vlm.models.glm5_next import language
+
+    mx.random.seed(7)
+    config = _tiny_config()
+    model = language.LanguageModel(config.text_config, config)
+    attention = model.model.layers[1].self_attn
+    heads = attention.num_heads
+    rows = 2100  # rows // 256 = 8: exercises 2, 3, 4 and 8 blocks
+    q = mx.random.normal((1, heads, rows, attention.q_head_dim)).astype(mx.bfloat16)
+    kv = mx.random.normal((1, 1, past_len + rows, attention.kv_lora_rank)).astype(mx.bfloat16)
+    total = past_len + rows
+    # The engine passes a boolean causal mask sliced out of a larger one.
+    full = mx.tril(mx.ones((total + 64, total + 64), dtype=mx.bool_), k=0)
+    mask = full[past_len:total, :total][None, None]
+
+    monkeypatch.setattr(language, "_DENSE_ROW_BLOCKS", 1)
+    ref = attention._dense_flat(q, kv, mask, rows, past_len)
+    outs = []
+    for blocks in (2, 3, 4, 8):
+        monkeypatch.setattr(language, "_DENSE_ROW_BLOCKS", blocks)
+        outs.append(attention._dense_flat(q, kv, mask, rows, past_len))
+    mx.eval(ref, outs)
+    for out in outs:
+        assert out.shape == ref.shape and out.dtype == ref.dtype
+        assert mx.array_equal(out, ref).item()
+    # Without an explicit mask the one-call "causal" path is kept.
+    monkeypatch.setattr(language, "_DENSE_ROW_BLOCKS", 4)
+    unmasked = attention._dense_flat(q, kv, None, rows, past_len)
+    monkeypatch.setattr(language, "_DENSE_ROW_BLOCKS", 1)
+    unmasked_ref = attention._dense_flat(q, kv, None, rows, past_len)
+    mx.eval(unmasked, unmasked_ref)
+    assert mx.array_equal(unmasked, unmasked_ref).item()

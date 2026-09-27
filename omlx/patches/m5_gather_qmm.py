@@ -58,6 +58,15 @@ correct for any K and row count in one dispatch, bit-identical to mlx's
 sorted kernel wherever that kernel is correct. Each kernel instantiation self-tests
 once; anything unsupported or failing keeps the stock handling above.
 ``OMLX_M5_GATHER_QMM_NAX=0`` disables only this route.
+
+``fused_gate_up_activation`` lets a SwitchGLU forward whose fused ``[gate;
+up]`` sorted projection would take that route run its SwiGLU in the NAX
+kernel's epilogue instead of a separate elementwise pass (bit-identical;
+``OMLX_M5_GATHER_QMM_NAX_SWIGLU=0`` disables it). Given the token rows and
+the sorted row map (``sort_routes``), that kernel reads each routed token's
+row in place instead of from the ``[T * k, 1, K]`` copy that the sort
+would otherwise gather (bit-identical; ``OMLX_M5_GATHER_QMM_NAX_ROW_MAP=0``
+disables it).
 """
 
 from __future__ import annotations
@@ -264,6 +273,14 @@ def _on_nax_host() -> bool:
     return _nax_host
 
 
+def _nax_rows_ok(x, w) -> bool:
+    """Same gate as mlx's own choice of the sorted rhs kernel (GatherQMM:
+    B >= 16 rows and B / E >= 4); fewer rows per expert run the per-row
+    qmv kernel, which is correct and cheaper there."""
+    rows = x.shape[0] if x.ndim == 3 else 0
+    return rows >= 16 and w.ndim == 3 and rows // max(int(w.shape[0]), 1) >= 4
+
+
 def _nax_sorted_gather_qmm(x, w, args, kwargs):
     """Route a sorted rhs gather to the NAX kernel; None keeps mlx's path."""
     params = dict(zip(_POSITIONAL, args))
@@ -279,11 +296,7 @@ def _nax_sorted_gather_qmm(x, w, args, kwargs):
         or not params.get("transpose", True)
     ):
         return None
-    # Same gate as mlx's own choice of the sorted rhs kernel (GatherQMM:
-    # B >= 16 rows and B / E >= 4); fewer rows per expert run the per-row
-    # qmv kernel, which is correct and cheaper there.
-    rows = x.shape[0] if x.ndim == 3 else 0
-    if rows < 16 or w.ndim != 3 or rows // max(int(w.shape[0]), 1) < 4:
+    if not _nax_rows_ok(x, w):
         return None
     mode = params.get("mode") or "affine"
     group_size = params.get("group_size")
@@ -324,6 +337,112 @@ def _gather_qmm_rerouted(x, w, *args, **kwargs):
 
 
 _gather_qmm_rerouted._omlx_m5_reroute = True
+
+
+# SwitchGLU activations the gate/up epilogue reproduces, by exact class:
+# ``__call__(x_up, x_gate)`` is mlx-lm / mlx-vlm's compiled
+# ``swiglu(x_gate, x_up) = nn.silu(x_gate) * x_up`` ...
+_SWIGLU_ACTIVATIONS = frozenset(
+    {
+        ("mlx_lm.models.switch_layers", "SwiGLU"),
+        ("mlx_vlm.models.switch_layers", "SwiGLU"),
+        ("omlx.patches.glm_moe_dsa.switch_layers", "SwiGLU"),
+        ("omlx.patches.deepseek_v4.switch_layers", "SwiGLU"),
+    }
+)
+# ... or GLM-5.3's clamped SwiGLU (``limit`` attribute; None: plain).
+_CLAMPED_SWIGLU_ACTIVATIONS = frozenset(
+    {("mlx_vlm.models.glm5_next.language", "Glm5NextClampedSwiGLU")}
+)
+_UNSUPPORTED = object()
+
+
+def _swiglu_limit(activation):
+    """None (plain SwiGLU), the clip limit, or _UNSUPPORTED."""
+    cls = type(activation)
+    key = (cls.__module__, cls.__qualname__)
+    if key in _SWIGLU_ACTIVATIONS:
+        return None
+    if key in _CLAMPED_SWIGLU_ACTIVATIONS:
+        limit = getattr(activation, "limit", None)
+        return None if limit is None else float(limit)
+    return _UNSUPPORTED
+
+
+def sort_routes(x, indices):
+    """mlx-lm's ``_gather_sort`` without the gather.
+
+    Returns ``(x_tok, row_map, idx, inv_order)``: the token rows
+    ``x.flatten(0, -3)``, the sorted row -> token row map ``order // k``,
+    the sorted expert indices and the inverse order, computed by the same
+    ops, so ``x_tok[row_map]`` is exactly ``_gather_sort``'s sorted ``x``.
+    Callers keep that indexing lazy: it only runs when a consumer needs the
+    replicated ``[T * k, 1, K]`` rows (``fused_gate_up_activation`` with
+    ``token_rows`` reads them in place instead).
+    """
+    *_, M = indices.shape
+    indices = indices.flatten()
+    order = mx.argsort(indices)
+    inv_order = mx.argsort(order)
+    return x.flatten(0, -3), order // M, indices[order], inv_order
+
+
+def fused_gate_up_activation(proj, x, indices, activation, token_rows=None):
+    """``activation(x_up, x_gate)`` of a fused ``[gate; up]`` projection in
+    one kernel, or None.
+
+    ``proj`` is a quantized switch linear whose expert rows are the gate
+    rows followed by the up rows, ``x`` / ``indices`` the sorted routed rows
+    (``[M, 1, K]`` / ``[M]``) of what would be a ``sorted_indices=True``
+    call. Where that call would run on the NAX sorted gather kernel (this
+    wrapper installed on an M5 host, >= 16 rows and >= 4 rows per expert, a
+    layout ``m5_gather_qmm_nax`` supports, no per-expert bias) and the
+    activation is a SwiGLU this module knows, the activation runs in the
+    kernel's epilogue (``m5_gather_qmm_nax.sorted_gather_qmm_swiglu``,
+    self-tested bit-identical to the unfused path) and only the ``[M, 1,
+    N / 2]`` result is written. None otherwise: the caller runs the
+    projection, the split and the activation itself.
+
+    ``token_rows`` = ``(x_tok, row_map)`` with ``x == x_tok[row_map]``
+    (``sort_routes``) lets the kernel read the sorted rows from the token
+    rows in place, so a lazy ``x`` is never materialised (bit-identical;
+    ``OMLX_M5_GATHER_QMM_NAX_ROW_MAP=0`` disables it). If the row-mapped
+    kernel declines, ``x`` is used as before.
+    """
+    limit = _swiglu_limit(activation)
+    if limit is _UNSUPPORTED:
+        return None
+    if not getattr(mx.gather_qmm, "_omlx_m5_reroute", False):
+        return None
+    if not (_nax.swiglu_enabled() and _on_nax_host()):
+        return None
+    if "bias" in proj or not all(hasattr(proj, a) for a in ("group_size", "bits")):
+        return None
+    w = proj.get("weight")
+    scales = proj.get("scales")
+    if not isinstance(w, mx.array) or not isinstance(scales, mx.array):
+        return None
+    if not isinstance(x, mx.array) or not isinstance(indices, mx.array):
+        return None
+    if not _nax_rows_ok(x, w):
+        return None
+    kw = dict(
+        group_size=int(proj.group_size),
+        bits=int(proj.bits),
+        mode=getattr(proj, "mode", None) or "affine",
+        limit=limit,
+    )
+    if token_rows is not None and _nax.row_map_enabled():
+        x_tok, row_map = token_rows
+        if isinstance(x_tok, mx.array) and isinstance(row_map, mx.array):
+            out = _nax.sorted_gather_qmm_swiglu(
+                x_tok, w, scales, proj.get("biases"), indices, row_map=row_map, **kw
+            )
+            if out is not None:
+                return out
+    return _nax.sorted_gather_qmm_swiglu(
+        x, w, scales, proj.get("biases"), indices, **kw
+    )
 
 
 def apply_m5_gather_qmm_workaround() -> bool:

@@ -80,6 +80,16 @@ def glm5_native_route_counters(*, reset: bool = False) -> dict[str, int]:
         return snapshot
 
 
+def _dense_row_blocks() -> int:
+    """Causal row blocks of the dense-prefix attention (1 = one call)."""
+    import os
+
+    return max(1, int(os.environ.get("OMLX_GLM5_DENSE_ROW_BLOCKS", "8") or 1))
+
+
+_DENSE_ROW_BLOCKS = _dense_row_blocks()
+
+
 def _cache_parts(cache):
     """(kv, pool) halves of a sparse-layer cache; either half may be missing."""
     try:
@@ -385,6 +395,50 @@ def recurrent_kimi_delta(
     return out, state
 
 
+class KdaStepCapture:
+    """A fused KDA verify block, kept so a speculative rollback is exact.
+
+    Holds the block's ``kda_decode_step`` inputs (the fused input projection
+    ``proj`` and, when the gate projections ran outside the kernel, their
+    rows ``a_pre``/``gate_pre``) and the layer's entry conv/recurrent states.
+    Each kernel row depends only on the rows before it (causal short conv,
+    per-row l2norm and gate projections, sequential delta rule), so
+    ``replay(n)`` over the first ``n`` rows returns bit for bit the states
+    the block held after row ``n``.
+    """
+
+    __slots__ = ("layer", "proj", "conv_state", "state", "a_pre", "gate_pre")
+
+    def __init__(self, layer, proj, conv_state, state, a_pre=None, gate_pre=None):
+        self.layer = layer
+        self.proj = proj
+        self.conv_state = conv_state
+        self.state = state
+        self.a_pre = a_pre
+        self.gate_pre = gate_pre
+
+    @property
+    def width(self) -> int:
+        return int(self.proj.shape[1])
+
+    def replay(self, n: int):
+        """``(conv_state, recurrent_state)`` after the first ``n`` rows."""
+        n = int(n)
+        if not 1 <= n <= self.width:
+            raise ValueError(f"KDA replay of {n} rows from a {self.width}-row block")
+
+        def rows(a):
+            return None if a is None else a[:, :n]
+
+        result = self.layer._kda_kernel_step(
+            rows(self.proj), self.conv_state, self.state,
+            rows(self.a_pre), rows(self.gate_pre),
+        )
+        if result is None:
+            raise RuntimeError("fused KDA kernel declined a captured verify block")
+        return result[1], result[2]
+
+
 class Glm5NextLinearAttention(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -542,13 +596,17 @@ class Glm5NextLinearAttention(nn.Module):
         ]
         return mx.concatenate([outs[g][..., a:b] for g, a, b in runs], axis=-1)
 
-    def _decode_step(self, inputs, mask, cache):
+    def _decode_step(self, inputs, mask, cache, capture=None):
         """Fused layer body for one sequence and S <= 8 tokens (bit-identical).
 
         One kernel (``decode_kernels.kda_decode_step``) replaces the conv,
         SiLU, l2norm, gate projections, delta rule and RMSNormGated ops
         between the fused input projection and o_proj. Returns None when the
         layer or inputs are not covered.
+
+        ``capture`` (a list, for speculative verify blocks) receives a
+        ``KdaStepCapture`` of the block's kernel inputs and entry states, from
+        which ``KdaStepCapture.replay`` rebuilds the caches after any prefix.
         """
         B, S, _ = inputs.shape
         fg = self.forget_gate
@@ -589,13 +647,29 @@ class Glm5NextLinearAttention(nn.Module):
         if not (isinstance(f_b, nn.QuantizedLinear) and bits <= in_kernel and len(bits) == 1):
             a_pre = linear_forward(f_b, proj[..., v_end:fa_end])
             gate_pre = linear_forward(g_b, proj[..., fa_end:ga_end])
-        result = _decode_kernels.kda_decode_step(
+        conv_in, state_in = cache[0], cache[1]
+        result = self._kda_kernel_step(proj, conv_in, state_in, a_pre, gate_pre)
+        if result is None:
+            return None
+        y, conv_state, state = result
+        if capture is not None:
+            capture.append(KdaStepCapture(self, proj, conv_in, state_in, a_pre, gate_pre))
+        cache[0] = conv_state
+        cache[1] = state
+        cache.advance(S)
+        return linear_forward(self.o_proj, y)
+
+    def _kda_kernel_step(self, proj, conv_state, state, a_pre, gate_pre):
+        """``decode_kernels.kda_decode_step`` for this layer: (y, conv, state)."""
+        fg = self.forget_gate
+        _, _, v_end, fa_end, ga_end = self._split_pts
+        return _decode_kernels.kda_decode_step(
             proj,
-            cache[0],
+            conv_state,
             self.conv1d.weight,
             fg.A_log,
             fg.dt_bias,
-            cache[1],
+            state,
             self.o_norm.weight,
             heads=self.num_heads,
             head_dim=self.head_dim,
@@ -606,18 +680,11 @@ class Glm5NextLinearAttention(nn.Module):
             l2_eps=1e-6,
             norm_eps=self.o_norm.eps,
             lower_bound=fg.safe_gate_lower_bound,
-            f_b=f_b,
-            g_b=g_b,
+            f_b=fg.f_b_proj,
+            g_b=self.g_b_proj,
             a_pre=a_pre,
             gate_pre=gate_pre,
         )
-        if result is None:
-            return None
-        y, conv_state, state = result
-        cache[0] = conv_state
-        cache[1] = state
-        cache.advance(S)
-        return linear_forward(self.o_proj, y)
 
     def __call__(
         self,
@@ -1163,6 +1230,15 @@ class Glm5NextSparseAttention(nn.Module):
         Uses the expanded per-head K/V of the short-context path. The fused
         SDPA kernel has no 512-wide head, so latent-space SDPA would
         materialize the full score matrix.
+
+        With an explicit boolean mask (the engine's prefill; SDPA runs its
+        unfused fallback: scores, masked select, softmax, P x V) the rows run
+        in causal blocks: block ``[a, b)`` only takes keys ``[0, past_len +
+        b)``. Every key past that is masked for all rows of the block, i.e.
+        gets probability exactly 0, and the softmax maps each score to the
+        same thread whatever the row length, so each block reproduces its
+        rows of the one-call result bitwise while skipping ~44% of the
+        score / value work (8 blocks).
         """
         kv_rows = kv_latent[:, :, : past_len + rows]
         k = self.embed_q(kv_rows, transpose=False)
@@ -1171,12 +1247,32 @@ class Glm5NextSparseAttention(nn.Module):
         if k.dtype != q_rows.dtype:
             k = k.astype(q_rows.dtype)
             v = v.astype(q_rows.dtype)
-        dense_mask = (
-            "causal" if mask is None else mask[..., :rows, : past_len + rows]
-        )
-        out = mx.fast.scaled_dot_product_attention(
-            q_rows, k, v, scale=self.scale, mask=dense_mask
-        )
+        n_blocks = _DENSE_ROW_BLOCKS if mask is not None else 1
+        n_blocks = max(1, min(n_blocks, rows // 256))
+        if n_blocks == 1:
+            dense_mask = (
+                "causal" if mask is None else mask[..., :rows, : past_len + rows]
+            )
+            out = mx.fast.scaled_dot_product_attention(
+                q_rows, k, v, scale=self.scale, mask=dense_mask
+            )
+        else:
+            bounds = [0]
+            bounds += [(rows * i // n_blocks) // 64 * 64 for i in range(1, n_blocks)]
+            bounds.append(rows)
+            outs = []
+            for a, b in zip(bounds[:-1], bounds[1:]):
+                end = past_len + b
+                outs.append(
+                    mx.fast.scaled_dot_product_attention(
+                        q_rows[:, :, a:b],
+                        k[:, :, :end],
+                        v[:, :, :end],
+                        scale=self.scale,
+                        mask=mask[..., a:b, :end],
+                    )
+                )
+            out = mx.concatenate(outs, axis=2)
         return out.transpose(0, 2, 1, 3).reshape(q.shape[0], rows, -1)
 
     def _finish(self, flat, out_dense):
@@ -1975,7 +2071,12 @@ class Glm5NextModel(nn.Module):
         prefill = h.shape[1] >= 256
         # Each completed layer is waited for and the allocator cache is
         # released (layer-specific buffer sizes would otherwise accumulate).
-        pipeline = LayerPipeline(on_evaluated=mx.clear_cache) if prefill else None
+        # The last layer stays lazy: a prefill chunk only needs its cache update.
+        pipeline = (
+            LayerPipeline(on_evaluated=mx.clear_cache, lazy_last=True)
+            if prefill
+            else None
+        )
         # One-token decode: start encoding the step every few layers while the
         # rest of the graph is still being built (scheduling only, see
         # _DECODE_EVAL_EVERY).
