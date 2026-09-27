@@ -412,6 +412,78 @@ def capture_eligible(host: Any, cache: Optional[List[Any]]) -> bool:
     )
 
 
+# A later prefill chunk of at least 2 tokens re-primes a tail-only head from
+# scratch (see _capture_single); one token of margin covers timelines whose
+# prompt count includes the token the first decode step forwards.
+_TAIL_SUPERSEDED_MIN_REMAINING = 3
+
+
+def tail_hidden_rows(host: Any, inputs: Any) -> Optional[int]:
+    """Rows of the trunk hidden a tail-only head's capture of this chunk reads.
+
+    A chunk longer than the head's tail restarts the head context and folds
+    only its last ``tail`` (hidden, next token) pairs plus the pending row,
+    so the backbone may compute the hidden for those ``tail + 1`` rows only.
+    Returns None whenever the capture could read more (batched rows, a
+    deferred-history context, short chunks).
+    """
+    tail = getattr(host, "_omlx_mtp_prime_tail", None)
+    if not tail or inputs is None or getattr(inputs, "ndim", 0) != 2:
+        return None
+    if int(inputs.shape[0]) != 1 or int(inputs.shape[1]) <= int(tail) + 1:
+        return None
+    if _PREFILL_SCOPE.get() is not None or _DECODE_SCOPE.get() is not None:
+        return None
+    ctx = getattr(host, _CTX_ATTR, None)
+    if ctx is not None and (
+        getattr(ctx, "deferred_pairs", None) is not None
+        or getattr(ctx, "window_exceeded", False)
+    ):
+        return None
+    if prime_window():
+        return None
+    return int(tail) + 1
+
+
+def claim_superseded_tail_chunk(host: Any, inputs: Any, cache: Optional[List[Any]]) -> bool:
+    """Whether a tail-only head's capture of this prefill chunk is wasted.
+
+    Heads that prime only the prompt's tail (``_omlx_mtp_prime_tail``) restart
+    their context on every multi-token prefill chunk, so only the last
+    chunk's capture survives. Capturing an earlier chunk still makes the
+    backbone produce the final hidden state for all of its rows (the last
+    decoder layer's attention output and MoE, which a prefill chunk otherwise
+    never evaluates). Returns True, after accounting for the chunk in the
+    batched prefill scope, when at least ``_TAIL_SUPERSEDED_MIN_REMAINING``
+    prompt tokens remain after this chunk for every row; the caller then
+    skips the capture and the hidden state. Anything unknown returns False.
+    """
+    tail = getattr(host, "_omlx_mtp_prime_tail", None)
+    if not tail or inputs is None or getattr(inputs, "ndim", 0) != 2:
+        return False
+    rows, count = int(inputs.shape[0]), int(inputs.shape[1])
+    prefill = _PREFILL_SCOPE.get()
+    if prefill is not None and prefill["host"] is host:
+        if len(prefill["uids"]) != rows:
+            return False
+        remaining = min(
+            length - prefill["consumed"] - count for length in prefill["lengths"]
+        )
+        if remaining < _TAIL_SUPERSEDED_MIN_REMAINING:
+            return False
+        prefill["consumed"] += count
+        return True
+    if rows != 1 or _DECODE_SCOPE.get() is not None:
+        return False
+    plan = _find_plan(host)
+    anchor = _anchor(cache)
+    offset = anchor.offset if anchor is not None else None
+    if plan is None or offset is None:
+        return False
+    remaining = len(plan.prompt_tokens) - (int(offset) + count)
+    return remaining >= _TAIL_SUPERSEDED_MIN_REMAINING + 1
+
+
 @dataclass
 class _OwnedPriming:
     requests: dict = field(default_factory=dict)
