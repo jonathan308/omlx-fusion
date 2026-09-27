@@ -14,6 +14,12 @@ queued with ``mx.async_eval`` and the host only waits for the layer queued
 ``depth`` steps earlier. With the default ``depth=1`` at most two layers are
 in flight; an optional ``on_evaluated`` hook (e.g. ``mx.clear_cache``) runs
 after each completed layer, like the per-layer release of a blocking loop.
+
+With ``lazy_last=True`` each layer is queued when the next one is pushed and
+``drain`` leaves the last push unevaluated. A prefill chunk only needs the
+last layer's cache update, which the caller evaluates with the cache; the
+last layer's attention output and MoE then never run unless something reads
+the model output (which evaluates them lazily as usual).
 """
 
 from __future__ import annotations
@@ -32,12 +38,14 @@ class LayerPipeline:
     cache, so clearing is safe).
     """
 
-    __slots__ = ("_depth", "_inflight", "_on_evaluated")
+    __slots__ = ("_depth", "_inflight", "_on_evaluated", "_lazy_last", "_held")
 
-    def __init__(self, depth: int = 1, on_evaluated=None):
+    def __init__(self, depth: int = 1, on_evaluated=None, lazy_last: bool = False):
         self._depth = max(0, int(depth))
         self._inflight: deque = deque()
         self._on_evaluated = on_evaluated
+        self._lazy_last = bool(lazy_last)
+        self._held = None
 
     def _wait_oldest(self) -> None:
         mx.eval(*self._inflight.popleft())
@@ -45,13 +53,21 @@ class LayerPipeline:
             self._on_evaluated()
 
     def push(self, *arrays) -> None:
-        """Queue ``arrays`` for evaluation; block on the oldest beyond depth."""
+        """Queue ``arrays`` for evaluation; block on the oldest beyond depth.
+
+        With ``lazy_last`` the push is held and the previous one is queued.
+        """
+        if self._lazy_last:
+            arrays, self._held = self._held, arrays
+            if arrays is None:
+                return
         mx.async_eval(*arrays)
         self._inflight.append(arrays)
         while len(self._inflight) > self._depth:
             self._wait_oldest()
 
     def drain(self) -> None:
-        """Wait for every queued layer."""
+        """Wait for every queued layer (a held ``lazy_last`` push stays lazy)."""
+        self._held = None
         while self._inflight:
             self._wait_oldest()

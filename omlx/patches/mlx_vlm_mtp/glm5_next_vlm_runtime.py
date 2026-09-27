@@ -423,7 +423,12 @@ def _patch_model_call(g5_lang: Any) -> None:
         prefill = h.shape[1] >= 256
         # Each completed layer is waited for and the allocator cache is
         # released (layer-specific buffer sizes would otherwise accumulate).
-        pipeline = LayerPipeline(on_evaluated=mx.clear_cache) if prefill else None
+        # The last layer stays lazy: a prefill chunk only needs its cache update.
+        pipeline = (
+            LayerPipeline(on_evaluated=mx.clear_cache, lazy_last=True)
+            if prefill
+            else None
+        )
         eval_every = (
             getattr(g5_lang, "_DECODE_EVAL_EVERY", 0) if h.shape[1] == 1 else 0
         )

@@ -1975,7 +1975,12 @@ class Glm5NextModel(nn.Module):
         prefill = h.shape[1] >= 256
         # Each completed layer is waited for and the allocator cache is
         # released (layer-specific buffer sizes would otherwise accumulate).
-        pipeline = LayerPipeline(on_evaluated=mx.clear_cache) if prefill else None
+        # The last layer stays lazy: a prefill chunk only needs its cache update.
+        pipeline = (
+            LayerPipeline(on_evaluated=mx.clear_cache, lazy_last=True)
+            if prefill
+            else None
+        )
         # One-token decode: start encoding the step every few layers while the
         # rest of the graph is still being built (scheduling only, see
         # _DECODE_EVAL_EVERY).
