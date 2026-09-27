@@ -25,14 +25,30 @@ same math with fewer, cheaper dispatches:
 * attention of verify forwards whose rows x GQA factor exceed MLX's vector
   SDPA kernel (the full-attention layers at 3+ rows) runs as row chunks that
   fit it, instead of MLX's unfused matmul / softmax fallback.
+* long KV caches: from ``_FLASH_MIN_KEYS`` keys every forward's attention
+  runs the split-key matrix kernel ``sdpa_flash`` (float32 simdgroup MMA, all
+  rows and heads of a KV head sharing each K/V tile: 2-3x MLX's vector kernel,
+  which is ALU-bound at GQA 16); multi-row forwards over shorter 2-pass-sized
+  caches read the cache once for all rows (``sdpa_rows``) instead of once per
+  row chunk.
 
-Exactness: a one-row (decode) forward is bit-identical to the reference.
+Exactness: a one-row (decode) forward is bit-identical to the reference
+below ``_FLASH_MIN_KEYS`` keys (or with ``OMLX_MIMO_DECODE_FLASH=0``).
 For verify forwards (L > 1) two reductions run in another order than the
 reference: every row's router logits are the M=1 gemv a decode step computes
-(MLX's batched float32 matmul sums differently) and chunked attention rows
-use the vector SDPA kernel; everything else is bit-identical.  KV-cache
-updates, the SDPA calls themselves and lm_head are the reference code;
-forwards outside the fast path's contract run the reference layer loop.
+(MLX's batched float32 matmul sums differently) and attention rows use the
+vector SDPA kernel's arithmetic (``sdpa_rows`` is bit-identical to MLX's
+kernel on the same rows); everything else is bit-identical.  ``sdpa_flash``
+computes MLX's float32 attention in another summation order (within one bf16
+ULP of MLX's kernel, closer to float64) for one-row and verify forwards
+alike, so a verify row's attention matches the one-row decode's at the same
+position bit for bit.  (Whole verify rows can still differ from decode steps
+by rounding, here as on the reference path: MLX runs quantized matmuls of 2+
+rows as ``qmv_wide`` and one-row ones as ``qmv``, and a window layer's
+rotating cache hands a verify its keys in time order but a decode step in
+ring order.)  KV-cache updates, the SDPA calls themselves and lm_head are the
+reference code; forwards outside the fast path's contract run the reference
+layer loop.
 """
 
 from __future__ import annotations
@@ -92,6 +108,31 @@ def sdpa_chunks_enabled() -> bool:
 def experts_enabled() -> bool:
     """Decode-time MXFP4 expert kernels (``moe_decode``); on by default."""
     return _env_on("OMLX_MIMO_DECODE_EXPERTS")
+
+
+def sdpa_rows_enabled() -> bool:
+    """Multi-row forwards' attention in one pass over the KV cache
+    (``sdpa_rows``, bit-identical to MLX's vector kernel); on by default."""
+    return _env_on("OMLX_MIMO_DECODE_SDPA_ROWS")
+
+
+def sdpa_flash_enabled() -> bool:
+    """Long-context attention through the split-key matrix kernel
+    (``sdpa_flash``: MLX's float32 math in another summation order); on by
+    default."""
+    return _env_on("OMLX_MIMO_DECODE_FLASH")
+
+
+# Key count from which ``sdpa_flash`` serves decode / verify attention.
+_FLASH_MIN_KEYS = 4096
+
+
+def _flash_min_keys() -> int:
+    value = os.environ.get("OMLX_MIMO_DECODE_FLASH_MIN_KEYS", "")
+    try:
+        return max(1, int(value)) if value else _FLASH_MIN_KEYS
+    except ValueError:
+        return _FLASH_MIN_KEYS
 
 
 # ---------------------------------------------------------------------------
@@ -852,7 +893,53 @@ def _sdpa_row_chunks(sdpa, q, k, v, cache, scale, mask, sinks, rows):
     return out.reshape(out.shape[0], L, -1)
 
 
-def _attention(attn, x, mask, cache, sdpa, offsets_memo, row_chunks):
+# Attention functions that compute MLX's fused SDPA for the fast path's calls
+# (at most MAX_ROWS query rows, unquantized caches): mlx_lm's own and oMLX's
+# routing wrappers, which pass such calls through to it unchanged.
+_MLX_SDPA = {
+    "mlx_lm.models.base": ("scaled_dot_product_attention",),
+    "omlx.patches.sdpa256_attention": ("patched_sdpa",),
+    "omlx.patches.qwen35_fa256_attention": ("patched_lm_sdpa",),
+    "omlx.patches.turboquant_attention": ("patched_sdpa",),
+}
+
+
+def _is_mlx_sdpa(fn) -> bool:
+    names = _MLX_SDPA.get(getattr(fn, "__module__", None) or "")
+    return bool(names) and getattr(fn, "__name__", "") in names
+
+
+def _vector_attention(q, k, v, cache, scale, mask, sinks, kernels):
+    """``(B, L, H * Dv)`` attention of a short forward from the one-pass
+    kernels, or ``None`` (the caller keeps MLX's SDPA).
+
+    ``kernels`` is ``(rows, flash, flash_min_keys)``.  From
+    ``flash_min_keys`` keys ``sdpa_flash`` serves every row count (so a verify
+    row's attention matches the one-row decode's); below it, forwards of 2+
+    rows use ``sdpa_rows``, which is MLX's own arithmetic in one pass.
+    """
+    rows_on, flash_on, flash_min = kernels
+    if not (rows_on or flash_on) or cache is None or hasattr(cache, "bits"):
+        return None
+    inner = getattr(cache, "_cache", None)
+    if inner is not None and hasattr(inner, "bits"):
+        return None
+    if not isinstance(k, mx.array) or not isinstance(v, mx.array) or k.ndim != 4:
+        return None
+    if flash_on and k.shape[2] >= flash_min:
+        from omlx.patches.mimo_v2 import sdpa_flash
+
+        out = sdpa_flash.sdpa_flash(q, k, v, scale, mask, sinks)
+        if out is not None:
+            return out
+    if rows_on and q.shape[2] > 1:
+        from omlx.patches.mimo_v2 import sdpa_rows
+
+        return sdpa_rows.sdpa_rows(q, k, v, scale, mask, sinks)
+    return None
+
+
+def _attention(attn, x, mask, cache, sdpa, offsets_memo, row_chunks, kernels=(False, False, 0)):
     B, L, _ = x.shape
     fused = attn.__dict__.get("_omlx_qkv")
     if fused and not fused.current(attn):
@@ -901,6 +988,11 @@ def _attention(attn, x, mask, cache, sdpa, offsets_memo, row_chunks):
         queries = attn.rope(queries, offset=offset)
         keys = attn.rope(keys, offset=offset)
     keys, values = cache.update_and_fetch(keys, values)
+    output = _vector_attention(
+        queries, keys, values, cache, attn.scale, mask, attn.attention_sink_bias, kernels
+    )
+    if output is not None:
+        return attn.o_proj(output)
     n_rep = max(1, attn.n_heads // attn.n_kv_heads)
     if row_chunks and L > 1 and L * n_rep > _SDPA_VECTOR_ROWS and n_rep <= _SDPA_VECTOR_ROWS:
         output = _sdpa_row_chunks(
@@ -980,10 +1072,17 @@ def run_layers(model, h, cache, full_mask, swa_mask):
     offsets_memo = {}
     use_experts = experts_enabled()
     row_chunks = sdpa_chunks_enabled()
+    # The one-pass kernels replace MLX's own SDPA only; a patched attention
+    # function bound in the model module keeps serving its calls.
+    kernels = (False, False, 0)
+    if _is_mlx_sdpa(sdpa):
+        kernels = (sdpa_rows_enabled(), sdpa_flash_enabled(), _flash_min_keys())
     for i, layer in enumerate(layers):
         nxt = layers[i + 1].input_layernorm if i + 1 < n else model.norm
         mask = swa_mask if layer.is_sliding_window else full_mask
-        a = _attention(layer.self_attn, x, mask, cache[i], sdpa, offsets_memo, row_chunks)
+        a = _attention(
+            layer.self_attn, x, mask, cache[i], sdpa, offsets_memo, row_chunks, kernels
+        )
         post = layer.post_attention_layernorm
         mlp = layer.mlp
         gate = getattr(mlp, "gate", None)
