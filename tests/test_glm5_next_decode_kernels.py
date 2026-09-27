@@ -448,6 +448,33 @@ def _make_pool_caches():
     return PoolingCache(4), KVCache()
 
 
+@pytest.mark.parametrize("pool", [512, 1025, 1026, 1500, 2048])
+def test_dsa_topk_rows_matches_native_topk(pool):
+    """Decode/verify indexer top-k (bitonic sort) against the native
+    radix-select kernel: same indices in the same order, with exact score
+    ties, -1e30 masked blocks and a NaN."""
+    if not _native_indexer_available():
+        pytest.skip("GLM DSA native indexer extension is not built")
+    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
+
+    for rows in (1, 4, 8):
+        for trial in range(4):
+            mx.random.seed(pool + 10 * rows + trial)
+            s = mx.random.normal((1, rows, pool))
+            if trial == 1:
+                s = mx.round(s * 4) / 4
+            if trial == 2:
+                s = mx.where(mx.random.uniform(shape=s.shape) < 0.3, -1e30, s)
+            s = s.astype(mx.bfloat16)
+            if trial == 3:
+                s = s.at[0, 0, 7].add(float("nan"))
+            expected = fast.dsa_topk_indices(s[:, None], 512)[:, 0]
+            got = dk.dsa_topk_rows(s, 512)
+            assert got is not None and got.dtype == expected.dtype
+            assert mx.array_equal(got, expected).item(), (rows, trial)
+
+
 def test_indexer_fast_selection_matches_general_path():
     if not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
@@ -580,7 +607,7 @@ def _check_small_model(seed=41, prompt_len=2101, heads=16):
 
 _ALWAYS_FUSED = {
     "hc_mix", "moe_gate_up", "moe_down", "dsa_scores", "kda", "router", "latent_attn",
-    "multi_qmv", "router_select_fused", "moe_shared_split",
+    "multi_qmv", "router_select_fused", "moe_shared_split", "dsa_topk",
 }
 
 

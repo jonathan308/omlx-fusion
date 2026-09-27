@@ -1412,6 +1412,140 @@ def dsa_decode_scores(
     )[0]
 
 
+# Top-k of the indexer's pooled-block scores for decode/verify rows (at most
+# 2048 blocks): the native radix-select kernel's output, which is a function
+# of the scores alone (keys of the 16-bit ordered score bits; strictly
+# greater keys in index order, then threshold ties in index order), found
+# with a threadgroup bitonic sort of (key, index) instead of two histogram
+# passes over contended threadgroup atomics and two serial bin scans.
+_DSA_TOPK_SOURCE = r"""
+  // One threadgroup (1024 threads) per score row; P <= 2048 scores.
+  const uint tid = thread_position_in_threadgroup.x;
+  const int row = int(threadgroup_position_in_grid.y);
+  const int P = int(dims[0]);
+  const device T* rs = scores + size_t(row) * P;
+  device uint* ro = out + size_t(row) * TOPK;
+  threadgroup uint sorted[2048];
+  threadgroup uint part_g[32];
+  threadgroup uint part_t[32];
+  threadgroup uint tkey[1];
+  const uint lane = tid % 32;
+  const uint sg = tid / 32;
+
+  // Composite sort keys: ordered 16-bit score key, then lower index first.
+  for (uint i = tid; i < 2048u; i += 1024u) {
+    uint v = 0u;
+    if (int(i) < P) {
+      const ushort bits = as_type<ushort>(rs[i]);
+      const uint key = (bits & 0x8000) ? uint((~bits) & 0xffff) : uint(bits | 0x8000);
+      v = (key << 16) | (0xffffu - i);
+    }
+    sorted[i] = v;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // Bitonic sort, descending.
+  for (uint k = 2u; k <= 2048u; k <<= 1) {
+    for (uint j = k >> 1; j > 0u; j >>= 1) {
+      const uint i = ((tid / j) * 2u * j) + (tid % j);
+      const uint p = i + j;
+      const uint a = sorted[i];
+      const uint b = sorted[p];
+      const bool desc = (i & k) == 0u;
+      if ((a < b) == desc) {
+        sorted[i] = b;
+        sorted[p] = a;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+  if (tid == 0) {
+    tkey[0] = sorted[TOPK - 1] >> 16;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint threshold_key = tkey[0];
+
+  // Deterministic output (as the native kernel): strictly greater keys in
+  // index order fill [0, n_greater), threshold ties in index order the rest.
+  const int seg = (P + 1023) / 1024;
+  const int s0 = int(tid) * seg;
+  const int s1 = metal::min(s0 + seg, P);
+  uint local_g = 0, local_t = 0;
+  for (int i = s0; i < s1; ++i) {
+    const ushort bits = as_type<ushort>(rs[i]);
+    const uint key = (bits & 0x8000) ? uint((~bits) & 0xffff) : uint(bits | 0x8000);
+    local_g += key > threshold_key ? 1u : 0u;
+    local_t += key == threshold_key ? 1u : 0u;
+  }
+  const uint pre_g = metal::simd_prefix_exclusive_sum(local_g);
+  const uint pre_t = metal::simd_prefix_exclusive_sum(local_t);
+  if (lane == 31) {
+    part_g[sg] = pre_g + local_g;
+    part_t[sg] = pre_t + local_t;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0) {
+    const uint pg = part_g[lane];
+    const uint pt = part_t[lane];
+    const uint eg = metal::simd_prefix_exclusive_sum(pg);
+    const uint et = metal::simd_prefix_exclusive_sum(pt);
+    part_g[lane] = eg;
+    part_t[lane] = et;
+    if (lane == 31) {
+      tkey[0] = eg + pg;   // total strictly greater
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint n_greater = tkey[0];
+  uint pos_g = part_g[sg] + pre_g;
+  uint pos_t = n_greater + part_t[sg] + pre_t;
+  if (local_g > 0 || (local_t > 0 && pos_t < uint(TOPK))) {
+    for (int j = s0; j < s1; ++j) {
+      const ushort bits = as_type<ushort>(rs[j]);
+      const uint key = (bits & 0x8000) ? uint((~bits) & 0xffff) : uint(bits | 0x8000);
+      if (key > threshold_key) {
+        ro[pos_g++] = uint(j);
+      } else if (key == threshold_key) {
+        if (pos_t < uint(TOPK)) {
+          ro[pos_t++] = uint(j);
+        }
+      }
+    }
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _dsa_topk_kernel():
+    return mx.fast.metal_kernel(
+        name="glm5_dsa_topk_rows",
+        input_names=["scores", "dims"],
+        output_names=["out"],
+        source=_DSA_TOPK_SOURCE,
+    )
+
+
+def dsa_topk_rows(scores: mx.array, topk: int) -> Optional[mx.array]:
+    """``omlx_glm_kernels.dsa_topk_indices(scores[:, None], topk)[:, 0]``
+    (non-bucketed, no causal prefix) for ``scores`` [1, L, P] with L <= 8 and
+    topk <= P <= 2048. Returns [1, L, topk] uint32 or None."""
+    if "dsa_topk" in DISABLED:
+        return None
+    if scores.ndim != 3 or scores.shape[0] != 1 or not 1 <= scores.shape[1] <= 8:
+        return None
+    _, L, P = scores.shape
+    if not 1 <= topk <= P <= 2048 or scores.dtype not in (mx.bfloat16, mx.float16):
+        return None
+    STATS["dsa_topk"] += 1
+    return _dsa_topk_kernel()(
+        inputs=[scores, mx.array([P], dtype=mx.int32)],
+        template=[("T", scores.dtype), ("TOPK", topk)],
+        grid=(1024, L, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(1, L, topk)],
+        output_dtypes=[mx.uint32],
+    )[0]
+
+
 # Expands the selected pooled blocks into token indices exactly like
 # Glm5NextIndexer.__call__ (validity, kpool expansion, left padding, the
 # always-selected tail window and the -1 padding up to the output width).

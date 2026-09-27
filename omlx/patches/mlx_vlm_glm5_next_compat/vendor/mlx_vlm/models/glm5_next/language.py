@@ -692,7 +692,10 @@ class Glm5NextIndexer(nn.Module):
         )
         if scores is None:
             return None
-        selected = self._native_topk(scores, select_k)
+        # Same output as the native top-k (which covers select_k == 512 only).
+        selected = dk.dsa_topk_rows(scores, select_k) if select_k == 512 else None
+        if selected is None:
+            selected = self._native_topk(scores, select_k)
         if selected is None:
             return None
         left_padding = getattr(kv_cache, "left_padding", None)
