@@ -161,9 +161,10 @@ from .worker_bundle import (
     worker_source_digest,
 )
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/admin/api/cluster", tags=["cluster"])
 join_router = APIRouter(prefix="/cluster/join", tags=["cluster-enrollment"])
-logger = logging.getLogger(__name__)
 
 _get_engine_pool: Any | None = None
 
@@ -4836,10 +4837,13 @@ async def _activate_and_report(
         except BaseException as exc:
             # A deployment is not active merely because it passed planning.
             # Remove the failed engine first, then restore the exact registry
-            # record clients saw before this request.
+            # record clients saw before this request. Rollback errors are only
+            # logged, so the caller still gets the readiness failure.
             try:
                 await pool.prepare_cluster_reload(model_id)
-            finally:
+            except Exception:
+                logger.exception("Could not unload failed cluster model %s", model_id)
+            try:
                 if previous is None:
                     await asyncio.to_thread(
                         registry.remove,
@@ -4854,6 +4858,10 @@ async def _activate_and_report(
                         unregister(model_id)
                 else:
                     await asyncio.to_thread(registry.upsert, previous)
+            except Exception:
+                logger.exception(
+                    "Could not restore the cluster registry for %s", model_id
+                )
             if isinstance(exc, Exception):
                 raise DistributedLaunchError(
                     f"Cluster readiness check failed: {exc}"

@@ -2897,8 +2897,11 @@ class TestStopSafety:
 
         mock_inner_engine = MagicMock()
 
+        loaded_at_close = []
+
         def close_side_effect():
             events.append("inner_close")
+            loaded_at_close.append(engine._loaded)
             assert engine._engine is None
             assert engine._vlm_model is None
             assert engine._processor is None
@@ -2914,6 +2917,9 @@ class TestStopSafety:
         await engine.stop()
 
         assert events == ["stop", "vision_cache", "inner_close"]
+        # The memory enforcer reads a loaded engine with no scheduler as a
+        # wrapper break, so the flag must drop together with _engine.
+        assert loaded_at_close == [False]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("release_fails", [False, True])
