@@ -559,17 +559,20 @@ class _CacheFreshnessWait:
 
 # GLM-5.3 prefill chunk on NAX (M5) hosts that run the DSA sparse attention
 # on the tensor units: its cost per query no longer depends on the chunk, so
-# a wider chunk only feeds the 288-expert MoE more rows per expert (M5 Ultra:
-# +3-6% at 4096; 8192 adds another 1-6% but ~10 GB more peak activations).
-_GLM5_NAX_PREFILL_STEP = 4096
+# a wider chunk only feeds the 288-expert MoE more rows per expert (M5 Ultra,
+# stock mlx: 4096 is +3-6% over 2048, 8192 another +2-6% at 16k-64k prompts
+# for ~2 GB more peak memory). Hosts below 128 GB keep 4096-token chunks.
+_GLM5_NAX_PREFILL_STEP = 8192
+_GLM5_NAX_PREFILL_STEP_SMALL_HOST = 4096
 
 
 def _glm5_next_nax_prefill_step() -> int:
     """Prefill floor for GLM-5.3 on NAX hosts (0 keeps the default step).
 
     Needs the tensor-unit sparse MLA path; the paged-cache block follows the
-    floor. OMLX_GLM5_PREFILL_STEP overrides it (0 keeps the default step,
-    e.g. 8192 for more throughput at a larger activation peak).
+    floor, so larger blocks also make prefix-cache reuse coarser.
+    OMLX_GLM5_PREFILL_STEP overrides it (0 keeps the default step, e.g.
+    4096 for finer prefix-cache blocks and a lower activation peak).
     """
     raw = os.environ.get("OMLX_GLM5_PREFILL_STEP", "").strip()
     if raw:
@@ -583,12 +586,13 @@ def _glm5_next_nax_prefill_step() -> int:
         from .settings import get_system_memory
     except ImportError:
         return 0
-    if (
-        is_nax_available()
-        and nax_sparse_mla_available()
-        and get_system_memory() >= 64 * 1024**3
-    ):
+    if not (is_nax_available() and nax_sparse_mla_available()):
+        return 0
+    memory = get_system_memory()
+    if memory >= 128 * 1024**3:
         return _GLM5_NAX_PREFILL_STEP
+    if memory >= 64 * 1024**3:
+        return _GLM5_NAX_PREFILL_STEP_SMALL_HOST
     return 0
 
 
