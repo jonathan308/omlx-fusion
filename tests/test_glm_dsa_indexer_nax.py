@@ -178,6 +178,17 @@ def _run_indexer(indexer, chunks, seed=5):
     return outs
 
 
+def _require_native_scores():
+    """The non-NAX indexer path these tests compare against scores with the
+    native kernel; without it that path falls back to MLX ops, which round
+    the scores differently, so the exactness and near-tie bounds do not
+    apply."""
+    from omlx.custom_kernels.glm_moe_dsa import fast
+
+    if not fast.has_symbol("dsa_indexer_scores"):
+        pytest.skip("native DSA indexer kernel unavailable")
+
+
 def _native_masked_scores(q, pool_keys, weights, before, pool_len, ratio):
     """The previous call-site computation: native kernel + mx.where mask."""
     from mlx_vlm.models.glm5_next import language
@@ -198,6 +209,7 @@ def _native_masked_scores(q, pool_keys, weights, before, pool_len, ratio):
 def test_indexer_fast_path_plumbing_is_exact(monkeypatch):
     """With the old score computation plugged in, the all-rows fast path
     returns bit-identical top-k indices to the 512-row loop."""
+    _require_native_scores()
     from mlx_vlm.models.glm5_next import language
 
     indexer = _make_indexer()
@@ -217,6 +229,7 @@ def test_indexer_fast_path_plumbing_is_exact(monkeypatch):
 
 
 def test_indexer_nax_selection_matches_up_to_near_ties(monkeypatch):
+    _require_native_scores()
     from mlx_vlm.models.glm5_next import language
 
     indexer = _make_indexer()
@@ -278,6 +291,7 @@ def test_topk_differences_are_threshold_near_ties():
 def test_indexer_without_cache(monkeypatch):
     """Cache-less prefill (positions from 0) takes the NAX path and selects
     the same pools as the native path (up to near ties)."""
+    _require_native_scores()
     from mlx_vlm.models.glm5_next import language
 
     indexer = _make_indexer()
