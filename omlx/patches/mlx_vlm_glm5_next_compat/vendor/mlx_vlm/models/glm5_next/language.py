@@ -91,8 +91,24 @@ def _cache_parts(cache):
 # Single-sequence decode (L == 1) and short verify blocks (L <= 8, the
 # DECODE_BLOCK_SIZE of the shared HC helpers) run fused kernels that
 # reproduce the reference op graph bit for bit; see decode_kernels.py.
-# OMLX_GLM5_DECODE_FUSION=0 restores the reference graph.
-_DECODE_FUSION = os.environ.get("OMLX_GLM5_DECODE_FUSION", "1") != "0"
+# They are validated bit for bit on M5 (NAX) GPUs and are used there by
+# default; OMLX_GLM5_DECODE_FUSION=1 forces them on elsewhere and =0 restores
+# the reference graph everywhere.
+
+
+def _decode_fusion_default() -> bool:
+    value = os.environ.get("OMLX_GLM5_DECODE_FUSION", "").strip()
+    if value in ("0", "1"):
+        return value == "1"
+    try:
+        from omlx.custom_kernels.nax import is_nax_available
+
+        return bool(is_nax_available())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_DECODE_FUSION = _decode_fusion_default()
 _DECODE_BLOCK = 8
 
 
