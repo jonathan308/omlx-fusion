@@ -590,7 +590,10 @@ class _RegisteredRow(NamedTuple):
 
 _UID_ROW_REGISTRY_MAX = 4096
 _QWEN4_WIDE_PREFILL_STEP = 8192
-_QWEN4_WIDE_PREFILL_MIN_TOKENS = 2048 + _QWEN4_WIDE_PREFILL_STEP
+# With SSD-backed PLE the first chunk stays narrow; widen as soon as a full
+# narrow chunk remains after it: the wide step only feeds the expert GEMMs
+# more rows per expert, it never waits for the whole 8192 to be available.
+_QWEN4_WIDE_PREFILL_MIN_TOKENS = 2048 + 2048
 # Keyed by (id(model), uid): mlx-lm's BatchGenerator numbers uids per
 # instance starting at 0, so two engines serving concurrently (or an engine
 # reload) produce colliding uid sequences. The model object is the one
@@ -2197,6 +2200,9 @@ class Scheduler:
         # prefill step changes cache-ON from one forward into multiple forwards.
         self._qwen35_prefill_floor = self._detect_qwen35_prefill_floor()
         self._qwen4_wide_prefill_step = self._detect_qwen4_wide_prefill_step()
+        self._qwen4_wide_first_chunk = bool(
+            self._qwen4_wide_prefill_step
+        ) and not self._qwen4_ple_gathers_ahead()
         self._glm_dsa_adaptive_prefill = None
         try:
             from .patches.glm_moe_dsa.generate_patch import (
@@ -3302,7 +3308,7 @@ class Scheduler:
         return 0
 
     def _detect_qwen4_wide_prefill_step(self) -> int:
-        """Return the step used after the first chunk of long Qwen4-Exp prompts."""
+        """Return the wide Qwen4-Exp prefill step (0 when the host cannot use it)."""
         try:
             model_type = str(getattr(self.model, "model_type", "") or "")
             if not model_type:
@@ -3325,6 +3331,32 @@ class Scheduler:
         except Exception:
             logger.debug("qwen4 wide prefill probe failed", exc_info=True)
         return 0
+
+    def _qwen4_ple_gathers_ahead(self) -> bool:
+        """True when SSD-backed PLE rows are gathered one prefill chunk ahead.
+
+        Only then does a narrow first chunk buy anything: it lets the gather
+        of the next chunk overlap GPU work. Resident PLE tables have no
+        gather-ahead, and unknown layouts count as gathering ahead.
+        """
+        if getattr(self.model, "prefetch_ple", None) is None:
+            return False
+        language_model = getattr(self.model, "_language_model", None) or getattr(
+            self.model, "language_model", None
+        )
+        layers = getattr(getattr(language_model, "model", None), "layers", None)
+        if layers is None:
+            return True
+        try:
+            for layer in layers:
+                ple = getattr(layer, "ple", None)
+                embedding = getattr(getattr(ple, "ple_embedding", None), "ngram_embedding", None)
+                if getattr(embedding, "prefetch", None) is not None:
+                    return True
+        except Exception:
+            logger.debug("qwen4 PLE gather-ahead probe failed", exc_info=True)
+            return True
+        return False
 
     # Default block size for ArraysCache-only hybrid models. Raise the effective
     # target to the configured/model-specific prefill step so cache ON/OFF use
@@ -6213,15 +6245,21 @@ class Scheduler:
             if floor and size < floor:
                 size = floor
             wide = getattr(self, "_qwen4_wide_prefill_step", 0)
-            if (
-                wide
-                and processed_tokens > 0
-                and processed_tokens + remaining_tokens
-                >= _QWEN4_WIDE_PREFILL_MIN_TOKENS
+            if wide and (
+                (
+                    processed_tokens > 0
+                    and processed_tokens + remaining_tokens
+                    >= _QWEN4_WIDE_PREFILL_MIN_TOKENS
+                )
+                or (
+                    processed_tokens == 0
+                    and getattr(self, "_qwen4_wide_first_chunk", False)
+                )
             ):
-                # Wide steps feed the expert GEMMs more rows per expert. The
-                # first chunk stays narrow so the SSD n-gram gather for the
-                # next chunk overlaps GPU work.
+                # Wide steps feed the expert GEMMs more rows per expert. With
+                # SSD-backed PLE the first chunk stays narrow so the n-gram
+                # gather for the next chunk overlaps GPU work; resident PLE has
+                # nothing to overlap, so the first chunk is wide too.
                 size = max(size, wide)
                 if getattr(self, "block_aware_cache", None) is None:
                     # No block clamp runs; end on the grid that cache-ON uses.
