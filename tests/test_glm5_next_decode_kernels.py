@@ -1626,3 +1626,56 @@ def test_decode_early_eval_only_schedules(every, monkeypatch):
         for x, y in zip(a.state, b.state):
             if isinstance(x, mx.array):
                 assert _mismatches(x, y) == 0
+
+
+def test_compiled_decode_releases_the_weights_when_the_model_is_dropped():
+    """One-token steps compile each layer's FFN half around multi-output fused
+    kernels (router logits, route-selecting gate/up, HC pre/post). MLX 0.32.2
+    leaks such intermediates of a compiled trace with everything they reference
+    (ml-explore/mlx#4453): with the weights as trace constants, dropping the
+    model left MoE layers' routed gate/up experts allocated (~73 MB per layer
+    here, ~2.5 GB on GLM-5.3). Runs on a worker thread whose final
+    ``mx.clear_streams()`` drops its compile cache, like an engine thread."""
+    import gc
+    import threading
+
+    result = {}
+
+    def work():
+        gc.collect()
+        mx.clear_cache()
+        base = mx.get_active_memory()
+        # Pausing the collector makes the groups MLX 0.32.2 leaks deterministic
+        # here (one to three MoE layers' gate/up experts without the fix).
+        gc.disable()
+        try:
+            run()
+        finally:
+            gc.enable()
+        gc.collect()
+        mx.synchronize()
+        mx.clear_streams()
+        gc.collect()
+        mx.clear_cache()
+        result["leak"] = mx.get_active_memory() - base
+
+    def run():
+        model = _fused_shape_model(7)
+        cache = model.make_cache()
+        prompt = mx.random.randint(0, 256, (1, 64)).astype(mx.int32)
+        logits = model(prompt, cache=cache).logits
+        token = mx.argmax(logits[:, -1:], axis=-1).astype(mx.int32)
+        before = dict(_stats())
+        for _ in range(3):
+            logits = model(token, cache=cache).logits
+            token = mx.argmax(logits[:, -1:], axis=-1).astype(mx.int32)
+            mx.eval(token)
+        result["router_select_fused"] = _stats()["router_select_fused"] - before.get(
+            "router_select_fused", 0
+        )
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    worker.join()
+    assert result["router_select_fused"] > 0  # the compiled fused MoE path ran
+    assert result["leak"] < (1 << 20), f"{result['leak']} bytes still active"

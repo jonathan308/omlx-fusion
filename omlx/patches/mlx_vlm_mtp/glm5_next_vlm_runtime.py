@@ -366,7 +366,14 @@ def _patch_decoder_layer(g5_lang: Any) -> None:
             and 1 <= x.shape[1] <= _MAX_CHAIN_DEPTH + 1
         ):
             if self._ffn_c is None:
-                self._ffn_c = mx.compile(self._ffn_block)
+                # The vendor's compile keeps the layer's weights out of the
+                # trace's constants (a leaked trace would pin them in memory).
+                compile_ffn_block = getattr(g5_lang, "compile_ffn_block", None)
+                self._ffn_c = (
+                    compile_ffn_block(self, self._ffn_block)
+                    if compile_ffn_block is not None
+                    else mx.compile(self._ffn_block)
+                )
             return self._ffn_c(x)
         return self._ffn_block(x)
 
