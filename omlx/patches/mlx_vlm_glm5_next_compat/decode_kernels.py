@@ -1368,6 +1368,42 @@ _KDA_SOURCE = r"""
     as_[t][i] = a_pre[t * QKV + h * DK + i];
     gates[t][i] = gate_pre[t * QKV + h * DK + i];
   }
+#elif GATE5
+  // One token, 5-bit K = 128 rows: MLX's qmv (qmv_impl): lanes 0..15 load
+  // 8 values each (load_vector_safe / qdot_safe with N = 8, i.e. load_vector
+  // / qdot), lanes 16..31 add nothing, one simd_sum per row.
+  {
+    static_assert(TOK == 1 && DK == 128, "5-bit gate rows: one token");
+    constexpr int WBYTES = 128 * 5 / 8;           // 80 bytes per weight row
+    constexpr int G = 128 / GS;                   // groups per row
+    for (int rr = 0; rr < (2 * DK) / 32; rr++) {
+      const int q = int(sg) * ((2 * DK) / 32) + rr;
+      const int which = q / DK;
+      const int i = q % DK;
+      const int row = h * DK + i;
+      float result = 0;
+      if (lane < 16u) {
+        const device T* xin = proj + (which == 0 ? OFF_FA : OFF_GA) + int(lane) * 8;
+        float x_thread[8];
+        float sum = glm_load_vector<T, 8, 5>(xin, x_thread);
+        const device uint8_t* wl = (const device uint8_t*)(which == 0 ? fb_w : gb_w)
+            + size_t(row) * WBYTES + int(lane) * 5;
+        const device T* sl = (which == 0 ? fb_s : gb_s) + row * G + int(lane) / (GS / 8);
+        const device T* bl = (which == 0 ? fb_b : gb_b) + row * G + int(lane) / (GS / 8);
+        const float s = sl[0];
+        const float b = bl[0];
+        result += glm_qdot<8, 5>(wl, x_thread, s, b, sum);
+      }
+      result = simd_sum(result);
+      if (lane == 0) {
+        if (which == 0) {
+          as_[0][i] = static_cast<T>(result);
+        } else {
+          gates[0][i] = static_cast<T>(result);
+        }
+      }
+    }
+  }
 #else
   {
     constexpr int VPT = 32;                       // values per thread (K = 128)
@@ -1532,6 +1568,7 @@ def _kda_kernel(
     pre_ag: bool,
     sig_b_precise: bool = False,
     sig_g_precise: bool = False,
+    gate5: bool = False,
 ):
     inputs = ["proj", "conv_w", "a_log", "dt_bias", "norm_w", "consts"]
     if has_conv_state:
@@ -1545,7 +1582,7 @@ def _kda_kernel(
     return mx.fast.metal_kernel(
         name=(
             f"glm5_kda_decode_c{int(has_conv_state)}_s{int(has_state)}_p{int(pre_ag)}"
-            f"_b{int(sig_b_precise)}_g{int(sig_g_precise)}"
+            f"_b{int(sig_b_precise)}_g{int(sig_g_precise)}{'_q5' if gate5 else ''}"
         ),
         input_names=inputs,
         output_names=["y", "conv_state_out", "state_out"],
@@ -1557,6 +1594,7 @@ def _kda_kernel(
             PRE_AG=int(pre_ag),
             SIG_B_PRECISE=int(sig_b_precise),
             SIG_G_PRECISE=int(sig_g_precise),
+            GATE5=int(gate5),
         ),
     )
 
@@ -1633,7 +1671,11 @@ def kda_decode_step(
         if any(p is None for p in parts):
             return None
         (fw, fs, fbias, fbits, fgs), (gw, gs_, gbias, gbits, ggs) = parts
-        if (fbits, fgs) != (gbits, ggs) or fbits not in (4, 8) or fgs not in (32, 64, 128):
+        if (fbits, fgs) != (gbits, ggs) or fgs not in (32, 64, 128):
+            return None
+        # 4/8 bits: MLX's qmv_quad (any token count). 5 bits: the one-row
+        # qmv (more rows take qmv_wide, which is not replayed).
+        if fbits not in (4, 8) and not (fbits == 5 and T == 1):
             return None
         if fw.shape != (qkv, 128 * fbits // 32) or gw.shape != fw.shape:
             return None
@@ -1656,8 +1698,11 @@ def kda_decode_step(
     sig_g = eager_sigmoid_precise(mx.float32)
     if sig_b is None or sig_g is None:
         return None
-    kernel = _kda_kernel(conv_state is not None, state is not None, pre, sig_b, sig_g)
+    gate5 = not pre and dict(template)["BITS"] == 5
+    kernel = _kda_kernel(conv_state is not None, state is not None, pre, sig_b, sig_g, gate5)
     STATS["kda"] += 1
+    if gate5:
+        STATS["kda_gate5"] += 1
     y, conv_out, state_out = kernel(
         inputs=inputs,
         template=template,

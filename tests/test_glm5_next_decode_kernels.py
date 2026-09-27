@@ -647,8 +647,9 @@ def test_eager_sigmoid_probe_reproduces_mx_sigmoid():
         assert _mismatches(exact if precise else default, mx.sigmoid(x)) == 0
 
 
+@pytest.mark.parametrize("gate_bits", [8, 5])
 @pytest.mark.parametrize("seed", range(20, 30))
-def test_kda_decode_step_seed_sweep_is_bitwise_reference(seed, monkeypatch):
+def test_kda_decode_step_seed_sweep_is_bitwise_reference(seed, gate_bits, monkeypatch):
     """The reference's beta and output-gate sigmoids are eager mx.sigmoid
     kernels, whose exp differs between MLX builds (precise in the release
     wheel's precompiled kernels); several of these seeds differed in a few
@@ -656,7 +657,7 @@ def test_kda_decode_step_seed_sweep_is_bitwise_reference(seed, monkeypatch):
     the runtime-compiled exp."""
     _skip_under_mtp_runtime()
     language = _language()
-    layer = _kda_layer(seed=seed)
+    layer = _kda_layer(seed=seed, gate_bits=gate_bits)
     fused_cache, reference_cache = _arrays_cache(), _arrays_cache()
     prompt = (mx.random.normal((1, 12, 1024)) * 0.8).astype(mx.bfloat16)
     monkeypatch.setattr(language, "_DECODE_FUSION", False)
@@ -667,7 +668,10 @@ def test_kda_decode_step_seed_sweep_is_bitwise_reference(seed, monkeypatch):
         monkeypatch.setattr(language, "_DECODE_FUSION", False)
         reference = layer(x, cache=reference_cache)
         monkeypatch.setattr(language, "_DECODE_FUSION", True)
+        gate5 = _stats()["kda_gate5"]
         fused = layer(x, cache=fused_cache)
+        # 5-bit gate rows are replayed in the kernel for one token only.
+        assert _stats()["kda_gate5"] - gate5 == int(gate_bits == 5 and width == 1)
         mx.eval(reference, fused, fused_cache.cache, reference_cache.cache)
         assert _mismatches(fused, reference) == 0, f"step {step} width {width}"
         assert _mismatches(fused_cache[1], reference_cache[1]) == 0

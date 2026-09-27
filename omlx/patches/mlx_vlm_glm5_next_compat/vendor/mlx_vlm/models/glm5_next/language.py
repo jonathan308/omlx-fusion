@@ -443,7 +443,10 @@ class Glm5NextLinearAttention(nn.Module):
         a_pre = gate_pre = None
         f_b, g_b = fg.f_b_proj, self.g_b_proj
         bits = {getattr(m, "bits", None) for m in (f_b, g_b)}
-        if not (isinstance(f_b, nn.QuantizedLinear) and bits <= {4, 8} and len(bits) == 1):
+        # The kernel replays the gate projections for 4/8-bit rows (qmv_quad)
+        # and, for one token, 5-bit rows (qmv); otherwise they run here.
+        in_kernel = {4, 8} | ({5} if S == 1 else set())
+        if not (isinstance(f_b, nn.QuantizedLinear) and bits <= in_kernel and len(bits) == 1):
             a_pre = linear_forward(f_b, proj[..., v_end:fa_end])
             gate_pre = linear_forward(g_b, proj[..., fa_end:ga_end])
         result = _decode_kernels.kda_decode_step(
