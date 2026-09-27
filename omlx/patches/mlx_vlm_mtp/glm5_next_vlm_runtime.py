@@ -57,6 +57,9 @@ _MAX_CHAIN_DEPTH = 7
 # half and the sparse attention already did. OMLX_GLM5_MTP_FUSED_VERIFY=0
 # keeps the reference ops there (same values, slower).
 _FUSED_VERIFY = os.environ.get("OMLX_GLM5_MTP_FUSED_VERIFY", "1").strip() != "0"
+# Verify blocks (2..8 rows) start evaluating every _DECODE_EVAL_EVERY layers
+# while the rest of the forward is built, like one-token decode steps.
+_VERIFY_EARLY_EVAL = os.environ.get("OMLX_GLM5_MTP_VERIFY_EARLY_EVAL", "1").strip() != "0"
 
 # Source-side prefixes for the nextn MTP layer. glm5_next checkpoints use the
 # VLM-nested form; the other two are accepted so a text-only re-export or a
@@ -524,6 +527,10 @@ def _patch_model_call(g5_lang: Any) -> None:
         # layer, as Glm5NextModel.__call__ does.
         deferred_cls = getattr(g5_lang, "_HCDeferred", None)
         defer = deferred_cls is not None and gdn_sink is None and h.shape[:2] == (1, 1)
+        if _VERIFY_EARLY_EVAL and 1 < h.shape[1] <= _MAX_CHAIN_DEPTH + 1:
+            # Verify blocks are as dispatch-bound as one-token steps: start
+            # evaluating them the same way (scheduling only, same values).
+            eval_every = getattr(g5_lang, "_DECODE_EVAL_EVERY", 0)
 
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
