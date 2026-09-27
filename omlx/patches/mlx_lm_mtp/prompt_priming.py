@@ -1476,6 +1476,11 @@ def maybe_capture(host, inputs, normed, cache):
                     inputs[row : row + 1, :valid],
                     normed[row : row + 1, :valid],
                     [SimpleNamespace(offset=offset)],
+                    # A row this scope prefilled from offset 0 (its skipped
+                    # chunks are its own; see _tail_restart_on_own_prefix).
+                    own_prefix=(
+                        int(offsets[row]) == 0 if prefill is not None else None
+                    ),
                 )
                 state.uids[uid] = _slot(host)
         finally:
@@ -1618,8 +1623,34 @@ def _flush_deferred_history(model, ctx, chunk_size=512):
     ctx.deferred_pairs = []
 
 
+def _tail_restart_on_own_prefix(
+    host: Any, plan: Optional[_PrimePlan], seq_start: int, own_prefix: Optional[bool]
+) -> bool:
+    """Whether a tail-only head may start a timeline at ``seq_start`` > 0.
+
+    claim_superseded_tail_chunk skips the capture of prefill chunks whose
+    tail a later chunk replaces, so a cold prompt's last chunk arrives with
+    no context. A tail-only head (``_omlx_mtp_prime_tail``) restarts from
+    every multi-token chunk after the first, discarding what earlier chunks
+    folded, so starting it on that chunk as a restart gives the head state
+    of capturing every chunk. Only a timeline this request prefilled from
+    offset 0 qualifies (``own_prefix`` from the batched scope's row offset,
+    else the scheduler plan's zero cached prefix); a restored prefix-cache
+    hit keeps Fusion's fail-closed start.
+    """
+    if seq_start <= 0 or not getattr(host, "_omlx_mtp_prime_tail", None):
+        return False
+    if own_prefix is not None:
+        return bool(own_prefix)
+    return plan is not None and int(plan.cached_tokens) == 0
+
+
 def _capture_single(
-    host: Any, inputs: Any, normed: Any, cache: Optional[List[Any]]
+    host: Any,
+    inputs: Any,
+    normed: Any,
+    cache: Optional[List[Any]],
+    own_prefix: Optional[bool] = None,
 ) -> None:
     """Fold this forward's (hidden, next_token) pairs into the priming cache.
 
@@ -1718,6 +1749,7 @@ def _capture_single(
         # durable history and verifies every draft.
         restored_suffix = offset_after != seq_len
         suffix_local = qwen4_suffix_capable
+        tail_restart = False
         if suffix_local:
             if not (
                 _text_only_suffix_plan(host, plan)
@@ -1734,8 +1766,12 @@ def _capture_single(
             # Fusion intentionally keeps generic/DS4 partial-history capture
             # fail-closed.  Only the explicitly tagged Qwen4 target can prove
             # that its absolute target history and local verified-drafter
-            # history are safe to advance on separate timelines.
-            return
+            # history are safe to advance on separate timelines.  A tail-only
+            # head whose earlier chunks of this prompt were superseded starts
+            # here as the restart it would have taken anyway.
+            if not _tail_restart_on_own_prefix(host, plan, seq_start, own_prefix):
+                return
+            tail_restart = True
         if not suffix_local and seq_len <= 1:
             # A lone decode step cannot start a prompt timeline.
             return
@@ -1771,6 +1807,11 @@ def _capture_single(
             return
         if suffix_local and mtp_cache_offset(ctx.mtp_cache) != 0:
             return
+        if tail_restart:
+            # Same state as the restart below (which a chunk no longer than
+            # the tail would not take on a fresh context): only this chunk's
+            # pairs, never published as a boundary snapshot.
+            ctx.tail_only = True
         setattr(host, _CTX_ATTR, ctx)
 
     tail = getattr(host, "_omlx_mtp_prime_tail", None)
