@@ -13,6 +13,7 @@ from .activations import swiglu
 from omlx.utils.fast_attention import (
     blocked_sliding_window_attention,
     mixed_head_dim_sdpa,
+    window_query_padding,
 )
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
@@ -144,8 +145,20 @@ class Attention(nn.Module):
     ) -> mx.array:
         B, L, _ = x.shape
 
+        # Blocked window attention runs whole 128-query blocks. Padding the
+        # (hidden-wide) projection input costs a third of padding the
+        # (64 x 192-wide) queries; projection and RoPE are row-wise, so the
+        # real rows are bit-identical and the padded ones are dropped.
+        q_pad = (
+            window_query_padding(L)
+            if self.is_sliding_window and B == 1 and not hasattr(cache, "bits")
+            else 0
+        )
+        q_in = mx.pad(x, [(0, 0), (0, q_pad), (0, 0)]) if q_pad else x
         queries = (
-            self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim).swapaxes(1, 2)
+            self.q_proj(q_in)
+            .reshape(B, L + q_pad, self.n_heads, self.head_dim)
+            .swapaxes(1, 2)
         )
         keys = (
             self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim).swapaxes(1, 2)
@@ -181,6 +194,7 @@ class Attention(nn.Module):
                     window=self.sliding_window_size,
                     sinks=self.attention_sink_bias,
                     mask=mask,
+                    query_len=L,
                 )
             else:
                 output = mixed_head_dim_sdpa(
@@ -192,6 +206,8 @@ class Attention(nn.Module):
                     sinks=self.attention_sink_bias,
                 )
         if output is None:
+            if q_pad:
+                queries = queries[:, :, :L]
             output = scaled_dot_product_attention(
                 queries,
                 keys,

@@ -171,6 +171,41 @@ def test_mixed_cache_forward_and_continuous_batching():
     assert all(response.finish_reason == "length" for response in finished)
 
 
+def test_window_layers_pad_the_projection_input_not_the_queries(monkeypatch):
+    """Padding the q_proj input for the blocked window path is bit-exact."""
+    mimo_v2 = _load_patch_module()
+    from omlx.utils import fast_attention
+
+    mx.random.seed(5)
+    config = _minimal_config(sliding_window_size=128, hybrid_layer_pattern=[1, 1, 0, 1])
+    model = mimo_v2.Model(mimo_v2.ModelArgs.from_dict(config))
+    model.set_dtype(mx.bfloat16)
+    first_chunk = mx.random.randint(0, 1000, (1, 300))  # 84 padding rows
+    second_chunk = mx.random.randint(0, 1000, (1, 257))  # 127, after a prefix
+    real_pad = mimo_v2.window_query_padding
+    asked = []
+
+    def run(pad_fn):
+        monkeypatch.setattr(mimo_v2, "window_query_padding", pad_fn)
+        cache = model.make_cache()
+        out = [model(first_chunk, cache=cache), model(second_chunk, cache=cache)]
+        mx.eval(out)
+        return out
+
+    padded = run(lambda n: asked.append(n) or real_pad(n))
+    assert set(asked) == {300, 257}
+    unpadded = run(lambda n: 0)  # the blocked path pads the queries itself
+    for a, b in zip(padded, unpadded):
+        assert mx.array_equal(a, b).item()
+
+    monkeypatch.setattr(fast_attention, "_ENABLED", False)  # masked full SDPA
+    reference = run(real_pad)
+    for a, b in zip(padded, reference):
+        assert mx.allclose(
+            a.astype(mx.float32), b.astype(mx.float32), atol=5e-2, rtol=5e-2
+        ).item()
+
+
 def test_sanitize_handles_fused_fp8_and_text_only_weights():
     mimo_v2 = _load_patch_module()
     config = _minimal_config(
