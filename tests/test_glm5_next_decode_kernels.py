@@ -27,6 +27,20 @@ def _apply_glm5_next_compat():
     compat.apply_mlx_vlm_glm5_next_compat_patch()
 
 
+def _skip_under_mtp_runtime():
+    """Model-level fused decode checks need the vendor layer calls.
+
+    ``glm5_next_vlm_runtime.apply()`` (MTP checkpoints) replaces the layer
+    ``__call__`` methods process-wide and those bodies do not route the fused
+    decode kernels, so once an earlier test in the process applied it these
+    checks do not apply.
+    """
+    from omlx.patches.mlx_vlm_mtp import glm5_next_vlm_runtime
+
+    if getattr(glm5_next_vlm_runtime, "_APPLIED", False):
+        pytest.skip("glm5_next MTP runtime replaced the layer calls in this process")
+
+
 def _language():
     from mlx_vlm.models.glm5_next import language
 
@@ -497,6 +511,7 @@ _ALWAYS_FUSED = {
 
 
 def test_small_model_decode_and_verify_logits_are_bitwise_reference():
+    _skip_under_mtp_runtime()
     if not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
     used = _check_small_model()
@@ -504,6 +519,7 @@ def test_small_model_decode_and_verify_logits_are_bitwise_reference():
 
 
 def test_small_model_dense_attention_is_bitwise_reference():
+    _skip_under_mtp_runtime()
     from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
 
     used = _check_small_model(seed=43, prompt_len=300)
@@ -576,6 +592,7 @@ def _arrays_cache():
 
 @pytest.mark.parametrize("gate_bits", [8, 5])
 def test_kda_decode_step_is_bitwise_reference(gate_bits, monkeypatch):
+    _skip_under_mtp_runtime()
     language = _language()
     layer = _kda_layer(gate_bits=gate_bits, seed=gate_bits)
     fused_cache, reference_cache = _arrays_cache(), _arrays_cache()
@@ -599,6 +616,7 @@ def test_kda_decode_step_is_bitwise_reference(gate_bits, monkeypatch):
 
 @pytest.mark.parametrize("width", [1, 4])
 def test_kda_decode_step_from_empty_cache(width, monkeypatch):
+    _skip_under_mtp_runtime()
     language = _language()
     layer = _kda_layer(seed=30 + width)
     x = (mx.random.normal((1, width, 1024)) * 0.7).astype(mx.bfloat16)
@@ -1200,6 +1218,7 @@ def test_upstream_kda_prefill_then_fused_decode_is_bitwise_reference(monkeypatch
     """Caches written by upstream's fused KDA prefill (glm53_kda_prework,
     >= 64-row chunks; the test prompts' 512-token chunks) feed the fused
     decode and verify paths exactly like the stock prefill's."""
+    _skip_under_mtp_runtime()
     try:
         from omlx.patches import glm53_kda_prework as prework
     except ImportError:
