@@ -38,6 +38,7 @@ from omlx.utils.layer_pipeline import LayerPipeline
 import mlx.core as mx
 import mlx.nn as nn
 
+from .. import glm53_kda_prework
 from ..mlx_lm_mtp import prompt_priming
 from .glm5_next_batch_rollback import rollback_rows
 
@@ -240,6 +241,12 @@ def _patch_linear_attention(g5_lang: Any) -> None:
 
     def __call__(self, inputs, mask=None, cache=None, gdn_sink=None):
         B, S, _ = inputs.shape
+        # Same fused KDA prefill route as the vendor body's gate. The verify
+        # capture path needs the stock locals, so it never takes the shortcut.
+        if gdn_sink is None and glm53_kda_prework.glm53_kda_prefill_eligible(
+            self, inputs, mask, cache
+        ):
+            return glm53_kda_prework.glm53_kda_prefill(self, inputs, cache)
         has_right_padding = cache is not None and cache.lengths is not None
         if has_right_padding:
             mask = mx.arange(S)[None] < cache.lengths[:, None]
@@ -410,7 +417,9 @@ def _patch_model_call(g5_lang: Any) -> None:
 
         # This replaces Glm5NextModel.__call__; preserve its prefill memory policy.
         prefill = h.shape[1] >= 256
-        pipeline = LayerPipeline() if prefill else None
+        # Each completed layer is waited for and the allocator cache is
+        # released (layer-specific buffer sizes would otherwise accumulate).
+        pipeline = LayerPipeline(on_evaluated=mx.clear_cache) if prefill else None
 
         for layer, c in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
@@ -420,6 +429,8 @@ def _patch_model_call(g5_lang: Any) -> None:
                 h = layer(h, mask=mask, cache=c)
             if pipeline is not None:
                 pipeline.push(h)
+        if pipeline is not None:
+            pipeline.drain()
 
         # Collapse the mHC streams first: everything downstream (the final
         # norm, the lm_head, and the nextn head) consumes the ordinary

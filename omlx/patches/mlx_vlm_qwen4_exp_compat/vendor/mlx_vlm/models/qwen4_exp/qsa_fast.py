@@ -27,45 +27,41 @@ _NATIVE_QSA_TOPK_DISABLED = False
 _NATIVE_QSA_TOPK_PROVEN = False
 _NATIVE_QSA_MAIN_DISABLED = False
 _NATIVE_QSA_MAIN_PROVEN = False
+_NAX_QSA_MAIN_DISABLED = False
+_NAX_QSA_MAIN_PROVEN = False
 
 
-def _nax_gpu() -> bool:
-    try:
-        from omlx.custom_kernels.nax import is_nax_available
-
-        return bool(is_nax_available())
-    except Exception:
-        return False
-
-
-def _min_rows(env: str, nax_default: int) -> int:
+def _min_rows(env: str, default: int) -> int:
     raw = os.environ.get(env, "").strip()
     if raw:
         try:
             return max(0, int(raw))
         except ValueError:
             pass
-    return nax_default if _nax_gpu() else 0
+    return default
 
 
+# Measured on M5 (NAX) and M3 Ultra alike. On M3 Ultra Flash-Next at 64k the
+# thresholds took Lightning MTP from 48 to 63-65 tok/s and decode from 50.8 to
+# 52.3 tok/s.
 @functools.lru_cache(maxsize=None)
 def _native_score_min_rows() -> int:
     """Query rows from which the native indexer-score kernel engages; below it the
-    MLX ops are faster on NAX GPUs (0.27 vs 0.36-0.77 ms per layer at 1-16 rows)."""
+    MLX ops are faster (NAX: 0.27 vs 0.36-0.77 ms per layer at 1-16 rows)."""
     return _min_rows("OMLX_QWEN4_QSA_NATIVE_SCORE_MIN_ROWS", 32)
 
 
 @functools.lru_cache(maxsize=None)
 def _native_topk_min_rows() -> int:
     """Query rows from which the native top-k engages; argpartition ties or wins
-    below it on NAX GPUs (0.26-0.31 vs 0.26 ms per layer at one row)."""
+    below it (NAX: 0.26-0.31 vs 0.26 ms per layer at one row)."""
     return _min_rows("OMLX_QWEN4_QSA_NATIVE_TOPK_MIN_ROWS", 8)
 
 
 @functools.lru_cache(maxsize=None)
 def _native_main_min_rows() -> int:
     """Query rows from which the native sparse GQA kernel engages; the gathered SDPA
-    is faster below it on NAX GPUs (0.7 vs 1.6 ms per layer at verify width)."""
+    is faster below it (NAX: 0.7 vs 1.6 ms per layer at verify width)."""
     return _min_rows("OMLX_QWEN4_QSA_NATIVE_MAIN_MIN_ROWS", 24)
 
 
@@ -77,6 +73,16 @@ def contiguous_causal_query_chunk(key_tokens: int) -> int:
     if key_tokens <= 16384:
         return 64
     return 128
+
+
+def _native_causal_query_chunk(key_tokens: int) -> int:
+    """Amortize native QSA dispatches while bounding its FP32 score sheet."""
+
+    if key_tokens <= 32768:
+        return 4096
+    if key_tokens <= 65536:
+        return 2048
+    return 1024
 
 
 _TOKEN_MAJOR_MIN_QUERIES = 32
@@ -358,6 +364,66 @@ def _native_sparse_gqa_attention(
         return None
 
 
+def _nax_sparse_gqa_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    selected_blocks: mx.array,
+    *,
+    q_offset: int,
+) -> mx.array | None:
+    """Tensor-unit QSA over per-tile unions of the selected blocks, or None.
+
+    Same contract and geometry as :func:`_native_sparse_gqa_attention`
+    (bf16 only); a compile or dispatch failure disables it for the process.
+    """
+
+    global _NAX_QSA_MAIN_DISABLED, _NAX_QSA_MAIN_PROVEN
+    if _NAX_QSA_MAIN_DISABLED:
+        return None
+    from . import qsa_nax
+
+    if (
+        not qsa_nax.enabled()
+        or queries.ndim != 4
+        or queries.shape[0] != 1
+        or queries.shape[1] != 24
+        or queries.shape[-1] != 256
+        or keys.ndim != 4
+        or values.shape != keys.shape
+        or keys.shape[0] != 1
+        or keys.shape[1] != 2
+        or keys.shape[-1] != 256
+        or queries.dtype != mx.bfloat16
+        or keys.dtype != mx.bfloat16
+        or values.dtype != mx.bfloat16
+        or selected_blocks.ndim != 3
+        or selected_blocks.shape != (1, queries.shape[2], 512)
+        or q_offset < 0
+        or q_offset + queries.shape[2] > keys.shape[2]
+    ):
+        return None
+    if queries.shape[2] < _native_main_min_rows() or not qsa_nax.nax_available():
+        return None
+    try:
+        output = qsa_nax.sparse_gqa_attention(
+            queries,
+            keys,
+            values,
+            selected_blocks,
+            q_offset=q_offset,
+        )
+        if not _NAX_QSA_MAIN_PROVEN:
+            # Prove the JIT pipelines before later cache updates make a
+            # fallback unsafe (same reasoning as the native kernel).
+            mx.eval(output)
+            _NAX_QSA_MAIN_PROVEN = True
+        return output
+    except Exception:
+        _NAX_QSA_MAIN_DISABLED = True
+        return None
+
+
 def _decode_qsa_sdpa(
     queries: mx.array,
     keys: mx.array,
@@ -577,9 +643,9 @@ def contiguous_causal_gathered_qsa(
     if query_chunk is None:
         query_chunk = contiguous_causal_query_chunk(key_tokens)
         # The direct-index main-attention kernel carries no per-query gathered
-        # K/V tensor, so a 1024-row tile keeps the FP32 score sheet small
-        # (268 MB at 256K keys) while cutting per-tile dispatches. Preserve
-        # the smaller portable tiles whenever the exact production ABI is absent.
+        # K/V tensor. Use wider tiles while the FP32 score sheet stays bounded
+        # to 128 MiB through 64K keys, then preserve the 1,024-row long-context
+        # tile (256 MiB at the model's 256K context limit).
         if (
             queries.shape[1:] == (24, query_tokens, 256)
             and keys.shape[1] == 2
@@ -592,7 +658,9 @@ def contiguous_causal_gathered_qsa(
                 if fast.is_native_available() and fast.has_symbol(
                     "qwen4_qsa_sparse_gqa_attention"
                 ):
-                    query_chunk = max(query_chunk, 1024)
+                    query_chunk = max(
+                        query_chunk, _native_causal_query_chunk(key_tokens)
+                    )
             except Exception:
                 pass
     if query_chunk <= 0:
@@ -696,6 +764,17 @@ def contiguous_causal_gathered_qsa(
                 selected_block_rows = mx.sort(selected_block_rows, axis=-1)
 
             selected_count = mx.minimum(complete_counts, block_budget)
+
+            nax_output = _nax_sparse_gqa_attention(
+                queries[:, :, start:stop],
+                keys,
+                values,
+                selected_block_rows,
+                q_offset=query_start + start,
+            )
+            if nax_output is not None:
+                outputs.append(nax_output)
+                continue
 
             native_output = _native_sparse_gqa_attention(
                 queries[:, :, start:stop],
