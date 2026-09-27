@@ -238,7 +238,12 @@ class SwitchGLU(nn.Module):
             and do_sort
             and hasattr(glm_fast, "glm_moe_weighted_sum")
         ):
-            return glm_fast.glm_moe_weighted_sum(x, inv_order, scores)
+            try:
+                return glm_fast.glm_moe_weighted_sum(x, inv_order, scores)
+            except ValueError:
+                # Shape outside the kernel's contract (e.g. top-k other than
+                # 6/8): combine the unsorted per-expert rows instead.
+                pass
 
         if do_sort:
             x = _scatter_unsort(x, inv_order, indices.shape)
