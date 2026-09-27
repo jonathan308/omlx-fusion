@@ -4544,10 +4544,13 @@ class TestSchedulerArraysCacheBlockAlignment:
             )
 
         try:
-            step = expected or 2048
             assert scheduler._qwen35_prefill_floor == expected
-            assert scheduler._prefill_step_size_for_progress(0, 16384) == step
-            assert scheduler.config.paged_cache_block_size == step
+            # Fusion widens glm5_next steps to the GLM DSA adaptive 8192 once
+            # the native sparse kernels are available (glm_moe_dsa
+            # generate_patch); that step takes precedence over the NAX floor
+            # and the paged block follows it.
+            assert scheduler._prefill_step_size_for_progress(0, 16384) == 8192
+            assert scheduler.config.paged_cache_block_size == 8192
         finally:
             scheduler.shutdown()
 
@@ -4913,6 +4916,10 @@ class TestDecodeClearGating:
         scheduler.batch_generator.next_generated.return_value = [
             MagicMock()
         ] * tokens_per_step
+        # Each boundary also refreshes the executor memory sample, which reads
+        # the MLX pool itself since upstream's memory-guard rework (#3933);
+        # stub it so get_cache_memory counts only the clear gate.
+        scheduler._current_usage_bytes = MagicMock(return_value=0)
         return scheduler
 
     def test_decode_clear_skipped_when_cache_below_threshold(
@@ -4940,6 +4947,7 @@ class TestDecodeClearGating:
 
         clear.assert_not_called()
         assert cache_mem.call_count == 5
+        assert scheduler._current_usage_bytes.call_count == 5
         assert scheduler._tokens_since_clear_cache == 0
 
     def test_decode_clear_fires_above_threshold_via_synced_clear(
