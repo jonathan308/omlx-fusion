@@ -403,6 +403,56 @@ def test_fused_verify_cycles_are_bitwise_reference_with_nax_tf32():
             assert {"router_rows", "hc_expand"} <= set(families), families
 
 
+@pytest.mark.parametrize("every", [1, 3])
+def test_verify_early_eval_only_schedules(every, monkeypatch):
+    """Verify blocks evaluate every few layers while the forward is still
+    being built; logits, hidden states and rolled-back caches are those of
+    the lazy forward."""
+    from omlx.patches.mlx_lm_mtp import cache_rollback
+
+    rt, language = _runtime()
+    model = _model(13, KDA_BITS["8-bit/5-bit"])
+    prompt = mx.random.randint(0, VOCAB, (1, 300)).astype(mx.int32)
+    caches = []
+    for _ in range(2):
+        cache = model.make_cache()
+        mx.eval(model(prompt, cache=cache).logits)
+        caches.append(cache)
+    calls = []
+    real_async_eval = mx.async_eval
+
+    def counting_async_eval(*args):
+        calls.append(len(args))
+        return real_async_eval(*args)
+
+    def verify(block, cache):
+        cache_rollback.set_undo_armed(True)
+        try:
+            out = model(block, cache=cache, return_hidden=True)
+        finally:
+            cache_rollback.set_undo_armed(False)
+        mx.eval(out.logits, out.hidden_states)
+        return out
+
+    monkeypatch.setattr(language, "_DECODE_EVAL_EVERY", every)
+    widths = [2, 4, 8]
+    for step, width in enumerate(widths):
+        block = mx.random.randint(0, VOCAB, (1, width)).astype(mx.int32)
+        monkeypatch.setattr(rt, "_VERIFY_EARLY_EVAL", False)
+        lazy = verify(block, caches[0])
+        monkeypatch.setattr(rt, "_VERIFY_EARLY_EVAL", True)
+        monkeypatch.setattr(mx, "async_eval", counting_async_eval)
+        early = verify(block, caches[1])
+        monkeypatch.setattr(mx, "async_eval", real_async_eval)
+        assert _bitwise_equal(early.logits, lazy.logits), step
+        assert _bitwise_equal(early.hidden_states[-1], lazy.hidden_states[-1]), step
+        for cache, out in ((caches[0], lazy), (caches[1], early)):
+            model.rollback_speculative_cache(cache, out.gdn_states, width // 2, width)
+        _assert_caches_equal(caches[1], caches[0], f"step {step}")
+    # 4 layers: evaluations after layers `every`, 2 * every, ... (not the last).
+    assert len(calls) == len(widths) * len(range(every, 4, every))
+
+
 def _generate(model, prompt, count, fused, use_mtp):
     """Greedy tokens from mlx-lm's BatchGenerator with oMLX's MTP loop."""
     from types import SimpleNamespace
