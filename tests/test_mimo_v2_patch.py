@@ -359,10 +359,14 @@ def test_lightning_mtp_heads_forward_and_adapter_contract():
     assert first_hidden.shape == (1, 2, 128)
     assert mtp_cache.layer_idx == 1
 
-    second_logits = model.mtp_forward(first_hidden[:, -1:], mx.array([[4]]), mtp_cache)
+    from omlx.patches.mlx_lm_mtp.batch_generator import _clone_mtp_head_cache
+
+    # Draft steps run on the generator's per-cycle clone.
+    draft_cache = _clone_mtp_head_cache(mtp_cache)
+    second_logits = model.mtp_forward(first_hidden[:, -1:], mx.array([[4]]), draft_cache)
     mx.eval(logits, first_logits, second_logits)
     assert second_logits.shape == (1, 1, 1000)
-    assert mtp_cache.layer_idx == 2
+    assert draft_cache.layer_idx == 2 and mtp_cache.layer_idx == 1
 
     changed_hidden = mx.concatenate([hidden[:, :1], hidden[:, 1:] + 5], axis=1)
     original_logits = model.mtp_forward(
@@ -818,6 +822,8 @@ def test_mtp_priming_folds_feed_every_head_without_a_cycle():
 
 
 def test_mtp_fold_skips_heads_past_the_loaded_depth():
+    from omlx.patches.mlx_lm_mtp.batch_generator import _clone_mtp_head_cache
+
     model = _mtp_model(depth=1)
     cache = model.make_mtp_cache()
     model.mtp_begin_cycle(cache, 1)
@@ -825,7 +831,47 @@ def test_mtp_fold_skips_heads_past_the_loaded_depth():
     assert [c.offset for c in cache] == [4, 0, 0]
     assert cache.trunk_rows is None
     with pytest.raises(ValueError):
-        model.mtp_forward(mx.ones((1, 1, 128)), mx.array([[5]]), cache)
+        model.mtp_forward(
+            mx.ones((1, 1, 128)), mx.array([[5]]), _clone_mtp_head_cache(cache)
+        )
+
+
+def test_mtp_history_fold_after_an_abandoned_cycle():
+    # MTP can park mid-cycle and later resume: the generator then folds the
+    # tokens decoded while parked, and the activation seam, into the
+    # persistent cache without mtp_begin_cycle. The cache still carries the
+    # last cycle's state (in_cycle, layer_idx 1); those calls must fold every
+    # head, not run as draft steps (which paired the whole history with one
+    # trunk row and failed to concatenate).
+    model = _mtp_model()
+    n1, n2, d1, d2 = 4, 6, 7, 9
+    n = n1 + n2 + 2
+    mx.random.seed(3)
+    hidden = mx.random.normal((1, n, 128))
+    tokens = mx.random.randint(0, 1000, (1, n))
+    ref = _parallel_reference(model, hidden, tokens, drafts=(d1, d2))
+
+    cache = model.make_mtp_cache()
+    out = _fold_chunks(model, cache, hidden[:, :n1], tokens[:, :n1], [n1], begin=True)
+    _draft_two(model, cache, out, 5, 6)  # the abandoned cycle's drafts
+    assert cache.in_cycle and cache.layer_idx == 1
+
+    history = _fold_chunks(
+        model, cache, hidden[:, n1 : n1 + n2], tokens[:, n1 : n1 + n2], [n2], begin=False
+    )
+    seam = _fold_chunks(
+        model, cache, hidden[:, n1 + n2 : n - 1], tokens[:, n1 + n2 : n - 1], [1], begin=False
+    )
+    assert [c.offset for c in cache] == [n - 1, n - 2, n - 3]
+    out0 = _fold_chunks(model, cache, hidden[:, n - 1 :], tokens[:, n - 1 :], [1], begin=True)
+    _, out1, out2 = _draft_two(model, cache, out0, d1, d2)
+    mx.eval(history, seam, out0, out1, out2, *ref)
+
+    assert _close(history, ref[0][:, n1 : n1 + n2])
+    assert _close(seam, ref[0][:, n - 2 : n - 1])
+    assert _close(out0, ref[0][:, -1:])
+    assert _close(out1, ref[1][:, -1:])
+    assert _close(out2, ref[2][:, -2:])
 
 
 def test_mtp_predictor_module_runs_the_heads_in_parallel():

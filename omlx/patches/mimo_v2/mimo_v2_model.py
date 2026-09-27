@@ -487,18 +487,27 @@ class _MiMoMTPCache(list):
     keeps the last trunk rows those layers fold next.  ``mtp_begin_cycle``
     marks the next ``mtp_forward`` as the cycle's committed fold and the calls
     after it as draft steps on layers 1, 2, ...; the generator runs those on
-    a clone of this list, so their speculative rows die with the clone.  A
-    cache that never saw ``mtp_begin_cycle`` (prompt priming) treats every
-    call as a fold.
+    a clone of this list (``copy.copy``, see ``__copy__``), so their
+    speculative rows die with the clone.  Only such clones draft: every call
+    on the persistent cache is a fold, including the ones that never follow
+    ``mtp_begin_cycle`` (prompt priming, and the history the generator folds
+    when MTP resumes after parking mid-cycle).
     """
 
     def __init__(self, values=()):
         super().__init__(values)
         self.layer_idx = 0
         self.in_cycle = False
+        self.draft_clone = False
         # Replaced, never mutated: clones share these objects.
         self.trunk_rows = None
         self.draft_tokens = ()
+
+    def __copy__(self):
+        clone = type(self)(self)
+        clone.__dict__.update(self.__dict__)
+        clone.draft_clone = True
+        return clone
 
 
 class MiMoV2Model(PipelineMixin, nn.Module):
@@ -764,9 +773,9 @@ class Model(nn.Module):
     ):
         """Head forward: the cycle's committed fold, or one draft step.
 
-        Draft steps (every call after the fold of a ``mtp_begin_cycle``
-        cycle) ignore ``hidden_states``: each head reads the trunk rows the
-        fold kept, not the previous head's output.
+        Draft steps (calls on the cycle's clone after the fold of a
+        ``mtp_begin_cycle`` cycle) ignore ``hidden_states``: each head reads
+        the trunk rows the fold kept, not the previous head's output.
         """
         layers = self.mtp.layers
         if not isinstance(mtp_cache, _MiMoMTPCache) or not mtp_cache:
@@ -774,7 +783,8 @@ class Model(nn.Module):
             token_embeddings = self.model.embed_tokens(next_token_ids)
             hidden = layers[0](hidden_states, token_embeddings, cache)
         else:
-            step = mtp_cache.layer_idx if mtp_cache.in_cycle else 0
+            drafting = mtp_cache.in_cycle and mtp_cache.draft_clone
+            step = mtp_cache.layer_idx if drafting else 0
             if step >= len(self._mtp_active_layers()):
                 raise ValueError(
                     f"MiMo MTP draft step {step} exceeds the loaded draft depth"
