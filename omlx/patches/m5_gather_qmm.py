@@ -53,9 +53,9 @@ On NAX hosts every supported sorted call (``transpose=True`` rhs gather
 of ``[M, 1, K]`` rows, bf16/fp16 activations, affine 4/8-bit or MXFP4
 weights, at least 4 rows per expert) goes to the runtime-compiled kernel
 in ``m5_gather_qmm_nax`` before any of the above: segmented tile
-scheduling (one expert per 64-row tile) on the tensor units, correct for
-any K and row count in one dispatch, bit-identical to mlx's sorted kernel
-wherever that kernel is correct. Each kernel instantiation self-tests
+scheduling (one expert per 64- to 128-row tile) on the tensor units,
+correct for any K and row count in one dispatch, bit-identical to mlx's
+sorted kernel wherever that kernel is correct. Each kernel instantiation self-tests
 once; anything unsupported or failing keeps the stock handling above.
 ``OMLX_M5_GATHER_QMM_NAX=0`` disables only this route.
 """

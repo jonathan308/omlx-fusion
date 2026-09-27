@@ -29,7 +29,7 @@ needs_nax = pytest.mark.skipif(not _on_nax(), reason="needs an M5 (NAX) GPU")
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     monkeypatch.delenv("OMLX_M5_GATHER_QMM_NAX", raising=False)
-    monkeypatch.delenv("OMLX_M5_GATHER_QMM_NAX_SCHEDULE", raising=False)
+    monkeypatch.delenv("OMLX_M5_GATHER_QMM_NAX_PLAN", raising=False)
 
 
 def _stock():
@@ -74,9 +74,9 @@ def _routed_rows(tokens, top_k, E, K, dtype, skew, seed=2):
     return x[order // top_k][:, None, :], flat[order]
 
 
-def _nax(x, wq, scales, biases, idx, mode, bits, gs, schedule=None):
+def _nax(x, wq, scales, biases, idx, mode, bits, gs, plan=None):
     out = nax.sorted_gather_qmm(
-        x, wq, scales, biases, idx, group_size=gs, bits=bits, mode=mode, schedule=schedule
+        x, wq, scales, biases, idx, group_size=gs, bits=bits, mode=mode, plan=plan
     )
     assert out is not None
     return out
@@ -171,39 +171,81 @@ _ALIGNED = [
 ]
 
 
-@pytest.fixture(params=["64", "128"])
-def tile_rows(request, monkeypatch):
-    """Run a test with 64-row and with 128-row output tiles."""
-    monkeypatch.setenv("OMLX_M5_GATHER_QMM_NAX_BM", request.param)
-    return int(request.param)
+P = nax.Plan
+SEG, DB = nax._SCHED_SEG, nax._SCHED_DB
+
+# Every configuration _plan picks, plus the plain layouts of each schedule
+# and tile height, a 64-deep seg with 128-row tiles and a small x group.
+_PLANS = [
+    P(SEG, 64, 64, 0, 0),
+    P(DB, 64, 64, 0, 0),
+    P(DB, 64, 64, 32, 0),
+    P(DB, 96, 64, 32, 0),
+    P(SEG, 96, 128, 32, 0),
+    P(SEG, 128, 128, 32, 8192),
+    P(SEG, 128, 64, 0, 0),
+    P(DB, 128, 64, 0, 0),
+    P(SEG, 96, 64, 3, 0),
+]
 
 
-def test_tile_rows_selection(monkeypatch):
-    monkeypatch.delenv("OMLX_M5_GATHER_QMM_NAX_BM", raising=False)
-    # GLM-5.3 at 4096-token chunks (114 rows per expert, K 4096 / 2048)
-    assert nax._tile_rows(32768, 288, 4096) == 128
-    assert nax._tile_rows(32768, 288, 2048) == 128
-    # MiMo at 4096 (128 rows) and 8192 (256 rows) tokens
-    assert nax._tile_rows(32768, 256, 4096) == 128
-    assert nax._tile_rows(65536, 256, 4096) == 64
-    # Qwen3.8 (40 / 160 rows per expert, short K) and small chunks
-    assert nax._tile_rows(20480, 512, 2560) == 64
-    assert nax._tile_rows(81920, 512, 2560) == 64
-    assert nax._tile_rows(16384, 288, 4096) == 64
-    assert nax._tile_rows(32768, 288, 640) == 64
-    monkeypatch.setenv("OMLX_M5_GATHER_QMM_NAX_BM", "128")
-    assert nax._tile_rows(20480, 512, 2560) == 128
+def _plan_id(plan):
+    return plan.describe().replace(" ", "-")
+
+
+@pytest.fixture(params=_PLANS, ids=_plan_id)
+def forced_plan(request, monkeypatch):
+    """Run a test with every configuration pinned through the env override."""
+    plan = request.param
+    sched = "seg" if plan.sched == SEG else "db"
+    monkeypatch.setenv(
+        "OMLX_M5_GATHER_QMM_NAX_PLAN",
+        f"{sched},{plan.bm},{plan.bk},{plan.gx},{plan.pad}",
+    )
+    return plan
+
+
+def test_plan_selection(monkeypatch):
+    monkeypatch.delenv("OMLX_M5_GATHER_QMM_NAX_PLAN", raising=False)
+    # Qwen3.8 (E=512 top-10; gate_up K=2560, down K=640) at 1k/2k/4k/8k
+    assert nax._plan(10240, 512, 2560, 1280) == P(DB, 64, 64, 0, 0)
+    assert nax._plan(20480, 512, 2560, 1280) == P(DB, 64, 64, 32, 0)
+    assert nax._plan(40960, 512, 2560, 1280) == P(DB, 96, 64, 32, 0)
+    assert nax._plan(81920, 512, 2560, 1280) == P(SEG, 128, 128, 32, 8192)
+    assert nax._plan(40960, 512, 640, 2560) == P(DB, 64, 64, 0, 0)
+    assert nax._plan(81920, 512, 640, 2560) == P(SEG, 96, 128, 32, 0)
+    # GLM-5.3 (E=288 top-8) at 2k / 4k / 8k-token chunks
+    assert nax._plan(16384, 288, 4096, 2048) == P(DB, 96, 64, 32, 0)
+    assert nax._plan(32768, 288, 2048, 4096) == P(SEG, 128, 128, 32, 8192)
+    assert nax._plan(65536, 288, 4096, 4096) == P(SEG, 128, 128, 32, 8192)
+    # MiMo-V2.6 (E=256 top-8) at 1k / 2k / 8k
+    assert nax._plan(8192, 256, 4096, 2048) == P(DB, 64, 64, 0, 0)
+    assert nax._plan(16384, 256, 2048, 4096) == P(DB, 96, 64, 32, 0)
+    assert nax._plan(65536, 256, 4096, 4096) == P(SEG, 128, 128, 32, 8192)
+    # ragged K / N keep 64-row seg tiles in the plain layout
+    assert nax._plan(81920, 512, 2560 + 32, 1280) == P(SEG, 64, 64, 0, 0)
+    assert nax._plan(81920, 512, 2560, 1280 + 32) == P(SEG, 64, 64, 0, 0)
+    # the env override pins a configuration; invalid values are ignored
+    monkeypatch.setenv("OMLX_M5_GATHER_QMM_NAX_PLAN", "seg,96,64,4,0")
+    assert nax._plan(10240, 512, 2560, 1280) == P(SEG, 96, 64, 4, 0)
+    for bad in ("seg,80,64,0,0", "db,64,256,0,0", "xx,64,64,0,0", "seg,64,64", "seg,64,64,0,99999"):
+        monkeypatch.setenv("OMLX_M5_GATHER_QMM_NAX_PLAN", bad)
+        assert nax._plan(10240, 512, 2560, 1280) == P(DB, 64, 64, 0, 0)
 
 
 @needs_nax
 @pytest.mark.parametrize("mode,bits,gs,dtype", _ALIGNED)
-@pytest.mark.parametrize("schedule", [0, 1])
-def test_bit_identical_to_stock_sorted_kernel(mode, bits, gs, dtype, schedule, tile_rows):
-    """Aligned K: same dequantization and tensor-op order as mlx's kernel."""
-    E, N, K = len(_COUNTS), 128, 256
+@pytest.mark.parametrize("plan", _PLANS, ids=_plan_id)
+@pytest.mark.parametrize("K", [256, 384])
+def test_bit_identical_to_stock_sorted_kernel(mode, bits, gs, dtype, plan, K):
+    """K % 64 == 0: same dequantization and tensor-op order as mlx's kernel.
+
+    K = 384 leaves a 64-deep tail after the 128-deep K steps.
+    """
+    E, N = len(_COUNTS), 128
     wq, scales, biases, _ = _quantized(E, N, K, mode, bits, gs, dtype)
     x, idx = _rows(_COUNTS, K, dtype)
-    out = _nax(x, wq, scales, biases, idx, mode, bits, gs, schedule)
+    out = _nax(x, wq, scales, biases, idx, mode, bits, gs, plan)
     ref = _stock_sorted(x, wq, scales, biases, idx, mode, bits, gs)
     assert out.shape == ref.shape and out.dtype == ref.dtype
     assert mx.array_equal(out, ref).item()
@@ -212,15 +254,16 @@ def test_bit_identical_to_stock_sorted_kernel(mode, bits, gs, dtype, schedule, t
 @needs_nax
 @pytest.mark.parametrize("mode,gs", [("affine", 64), ("mxfp4", 32)])
 @pytest.mark.parametrize("skew", [0.0, 1.2])
-def test_routed_rows_match_stock(mode, gs, skew, tile_rows):
+def test_routed_rows_match_stock(mode, gs, skew):
     """SwitchGLU routing (uniform and skewed, empty experts) at MoE shapes."""
-    E, N, K = 64, 192, 512
+    E, N, K = 64, 192, 1152
     wq, scales, biases, _ = _quantized(E, N, K, mode, 4, gs, mx.bfloat16, seed=5)
-    x, idx = _routed_rows(300, 8, E, K, mx.bfloat16, skew)
-    ref = _stock_sorted(x, wq, scales, biases, idx, mode, 4, gs)
-    for schedule in (None, 0, 1):
-        out = _nax(x, wq, scales, biases, idx, mode, 4, gs, schedule)
-        assert mx.array_equal(out, ref).item(), f"schedule={schedule}"
+    for tokens in (160, 600, 1200):  # 20, 75 and 150 rows per expert
+        x, idx = _routed_rows(tokens, 8, E, K, mx.bfloat16, skew)
+        ref = _stock_sorted(x, wq, scales, biases, idx, mode, 4, gs)
+        for plan in [None] + _PLANS:
+            out = _nax(x, wq, scales, biases, idx, mode, 4, gs, plan)
+            assert mx.array_equal(out, ref).item(), f"tokens={tokens} plan={plan}"
 
 
 @needs_nax
@@ -229,7 +272,7 @@ def test_routed_rows_match_stock(mode, gs, skew, tile_rows):
     [("affine", 4, mx.bfloat16), ("affine", 8, mx.float16), ("mxfp4", 4, mx.bfloat16)],
 )
 @pytest.mark.parametrize("K", [32, 96, 544])
-def test_ragged_k_matches_fp32_reference(mode, bits, dtype, K, tile_rows):
+def test_ragged_k_matches_fp32_reference(mode, bits, dtype, K, forced_plan):
     """K % 64 == 32 (group 32): the stock kernel's tail is wrong here."""
     E, N = len(_COUNTS), 128
     wq, scales, biases, wd = _quantized(E, N, K, mode, bits, 32, dtype)
@@ -264,8 +307,9 @@ def test_ragged_k_tail_never_reads_past_the_row():
 
 @needs_nax
 @pytest.mark.parametrize("mode,gs", [("affine", 64), ("mxfp4", 32)])
-def test_ragged_n_matches_stock(mode, gs):
-    E, N, K = len(_COUNTS), 100, 256
+@pytest.mark.parametrize("K", [256, 384])
+def test_ragged_n_matches_stock(mode, gs, K, forced_plan):
+    E, N = len(_COUNTS), 100
     wq, scales, biases, _ = _quantized(E, N, K, mode, 4, gs, mx.bfloat16)
     x, idx = _rows(_COUNTS, K, mx.bfloat16)
     out = _nax(x, wq, scales, biases, idx, mode, 4, gs)
@@ -275,7 +319,7 @@ def test_ragged_n_matches_stock(mode, gs):
 
 @needs_nax
 @pytest.mark.parametrize("mode,gs", [("affine", 64), ("mxfp4", 32)])
-def test_more_than_32768_rows(mode, gs, tile_rows):
+def test_more_than_32768_rows(mode, gs):
     """One call past the stock kernel's int16 row-offset limit.
 
     Every row is independent, so the stock kernel run on <= 32768-row
@@ -294,9 +338,9 @@ def test_more_than_32768_rows(mode, gs, tile_rows):
             _stock_sorted(x[half:], wq, scales, biases, idx[half:], mode, 4, gs),
         ]
     )
-    for schedule in (0, 1):
-        out = _nax(x, wq, scales, biases, idx, mode, 4, gs, schedule)
-        assert mx.array_equal(out, ref).item()
+    for plan in [None] + _PLANS:
+        out = _nax(x, wq, scales, biases, idx, mode, 4, gs, plan)
+        assert mx.array_equal(out, ref).item(), f"plan={plan}"
 
 
 @needs_nax
@@ -306,21 +350,23 @@ def test_single_expert_and_all_experts_empty_but_one():
     # >= 4 rows per expert overall, so mlx picks its sorted rhs kernel too.
     for counts in ((0,) * 31 + (300,), (129,) + (0,) * 31):
         x, idx = _rows(counts, K, mx.bfloat16)
-        out = _nax(x, wq, scales, biases, idx, "affine", 4, 64)
         ref = _stock_sorted(x, wq, scales, biases, idx, "affine", 4, 64)
-        assert mx.array_equal(out, ref).item()
+        for plan in [None] + _PLANS:
+            out = _nax(x, wq, scales, biases, idx, "affine", 4, 64, plan)
+            assert mx.array_equal(out, ref).item(), f"plan={plan}"
 
 
 @needs_nax
-def test_tile_scan_descriptors():
-    """(row_start, expert, rows) tiles, expert-major, <= 64 rows each."""
+@pytest.mark.parametrize("bm", [64, 96, 128])
+def test_tile_scan_descriptors(bm):
+    """(row_start, expert, rows) tiles, expert-major, <= bm rows each."""
     counts = (70, 0, 5, 33, 64, 17, 1, 130, 0, 11)
     idx = mx.array(np.repeat(np.arange(len(counts)), counts).astype(np.uint32))
     M, E = int(idx.shape[0]), len(counts)
-    max_tiles = (M + 63) // 64 + E
+    max_tiles = (M + bm - 1) // bm + E
     tiles, count = nax._get_kernel("scan")(
         inputs=[idx, mx.array([M, E, max_tiles], dtype=mx.int32)],
-        template=[("BM", 64), ("MAXE", nax._MAX_EXPERTS)],
+        template=[("BM", bm), ("MAXE", nax._MAX_EXPERTS)],
         grid=(1024, 1, 1),
         threadgroup=(1024, 1, 1),
         output_shapes=[(max_tiles * 4,), (1,)],
@@ -329,8 +375,8 @@ def test_tile_scan_descriptors():
     expect = []
     start = 0
     for e, n in enumerate(counts):
-        for r in range(start, start + n, 64):
-            expect.append((r, e, min(64, start + n - r), 0))
+        for r in range(start, start + n, bm):
+            expect.append((r, e, min(bm, start + n - r), 0))
         start += n
     n_tiles = int(count[0].item())
     assert n_tiles == len(expect)
@@ -339,7 +385,8 @@ def test_tile_scan_descriptors():
 
 
 @needs_nax
-def test_tile_scan_randomized():
+@pytest.mark.parametrize("bm", [64, 96])
+def test_tile_scan_randomized(bm):
     """Row counts with every M % 4, clustered and sparse expert use."""
     rng = np.random.default_rng(7)
     for trial in range(40):
@@ -347,10 +394,10 @@ def test_tile_scan_randomized():
         M = int(rng.integers(8, 3000))
         pool = rng.integers(0, E, max(1, E // 5)) if trial % 2 else np.arange(E)
         idx_np = np.sort(rng.choice(pool, M)).astype(np.uint32)
-        max_tiles = (M + 63) // 64 + min(E, M)
+        max_tiles = (M + bm - 1) // bm + min(E, M)
         tiles, count = nax._get_kernel("scan")(
             inputs=[mx.array(idx_np), mx.array([M, E, max_tiles], dtype=mx.int32)],
-            template=[("BM", 64), ("MAXE", nax._MAX_EXPERTS)],
+            template=[("BM", bm), ("MAXE", nax._MAX_EXPERTS)],
             grid=(1024, 1, 1),
             threadgroup=(1024, 1, 1),
             output_shapes=[(max_tiles * 4,), (1,)],
@@ -360,7 +407,7 @@ def test_tile_scan_randomized():
         for e in range(E):
             lo = int(np.searchsorted(idx_np, e, "left"))
             hi = int(np.searchsorted(idx_np, e, "right"))
-            expect += [(r, e, min(64, hi - r), 0) for r in range(lo, hi, 64)]
+            expect += [(r, e, min(bm, hi - r), 0) for r in range(lo, hi, bm)]
         n_tiles = int(count[0].item())
         got = np.array(tiles).reshape(-1, 4)[:n_tiles]
         assert [tuple(int(v) for v in t) for t in got] == expect, (E, M)
@@ -482,13 +529,17 @@ def test_failed_self_test_falls_back(_installed, monkeypatch):
 
 
 @needs_nax
-def test_self_test_passes_for_supported_instantiations():
-    for bm in (64, 128):
-        for key in [
-            (mx.bfloat16, "affine", 4, 64, 1, True, True),
-            (mx.bfloat16, "affine", 4, 32, 0, True, False),
-            (mx.float16, "affine", 8, 64, 0, False, True),
-            (mx.bfloat16, "mxfp4", 4, 32, 1, True, True),
-            (mx.bfloat16, "mxfp4", 4, 32, 0, False, False),
-        ]:
-            assert nax._self_test(key + (bm,)) is True, key + (bm,)
+@pytest.mark.parametrize("plan", _PLANS, ids=_plan_id)
+def test_self_test_passes_for_supported_instantiations(plan):
+    for key in [
+        (mx.bfloat16, "affine", 4, 64, True, True),
+        (mx.bfloat16, "affine", 4, 32, True, False),
+        (mx.float16, "affine", 8, 64, False, True),
+        (mx.bfloat16, "mxfp4", 4, 32, True, True),
+        (mx.bfloat16, "mxfp4", 4, 32, False, False),
+    ]:
+        if plan.sched == DB and not (key[4] and key[5]):
+            continue  # db runs aligned shapes only (seg covers the rest)
+        dtype, mode, bits, gs, align_n, align_k = key
+        full = (dtype, mode, bits, gs, plan, align_n, align_k)
+        assert nax._self_test(full) is True, full

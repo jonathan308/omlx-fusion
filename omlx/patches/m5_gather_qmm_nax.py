@@ -18,31 +18,45 @@ tile primitives of the installed mlx (``steel/gemm/nax.h``, read from the
 package's ``include`` directory):
 
 - a one-threadgroup pre-pass cuts every expert's run of sorted rows into
-  (row_start, expert, rows) tiles of at most 64 rows, so partial tiles only
-  occur at the end of a run;
-- the matmul computes one single-expert 64x64 output tile per threadgroup
-  (four simdgroups in a 32x2x2 threadgroup; 1-D threadgroups measured up
-  to 16% slower). Two schedules share the tile list: ``seg`` (mlx's
-  segmented kernel: weight tile dequantized into threadgroup memory
-  between two barriers per K step) and ``db`` (double-buffered weight
-  tiles, one barrier per K step) for up to 128 rows per expert. Both skip
-  the 16-row activation fragments of a partial tile that hold no rows.
+  (row_start, expert, rows) tiles of at most BM rows (64, 96 or 128), so
+  partial tiles only occur at the end of a run;
+- the matmul computes one single-expert BM x 64 output tile per
+  threadgroup (BM / 32 x 2 simdgroups, each owning a 32 x 32 block). Two
+  schedules share the tile list: ``seg`` (mlx's segmented kernel: the
+  weight tile of a K step, 64 or 128 deep, dequantized into threadgroup
+  memory between two barriers) and ``db`` (double-buffered 64-deep weight
+  tiles, one barrier per K step). Both skip the 16-row activation
+  fragments of a partial tile that hold no rows.
+- threadgroups are either laid out (column, tile) as mlx does, or with
+  the tile index on the grid's x axis in groups of 32 tiles and
+  (group, column) on y, so every threadgroup of a row tile shares one x
+  coordinate and a tile's columns run 32 threadgroups apart. On M5 Ultra
+  the gain tracked how few x coordinates a row tile's threadgroups span
+  (activation reuse across its columns): 3-28% from 36 rows per expert.
+  Below that weight streaming dominates and the plain layout (each
+  expert's column slabs in order) stays faster.
 
-Both schedules dequantize exactly like mlx (fp32 ``scale * q + bias``
-rounded once to the activation dtype for affine; ``bfloat(e8m0) * e2m1``
-for MXFP4) and issue the same 16x32x16 tensor ops in the same K order, so
-every output element is bit-identical to mlx's sorted kernel wherever that
-kernel is correct. The K tail zero-fills both operands past K (the stock
-kernel reads stale activations there; mlx's fixed kernel still reads the
-weight bytes and scales past the row, which can be NaN at the end of the
-last expert) and row offsets are 32-bit.
+``_plan`` picks the schedule, tile height, K step and layout from the
+mean rows per expert and K (measured on M5 Ultra at the Qwen3.8, GLM-5.3
+and MiMo-V2.6 expert shapes).
+
+Every configuration dequantizes exactly like mlx (fp32 ``scale * q +
+bias`` rounded once to the activation dtype for affine; ``bfloat(e8m0) *
+e2m1`` for MXFP4) and issues the same 16x32x16 tensor ops in the same K
+order, so every output element is bit-identical to mlx's sorted kernel
+wherever that kernel is correct. A K tail (a multiple of 32) runs only its
+valid 32-deep sub-steps and never reads weight bytes or scales past K (the
+stock kernel reads stale activations there; mlx's fixed kernel still reads
+the weight bytes and scales past the row, which can be NaN at the end of
+the last expert) and row offsets are 32-bit.
 
 Supported: ``transpose=True``, rhs-indices only, ``x`` of shape
 ``[M, 1, K]`` with a flat sorted ``uint32`` index of length ``M``, bf16/fp16
 activations, affine 4/8-bit with group 32/64/128 (scales and biases in the
 activation dtype) and MXFP4 (group 32). Anything else returns None and the
 caller keeps the stock path. ``OMLX_M5_GATHER_QMM_NAX=0`` disables the
-module; ``OMLX_M5_GATHER_QMM_NAX_SCHEDULE=seg|db`` pins a schedule (testing).
+module; ``OMLX_M5_GATHER_QMM_NAX_PLAN=sched,bm,bk,gx,pad`` (e.g.
+``seg,128,128,32,8192``) pins a configuration (testing).
 """
 
 from __future__ import annotations
@@ -51,34 +65,27 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import mlx.core as mx
 
 logger = logging.getLogger(__name__)
 
 _ENV_ENABLE = "OMLX_M5_GATHER_QMM_NAX"
-_ENV_SCHEDULE = "OMLX_M5_GATHER_QMM_NAX_SCHEDULE"
-_ENV_TILE = "OMLX_M5_GATHER_QMM_NAX_BM"
+_ENV_PLAN = "OMLX_M5_GATHER_QMM_NAX_PLAN"
 
-# Tile geometry (fixed; the Metal source assumes it).
-_BM = 64
+# Output tile width and column simdgroups (fixed; the Metal source assumes
+# them). Tile heights are multiples of 32 rows (one row simdgroup each).
 _BN = 64
-_WM = 2
 _WN = 2
-# Taller variant (8 simdgroups): one weight-tile stream serves 128 rows.
-_BM_TALL = 128
+_TILE_ROWS = (64, 96, 128)
 
 # Largest expert count the one-threadgroup pre-pass handles (its run
 # bounds live in threadgroup memory).
 _MAX_EXPERTS = 2048
 
-# Use the double-buffered schedule up to this many sorted rows per expert.
-# Measured on M5 Ultra: db is up to 12% faster at 14-64 rows per expert and
-# on par at 114-128; from 160 rows (mostly full tiles) the single-buffered
-# schedule, whose smaller threadgroup footprint keeps more tiles in flight,
-# is up to 5% faster.
-_DB_MAX_ROWS_PER_EXPERT = 128
+# Row tiles per grid-x group in the tile-on-x layout.
+_GX = 32
 
 _MLX_UTILS_HEADERS = (
     "mlx/backend/metal/kernels/utils.h",
@@ -248,22 +255,34 @@ using namespace mlx::steel;
 
 namespace omlx_gqmm {
 
-STEEL_CONST int kBM = 64;
 STEEL_CONST int kBN = 64;
-STEEL_CONST int kBK = 64;
-STEEL_CONST int kWM = 2;
 STEEL_CONST int kWN = 2;
-STEEL_CONST int kThreads = kWM * kWN * 32;
-STEEL_CONST short kSK = 32;
-STEEL_CONST short kSM = kBM / kWM;
+STEEL_CONST short kSM = 32;
 STEEL_CONST short kSN = kBN / kWN;
+STEEL_CONST short kSK = 32;
 STEEL_CONST short kTM = kSM / 16;
 STEEL_CONST short kTN = kSN / 16;
 STEEL_CONST short kTK = kSK / 16;
-// Every loader thread dequantizes kVPT consecutive values of one weight row
-// (the split of mlx's QuantizedBlockLoader for a 64x64 tile).
-STEEL_CONST int kVPT = kBN * kBK / kThreads;
-STEEL_CONST int kTPR = kBK / kVPT;
+
+// Tile geometry: BM rows in BM / 32 row simdgroups times kWN column
+// simdgroups, K steps BK deep. kLT loader threads dequantize the kBN x BK
+// weight tile, each kVPT consecutive values of one weight row: every
+// thread when they split the tile evenly, else the largest power of two
+// below the thread count (96-row tiles: 128 of 192).
+template <int BM, int BK>
+struct Geo {
+  STEEL_CONST int kBM = BM;
+  STEEL_CONST int kBK = BK;
+  STEEL_CONST int kWM = BM / kSM;
+  STEEL_CONST int kThreads = kWM * kWN * 32;
+  STEEL_CONST int kLT = (kThreads & (kThreads - 1)) == 0
+      ? kThreads
+      : (kThreads > 256 ? 256 : (kThreads > 128 ? 128 : 64));
+  STEEL_CONST int kVPT = kBN * BK / kLT;
+  STEEL_CONST int kTPR = BK / kVPT;
+  static_assert(BM % kSM == 0 && BK % kSK == 0, "tile geometry");
+  static_assert(kTPR >= 1 && kTPR * kVPT == BK, "loader split");
+};
 
 // Affine: w = scale * q + bias computed in fp32 and rounded once to T, as
 // mlx's dequantize() does (scale * q is exact in fp32).
@@ -274,19 +293,21 @@ struct AffineQ {
   STEEL_CONST int kGroup = GS;
   const device T* scales;
   const device T* biases;
-  float s;
-  float b;
+
+  struct P {
+    float s;
+    float b;
+  };
 
   METAL_FUNC void advance(const size_t n) thread {
     scales += n;
     biases += n;
   }
-  METAL_FUNC void load_params(const int g) thread {
-    s = float(scales[g]);
-    b = float(biases[g]);
+  METAL_FUNC P params(const int g) const thread {
+    return P{float(scales[g]), float(biases[g])};
   }
-  METAL_FUNC WT dq(const uint32_t q) const thread {
-    return static_cast<WT>(s * float(q) + b);
+  METAL_FUNC static WT dq(thread const P& p, const uint32_t q) {
+    return static_cast<WT>(p.s * float(q) + p.b);
   }
 };
 
@@ -298,76 +319,117 @@ struct Mxfp4Q {
   STEEL_CONST int kBits = 4;
   STEEL_CONST int kGroup = GS;
   const device uint8_t* scales;
-  float s;
+
+  struct P {
+    float s;
+  };
 
   METAL_FUNC void advance(const size_t n) thread {
     scales += n;
   }
-  METAL_FUNC void load_params(const int g) thread {
+  METAL_FUNC P params(const int g) const thread {
     uint8_t sb = scales[g];
-    s = float(static_cast<bfloat>(*(thread fp8_e8m0*)(&sb)));
+    return P{float(static_cast<bfloat>(*(thread fp8_e8m0*)(&sb)))};
   }
-  METAL_FUNC WT dq(const uint32_t q) const thread {
+  METAL_FUNC static WT dq(thread const P& p, const uint32_t q) {
     uint8_t qb = uint8_t(q);
-    return static_cast<WT>(s * float(*(thread fp4_e2m1*)(&qb)));
+    return static_cast<WT>(p.s * float(*(thread fp4_e2m1*)(&qb)));
   }
 };
 
-// Weight-tile loader: thread lid owns row lid / kTPR of the BN x BK tile
-// and the kVPT values from column (lid % kTPR) * kVPT. fetch() reads the
+// Weight-tile loader: loader thread lid owns row lid / kTPR of the
+// kBN x BK tile and the kVPT values from column (lid % kTPR) * kVPT, in
+// kNG chunks that each lie in one quantization group. fetch() reads the
 // packed words and group parameters of one K step, store() dequantizes
-// them into threadgroup memory (row stride BKP).
-template <typename Q>
+// them into threadgroup memory (row stride BKP). The *_tail variants
+// cover a K tail of k_valid (a multiple of 32) columns and never touch a
+// word or group at or past it.
+template <typename Q, typename G>
 struct TileLoader {
   using WT = typename Q::WT;
+  using P = typename Q::P;
   STEEL_CONST int kBits = Q::kBits;
+  STEEL_CONST int kVPT = G::kVPT;
   STEEL_CONST int kWords = kVPT * kBits / 32;
   STEEL_CONST int kPer = 32 / kBits;
   STEEL_CONST uint32_t kMask = (1u << kBits) - 1u;
+  STEEL_CONST int kGV = kVPT < Q::kGroup ? kVPT : Q::kGroup;
+  STEEL_CONST int kNG = kVPT / kGV;
+  STEEL_CONST int kWPG = kGV * kBits / 32;
+  STEEL_CONST int kBKP = G::kBK + 16 / sizeof(WT);
   static_assert(kWords * 32 == kVPT * kBits, "whole words per thread");
-  static_assert(Q::kGroup % kVPT == 0, "one group per thread and K step");
+  static_assert(kWPG >= 1 && kNG * kWPG == kWords, "group split");
 
   const device uint32_t* src;
   Q q;
   const short row;
   const short col;
   uint32_t raw[kWords];
+  P p[kNG];
 
   METAL_FUNC TileLoader(
       const device uint8_t* w_tile,
       const int K,
       thread const Q& q_,
       const uint lid) thread
-      : q(q_), row(short(lid / kTPR)), col(short((lid % kTPR) * kVPT)) {
+      : q(q_),
+        row(short(lid / G::kTPR)),
+        col(short((lid % G::kTPR) * kVPT)) {
     src = (const device uint32_t*)(w_tile + size_t(row) * (K * kBits / 8) +
                                    col * kBits / 8);
     q.advance(size_t(row) * (K / Q::kGroup));
   }
 
   METAL_FUNC void fetch(const int kb) thread {
-    const device uint32_t* p = src + kb * (kBK * kBits / 32);
+    const device uint32_t* ptr = src + kb * (G::kBK * kBits / 32);
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kWords; i++) {
-      raw[i] = p[i];
+      raw[i] = ptr[i];
     }
-    q.load_params((kb * kBK + col) / Q::kGroup);
+    STEEL_PRAGMA_UNROLL
+    for (short g = 0; g < kNG; g++) {
+      p[g] = q.params((kb * G::kBK + col + g * kGV) / Q::kGroup);
+    }
+  }
+
+  METAL_FUNC void fetch_tail(const int kb, const int k_valid) thread {
+    const device uint32_t* ptr = src + kb * (G::kBK * kBits / 32);
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kWords; i++) {
+      if (col + i * kPer < k_valid) {
+        raw[i] = ptr[i];
+      }
+    }
+    STEEL_PRAGMA_UNROLL
+    for (short g = 0; g < kNG; g++) {
+      if (col + g * kGV < k_valid) {
+        p[g] = q.params((kb * G::kBK + col + g * kGV) / Q::kGroup);
+      }
+    }
+  }
+
+  METAL_FUNC void store_words(threadgroup WT* Ws, const int k_valid) const
+      thread {
+    threadgroup WT* dst = Ws + row * kBKP + col;
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kWords; i++) {
+      if (col + i * kPer < k_valid) {
+        vec<WT, kPer> v;
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < kPer; j++) {
+          v[j] = Q::dq(p[i / kWPG], (raw[i] >> (kBits * j)) & kMask);
+        }
+        *(threadgroup vec<WT, kPer>*)(dst + i * kPer) = v;
+      }
+    }
   }
 
   METAL_FUNC void store(threadgroup WT* Ws) const thread {
-    threadgroup WT* dst = Ws + row * (kBK + 16 / sizeof(WT)) + col;
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < kWords; i++) {
-      vec<WT, kPer> v;
-      STEEL_PRAGMA_UNROLL
-      for (short j = 0; j < kPer; j++) {
-        v[j] = q.dq((raw[i] >> (kBits * j)) & kMask);
-      }
-      *(threadgroup vec<WT, kPer>*)(dst + i * kPer) = v;
-    }
+    store_words(Ws, G::kBK);
   }
 
   METAL_FUNC void zero(threadgroup WT* Ws) const thread {
-    threadgroup WT* dst = Ws + row * (kBK + 16 / sizeof(WT)) + col;
+    threadgroup WT* dst = Ws + row * kBKP + col;
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kVPT; i++) {
       dst[i] = WT(0);
@@ -375,41 +437,94 @@ struct TileLoader {
   }
 };
 
+// One 32-deep sub-step of a simdgroup's 32 x 32 block: full row blocks run
+// tile_matmad_nax; partial ones skip the 16-row fragments without rows
+// (the tensor ops of the others are the ones tile_matmad_nax issues).
+template <typename T, typename WT, int BKP, bool FULL>
+METAL_FUNC void sub_step(
+    thread NAXTile<float, kTM, kTN>& Dtile,
+    const device T* xn,
+    const threadgroup WT* ws,
+    const int K,
+    const short sgp_sm) {
+  NAXTile<WT, kTN, kTK> Btile;
+  if constexpr (FULL) {
+    NAXTile<T, kTM, kTK> Atile;
+
+    volatile int compiler_barrier;
+
+    Atile.load(xn, K);
+    Btile.template load<WT, BKP, 1>(ws);
+
+    tile_matmad_nax(
+        Dtile,
+        Atile,
+        metal::bool_constant<false>{},
+        Btile,
+        metal::bool_constant<true>{});
+
+    (void)compiler_barrier;
+  } else {
+    Btile.template load<WT, BKP, 1>(ws);
+    STEEL_PRAGMA_UNROLL
+    for (short mm = 0; mm < kTM; mm++) {
+      if (mm * 16 < sgp_sm) {
+        NAXTile<T, 1, kTK> Arow;
+        Arow.load_safe(xn + mm * 16 * K, K, short2(kSK, sgp_sm - mm * 16));
+        STEEL_PRAGMA_UNROLL
+        for (short nn = 0; nn < kTN; nn += 2) {
+          STEEL_PRAGMA_UNROLL
+          for (short kk = 0; kk < kTK; kk++) {
+            BaseNAXFrag::mma(
+                Dtile.frag_at(mm, nn),
+                Dtile.frag_at(mm, nn + 1),
+                Arow.frag_at(0, kk),
+                metal::bool_constant<false>{},
+                Btile.frag_at(nn, kk),
+                Btile.frag_at(nn + 1, kk),
+                metal::bool_constant<true>{});
+          }
+        }
+      }
+    }
+  }
+}
+
 // seg: mlx's segmented sorted gather kernel (affine_gather_qmm_rhs_seg_nax /
-// fp_gather_qmm_rhs_seg_nax): one single-expert BM x BN tile per
-// threadgroup, the weight tile dequantized into threadgroup memory between
-// two barriers per K step, then tile_matmad_nax. K tail: both operands are
-// zero past K. N tail: weight rows past N are zero, stores are bounded.
-template <typename T, typename Q, bool ALIGN_N, bool ALIGN_K>
+// fp_gather_qmm_rhs_seg_nax): one single-expert BM x kBN tile per
+// threadgroup, the weight tile of each BK-deep K step dequantized into
+// threadgroup memory between two barriers. K tail (K % BK, a multiple of
+// 32): only its sub-steps run. N tail: weight rows past N are zero, stores
+// are bounded.
+template <typename T, typename Q, typename G, bool ALIGN_N, bool ALIGN_K>
 METAL_FUNC void gather_seg(
     const device T* x,
     const device uint8_t* w,
     thread Q& q,
-    const device uint32_t* tiles,
+    const uint4 desc,
+    const int y_col,
     device T* y,
     const int N,
     const int K,
     threadgroup typename Q::WT* Ws,
-    const uint3 tid,
     const uint sgid,
     const uint lane) {
   using WT = typename Q::WT;
-  constexpr int BKP = kBK + 16 / sizeof(WT);
-  const uint4 desc = *((const device uint4*)tiles + tid.y);
+  constexpr int BKP = G::kBK + 16 / sizeof(WT);
   const int row_start = int(desc.x);
   const uint32_t expert = desc.y;
   const int rows = int(desc.z);
 
   const int K_w = K * Q::kBits / 8;
   const int K_g = K / Q::kGroup;
-  const int K_it = K / kBK;
-  const int y_col = int(tid.x) * kBN;
+  const int K_it = K / G::kBK;
   const short tgp_bn = ALIGN_N ? short(kBN) : short(min(kBN, N - y_col));
-  const int k_remain = K - K_it * kBK;
+  const int k_remain = K - K_it * G::kBK;
 
   const size_t w_row = size_t(expert) * N + y_col;
   q.advance(w_row * K_g);
-  TileLoader<Q> loader(w + w_row * K_w, K, q, sgid * 32 + lane);
+  TileLoader<Q, G> loader(w + w_row * K_w, K, q, sgid * 32 + lane);
+  const bool loads = G::kLT == G::kThreads || sgid * 32 + lane < uint(G::kLT);
   const bool row_live = ALIGN_N || loader.row < tgp_bn;
 
   x += size_t(row_start) * K;
@@ -425,100 +540,48 @@ METAL_FUNC void gather_seg(
   NAXTile<float, kTM, kTN> Dtile;
   Dtile.clear();
   const device T* xn = x + tm * K;
+  const threadgroup WT* ws = Ws + tn * BKP;
 
   dispatch_bool(sgp_sm == kSM, [&](auto kAlignedM) {
     for (int k = 0; k < K_it; k++) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (row_live) {
-        loader.fetch(k);
-        loader.store(Ws);
-      } else {
-        loader.zero(Ws);
+      if (loads) {
+        if (row_live) {
+          loader.fetch(k);
+          loader.store(Ws);
+        } else {
+          loader.zero(Ws);
+        }
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
       STEEL_PRAGMA_NO_UNROLL
-      for (int kk1 = 0; kk1 < kBK; kk1 += kSK) {
+      for (int kk1 = 0; kk1 < G::kBK; kk1 += kSK) {
         if (sg_active) {
-          NAXTile<WT, kTN, kTK> Btile;
-          if constexpr (kAlignedM.value) {
-            NAXTile<T, kTM, kTK> Atile;
-
-            volatile int compiler_barrier;
-
-            Atile.load(xn + kk1, K);
-            Btile.template load<WT, BKP, 1>(Ws + tn * BKP + kk1);
-
-            tile_matmad_nax(
-                Dtile,
-                Atile,
-                metal::bool_constant<false>{},
-                Btile,
-                metal::bool_constant<true>{});
-
-            (void)compiler_barrier;
-          } else {
-            // Partial tile: skip the 16-row fragments without rows (the
-            // tensor ops of the others are the ones tile_matmad_nax issues).
-            Btile.template load<WT, BKP, 1>(Ws + tn * BKP + kk1);
-            STEEL_PRAGMA_UNROLL
-            for (short mm = 0; mm < kTM; mm++) {
-              if (mm * 16 < sgp_sm) {
-                NAXTile<T, 1, kTK> Arow;
-                Arow.load_safe(
-                    xn + mm * 16 * K + kk1, K, short2(kSK, sgp_sm - mm * 16));
-                STEEL_PRAGMA_UNROLL
-                for (short nn = 0; nn < kTN; nn += 2) {
-                  STEEL_PRAGMA_UNROLL
-                  for (short kk = 0; kk < kTK; kk++) {
-                    BaseNAXFrag::mma(
-                        Dtile.frag_at(mm, nn),
-                        Dtile.frag_at(mm, nn + 1),
-                        Arow.frag_at(0, kk),
-                        metal::bool_constant<false>{},
-                        Btile.frag_at(nn, kk),
-                        Btile.frag_at(nn + 1, kk),
-                        metal::bool_constant<true>{});
-                  }
-                }
-              }
-            }
-          }
+          sub_step<T, WT, BKP, kAlignedM.value>(
+              Dtile, xn + kk1, ws + kk1, K, sgp_sm);
         }
       }
-      xn += kBK;
+      xn += G::kBK;
     }
 
     if (!ALIGN_K) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (row_live && loader.col < k_remain) {
-        loader.fetch(K_it);
-        loader.store(Ws);
-      } else {
-        loader.zero(Ws);
+      if (loads) {
+        if (row_live) {
+          loader.fetch_tail(K_it, k_remain);
+          loader.store_words(Ws, k_remain);
+        } else {
+          loader.zero(Ws);
+        }
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
       STEEL_PRAGMA_NO_UNROLL
-      for (int kk1 = 0; kk1 < kBK; kk1 += kSK) {
+      for (int kk1 = 0; kk1 < k_remain; kk1 += kSK) {
         if (sg_active) {
-          NAXTile<T, kTM, kTK> Atile;
-          NAXTile<WT, kTN, kTK> Btile;
-
-          volatile int compiler_barrier;
-
-          const short psk = short(min(int(kSK), max(0, k_remain - kk1)));
-          Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
-          Btile.template load<WT, BKP, 1>(Ws + tn * BKP + kk1);
-
-          tile_matmad_nax(
-              Dtile,
-              Atile,
-              metal::bool_constant<false>{},
-              Btile,
-              metal::bool_constant<true>{});
-
-          (void)compiler_barrier;
+          sub_step<T, WT, BKP, kAlignedM.value>(
+              Dtile, xn + kk1, ws + kk1, K, sgp_sm);
         }
       }
     }
@@ -531,42 +594,42 @@ METAL_FUNC void gather_seg(
   });
 }
 
-// db: the same tiles and arithmetic with double-buffered weight tiles: the
-// packed words of step k + 1 are fetched before the tensor ops of step k and
-// dequantized into the other buffer after them, so each K step has a single
-// barrier. Activation fragments are read straight from device memory (rows
-// past the tile are clamped to its last row and never stored) and 16-row
-// fragments without rows of the tile are skipped. Requires K % 64 == 0 and
-// N % 64 == 0.
-template <typename T, typename Q>
+// db: the same tiles and arithmetic with double-buffered 64-deep weight
+// tiles: the packed words of step k + 1 are fetched before the tensor ops
+// of step k and dequantized into the other buffer after them, so each K
+// step has a single barrier. Activation fragments are read straight from
+// device memory (rows past the tile are clamped to its last row and never
+// stored) and 16-row fragments without rows of the tile are skipped.
+// Requires K % 64 == 0 and N % 64 == 0.
+template <typename T, typename Q, typename G>
 METAL_FUNC void gather_db(
     const device T* x,
     const device uint8_t* w,
     thread Q& q,
-    const device uint32_t* tiles,
+    const uint4 desc,
+    const int y_col,
     device T* y,
     const int N,
     const int K,
     threadgroup typename Q::WT* Ws,
-    const uint3 tid,
     const uint sgid,
     const uint lane) {
   using WT = typename Q::WT;
-  constexpr int BKP = kBK + 16 / sizeof(WT);
+  static_assert(G::kBK == 64, "db runs 64-deep K steps");
+  constexpr int BKP = G::kBK + 16 / sizeof(WT);
   constexpr int kTile = kBN * BKP;
-  const uint4 desc = *((const device uint4*)tiles + tid.y);
   const int row_start = int(desc.x);
   const uint32_t expert = desc.y;
   const int tile_rows = int(desc.z);
 
   const int K_w = K * Q::kBits / 8;
   const int K_g = K / Q::kGroup;
-  const int K_it = K / kBK;
-  const int y_col = int(tid.x) * kBN;
+  const int K_it = K / G::kBK;
 
   const size_t w_row = size_t(expert) * N + y_col;
   q.advance(w_row * K_g);
-  TileLoader<Q> loader(w + w_row * K_w, K, q, sgid * 32 + lane);
+  TileLoader<Q, G> loader(w + w_row * K_w, K, q, sgid * 32 + lane);
+  const bool loads = G::kLT == G::kThreads || sgid * 32 + lane < uint(G::kLT);
 
   const int m0 = kSM * int(sgid / kWN);
   const int rows = min(int(kSM), tile_rows - m0);
@@ -589,20 +652,22 @@ METAL_FUNC void gather_db(
   NAXTile<float, kTM, kTN> D;
   D.clear();
 
-  loader.fetch(0);
-  loader.store(Ws);
+  if (loads) {
+    loader.fetch(0);
+    loader.store(Ws);
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (int kb = 0; kb < K_it; kb++) {
     const bool more = kb + 1 < K_it;
-    if (more) {
+    if (more && loads) {
       loader.fetch(kb + 1);
     }
     const threadgroup WT* wb = wsg + (kb & 1) * kTile;
     STEEL_PRAGMA_UNROLL
-    for (short kk1 = 0; kk1 < kBK; kk1 += kSK) {
+    for (short kk1 = 0; kk1 < G::kBK; kk1 += kSK) {
       NAXTile<WT, kTN, 2> Btile;
       Btile.template load<WT, BKP, 1>(wb + kk1);
-      const int k = kb * kBK + kk1;
+      const int k = kb * G::kBK + kk1;
       STEEL_PRAGMA_UNROLL
       for (short i = 0; i < kTM; i++) {
         if (i < m_frags) {
@@ -635,7 +700,7 @@ METAL_FUNC void gather_db(
         }
       }
     }
-    if (more) {
+    if (more && loads) {
       loader.store(Ws + ((kb + 1) & 1) * kTile);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -649,60 +714,110 @@ METAL_FUNC void gather_db(
   }
 }
 
+// The row tile and output column of this threadgroup. GX == 0: grid
+// (columns, tiles) as mlx lays it out. GX > 0: tile t on grid x t % GX and
+// (t / GX, column) on y, so all threadgroups of a row tile share one x
+// coordinate and a tile's columns run GX threadgroups apart.
+template <int GX>
+METAL_FUNC bool tile_of(
+    const device uint32_t* tiles,
+    const uint tile_count,
+    const uint3 tid,
+    const int N,
+    thread uint4& desc,
+    thread int& y_col) {
+  uint t;
+  uint c;
+  if constexpr (GX > 0) {
+    const uint n_cols = uint((N + kBN - 1) / kBN);
+    t = (tid.y / n_cols) * GX + tid.x;
+    c = tid.y % n_cols;
+  } else {
+    t = tid.y;
+    c = tid.x;
+  }
+  if (t >= tile_count) {
+    return false;
+  }
+  desc = *((const device uint4*)tiles + t);
+  y_col = int(c) * kBN;
+  return true;
+}
+
 } // namespace omlx_gqmm
 """
 
-_AFFINE_SOURCE = """
-    using Q = omlx_gqmm::AffineQ<T, GS, BITS>;
-    constexpr int BKP = omlx_gqmm::kBK + 16 / sizeof(T);
-    threadgroup T Ws[(SCHED == 1 ? 2 : 1) * omlx_gqmm::kBN * BKP];
-    if (threadgroup_position_in_grid.y >= tile_count[0]) {
+_MM_SOURCE_TMPL = """
+    {q_type}
+    using G = omlx_gqmm::Geo<BM, BK>;
+    using WT = typename Q::WT;
+    constexpr int BKP = BK + 16 / sizeof(WT);
+    threadgroup WT Ws[(SCHED == 1 ? 2 : 1) * omlx_gqmm::kBN * BKP +
+                      PAD / sizeof(WT)];
+    uint4 desc;
+    int y_col;
+    if (!omlx_gqmm::tile_of<GX>(
+            tiles, tile_count[0], threadgroup_position_in_grid, params[0],
+            desc, y_col)) {{
         return;
-    }
-    Q q{scales, biases, 0.0f, 0.0f};
-    if constexpr (SCHED == 1) {
-        omlx_gqmm::gather_db<T, Q>(
-            x, (const device uint8_t*)w, q, tiles, y, params[0], params[1],
-            Ws, threadgroup_position_in_grid, simdgroup_index_in_threadgroup,
+    }}
+    {q_init}
+    if constexpr (SCHED == 1) {{
+        omlx_gqmm::gather_db<T, Q, G>(
+            x, (const device uint8_t*)w, q, desc, y_col, y, params[0],
+            params[1], Ws, simdgroup_index_in_threadgroup,
             thread_index_in_simdgroup);
-    } else {
-        omlx_gqmm::gather_seg<T, Q, ALIGN_N, ALIGN_K>(
-            x, (const device uint8_t*)w, q, tiles, y, params[0], params[1],
-            Ws, threadgroup_position_in_grid, simdgroup_index_in_threadgroup,
+    }} else {{
+        omlx_gqmm::gather_seg<T, Q, G, ALIGN_N, ALIGN_K>(
+            x, (const device uint8_t*)w, q, desc, y_col, y, params[0],
+            params[1], Ws, simdgroup_index_in_threadgroup,
             thread_index_in_simdgroup);
-    }
+    }}
 """
 
-_FP_SOURCE = """
-    using Q = omlx_gqmm::Mxfp4Q<GS>;
-    constexpr int BKP = omlx_gqmm::kBK + 16 / sizeof(bfloat);
-    threadgroup bfloat Ws[(SCHED == 1 ? 2 : 1) * omlx_gqmm::kBN * BKP];
-    if (threadgroup_position_in_grid.y >= tile_count[0]) {
-        return;
-    }
-    Q q{scales, 0.0f};
-    if constexpr (SCHED == 1) {
-        omlx_gqmm::gather_db<T, Q>(
-            x, (const device uint8_t*)w, q, tiles, y, params[0], params[1],
-            Ws, threadgroup_position_in_grid, simdgroup_index_in_threadgroup,
-            thread_index_in_simdgroup);
-    } else {
-        omlx_gqmm::gather_seg<T, Q, ALIGN_N, ALIGN_K>(
-            x, (const device uint8_t*)w, q, tiles, y, params[0], params[1],
-            Ws, threadgroup_position_in_grid, simdgroup_index_in_threadgroup,
-            thread_index_in_simdgroup);
-    }
-"""
+_AFFINE_SOURCE = _MM_SOURCE_TMPL.format(
+    q_type="using Q = omlx_gqmm::AffineQ<T, GS, BITS>;",
+    q_init="Q q{scales, biases};",
+)
+
+_FP_SOURCE = _MM_SOURCE_TMPL.format(
+    q_type="using Q = omlx_gqmm::Mxfp4Q<GS>;",
+    q_init="Q q{scales};",
+)
 
 _SCHED_SEG = 0
 _SCHED_DB = 1
 _SCHED_NAMES = {_SCHED_SEG: "seg", _SCHED_DB: "db"}
 
+
+class Plan(NamedTuple):
+    """One kernel configuration: schedule, tile rows, K step, layout, pad.
+
+    ``gx`` is the row tiles per grid-x group (0: mlx's (column, tile)
+    grid); ``pad`` is extra threadgroup memory in bytes (fewer resident
+    threadgroups).
+    """
+
+    sched: int
+    bm: int
+    bk: int
+    gx: int
+    pad: int
+
+    def describe(self) -> str:
+        s = f"{_SCHED_NAMES[self.sched]} {self.bm}x{_BN} bk{self.bk}"
+        if self.gx:
+            s += f" gx{self.gx}"
+        if self.pad:
+            s += f" pad{self.pad}"
+        return s
+
+
 _lock = threading.RLock()
 _kernels: dict[str, object] = {}
 _header_failed = False
 # Self-test verdict per kernel instantiation:
-# (dtype, mode, bits, group_size, schedule, align_N, align_K, tile_rows) -> bool.
+# (dtype, mode, bits, group_size, plan, align_n, align_k) -> bool.
 _verified: dict[tuple, bool] = {}
 
 
@@ -715,24 +830,14 @@ def enabled() -> bool:
     }
 
 
-def _mm_header(bm: int) -> str:
-    """The matmul header for a tile height (``kSM`` stays 32 rows/simdgroup)."""
-    if bm == _BM:
-        return _MM_HEADER
-    return _MM_HEADER.replace(
-        "STEEL_CONST int kBM = 64;", f"STEEL_CONST int kBM = {bm};"
-    ).replace("STEEL_CONST int kWM = 2;", f"STEEL_CONST int kWM = {bm // 32};")
-
-
-def _get_kernel(kind: str, bm: int = _BM):
+def _get_kernel(kind: str):
     """Build (once) the ``scan``, ``affine`` or ``fp`` kernel object."""
     global _header_failed
-    cache_key = kind if kind == "scan" or bm == _BM else f"{kind}_bm{bm}"
-    kernel = _kernels.get(cache_key)
+    kernel = _kernels.get(kind)
     if kernel is not None or _header_failed:
         return kernel
     with _lock:
-        kernel = _kernels.get(cache_key)
+        kernel = _kernels.get(kind)
         if kernel is not None:
             return kernel
         if kind == "scan":
@@ -755,7 +860,7 @@ def _get_kernel(kind: str, bm: int = _BM):
                 return None
             if kind == "affine":
                 kernel = mx.fast.metal_kernel(
-                    name="omlx_gqmm_affine" + ("" if bm == _BM else f"_bm{bm}"),
+                    name="omlx_gqmm_affine_v2",
                     input_names=[
                         "x",
                         "w",
@@ -766,48 +871,70 @@ def _get_kernel(kind: str, bm: int = _BM):
                         "params",
                     ],
                     output_names=["y"],
-                    header=mlx_src + _mm_header(bm),
+                    header=mlx_src + _MM_HEADER,
                     source=_AFFINE_SOURCE,
                 )
             else:
                 kernel = mx.fast.metal_kernel(
-                    name="omlx_gqmm_mxfp4" + ("" if bm == _BM else f"_bm{bm}"),
+                    name="omlx_gqmm_mxfp4_v2",
                     input_names=["x", "w", "scales", "tiles", "tile_count", "params"],
                     output_names=["y"],
-                    header=mlx_src + _mm_header(bm),
+                    header=mlx_src + _MM_HEADER,
                     source=_FP_SOURCE,
                 )
-        _kernels[cache_key] = kernel
+        _kernels[kind] = kernel
         return kernel
 
 
-def _schedule(rows: int, experts: int, K: int, N: int) -> int:
-    forced = os.environ.get(_ENV_SCHEDULE, "").strip().lower()
-    aligned = K % 64 == 0 and N % 64 == 0
-    if forced == "seg" or not aligned:
-        return _SCHED_SEG
-    if forced == "db":
-        return _SCHED_DB
-    if rows <= _DB_MAX_ROWS_PER_EXPERT * experts:
-        return _SCHED_DB
-    return _SCHED_SEG
+def _parse_plan(text: str) -> Optional[Plan]:
+    parts = [p.strip().lower() for p in text.split(",")]
+    if len(parts) != 5 or parts[0] not in ("seg", "db"):
+        return None
+    try:
+        bm, bk, gx, pad = (int(p) for p in parts[1:])
+    except ValueError:
+        return None
+    sched = _SCHED_SEG if parts[0] == "seg" else _SCHED_DB
+    if bm not in _TILE_ROWS or bk not in (64, 128) or gx < 0 or not 0 <= pad <= 8192:
+        return None
+    return Plan(sched, bm, bk, gx, pad)
 
 
-def _tile_rows(rows: int, experts: int, K: int) -> int:
-    """Rows per output tile: 128 when experts average 65-128 rows.
+def _plan(rows: int, experts: int, K: int, N: int) -> Plan:
+    """Kernel configuration for a call (mean rows per expert and K).
 
-    A 128-row tile streams each expert's weight tile once where two 64-row
-    tiles stream it twice (M5 Ultra, GLM-5.3 at 4096-token chunks, 114 rows
-    per expert: +5-8% on the expert GEMMs, bit-identical). With fewer rows,
-    or a short K, the half-empty taller tile is slower.
+    Measured on M5 Ultra (real routing profiles, Qwen3.8 / GLM-5.3 /
+    MiMo-V2.6 expert shapes at 1024-8192-token chunks):
+
+    - fewer than 36 rows per expert, or K < 1024 (a short down projection)
+      below 120 rows: weight streaming dominates; 64-row db tiles in mlx's
+      (column, tile) layout;
+    - 36-47 rows: 64-row db tiles, tile-on-x layout (+10%);
+    - 48-95 rows: 96-row db tiles, tile-on-x layout (+3-26%);
+    - 96+ rows (K >= 1024): 128-row seg tiles with 128-deep K steps and 8 KB
+      of extra threadgroup memory (fewer resident threadgroups), tile-on-x
+      layout (+5-29%);
+    - K < 1024 from 120 rows: 96-row seg tiles, 128-deep K steps (+5%).
+
+    Ragged K or N keeps 64-row seg tiles in the plain layout.
     """
-    forced = os.environ.get(_ENV_TILE, "").strip()
-    if forced in ("64", "128"):
-        return int(forced)
+    forced = os.environ.get(_ENV_PLAN, "").strip()
+    if forced:
+        plan = _parse_plan(forced)
+        if plan is not None:
+            return plan
+    if K % 64 or N % 64:
+        return Plan(_SCHED_SEG, 64, 64, 0, 0)
     per_expert = rows / max(1, experts)
-    if 64 < per_expert <= 128 and K >= 2048:
-        return _BM_TALL
-    return _BM
+    if per_expert < 36 or (K < 1024 and per_expert < 120):
+        return Plan(_SCHED_DB, 64, 64, 0, 0)
+    if K < 1024:
+        return Plan(_SCHED_SEG, 96, 128, _GX, 0)
+    if per_expert < 48:
+        return Plan(_SCHED_DB, 64, 64, _GX, 0)
+    if per_expert < 96:
+        return Plan(_SCHED_DB, 96, 64, _GX, 0)
+    return Plan(_SCHED_SEG, 128, 128, _GX, 8192)
 
 
 def supports(
@@ -855,15 +982,14 @@ def supports(
     return scales.shape == (E, N, K // group_size)
 
 
-def _launch(
-    x, w, scales, biases, indices, group_size, bits, mode, sched, stream, bm=_BM
-):
+def _launch(x, w, scales, biases, indices, group_size, bits, mode, plan, stream):
     scan = _get_kernel("scan")
-    mm = _get_kernel("affine" if mode == "affine" else "fp", bm)
+    mm = _get_kernel("affine" if mode == "affine" else "fp")
     if scan is None or mm is None:
         return None
     M, K = int(x.shape[0]), int(x.shape[2])
     E, N = int(w.shape[0]), int(w.shape[1])
+    bm = plan.bm
     max_tiles = (M + bm - 1) // bm + min(E, M)
     kw = {} if stream is None else {"stream": stream}
     tiles, tile_count = scan(
@@ -882,15 +1008,23 @@ def _launch(
         template.append(("BITS", bits))
     inputs += [tiles, tile_count, mx.array([N, K], dtype=mx.int32)]
     template += [
-        ("SCHED", int(sched)),
+        ("SCHED", int(plan.sched)),
         ("ALIGN_N", N % _BN == 0),
-        ("ALIGN_K", K % 64 == 0),
+        ("ALIGN_K", K % plan.bk == 0),
+        ("BM", bm),
+        ("BK", plan.bk),
+        ("GX", plan.gx),
+        ("PAD", plan.pad),
     ]
     n_cols = (N + _BN - 1) // _BN
+    if plan.gx:
+        tg_grid = (plan.gx, ((max_tiles + plan.gx - 1) // plan.gx) * n_cols)
+    else:
+        tg_grid = (n_cols, max_tiles)
     return mm(
         inputs=inputs,
         template=template,
-        grid=(n_cols * 32, max_tiles * _WN, bm // 32),
+        grid=(tg_grid[0] * 32, tg_grid[1] * _WN, bm // 32),
         threadgroup=(32, _WN, bm // 32),
         output_shapes=[(M, 1, N)],
         output_dtypes=[x.dtype],
@@ -908,23 +1042,26 @@ def _stock_gather_qmm():
     return fn
 
 
-# Canary routing: an empty expert, runs spanning several 64-row tiles, and
-# partial tiles of every size class.
-_CANARY_COUNTS = (70, 0, 5, 33, 64, 17, 100, 11)
+# Canary routing: an empty expert, runs spanning several tiles of every
+# height, and partial tiles of every size class.
+_CANARY_COUNTS = (70, 0, 5, 33, 64, 17, 140, 11)
 
 
 def _self_test(key: tuple) -> Optional[bool]:
     """Run one kernel instantiation on a small canary.
 
-    Aligned K must be bit-identical to mlx's sorted kernel (correct there);
-    ragged K must match an fp32 dequantized reference to bf16 rounding.
-    Returns None when the canary could not be evaluated here (e.g. while a
-    function transformation is being traced); the caller then retries.
+    K % 64 == 0 must be bit-identical to mlx's sorted kernel (correct
+    there); ragged K must match an fp32 dequantized reference to bf16
+    rounding. Returns None when the canary could not be evaluated here
+    (e.g. while a function transformation is being traced); the caller then
+    retries.
     """
-    dtype, mode, bits, group_size, sched, align_n, align_k, bm = key
+    dtype, mode, bits, group_size, plan, align_n, align_k = key
     E = len(_CANARY_COUNTS)
     N = 128 if align_n else 96
-    K = 256 if align_k else 160
+    # Aligned: K % BK == 0. Unaligned: a 64-deep tail (bk 128, still
+    # K % 64 == 0) or a 32-deep ragged one (bk 64).
+    K = 256 if align_k else (320 if plan.bk == 128 else 160)
     try:
         k_w, k_x = mx.random.split(mx.random.key(0x2267), 2)
         wf = (mx.random.normal((E, N, K), key=k_w) * 0.05).astype(dtype)
@@ -943,12 +1080,10 @@ def _self_test(key: tuple) -> Optional[bool]:
         )
         M = int(idx.shape[0])
         x = (mx.random.normal((M, 1, K), key=k_x) * 0.5).astype(dtype)
-        out = _launch(
-            x, wq, scales, biases, idx, group_size, bits, mode, sched, None, bm
-        )
+        out = _launch(x, wq, scales, biases, idx, group_size, bits, mode, plan, None)
         if out is None:
             return False
-        if align_k:
+        if K % 64 == 0:
             ref = _stock_gather_qmm()(
                 x,
                 wq,
@@ -991,11 +1126,11 @@ def _self_test(key: tuple) -> Optional[bool]:
 
 
 def _describe(key: tuple) -> str:
-    dtype, mode, bits, group_size, sched, align_n, align_k, bm = key
+    dtype, mode, bits, group_size, plan, align_n, align_k = key
     return (
         f"{str(dtype).rsplit('.', 1)[-1]} {mode} {bits}-bit gs{group_size} "
-        f"({_SCHED_NAMES[sched]}{'' if align_n else ', ragged N'}"
-        f"{'' if align_k else ', ragged K'}{'' if bm == _BM else f', {bm}-row tiles'})"
+        f"({plan.describe()}{'' if align_n else ', ragged N'}"
+        f"{'' if align_k else ', K tail'})"
     )
 
 
@@ -1010,14 +1145,16 @@ def sorted_gather_qmm(
     bits: int,
     mode: str = "affine",
     stream=None,
-    schedule: Optional[int] = None,
+    plan: Optional[Plan] = None,
     verify: bool = True,
 ) -> Optional[mx.array]:
     """``x @ w[indices].T`` for sorted rows on the tensor units.
 
-    Returns None when the module is disabled, the call is not supported
-    (see ``supports``), the kernels cannot be built or the instantiation
-    failed its one-time self-test; the caller then keeps the stock path.
+    ``plan`` pins a configuration (testing); by default ``_plan`` picks
+    one. Returns None when the module is disabled, the call is not
+    supported (see ``supports``), the kernels cannot be built or the
+    instantiation failed its one-time self-test; the caller then keeps the
+    stock path.
     """
     if not enabled() or not supports(
         x, w, scales, biases, indices, group_size, bits, mode
@@ -1025,12 +1162,13 @@ def sorted_gather_qmm(
         return None
     M, K = int(x.shape[0]), int(x.shape[2])
     E, N = int(w.shape[0]), int(w.shape[1])
-    sched = _schedule(M, E, K, N) if schedule is None else int(schedule)
-    if sched == _SCHED_DB and (K % 64 or N % 64):
-        sched = _SCHED_SEG
-    bm = _tile_rows(M, E, K)
+    if plan is None:
+        plan = _plan(M, E, K, N)
+    if plan.sched == _SCHED_DB and (K % 64 or N % 64 or plan.bk != 64):
+        # db runs aligned 64-deep K steps only.
+        plan = plan._replace(sched=_SCHED_SEG)
     if verify:
-        key = (x.dtype, mode, bits, group_size, sched, N % _BN == 0, K % 64 == 0, bm)
+        key = (x.dtype, mode, bits, group_size, plan, N % _BN == 0, K % plan.bk == 0)
         ok = _verified.get(key)
         if ok is None:
             with _lock:
@@ -1041,6 +1179,4 @@ def sorted_gather_qmm(
                         _verified[key] = ok
         if not ok:
             return None
-    return _launch(
-        x, w, scales, biases, indices, group_size, bits, mode, sched, stream, bm
-    )
+    return _launch(x, w, scales, biases, indices, group_size, bits, mode, plan, stream)
