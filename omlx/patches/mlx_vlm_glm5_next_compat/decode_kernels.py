@@ -2964,6 +2964,105 @@ def hc_post_mm(connection, mixes: mx.array, residual: mx.array):
     )
 
 
+# ---------------------------------------------------------------------------
+# MLA per-head projections (embed_q / unembed_out) for one token
+# ---------------------------------------------------------------------------
+#
+# ``QuantizedMultiLinear`` runs a batched qmv: one 64-thread threadgroup per
+# 8 rows of one head (4096 tiny threadgroups for 64 heads x 512 rows), well
+# below the weight-streaming rate. The same per-row arithmetic (qmv_fast's
+# lane mapping, or qmv's single tail block when K is one qmv block) with NSG
+# simdgroups x 4 rows per threadgroup.
+_MH_QMV_SOURCE = r"""
+  const uint lane = thread_index_in_simdgroup;
+  const int sg = int(simdgroup_index_in_threadgroup);
+  const int h = int(threadgroup_position_in_grid.z);
+  const int r0 = (int(threadgroup_position_in_grid.y) * NSG + sg) * 4;
+  constexpr int WB = K * glm_bytes_per_pack<BITS>() / glm_pack_factor<BITS>();
+  constexpr int G = K / GS;
+  const device uint8_t* wh = (const device uint8_t*)w + (size_t(h) * N + r0) * WB;
+  const device T* sh = scales + (size_t(h) * N + r0) * G;
+  const device T* bh = biases + (size_t(h) * N + r0) * G;
+  const device T* xh = x + size_t(h) * K;
+  float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#if FAST
+  glm_qmv_rows<T, K, GS, BITS, 4>(wh, sh, bh, xh, lane, result);
+#else
+  {
+    // qmv_impl when K is exactly one block: every lane's values arrive in
+    // the tail (load_vector_safe / qdot_safe with a full remainder).
+    constexpr int VPT = glm_pack_factor<BITS>();
+    static_assert(K == VPT * 32, "one qmv block");
+    float x_thread[VPT];
+    float sum = glm_load_vector<T, VPT, BITS>(xh + lane * VPT, x_thread);
+    for (int row = 0; row < 4; row++) {
+      const device uint8_t* wl = wh + row * WB + lane * glm_bytes_per_pack<BITS>();
+      const float sc = sh[row * G + int(lane) / (GS / VPT)];
+      const float bi = bh[row * G + int(lane) / (GS / VPT)];
+      result[row] += glm_qdot<VPT, BITS>(wl, x_thread, sc, bi, sum);
+    }
+  }
+#endif
+  for (int r = 0; r < 4; r++) {
+    float v = simd_sum(result[r]);
+    if (lane == 0) {
+      y[size_t(h) * N + r0 + r] = static_cast<T>(v);
+    }
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _mh_qmv_kernel(fast: bool):
+    return mx.fast.metal_kernel(
+        name="glm5_mla_head_qmv" + ("_fast" if fast else "_block"),
+        input_names=["x", "w", "scales", "biases"],
+        output_names=["y"],
+        header=_QMV_HEADER,
+        source=_source(_MH_QMV_SOURCE, FAST=int(fast)),
+    )
+
+
+def mla_head_qmv(x: mx.array, layer, nsg: int = 8) -> Optional[mx.array]:
+    """``layer(x)`` (a ``QuantizedMultiLinear``, transpose=True) for one token:
+    ``x`` [1, H, 1, K] -> [1, H, 1, N], or None when not covered."""
+    if "mla_head_qmv" in DISABLED:
+        return None
+    if getattr(layer, "mode", "affine") != "affine" or layer.get("biases") is None:
+        return None
+    w, s, b = layer["weight"], layer["scales"], layer["biases"]
+    bits, gs = layer.bits, layer.group_size
+    if x.ndim != 4 or x.shape[0] != 1 or x.shape[2] != 1 or w.ndim != 3:
+        return None
+    H, K = x.shape[1], x.shape[3]
+    N = w.shape[1]
+    if w.shape[0] != H or s.shape != (H, N, K // gs) or b.shape != s.shape:
+        return None
+    if bits not in (4, 5, 6, 8) or K % gs or gs not in (32, 64, 128):
+        return None
+    if K in (64, 128) and bits in (4, 8):
+        return None  # MLX routes these to qmv_quad
+    if x.dtype not in (mx.bfloat16, mx.float16) or s.dtype != x.dtype or b.dtype != x.dtype:
+        return None
+    pack = {5: 8, 6: 4}.get(bits, 32 // bits)
+    fast = N % 8 == 0 and K % (pack * 2 * 32) == 0
+    if not fast and not (K == pack * 32 and N >= 8 and gs % pack == 0):
+        return None
+    if N % (4 * nsg):
+        nsg = 2
+        if N % 8:
+            return None
+    STATS["mla_head_qmv"] += 1
+    return _mh_qmv_kernel(fast)(
+        inputs=[x.reshape(H, K), w, s, b],
+        template=[("T", x.dtype), ("K", K), ("N", N), ("BITS", bits), ("GS", gs), ("NSG", nsg)],
+        grid=(32, (N // (4 * nsg)) * nsg, H),
+        threadgroup=(32, nsg, 1),
+        output_shapes=[(1, H, 1, N)],
+        output_dtypes=[x.dtype],
+    )[0]
+
+
 # Multi-row (verify block) router logits. The reference x @ W.T for
 # 2 <= L <= 8 rows runs MLX's NAX split-K GEMM: relaxed-precision 16x32x16
 # matmul2d ops along each K partition (2048 wide for 2048 < K <= 4096),

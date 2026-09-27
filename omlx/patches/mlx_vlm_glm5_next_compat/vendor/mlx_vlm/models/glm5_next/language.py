@@ -211,6 +211,16 @@ def _decode_hc_pre_deferred(connection, norm, x):
     return xn, h, post, comb, mm
 
 
+def _mla_head_proj(layer, x: mx.array) -> mx.array:
+    """``layer(x)`` for the MLA per-head projections (embed_q, unembed_out);
+    one token through ``decode_kernels.mla_head_qmv`` (same values)."""
+    if _decode_kernels is not None and _DECODE_FUSION and x.ndim == 4 and x.shape[2] == 1:
+        out = _decode_kernels.mla_head_qmv(x, layer)
+        if out is not None:
+            return out
+    return layer(x)
+
+
 def glm5_next_cast_predicate(key: str) -> bool:
     """Keep numerically sensitive GLM-5.3 parameters in FP32."""
     return not (
@@ -1095,7 +1105,7 @@ class Glm5NextSparseAttention(nn.Module):
             if L == 1 and mask is None:
                 # Exact fused latent attention reading the selected rows in
                 # place (no gathered copy of the latent keys).
-                q_latent = self.embed_q(q)
+                q_latent = _mla_head_proj(self.embed_q, q)
                 fused_attn = self._decode_latent(
                     q_latent, kv_latent, None, cache, indices=topk_indices[0, 0, 0]
                 )
@@ -1184,7 +1194,7 @@ class Glm5NextSparseAttention(nn.Module):
                     sparse_mask = sparse_mask & mask
                 attn_mask = sparse_mask
         elif L <= 8:
-            q_latent = self.embed_q(q)
+            q_latent = _mla_head_proj(self.embed_q, q)
             fused_attn = self._decode_latent(q_latent, kv_latent, attn_mask, cache)
 
         if (
@@ -1198,7 +1208,7 @@ class Glm5NextSparseAttention(nn.Module):
                 cache[0].keys = mx.depends(cache[0].keys, deps)
 
         if fused_attn is not None:
-            output = self.unembed_out(fused_attn)
+            output = _mla_head_proj(self.unembed_out, fused_attn)
             output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
             return self._finish(output, out_dense)
 
@@ -1206,7 +1216,7 @@ class Glm5NextSparseAttention(nn.Module):
         # decode. Expanding every cached key and value into all heads makes
         # verification cost grow with the complete context length.
         if L <= 8:
-            q = q_latent if q_latent is not None else self.embed_q(q)
+            q = q_latent if q_latent is not None else _mla_head_proj(self.embed_q, q)
             k = v = kv_latent
         else:
             k = self.embed_q(kv_latent, transpose=False)
@@ -1216,7 +1226,7 @@ class Glm5NextSparseAttention(nn.Module):
             q, k, v, cache=cache, scale=self.scale, mask=attn_mask
         )
         if L <= 8:
-            output = self.unembed_out(output)
+            output = _mla_head_proj(self.unembed_out, output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self._finish(output, out_dense)

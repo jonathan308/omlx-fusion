@@ -442,6 +442,41 @@ def test_one_token_dense_mlp_gate_up_is_bitwise_reference(bits, monkeypatch):
         assert _mismatches(fused, compiled) == 0
 
 
+@pytest.mark.parametrize("bits", [8, 5, 4, 6])
+@pytest.mark.parametrize("n_k", [(512, 256), (256, 512), (128, 1024)])
+def test_one_token_mla_head_qmv_is_bitwise_reference(bits, n_k):
+    """embed_q / unembed_out (QuantizedMultiLinear, 64 heads) for one token."""
+    from mlx_lm.models.mla import MultiLinear
+
+    from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
+
+    N, K = n_k
+    for gs in (64, 32):
+        mx.random.seed(bits * 31 + N + gs)
+        layer = MultiLinear(K, N, 64)
+        layer.weight = (mx.random.normal(layer.weight.shape) * 0.05).astype(mx.bfloat16)
+        layer = layer.to_quantized(gs, bits)
+        for trial in range(3):
+            x = (mx.random.normal((1, 64, 1, K)) * (1 + 2 * trial)).astype(mx.bfloat16)
+            reference = layer(x)
+            for nsg in (2, 8):
+                fused = dk.mla_head_qmv(x, layer, nsg=nsg)
+                assert fused is not None
+                assert _mismatches(fused, reference) == 0, (gs, trial, nsg)
+
+
+def test_mla_head_qmv_declines_qmv_quad_shapes():
+    from mlx_lm.models.mla import MultiLinear
+
+    from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
+
+    layer = MultiLinear(128, 512, 8).to_quantized(64, 8)
+    assert dk.mla_head_qmv(mx.zeros((1, 8, 1, 128), mx.bfloat16), layer) is None
+    layer = MultiLinear(256, 512, 8).to_quantized(64, 8)
+    assert dk.mla_head_qmv(mx.zeros((1, 8, 2, 256), mx.bfloat16), layer) is None
+    assert dk.mla_head_qmv(mx.zeros((1, 8, 1, 256), mx.bfloat16), MultiLinear(256, 512, 8)) is None
+
+
 def test_decode_experts_leave_sorted_route_counts_to_switch_glu():
     moe = _moe()
     x = mx.random.normal((1, 8, 1024)).astype(mx.bfloat16)  # 64 routes -> sorted
@@ -585,10 +620,13 @@ def test_indexer_fast_selection_matches_general_path():
 # ---------------------------------------------------------------------------
 
 
-def _fused_shape_model(seed, heads=16):
+def _fused_shape_model(seed, heads=16, quantize_mla=False):
+    from mlx_lm.models.mla import MultiLinear
     from mlx_vlm.models import glm5_next
 
     from omlx.patches.deepseek_v4.switch_layers import SwitchLinear
+
+    quantized = (nn.Linear, SwitchLinear) + ((MultiLinear,) if quantize_mla else ())
 
     language = _language()
     text = glm5_next.TextConfig(
@@ -614,7 +652,7 @@ def _fused_shape_model(seed, heads=16):
     model = language.LanguageModel(text)
     nn.quantize(
         model, group_size=64, bits=4,
-        class_predicate=lambda _, m: isinstance(m, (nn.Linear, SwitchLinear)),
+        class_predicate=lambda _, m: isinstance(m, quantized),
     )
     params = []
     for name, value in nn.utils.tree_flatten(model.parameters()):
@@ -637,15 +675,15 @@ def _fused_shape_model(seed, heads=16):
     return model
 
 
-def _check_small_model(seed=41, prompt_len=2101, heads=16):
+def _check_small_model(seed=41, prompt_len=2101, heads=16, quantize_mla=False):
     """Fused vs reference logits of a small model, bitwise; returns families used.
 
     Prompts beyond index_topk (2048) run the sparse DSA paths, shorter ones
     the dense latent attention.
     """
     language = _language()
-    fused_model = _fused_shape_model(seed, heads)
-    reference_model = _fused_shape_model(seed, heads)
+    fused_model = _fused_shape_model(seed, heads, quantize_mla)
+    reference_model = _fused_shape_model(seed, heads, quantize_mla)
     prompt = mx.random.randint(0, 256, (1, prompt_len)).astype(mx.int32)
     caches = []
     for model in (fused_model, reference_model):
@@ -700,6 +738,14 @@ def test_small_model_dense_attention_is_bitwise_reference():
         "moe_shared_split",
     } <= used, used
     assert ("latent_attn" in used) == dk.nax_available(), used
+
+
+def test_small_model_quantized_mla_is_bitwise_reference():
+    """Quantized MLA projections (as in the checkpoint): unembed_out (K =
+    kv_lora_rank) runs mla_head_qmv for one token; logits stay bitwise."""
+    _skip_under_mtp_runtime()
+    used = _check_small_model(seed=47, prompt_len=300, quantize_mla=True)
+    assert "mla_head_qmv" in used, used
 
 
 def test_small_model_bitwise_reference_with_nax_tf32():
