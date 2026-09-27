@@ -324,9 +324,11 @@ class Glm5NextLinearAttention(nn.Module):
         self.fuse_in = True
         self._fused_ready = False
 
-    def _fused_in_proj(self, inputs):
+    def _fused_in_proj(self, inputs, split=True):
         # q,k,v,f_a,g_a,b all take `inputs`; fuse into one matmul via a lossless
         # output-axis concat of the (quantized) weights, built once and cached.
+        # split=False returns (unsplit output, split points), or None when the
+        # projections cannot be fused.
         if not self._fused_ready:
             mods = [
                 self.q_proj,
@@ -338,12 +340,16 @@ class Glm5NextLinearAttention(nn.Module):
             ]
             quantized = [hasattr(m, "scales") for m in mods]
             if any(quantized) and not all(quantized):
+                if not split:
+                    return None
                 return tuple(linear_forward(m, inputs) for m in mods)
             if all(quantized):
                 specs = {
                     (m.group_size, m.bits, getattr(m, "mode", "affine")) for m in mods
                 }
                 if len(specs) != 1:
+                    if not split:
+                        return None
                     return tuple(linear_forward(m, inputs) for m in mods)
             pts, acc = [], 0
             for m in mods[:-1]:
@@ -368,6 +374,8 @@ class Glm5NextLinearAttention(nn.Module):
             )
         else:
             out = inputs @ self._fw.T
+        if not split:
+            return out, self._split_pts
         return mx.split(out, self._split_pts, axis=-1)
 
     def _decode_step(self, inputs, mask, cache):
