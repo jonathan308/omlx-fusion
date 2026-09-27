@@ -2309,6 +2309,15 @@ class Scheduler:
                 self._glm_dsa_adaptive_prefill.after,
                 self._glm_dsa_adaptive_prefill.min_remaining,
             )
+            if self._qwen35_prefill_floor:
+                # Fusion: GLM-5.3 (the only adaptive-step model with a family
+                # floor) takes its prefill width from this step alone (8192
+                # wherever the native sparse kernels load). The floor above
+                # (the NAX step, 8192 on NAX hosts with 128 GB+ and 4096
+                # below, or 4096 without NAX) follows it, so the chunk, the
+                # paged-cache block and the BatchGenerator step agree.
+                # OMLX_GLM5_PREFILL_STEP then sizes only DFlash prefill chunks.
+                self._qwen35_prefill_floor = self._glm_dsa_adaptive_prefill.step_size
 
         # For strict RotatingKVCache reuse, align paged cache block size to
         # the model's rotating window size when paged cache is enabled.

@@ -4475,6 +4475,12 @@ class TestSchedulerArraysCacheBlockAlignment:
                 "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
                 return_value=True,
             ),
+            # Fusion's GLM DSA adaptive step (covered by
+            # test_glm5_adaptive_step_is_the_one_prefill_width) stays off here.
+            patch(
+                "omlx.patches.glm_moe_dsa.generate_patch._glm5_native_sparse_available",
+                return_value=False,
+            ),
         ):
             scheduler = Scheduler(
                 model=self._hybrid_model(model_type=model_type),
@@ -4487,12 +4493,8 @@ class TestSchedulerArraysCacheBlockAlignment:
 
         try:
             assert scheduler._qwen35_prefill_floor == 4096
-            # Fusion widens glm5_next steps to the GLM DSA adaptive 8192 once
-            # the native sparse kernels are available (glm_moe_dsa
-            # generate_patch); the 4096 floor and block size still hold.
-            assert scheduler._prefill_step_size_for_progress(0, 4096) in (4096, 8192)
-            # ... and the paged block grows with that wider step.
-            assert scheduler.config.paged_cache_block_size in (4096, 8192)
+            assert scheduler._prefill_step_size_for_progress(0, 4096) == 4096
+            assert scheduler.config.paged_cache_block_size == 4096
         finally:
             scheduler.shutdown()
 
@@ -4545,6 +4547,12 @@ class TestSchedulerArraysCacheBlockAlignment:
                 "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
                 return_value=True,
             ),
+            # Fusion's GLM DSA adaptive step (covered by
+            # test_glm5_adaptive_step_is_the_one_prefill_width) stays off here.
+            patch(
+                "omlx.patches.glm_moe_dsa.generate_patch._glm5_native_sparse_available",
+                return_value=False,
+            ),
         ):
             scheduler = Scheduler(
                 model=self._hybrid_model(model_type="glm5_next"),
@@ -4556,13 +4564,10 @@ class TestSchedulerArraysCacheBlockAlignment:
             )
 
         try:
+            step = expected or 2048
             assert scheduler._qwen35_prefill_floor == expected
-            # Fusion widens glm5_next steps to the GLM DSA adaptive 8192 once
-            # the native sparse kernels are available (glm_moe_dsa
-            # generate_patch); that step takes precedence over the NAX floor
-            # and the paged block follows it.
-            assert scheduler._prefill_step_size_for_progress(0, 16384) == 8192
-            assert scheduler.config.paged_cache_block_size == 8192
+            assert scheduler._prefill_step_size_for_progress(0, 16384) == step
+            assert scheduler.config.paged_cache_block_size == step
         finally:
             scheduler.shutdown()
 
@@ -4751,12 +4756,77 @@ class TestSchedulerArraysCacheBlockAlignment:
         finally:
             scheduler.shutdown()
 
-    def test_glm5_native_sparse_prefill_aligns_cache_boundary_to_8192(
-        self, mock_tokenizer, tmp_path
+    @pytest.mark.parametrize(
+        (
+            "is_nax",
+            "nax_sparse_mla",
+            "memory_gb",
+            "nax_step_env",
+            "adaptive_step_env",
+            "floor",
+            "width",
+        ),
+        [
+            # The NAX step alone would give 8192 / 4096 / 0, the non-NAX
+            # floor 4096, OMLX_GLM5_PREFILL_STEP 16384: the adaptive step
+            # is the one width wherever a family floor exists.
+            (True, True, 256, None, None, 8192, 8192),
+            (True, True, 96, None, None, 8192, 8192),
+            (False, False, 256, None, None, 8192, 8192),
+            (True, True, 256, "16384", None, 8192, 8192),
+            (True, True, 48, None, None, 0, 8192),
+            (True, True, 256, None, "4096", 4096, 4096),
+        ],
+    )
+    def test_glm5_adaptive_step_is_the_one_prefill_width(
+        self,
+        mock_tokenizer,
+        tmp_path,
+        monkeypatch,
+        is_nax,
+        nax_sparse_mla,
+        memory_gb,
+        nax_step_env,
+        adaptive_step_env,
+        floor,
+        width,
     ):
-        with patch(
-            "omlx.patches.glm_moe_dsa.generate_patch._glm5_native_sparse_available",
-            return_value=True,
+        """Fusion: with the native sparse kernels GLM-5.3 prefills in the GLM
+        DSA adaptive step on every host; the model-family floor (the NAX step
+        or the non-NAX 4096) follows it, so the chunk, the paged-cache block
+        and the BatchGenerator step (max of step and floor) agree."""
+        import sys
+
+        for name, value in (
+            ("OMLX_GLM5_PREFILL_STEP", nax_step_env),
+            ("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP_SIZE", adaptive_step_env),
+        ):
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, value)
+        fake = SimpleNamespace(nax_sparse_mla_available=lambda: nax_sparse_mla)
+        with (
+            patch.dict(
+                sys.modules, {"omlx.patches.glm_moe_dsa.sparse_mla_nax": fake}
+            ),
+            patch(
+                "omlx.settings.get_system_memory",
+                return_value=memory_gb * 1024**3,
+            ),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=is_nax),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                return_value=True,
+            ),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                return_value=True,
+            ),
+            patch(
+                "omlx.patches.glm_moe_dsa.generate_patch._glm5_native_sparse_available",
+                return_value=True,
+            ),
         ):
             scheduler = Scheduler(
                 model=self._hybrid_model(model_type="glm5_next"),
@@ -4769,8 +4839,10 @@ class TestSchedulerArraysCacheBlockAlignment:
 
         try:
             assert scheduler._glm_dsa_adaptive_prefill is not None
-            assert scheduler._prefill_step_size_for_progress(0, 20_000) == 8192
-            assert scheduler.config.paged_cache_block_size == 8192
+            assert scheduler._glm_dsa_adaptive_prefill.step_size == width
+            assert scheduler._qwen35_prefill_floor == floor
+            assert scheduler._prefill_step_size_for_progress(0, 20_000) == width
+            assert scheduler.config.paged_cache_block_size == width
         finally:
             scheduler.shutdown()
 
