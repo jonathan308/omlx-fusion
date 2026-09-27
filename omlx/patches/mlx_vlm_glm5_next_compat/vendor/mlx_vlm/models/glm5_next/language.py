@@ -1441,11 +1441,18 @@ class Glm5NextMoE(nn.Module):
         fused = dk.moe_gate_up_swiglu(
             x2, None, limit, routed_gate, routed_up, shared.gate_proj, shared.up_proj,
             select=(*logits, gate.top_k, gate.routed_scaling_factor, gate.norm_topk_prob),
+            split_shared=True,
         )
         if fused is None:
             return None
-        act, routes, weights = fused
-        y = dk.moe_down_combine(act, routes, weights, sw.down_proj, shared.down_proj)
+        if len(fused) == 4:
+            act, shared_act, routes, weights = fused
+            y = dk.moe_down_combine(
+                act, routes, weights, sw.down_proj, shared.down_proj, shared_act_sep=shared_act
+            )
+        else:
+            act, routes, weights = fused
+            y = dk.moe_down_combine(act, routes, weights, sw.down_proj, shared.down_proj)
         return None if y is None else y.reshape(x.shape)
 
     def _decode_experts(self, x, indices, scores):

@@ -312,8 +312,9 @@ def test_decode_experts_are_bitwise_reference(length, shared_bits, slot_major, m
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_one_token_moe_selects_routes_inside_gate_up(seed, monkeypatch):
     """One token: the gate/up kernel replays the router's top-k selection
-    (router logits -> gate/up -> down), bitwise like the router select
-    kernel path and the reference MoE, including exact score ties."""
+    (router logits -> gate/up -> down; the shared expert's gate/up as its own
+    dispatch), bitwise like the one-launch and router-select-kernel paths
+    and the reference MoE, including exact score ties."""
     from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
 
     language = _language()
@@ -328,11 +329,16 @@ def test_one_token_moe_selects_routes_inside_gate_up(seed, monkeypatch):
     for trial in range(4):
         x = (mx.random.normal((1, 1, 4096)) * (0.3 + trial)).astype(mx.bfloat16)
         before = _stats()["router_select_fused"]
+        split = _stats()["moe_shared_split"]
         fused = moe(x)
         assert _stats()["router_select_fused"] == before + 1
+        assert _stats()["moe_shared_split"] == split + 1
+        monkeypatch.setattr(dk, "DISABLED", {"moe_shared_split"})
+        one_launch = moe(x)
         monkeypatch.setattr(dk, "DISABLED", {"router_select_fused"})
         two_step = moe(x)
         monkeypatch.setattr(dk, "DISABLED", set())
+        assert _mismatches(fused, one_launch) == 0
         monkeypatch.setattr(language, "_DECODE_FUSION", False)
         reference = moe(x)
         monkeypatch.setattr(language, "_DECODE_FUSION", True)

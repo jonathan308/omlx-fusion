@@ -508,6 +508,52 @@ _GATE_UP_SOURCE = r"""
 """
 
 
+# One token's shared-expert gate/up with the clamped SwiGLU: the shared slot
+# of the fused gate/up kernel as its own dispatch. It does not depend on the
+# router, so it runs concurrently with the router logits kernel (no barrier
+# between them) and hides that kernel's latency under its weight stream.
+_SHARED_GATE_UP_SOURCE = r"""
+  const uint simd_lid = thread_index_in_simdgroup;
+  const uint simd_gid = simdgroup_index_in_threadgroup;
+  const int tile = int(threadgroup_position_in_grid.y);
+  const T lim = T(limit[0]);
+  const T neg_lim = T(-limit[0]);
+  const int out_row = (tile * NSG + int(simd_gid)) * RPS;
+  float g_res[RPS] = {0};
+  float u_res[RPS] = {0};
+  {
+    constexpr int WB = K * SBITS / 8;
+    constexpr int G = K / SGS;
+    const size_t row0 = size_t(out_row);
+    glm_qmv_rows<T, K, SGS, SBITS, RPS>(
+        (const device uint8_t*)sh_gate_w + row0 * WB, sh_gate_s + row0 * G,
+        sh_gate_b + row0 * G, x, simd_lid, g_res);
+    glm_qmv_rows<T, K, SGS, SBITS, RPS>(
+        (const device uint8_t*)sh_up_w + row0 * WB, sh_up_s + row0 * G,
+        sh_up_b + row0 * G, x, simd_lid, u_res);
+  }
+  device T* o = out + out_row;
+  for (int row = 0; row < RPS; row++) {
+    float gv = simd_sum(g_res[row]);
+    float uv = simd_sum(u_res[row]);
+    if (simd_lid == 0) {
+      o[row] = glm_clamped_swiglu<T>(static_cast<T>(gv), static_cast<T>(uv), lim, neg_lim);
+    }
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _shared_gate_up_kernel():
+    return mx.fast.metal_kernel(
+        name="glm5_moe_shared_gate_up_swiglu",
+        input_names=["x", "limit", "sh_gate_w", "sh_gate_s", "sh_gate_b", "sh_up_w", "sh_up_s", "sh_up_b"],
+        output_names=["out"],
+        header=_QMV_HEADER,
+        source=_SHARED_GATE_UP_SOURCE,
+    )
+
+
 # Fused routed down projection + routing-weighted sum (+ shared expert down
 # projection and residual-free add), reproducing
 #   y = (down(act) * scores[..., None]).sum(-2).astype(T) + shared_down(act_s)
@@ -522,7 +568,9 @@ _DOWN_SOURCE = r"""
   const int tile = int(threadgroup_position_in_grid.y);
   const int token = int(threadgroup_position_in_grid.z);
 #endif
-  constexpr int RT = TOPK + HAS_SHARED;
+  // Activation slots per token: the routed ones, then the shared expert's
+  // unless it comes from its own input (SH_SEP).
+  constexpr int RT = TOPK + HAS_SHARED * (1 - SH_SEP);
   const int out_row = (tile * NSG + int(simd_gid)) * RPS;
 
   float acc[RPS] = {0};
@@ -550,10 +598,14 @@ _DOWN_SOURCE = r"""
     constexpr int SWB = K * SBITS / 8;
     constexpr int SG = K / SGS;
     const size_t row0 = size_t(out_row);
+#if SH_SEP
+    const device T* sh_x = sh_act + size_t(token) * K;
+#else
+    const device T* sh_x = act + (size_t(token) * RT + TOPK) * K;
+#endif
     glm_qmv_rows<T, K, SGS, SBITS, RPS>(
         (const device uint8_t*)sh_down_w + row0 * SWB, sh_down_s + row0 * SG,
-        sh_down_b + row0 * SG, act + (size_t(token) * RT + TOPK) * K,
-        simd_lid, sres);
+        sh_down_b + row0 * SG, sh_x, simd_lid, sres);
   }
 #endif
 #if SHARED_WIDE_DOWN
@@ -619,6 +671,10 @@ def _gate_up_kernel(
     inputs = ["x"] + routes + ["limit", "gate_w", "gate_s", "gate_b", "up_w", "up_s", "up_b"]
     if has_shared or shared_wide:
         inputs += ["sh_gate_w", "sh_gate_s", "sh_gate_b", "sh_up_w", "sh_up_s", "sh_up_b"]
+    if select and not has_shared:
+        # The shared expert's own gate/up output: read by nothing here, it
+        # orders that dispatch (and the router's) before this one.
+        inputs += ["after_shared"]
     suffix = "_widesh" if shared_wide else ("_shared" if has_shared else "")
     suffix += "_sm" if slot_major else ""
     suffix += "_select" if select else ""
@@ -642,12 +698,16 @@ def _gate_up_kernel(
 
 @lru_cache(maxsize=None)
 def _down_kernel(
-    has_shared: bool, add_shared_y: bool, slot_major: bool = False, shared_wide: bool = False
+    has_shared: bool,
+    add_shared_y: bool,
+    slot_major: bool = False,
+    shared_wide: bool = False,
+    shared_sep: bool = False,
 ):
     inputs = ["act", "indices", "scores", "down_w", "down_s", "down_b"]
     if has_shared:
         inputs += ["sh_down_w", "sh_down_s", "sh_down_b"]
-        if shared_wide:
+        if shared_wide or shared_sep:
             inputs += ["sh_act"]
     elif add_shared_y:
         inputs += ["shared_y"]
@@ -655,6 +715,7 @@ def _down_kernel(
         "_shared" if has_shared else ("_add" if add_shared_y else "")
     )
     suffix += "_sm" if slot_major else ""
+    suffix += "_shsep" if shared_sep else ""
     return mx.fast.metal_kernel(
         name=f"glm5_moe_down_combine{suffix}",
         input_names=inputs,
@@ -666,6 +727,7 @@ def _down_kernel(
             ADD_SHARED_Y=int(add_shared_y and not has_shared),
             SLOT_MAJOR=int(slot_major),
             SHARED_WIDE_DOWN=int(shared_wide),
+            SH_SEP=int(shared_sep and not shared_wide),
         ),
     )
 
@@ -704,6 +766,7 @@ def moe_gate_up_swiglu(
     nsg: int = 2,
     shared_wide: bool = False,
     select=None,
+    split_shared: bool = False,
 ):
     """Clamped-SwiGLU activations for every (token, routed expert[, shared]).
 
@@ -719,7 +782,11 @@ def moe_gate_up_swiglu(
     the ``moe_router_logits`` outputs) replaces ``indices``: every routed
     threadgroup replays the router's top-k selection, and the call returns
     ``(act, indices [1, top_k] uint32, scores [1, top_k] fp32)`` like
-    ``moe_router`` + this kernel, or None when not covered.
+    ``moe_router`` + this kernel, or None when not covered. With
+    ``split_shared`` too, the shared expert runs as its own dispatch first
+    (independent of the router, so it overlaps the router logits kernel)
+    and the call returns ``(act [1, top_k, N], shared_act [1, N], indices,
+    scores)`` for ``moe_down_combine(..., shared_act_sep=shared_act)``.
     """
     if "moe_gate_up" in DISABLED:
         return None
@@ -789,6 +856,30 @@ def moe_gate_up_swiglu(
     if shared_wide and "moe_shared_wide" in DISABLED:
         return None
     slot_major = _slot_major(T)
+    if split_shared and select is not None and has_shared and "moe_shared_split" not in DISABLED:
+        tiles = N // (rps * nsg)
+        limit_arr = inputs[len(routes) + 1]
+        act_sh = _shared_gate_up_kernel()(
+            inputs=[x, limit_arr] + inputs[-6:],
+            template=[("T", x.dtype), ("K", K), ("N", N), ("SBITS", sbits), ("SGS", sgsz),
+                      ("RPS", rps), ("NSG", nsg)],
+            grid=(32, tiles * nsg, 1),
+            threadgroup=(32, nsg, 1),
+            output_shapes=[(1, N)],
+            output_dtypes=[x.dtype],
+        )[0]
+        STATS["moe_gate_up"] += 1
+        STATS["router_select_fused"] += 1
+        STATS["moe_shared_split"] += 1
+        act, sel_indices, sel_scores = _gate_up_kernel(False, False, False, True)(
+            inputs=inputs[:-6] + [act_sh],
+            template=[t for t in template if t[0] not in ("SBITS", "SGS")],
+            grid=(32, tiles * nsg, topk),
+            threadgroup=(32, nsg, 1),
+            output_shapes=[(1, topk, N), (1, topk), (1, topk)],
+            output_dtypes=[x.dtype, mx.uint32, mx.float32],
+        )
+        return act, act_sh, sel_indices, sel_scores
     kernel = _gate_up_kernel(has_shared, shared_wide, slot_major, select is not None)
     STATS["moe_gate_up"] += 1
     tiles = N // (rps * nsg)
@@ -842,6 +933,7 @@ def moe_down_combine(
     shared_y: Optional[mx.array] = None,
     *,
     shared_act: Optional[mx.array] = None,
+    shared_act_sep: Optional[mx.array] = None,
     rps: int = 4,
     nsg: int = 2,
 ) -> Optional[mx.array]:
@@ -852,7 +944,9 @@ def moe_down_combine(
     last activation slot (``shared_down``), from ``shared_act`` [T, K] (the
     ``shared_wide`` gate/up output, with the multi-row qmv_wide arithmetic)
     or added from a precomputed ``shared_y`` [T, N].  Returns [T, N] in
-    ``act.dtype``.
+    ``act.dtype``. ``shared_act_sep`` [T, K] is the shared expert's one-token
+    activation from its own gate/up dispatch (``act`` then has only the
+    routed slots); the arithmetic is the in-``act`` shared slot's.
     """
     if "moe_down" in DISABLED:
         return None
@@ -869,7 +963,10 @@ def moe_down_combine(
         return None
     if shared_wide and ("moe_shared_wide" in DISABLED or not 2 <= T <= 8):
         return None
-    if rt != topk + int(has_shared and not shared_wide) or ds.dtype != act.dtype:
+    shared_sep = shared_act_sep is not None
+    if shared_sep and (not has_shared or shared_wide or shared_y is not None):
+        return None
+    if rt != topk + int(has_shared and not shared_wide and not shared_sep) or ds.dtype != act.dtype:
         return None
     if not _qmv_fast_ok(rbits, rgs, N, K) or N % (rps * nsg):
         return None
@@ -892,14 +989,17 @@ def moe_down_combine(
                 return None
         elif not _qmv_fast_ok(sbits, sgsz, N, K):
             return None
+        if shared_sep and (shared_act_sep.shape != (T, K) or shared_act_sep.dtype != act.dtype):
+            return None
         inputs += [sdw, sds, sdb] + ([shared_act] if shared_wide else [])
+        inputs += [shared_act_sep] if shared_sep else []
         template += [("SBITS", sbits), ("SGS", sgsz)]
     elif shared_y is not None:
         if shared_y.shape != (T, N) or shared_y.dtype != act.dtype:
             return None
         inputs.append(shared_y)
     slot_major = _slot_major(T)
-    kernel = _down_kernel(has_shared, shared_y is not None, slot_major, shared_wide)
+    kernel = _down_kernel(has_shared, shared_y is not None, slot_major, shared_wide, shared_sep)
     STATS["moe_down"] += 1
     if shared_wide:
         STATS["moe_down_shared_wide"] += 1
