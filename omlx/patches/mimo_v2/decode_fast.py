@@ -63,7 +63,25 @@ def _env_on(name: str) -> bool:
 
 
 def enabled() -> bool:
-    return _env_on("OMLX_MIMO_DECODE_FAST")
+    """On by default on M5 (NAX) GPUs, where the fused path is validated.
+
+    OMLX_MIMO_DECODE_FAST=1 forces it on elsewhere, =0 turns it off.
+    """
+    value = os.environ.get("OMLX_MIMO_DECODE_FAST", "").strip().lower()
+    if value in ("0", "false", "off", "no"):
+        return False
+    if value in ("1", "true", "on", "yes"):
+        return True
+    return _nax_available()
+
+
+def _nax_available() -> bool:
+    try:
+        from omlx.custom_kernels.nax import is_nax_available
+
+        return bool(is_nax_available())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def sdpa_chunks_enabled() -> bool:

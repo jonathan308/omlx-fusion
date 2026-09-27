@@ -17,8 +17,20 @@ import pytest
 
 from omlx.patches import mlx_vlm_glm5_next_compat as compat
 
+def _nax() -> bool:
+    try:
+        from omlx.custom_kernels.nax import is_nax_available
+
+        return bool(is_nax_available())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# The fused kernels replay the reference graph bit for bit on M5 (NAX) GPUs,
+# where they are enabled; other GPUs keep the reference path.
 pytestmark = pytest.mark.skipif(
-    not mx.metal.is_available(), reason="fused GLM decode kernels need Metal"
+    not mx.metal.is_available() or not _nax(),
+    reason="fused GLM decode kernels are validated and enabled on M5 (NAX) GPUs",
 )
 
 

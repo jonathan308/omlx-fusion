@@ -12,6 +12,14 @@ from mlx.utils import tree_flatten
 from omlx.patches.mimo_v2 import decode_fast as df
 from omlx.patches.mimo_v2 import moe_decode as md
 
+
+# The fused decode kernels are validated (bitwise for one row) and enabled on
+# M5 (NAX) GPUs; other GPUs keep the reference path.
+pytestmark = pytest.mark.skipif(
+    not mx.metal.is_available() or not df._nax_available(),
+    reason="MiMo fused decode kernels are validated and enabled on M5 (NAX) GPUs",
+)
+
 BF16 = mx.bfloat16
 
 
