@@ -1320,16 +1320,21 @@ _DSA_SCORES_SOURCE = r"""
 
   for (int hh = 0; hh < HEADS / NSG; hh++) {
     const int h = int(sg) * (HEADS / NSG) + hh;
-    simdgroup_matrix<float, 8, 8> c = simdgroup_matrix<float, 8, 8>(0.0f);
+    // This head's query fragments, loaded ahead of the (accumulator
+    // dependent) MMA chain; the chain itself is unchanged.
+    float2 av[DIM / 8];
     for (int kb = 0; kb < DIM / 8; kb++) {
-      float2 av = float2(0.0f);
+      av[kb] = float2(0.0f);
       if (fm < L) {
         const device T* qr = q + (size_t(fm) * HEADS + h) * DIM + kb * 8 + fn;
-        av[0] = static_cast<float>(qr[0]);
-        av[1] = static_cast<float>(qr[1]);
+        av[kb][0] = static_cast<float>(qr[0]);
+        av[kb][1] = static_cast<float>(qr[1]);
       }
+    }
+    simdgroup_matrix<float, 8, 8> c = simdgroup_matrix<float, 8, 8>(0.0f);
+    for (int kb = 0; kb < DIM / 8; kb++) {
       simdgroup_matrix<float, 8, 8> a;
-      reinterpret_cast<thread float2&>(a.thread_elements()) = av;
+      reinterpret_cast<thread float2&>(a.thread_elements()) = av[kb];
       simdgroup_multiply_accumulate(c, a, bfrag[kb], c);
     }
     float2 cv = reinterpret_cast<thread float2&>(c.thread_elements());
