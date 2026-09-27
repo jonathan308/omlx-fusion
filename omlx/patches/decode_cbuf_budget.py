@@ -25,7 +25,10 @@ logger = logging.getLogger(__name__)
 
 _DECODE_MAX_ROWS = 8
 _DECODE_MB = 1_000_000
+# Ops per command buffer during decode (0 keeps mlx's default).
+_DECODE_OPS = int(os.environ.get("OMLX_DECODE_CBUF_OPS", "0") or 0)
 _default_mb: int | None = None
+_default_ops: int | None = None
 _wrapped: set[type] = set()
 
 
@@ -42,13 +45,17 @@ def _wrap(cls: type) -> None:
 
     def __call__(self, inputs, *args, **kwargs):
         rows = inputs.shape[1] if getattr(inputs, "ndim", 0) >= 2 else 1
-        mx.metal.set_command_buffer_limits(
-            0, _DECODE_MB if rows <= _DECODE_MAX_ROWS else _default_mb
-        )
+        _set_for_rows(rows)
         return original(self, inputs, *args, **kwargs)
 
     cls.__call__ = __call__
     _wrapped.add(cls)
+
+
+def _read_defaults() -> None:
+    global _default_mb, _default_ops
+    if _default_mb is None:
+        _default_ops, _default_mb = mx.metal.set_command_buffer_limits(0, 0)
 
 
 def apply(model: Any) -> bool:
@@ -56,8 +63,7 @@ def apply(model: Any) -> bool:
     global _default_mb
     if model is None or not _available():
         return False
-    if _default_mb is None:
-        _default_mb = mx.metal.set_command_buffer_limits(0, 0)[1]
+    _read_defaults()
     for obj in (model, getattr(model, "language_model", None)):
         if obj is not None:
             _wrap(type(obj))
@@ -66,9 +72,10 @@ def apply(model: Any) -> bool:
 
 
 def _set_for_rows(rows: int) -> None:
-    mx.metal.set_command_buffer_limits(
-        0, _DECODE_MB if rows <= _DECODE_MAX_ROWS else _default_mb
-    )
+    if rows <= _DECODE_MAX_ROWS:
+        mx.metal.set_command_buffer_limits(_DECODE_OPS or _default_ops, _DECODE_MB)
+    else:
+        mx.metal.set_command_buffer_limits(_default_ops, _default_mb)
 
 
 def apply_target_ops(target_ops: Any) -> bool:
@@ -78,8 +85,7 @@ def apply_target_ops(target_ops: Any) -> bool:
     global _default_mb
     if target_ops is None or not _available():
         return False
-    if _default_mb is None:
-        _default_mb = mx.metal.set_command_buffer_limits(0, 0)[1]
+    _read_defaults()
     cls = type(target_ops)
     if cls in _wrapped:
         return True
