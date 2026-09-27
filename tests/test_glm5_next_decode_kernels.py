@@ -555,7 +555,7 @@ def _check_small_model(seed=41, prompt_len=2101, heads=16):
 
 _ALWAYS_FUSED = {
     "hc_mix", "moe_gate_up", "moe_down", "dsa_scores", "kda", "router", "latent_attn",
-    "multi_qmv",
+    "multi_qmv", "router_select_fused", "moe_shared_split",
 }
 
 
@@ -572,7 +572,10 @@ def test_small_model_dense_attention_is_bitwise_reference():
     from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
 
     used = _check_small_model(seed=43, prompt_len=300)
-    assert {"hc_mix", "kda", "router", "moe_gate_up", "multi_qmv"} <= used, used
+    assert {
+        "hc_mix", "kda", "router", "moe_gate_up", "multi_qmv", "router_select_fused",
+        "moe_shared_split",
+    } <= used, used
     assert ("latent_attn" in used) == dk.nax_available(), used
 
 
