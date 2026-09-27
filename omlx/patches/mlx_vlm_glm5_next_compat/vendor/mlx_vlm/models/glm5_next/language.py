@@ -14,7 +14,9 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, CacheList, KVCache
-from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
+from ..deepseek_v4.hyper_connection import HyperConnection as _HyperConnection
+from ..deepseek_v4.hyper_connection import hc_expand as _hc_expand
+from ..linear import DECODE_BLOCK_SIZE
 from mlx_lm.models.mla import MultiLinear
 from omlx.patches import glm53_kda_prework
 from omlx.patches.deepseek_v4.switch_layers import SwitchGLU, _sort_threshold
@@ -29,6 +31,7 @@ from omlx.patches.glm_moe_dsa.sparse_mla import (
     sparse_mla_attention_nope,
 )
 from .config import ModelConfig, TextConfig
+from . import hc_prefill
 from .gated_delta import gated_delta_update
 from .linear import fused_quantized_matmul, linear_forward
 
@@ -169,6 +172,30 @@ def glm5_next_cast_predicate(key: str) -> bool:
         or key.endswith("dt_bias")
         or key.endswith("mlp.gate.weight")
     )
+
+
+class HyperConnection(_HyperConnection):
+    """mlx-vlm's hyper-connection with fused, batch-invariant prefill kernels.
+
+    Blocks longer than ``DECODE_BLOCK_SIZE`` take ``hc_prefill.hc_pre``;
+    decode and short verify blocks keep the canonical path.
+    """
+
+    def __call__(self, x: mx.array):
+        if x.ndim == 4 and x.shape[1] > DECODE_BLOCK_SIZE:
+            fused = hc_prefill.hc_pre(self, x)
+            if fused is not None:
+                return fused
+        return super().__call__(x)
+
+
+def hc_expand(x, residual, post, comb, **kwargs):
+    """``hc_expand`` with a single-pass kernel for prefill-length blocks."""
+    if x.ndim == 3 and x.shape[1] > DECODE_BLOCK_SIZE and not kwargs:
+        fused = hc_prefill.hc_expand(x, residual, post, comb)
+        if fused is not None:
+            return fused
+    return _hc_expand(x, residual, post, comb, **kwargs)
 
 
 class Glm5NextRMSNormGated(nn.Module):
