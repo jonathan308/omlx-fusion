@@ -51,6 +51,7 @@ from mlx_vlm.models.switch_layers import (
 
 from ..scheduler import _sync_and_clear_cache
 from . import moe_verify_gather
+from .m5_gather_qmm import fused_gate_up_activation
 
 logger = logging.getLogger(__name__)
 
@@ -149,10 +150,17 @@ def _make_patched_call(orig_call):
             x, idx, inv_order = _gather_sort(x, indices)
         if self.training:
             idx = mx.stop_gradient(idx)
-        x_gate_up = gate_up(x, idx, sorted_indices=do_sort)
-        x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+        x_act = None
+        if do_sort and not self.training:
+            # Sorted prefill on M5: the activation in the [gate; up]
+            # matmul's epilogue (bit-identical; None keeps this path).
+            x_act = fused_gate_up_activation(gate_up, x, idx, self.activation)
+        if x_act is None:
+            x_gate_up = gate_up(x, idx, sorted_indices=do_sort)
+            x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+            x_act = self.activation(x_up, x_gate)
         x = self.down_proj(
-            self.activation(x_up, x_gate),
+            x_act,
             idx,
             sorted_indices=do_sort,
         )

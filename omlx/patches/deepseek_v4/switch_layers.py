@@ -15,6 +15,7 @@ import mlx.nn as nn
 from mlx_lm.models.activations import swiglu
 from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 from omlx.custom_kernels.nax import is_nax_available
+from omlx.patches.m5_gather_qmm import fused_gate_up_activation
 
 _DEEPSEEK_MXFP4_SMALL_BLOCK_BM = 16
 _DEEPSEEK_MXFP4_SMALL_BLOCK_VARIANT = 1
@@ -525,13 +526,28 @@ class SwitchGLU(nn.Module):
             and self.up_proj.num_experts == self.gate_proj.num_experts
             and glm_fast.has_symbol("deepseek_affine_gather_qmm_pair_concat_blocks")
         )
+        x_act = None
         if fused_gate_up:
-            # One gather_qmm over the [gate; up] expert rows; each output
-            # column is the same K-reduction as in the separate calls.
-            x_gate_up = self.gate_up_proj(
-                x, idx, sorted_indices=do_sort, block_plan=block_plan
-            )
-            x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+            if (
+                do_sort
+                and block_plan is None
+                and not self.training
+                and isinstance(self.gate_up_proj, QuantizedSwitchLinear)
+                and self.gate_up_proj._native_block_kind(x, do_sort) is None
+            ):
+                # Sorted prefill on M5 (stock gather_qmm route): the
+                # activation in the [gate; up] matmul's epilogue
+                # (bit-identical; None keeps the path below).
+                x_act = fused_gate_up_activation(
+                    self.gate_up_proj, x, idx, self.activation
+                )
+            if x_act is None:
+                # One gather_qmm over the [gate; up] expert rows; each output
+                # column is the same K-reduction as in the separate calls.
+                x_gate_up = self.gate_up_proj(
+                    x, idx, sorted_indices=do_sort, block_plan=block_plan
+                )
+                x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
         elif use_pair_proj:
             block_meta, block_count, block_variant = _unpack_mxfp4_block_plan(
                 block_plan
@@ -589,7 +605,7 @@ class SwitchGLU(nn.Module):
             x_gate = self.gate_proj(
                 x, idx, sorted_indices=do_sort, block_plan=block_plan
             )
-        x = self.activation(x_up, x_gate)
+        x = self.activation(x_up, x_gate) if x_act is None else x_act
         if (
             block_plan is not None
             and native_kinds is not None
