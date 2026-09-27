@@ -51,3 +51,22 @@ def test_pipeline_depth_zero_is_synchronous(monkeypatch):
     pipe.push("a")
     pipe.push("b")
     assert [w[0] for w in waited] == ["a", "b"]
+
+
+def test_pipeline_runs_the_completion_hook_per_layer(monkeypatch):
+    """Every layer is waited for exactly once and the hook runs after each."""
+    events = []
+    real_eval = mx.eval
+
+    def spy_eval(*arrays):
+        events.append("eval")
+        return real_eval(*arrays)
+
+    monkeypatch.setattr(mx, "eval", spy_eval)
+    pipe = LayerPipeline(depth=1, on_evaluated=lambda: events.append("hook"))
+    h = mx.ones((8, 8))
+    for _ in range(5):
+        h = h * 2
+        pipe.push(h)
+    pipe.drain()
+    assert events == ["eval", "hook"] * 5

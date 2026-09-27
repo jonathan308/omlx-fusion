@@ -417,7 +417,9 @@ def _patch_model_call(g5_lang: Any) -> None:
 
         # This replaces Glm5NextModel.__call__; preserve its prefill memory policy.
         prefill = h.shape[1] >= 256
-        pipeline = LayerPipeline() if prefill else None
+        # Each completed layer is waited for and the allocator cache is
+        # released (layer-specific buffer sizes would otherwise accumulate).
+        pipeline = LayerPipeline(on_evaluated=mx.clear_cache) if prefill else None
 
         for layer, c in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
@@ -427,6 +429,8 @@ def _patch_model_call(g5_lang: Any) -> None:
                 h = layer(h, mask=mask, cache=c)
             if pipeline is not None:
                 pipeline.push(h)
+        if pipeline is not None:
+            pipeline.drain()
 
         # Collapse the mHC streams first: everything downstream (the final
         # norm, the lm_head, and the nextn head) consumes the ordinary

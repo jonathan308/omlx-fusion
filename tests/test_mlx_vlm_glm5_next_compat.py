@@ -1233,8 +1233,9 @@ def test_prefill_pipelines_layers_with_bounded_inflight(monkeypatch):
     perf/bounded-layer-pipelining replaced the blocking per-layer ``mx.eval`` +
     ``mx.clear_cache`` with ``omlx.utils.layer_pipeline.LayerPipeline``: each
     layer is queued with ``mx.async_eval`` and the host only waits for the
-    layer queued before it, so at most two layers are in flight and the
-    allocator pool is left intact between layers.
+    layer queued before it, so at most two layers are in flight. The
+    allocator cache is still released after each completed layer (layer-
+    specific buffer sizes would otherwise accumulate in the pool).
     """
     import mlx_vlm.models.glm5_next.language as lang
     from omlx.utils import layer_pipeline
@@ -1276,7 +1277,10 @@ def test_prefill_pipelines_layers_with_bounded_inflight(monkeypatch):
         "prefill must wait on the previous layer (bounded in-flight depth),"
         f" got {len(waited)} waits for {text.num_hidden_layers} layers"
     )
-    assert not clears, "prefill must leave the allocator pool intact between layers"
+    assert len(clears) >= text.num_hidden_layers, (
+        "prefill must release the allocator pool after each completed layer,"
+        f" got {len(clears)} clears for {text.num_hidden_layers} layers"
+    )
 
     queued.clear()
     waited.clear()
