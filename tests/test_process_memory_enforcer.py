@@ -1516,8 +1516,15 @@ class TestMetalWiredLimit:
             patch("omlx.process_memory_enforcer.mx") as mock_mx,
             patch.object(asyncio, "create_task", side_effect=_close_coro),
         ):
+            # A real device: the resident limit keeps max(16 GiB, 10% of RAM)
+            # unwired, so a bare MagicMock (memory_size 1) would clamp it to 0.
+            mock_mx.device_info.return_value = {
+                "max_recommended_working_set_size": 200 * 1024**3,
+                "memory_size": 256 * 1024**3,
+            }
+            mock_mx.set_wired_limit.return_value = 0
             enforcer.start()
-        mock_mx.set_wired_limit.assert_called_once()
+        mock_mx.set_wired_limit.assert_called_once_with(200 * 1024**3)
 
 
 class TestSingleModelMemoryPressure:
