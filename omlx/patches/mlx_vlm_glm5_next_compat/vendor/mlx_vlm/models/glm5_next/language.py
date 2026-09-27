@@ -1393,6 +1393,9 @@ class Glm5NextMoE(nn.Module):
             )
 
     def __call__(self, x):
+        y = self._decode_select(x)
+        if y is not None:
+            return y
         indices, scores = self.gate(x)
         y = self._decode_experts(x, indices, scores)
         if y is not None:
@@ -1403,6 +1406,47 @@ class Glm5NextMoE(nn.Module):
         if self.shared_experts is not None:
             y = y + self.shared_experts(x)
         return y
+
+    def _decode_select(self, x):
+        """One token: router logits, then the gate/up kernel replaying the
+        router's top-k selection in each routed threadgroup (one dependent
+        dispatch less than router select + gate/up), then down/combine.
+        Bit-identical to the gate + _decode_experts path; None when not
+        covered."""
+        dk = _decode_kernels
+        gate = self.gate
+        sw = self.switch_mlp
+        shared = self.shared_experts
+        if (
+            dk is None
+            or not _DECODE_FUSION
+            or x.ndim != 3
+            or x.shape[:2] != (1, 1)
+            or gate.n_group != 1
+            or shared is None
+            or gate.top_k >= _sort_threshold(*_switch_projections(sw))
+        ):
+            return None
+        limit = getattr(sw.activation, "limit", None)
+        if limit is None or shared.limit != limit:
+            return None
+        x2 = x.reshape(1, -1)
+        logits = dk.moe_router_logits(x2, gate.weight, gate.e_score_correction_bias)
+        if logits is None:
+            return None
+        if "gate_up_proj" in sw:
+            routed_gate, routed_up = sw.gate_up_proj, None
+        else:
+            routed_gate, routed_up = sw.gate_proj, sw.up_proj
+        fused = dk.moe_gate_up_swiglu(
+            x2, None, limit, routed_gate, routed_up, shared.gate_proj, shared.up_proj,
+            select=(*logits, gate.top_k, gate.routed_scaling_factor, gate.norm_topk_prob),
+        )
+        if fused is None:
+            return None
+        act, routes, weights = fused
+        y = dk.moe_down_combine(act, routes, weights, sw.down_proj, shared.down_proj)
+        return None if y is None else y.reshape(x.shape)
 
     def _decode_experts(self, x, indices, scores):
         """Fused expert path for one sequence whose routes SwitchGLU leaves unsorted.

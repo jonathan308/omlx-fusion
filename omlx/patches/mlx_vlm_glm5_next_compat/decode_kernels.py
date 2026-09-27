@@ -318,6 +318,59 @@ inline T glm_maximum(T x, T y) {
   return x > y ? x : y;
 }
 
+// The router's top-k selection (the select kernel's loop, one simdgroup):
+// argpartition order of the biased scores, i.e. descending values with ties
+// to the lower expert index and NaNs last (lowest index first). Every lane
+// ends with the same picked[].
+template <int E, int TOPK, typename P>
+inline void glm_router_topk(P bz, uint lane, thread int* picked) {
+  constexpr int PER = (E + 31) / 32;
+  float vals[PER];
+  bool taken[PER];
+  for (int j = 0; j < PER; j++) {
+    const int e = j * 32 + int(lane);
+    vals[j] = e < E ? bz[e] : -INFINITY;
+    taken[j] = e >= E;
+  }
+  for (int r = 0; r < TOPK; r++) {
+    float best = -INFINITY;
+    int best_e = 0x7fffffff;
+    for (int j = 0; j < PER; j++) {
+      const int e = j * 32 + int(lane);
+      if (!taken[j] && !isnan(vals[j]) &&
+          (best_e == 0x7fffffff || vals[j] > best || (vals[j] == best && e < best_e))) {
+        best = vals[j];
+        best_e = e;
+      }
+    }
+    for (ushort off = 16; off >= 1; off >>= 1) {
+      float ob = simd_shuffle_xor(best, off);
+      int oe = simd_shuffle_xor(best_e, off);
+      const bool other_better = oe != 0x7fffffff &&
+          (best_e == 0x7fffffff || ob > best || (ob == best && oe < best_e));
+      if (other_better) {
+        best = ob;
+        best_e = oe;
+      }
+    }
+    if (best_e == 0x7fffffff) {
+      for (int j = 0; j < PER; j++) {
+        const int e = j * 32 + int(lane);
+        if (!taken[j] && e < best_e) {
+          best_e = e;
+        }
+      }
+      for (ushort off = 16; off >= 1; off >>= 1) {
+        best_e = min(best_e, simd_shuffle_xor(best_e, off));
+      }
+    }
+    picked[r] = best_e;
+    if ((best_e % 32) == int(lane)) {
+      taken[best_e / 32] = true;
+    }
+  }
+}
+
 // Glm5NextClampedSwiGLU / Glm5NextMLP epilogue on bfloat16 projections:
 //   silu(minimum(gate, limit)) * minimum(maximum(up, -limit), limit)
 template <typename T>
@@ -395,7 +448,30 @@ _GATE_UP_SOURCE = r"""
   float g_res[RPS] = {0};
   float u_res[RPS] = {0};
   if (r < TOPK) {
+#if SELECT
+    // One token: this simdgroup replays the router's selection on the
+    // biased sigmoid scores (no separate select dispatch); slot 0 / tile 0
+    // publishes the routes and routing weights for the down kernel.
+    int picked[TOPK];
+    glm_router_topk<NE, TOPK>(sel_biased, simd_lid, picked);
+    const int expert = picked[r];
+    if (z == 0 && tile == 0 && simd_gid == 0 && simd_lid == 0) {
+      float total = 0.0f;
+      float gathered[TOPK];
+      for (int q = 0; q < TOPK; q++) {
+        gathered[q] = sel_sig[picked[q]];
+        total = gathered[q] + total;
+      }
+      for (int q = 0; q < TOPK; q++) {
+        float qv = SEL_NORM ? gathered[q] / total : gathered[q];
+        float sv = qv * sel_scaling[0];
+        sel_indices[q] = uint(picked[q]);
+        sel_scores[q] = sv;
+      }
+    }
+#else
     const int expert = int(indices[token * TOPK + r]);
+#endif
     constexpr int WB = K * RBITS / 8;   // bytes per weight row
     constexpr int G = K / RGS;          // groups per row
     // ESTRIDE rows per expert; a fused [gate; up] tensor (ESTRIDE = 2N) is
@@ -533,22 +609,33 @@ def _source(body: str, **defines) -> str:
 
 
 @lru_cache(maxsize=None)
-def _gate_up_kernel(has_shared: bool, shared_wide: bool = False, slot_major: bool = False):
-    inputs = ["x", "indices", "limit", "gate_w", "gate_s", "gate_b", "up_w", "up_s", "up_b"]
+def _gate_up_kernel(
+    has_shared: bool,
+    shared_wide: bool = False,
+    slot_major: bool = False,
+    select: bool = False,
+):
+    routes = ["sel_sig", "sel_biased", "sel_scaling"] if select else ["indices"]
+    inputs = ["x"] + routes + ["limit", "gate_w", "gate_s", "gate_b", "up_w", "up_s", "up_b"]
     if has_shared or shared_wide:
         inputs += ["sh_gate_w", "sh_gate_s", "sh_gate_b", "sh_up_w", "sh_up_s", "sh_up_b"]
     suffix = "_widesh" if shared_wide else ("_shared" if has_shared else "")
     suffix += "_sm" if slot_major else ""
+    suffix += "_select" if select else ""
+    outputs = ["out", "shared_out"] if shared_wide else ["out"]
+    if select:
+        outputs += ["sel_indices", "sel_scores"]
     return mx.fast.metal_kernel(
         name=f"glm5_moe_gate_up_swiglu{suffix}",
         input_names=inputs,
-        output_names=["out", "shared_out"] if shared_wide else ["out"],
+        output_names=outputs,
         header=_QMV_HEADER,
         source=_source(
             _GATE_UP_SOURCE,
             HAS_SHARED=int(has_shared and not shared_wide),
             SHARED_WIDE=int(shared_wide),
             SLOT_MAJOR=int(slot_major),
+            SELECT=int(select),
         ),
     )
 
@@ -616,6 +703,7 @@ def moe_gate_up_swiglu(
     rps: int = 4,
     nsg: int = 2,
     shared_wide: bool = False,
+    select=None,
 ):
     """Clamped-SwiGLU activations for every (token, routed expert[, shared]).
 
@@ -626,9 +714,25 @@ def moe_gate_up_swiglu(
     returns ``(routed [T, TOPK, N], shared [T, N])``. ``routed_up=None``
     means ``routed_gate`` is a fused ``gate_up_proj`` ([E, 2N, *]: gate rows
     then up rows per expert, as the MoE gate/up fusion lays them out).
+
+    ``select = (sig, biased, top_k, scaling, norm_topk_prob)`` (one token,
+    the ``moe_router_logits`` outputs) replaces ``indices``: every routed
+    threadgroup replays the router's top-k selection, and the call returns
+    ``(act, indices [1, top_k] uint32, scores [1, top_k] fp32)`` like
+    ``moe_router`` + this kernel, or None when not covered.
     """
     if "moe_gate_up" in DISABLED:
         return None
+    if select is not None:
+        if "router_select_fused" in DISABLED or shared_wide or x.ndim != 2 or x.shape[0] != 1:
+            return None
+        sig, biased, sel_topk, sel_scaling, sel_norm = select
+        E_r = sig.shape[-1]
+        if sig.shape != (1, E_r) or biased.shape != (1, E_r) or not 1 <= sel_topk <= 32:
+            return None
+        if sig.dtype != mx.float32 or biased.dtype != mx.float32 or E_r > 1024:
+            return None
+        indices = mx.zeros((1, sel_topk), dtype=mx.uint32)  # shape only
     fused_gu = routed_up is None
     parts = [_affine_parts(m) for m in ((routed_gate,) if fused_gu else (routed_gate, routed_up))]
     if any(p is None for p in parts) or x.ndim != 2 or indices.ndim != 2:
@@ -654,11 +758,17 @@ def moe_gate_up_swiglu(
     has_shared = shared_gate is not None
     if shared_wide and (not has_shared or not 2 <= T <= 8 or rps != 4):
         return None
-    inputs = [x, indices, mx.array([limit], dtype=mx.float32), gw, gs, gb, uw, us, ub]
+    if select is not None:
+        routes = [sig, biased, mx.array([sel_scaling], dtype=mx.float32)]
+    else:
+        routes = [indices]
+    inputs = [x] + routes + [mx.array([limit], dtype=mx.float32), gw, gs, gb, uw, us, ub]
     template = [
         ("T", x.dtype), ("K", K), ("N", N), ("TOPK", topk), ("RBITS", rbits),
         ("RGS", rgs), ("RPS", rps), ("NSG", nsg), ("ESTRIDE", estride), ("UP_OFF", up_off),
     ]
+    if select is not None:
+        template += [("NE", E_r), ("SEL_NORM", int(bool(sel_norm) and sel_topk > 1))]
     if has_shared:
         sparts = [_affine_parts(m) for m in (shared_gate, shared_up)]
         if any(p is None for p in sparts):
@@ -679,7 +789,7 @@ def moe_gate_up_swiglu(
     if shared_wide and "moe_shared_wide" in DISABLED:
         return None
     slot_major = _slot_major(T)
-    kernel = _gate_up_kernel(has_shared, shared_wide, slot_major)
+    kernel = _gate_up_kernel(has_shared, shared_wide, slot_major, select is not None)
     STATS["moe_gate_up"] += 1
     tiles = N // (rps * nsg)
     slots = T * topk + 1 if shared_wide else T * (topk + int(has_shared))
@@ -697,6 +807,17 @@ def moe_gate_up_swiglu(
         STATS["moe_shared_wide"] += 1
         return routed, shared
     rt = topk + int(has_shared)
+    if select is not None:
+        STATS["router_select_fused"] += 1
+        act, sel_indices, sel_scores = kernel(
+            inputs=inputs,
+            template=template,
+            grid=grid,
+            threadgroup=(32, nsg, 1),
+            output_shapes=[(T, rt, N), (1, topk), (1, topk)],
+            output_dtypes=[x.dtype, mx.uint32, mx.float32],
+        )
+        return act, sel_indices, sel_scores
     return kernel(
         inputs=inputs,
         template=template,
@@ -1881,6 +2002,35 @@ def _router_select_kernel():
         output_names=["indices", "scores"],
         source=_ROUTER_SELECT_SOURCE,
     )
+
+
+def moe_router_logits(x: mx.array, weight: mx.array, bias: mx.array):
+    """The router logits kernel alone: ``(sigmoid(x @ W.T), sigmoid + bias)``
+    [T, E] fp32 with ``moe_router``'s arithmetic, or None when not covered."""
+    if "router" in DISABLED or "router_select_fused" in DISABLED:
+        return None
+    if x.ndim != 2 or weight.ndim != 2 or bias.ndim != 1:
+        return None
+    T, K = x.shape
+    E = weight.shape[0]
+    if weight.shape[1] != K or bias.shape[0] != E:
+        return None
+    if weight.dtype != mx.float32 or bias.dtype != mx.float32:
+        return None
+    if x.dtype not in (mx.bfloat16, mx.float16, mx.float32):
+        return None
+    if E < 16 or E >= 4096 or K >= 16 * E or K <= 64 or K % 128 or E % 16 or E > 1024:
+        return None
+    sig, biased = _router_logits_kernel()(
+        inputs=[x, weight, bias],
+        template=[("T", x.dtype), ("K", K), ("E", E), ("ROWS_PER_SIMD", 1)],
+        grid=(128 * (E // 4), T, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(T, E), (T, E)],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    STATS["router"] += 1
+    return sig, biased
 
 
 def moe_router(

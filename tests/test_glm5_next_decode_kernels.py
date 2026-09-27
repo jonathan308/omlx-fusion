@@ -309,6 +309,37 @@ def test_decode_experts_are_bitwise_reference(length, shared_bits, slot_major, m
         assert _mismatches(moe(x), reference) == 0
 
 
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_one_token_moe_selects_routes_inside_gate_up(seed, monkeypatch):
+    """One token: the gate/up kernel replays the router's top-k selection
+    (router logits -> gate/up -> down), bitwise like the router select
+    kernel path and the reference MoE, including exact score ties."""
+    from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
+
+    language = _language()
+    moe = _moe(experts=288, hidden=4096, inter=2048, shared_bits=8, seed=seed)
+    if seed == 2:
+        weight = moe.gate.weight
+        bias = moe.gate.e_score_correction_bias
+        for e in (7, 70, 140, 280):  # exact duplicates of expert 200
+            weight[e] = weight[200]
+            bias[e] = bias[200]
+        moe.gate.weight, moe.gate.e_score_correction_bias = weight, bias
+    for trial in range(4):
+        x = (mx.random.normal((1, 1, 4096)) * (0.3 + trial)).astype(mx.bfloat16)
+        before = _stats()["router_select_fused"]
+        fused = moe(x)
+        assert _stats()["router_select_fused"] == before + 1
+        monkeypatch.setattr(dk, "DISABLED", {"router_select_fused"})
+        two_step = moe(x)
+        monkeypatch.setattr(dk, "DISABLED", set())
+        monkeypatch.setattr(language, "_DECODE_FUSION", False)
+        reference = moe(x)
+        monkeypatch.setattr(language, "_DECODE_FUSION", True)
+        assert _mismatches(fused, two_step) == 0
+        assert _mismatches(fused, reference) == 0
+
+
 def test_decode_experts_leave_sorted_route_counts_to_switch_glu():
     moe = _moe()
     x = mx.random.normal((1, 8, 1024)).astype(mx.bfloat16)  # 64 routes -> sorted
