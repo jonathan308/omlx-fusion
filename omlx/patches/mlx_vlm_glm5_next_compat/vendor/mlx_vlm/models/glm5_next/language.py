@@ -20,6 +20,7 @@ from ..linear import DECODE_BLOCK_SIZE
 from mlx_lm.models.mla import MultiLinear
 from omlx.patches import glm53_kda_prework
 from omlx.patches.deepseek_v4.switch_layers import SwitchGLU, _sort_threshold
+from omlx.patches.glm_moe_dsa.sparse_mla_nax import sparse_mla_attention_nax
 from omlx.patches.glm_moe_dsa.deepseek_v32 import (
     Model as DSV32Model,
     group_expert_select,
@@ -53,6 +54,7 @@ _ROUTE_COUNTER_NAMES = (
     "indexer_fallback",
     "topk_native",
     "topk_fallback",
+    "sparse_mla_nax",
     "sparse_mla_native",
     "exact_block_native",
     "dense_attention_fallback",
@@ -1114,8 +1116,13 @@ class Glm5NextSparseAttention(nn.Module):
                 )
                 q_latent = q_latent.astype(native_dtype)
                 kv_latent_native = kv_latent.astype(native_dtype)
-                output = None
-                if Kv >= 4096:
+                # Tensor-unit kernel (M5): same fp32 math as the native
+                # kernel, at any context the indexer runs for.
+                output = sparse_mla_attention_nax(
+                    q_latent, kv_latent_native, topk_indices, self.scale
+                )
+                nax_output = output is not None
+                if output is None and Kv >= 4096:
                     output = sparse_mla_attention_nope(
                         q_latent,
                         kv_latent_native,
@@ -1137,7 +1144,7 @@ class Glm5NextSparseAttention(nn.Module):
                             self.scale,
                         )
                 if output is not None:
-                    _record_route("sparse_mla_native")
+                    _record_route("sparse_mla_nax" if nax_output else "sparse_mla_native")
                     output_flat = q8_vup_flat(
                         output,
                         self.unembed_out,

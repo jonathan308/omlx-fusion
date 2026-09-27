@@ -1113,8 +1113,15 @@ def test_sparse_attention_native_routes_get_fp16_despite_fp32_activations(monkey
         seen.append(("exact_block", *(t.dtype for t in (q, k, v))))
         return mx.zeros(q.shape, dtype=q.dtype)
 
+    def spy_nax(q_latent, kv_latent, topk_indices, scale):
+        # The tensor-unit kernel is tried first on M5 hosts; decline here so
+        # the native kernel route below is exercised on every host.
+        seen.append(("sparse_mla_nax", q_latent.dtype, kv_latent.dtype))
+        return None
+
     monkeypatch.setattr(lang, "sparse_mla_attention", spy_sma)
     monkeypatch.setattr(lang, "exact_block_token_attention", spy_eba)
+    monkeypatch.setattr(lang, "sparse_mla_attention_nax", spy_nax)
     monkeypatch.setattr(lang, "q8_vup_flat", lambda *a, **k: None)
     # Keep every row on the mocked native routes; the dense prefix would add
     # a real FP32 attention pass over 2051 rows.
@@ -1123,6 +1130,11 @@ def test_sparse_attention_native_routes_get_fp16_despite_fp32_activations(monkey
     x = mx.random.normal((1, 4096, 4096), dtype=mx.float32)
     out = attn(x, mask=None, cache=None)
     mx.eval(out)
+    nax = [s for s in seen if s[0] == "sparse_mla_nax"]
+    assert nax, "the sparse chunk must try the tensor-unit route first"
+    assert all(dt == mx.float16 for dt in nax[0][1:]), (
+        f"tensor-unit sparse MLA received {nax[0][1:]}, expected fp16"
+    )
     sma = [s for s in seen if s[0] == "sparse_mla"]
     assert sma, "Kv>=4096 must attempt the native sparse MLA route"
     assert all(dt == mx.float16 for dt in sma[0][1:]), (
