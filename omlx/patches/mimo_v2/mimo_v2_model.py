@@ -142,7 +142,10 @@ class Attention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        query_tail: Optional[int] = None,
     ) -> mx.array:
+        if query_tail is not None:
+            return self._tail_queries(x, mask, cache, query_tail)
         B, L, _ = x.shape
 
         # Blocked window attention runs whole 128-query blocks. Padding the
@@ -218,6 +221,66 @@ class Attention(nn.Module):
                 sinks=self.attention_sink_bias,
             )
         return self.o_proj(output.swapaxes(1, 2).reshape(B, L, -1))
+
+    def _tail_queries(self, x, mask, cache, query_tail: int) -> mx.array:
+        """Full-attention forward for only the last ``query_tail`` query rows.
+
+        Keys and values (and the cache update) cover all rows; the queries,
+        the attention output and the output projection cover the tail. Each
+        tail row sees the same keys under the same causal rule as in the
+        full forward.
+        """
+        B, L, _ = x.shape
+        T = int(query_tail)
+        offset = cache.offset if cache is not None else 0
+        queries = (
+            self.q_proj(x[:, L - T :])
+            .reshape(B, T, self.n_heads, self.head_dim)
+            .swapaxes(1, 2)
+        )
+        keys = (
+            self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim).swapaxes(1, 2)
+        )
+        values = (
+            self.v_proj(x)
+            .reshape(B, L, self.n_kv_heads, self.v_head_dim)
+            .swapaxes(1, 2)
+        )
+        if self.v_scale is not None:
+            values = values * self.v_scale
+        queries = self.rope(queries, offset=offset + L - T)
+        keys = self.rope(keys, offset=offset)
+        if cache is not None:
+            keys, values = cache.update_and_fetch(keys, values)
+        if isinstance(mask, mx.array):
+            mask = mask[..., -T:, :]
+        output = None
+        try:
+            # The fused mixed head-dim kernel, when this build has it, avoids
+            # materializing [heads, T, context] scores at long context.
+            from omlx.utils.fast_attention import mixed_head_dim_sdpa
+        except ImportError:
+            mixed_head_dim_sdpa = None
+        if mixed_head_dim_sdpa is not None and not hasattr(cache, "bits"):
+            output = mixed_head_dim_sdpa(
+                queries,
+                keys,
+                values,
+                scale=self.scale,
+                mask=mask,
+                sinks=self.attention_sink_bias,
+            )
+        if output is None:
+            output = scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                cache=cache,
+                scale=self.scale,
+                mask=mask,
+                sinks=self.attention_sink_bias,
+            )
+        return self.o_proj(output.swapaxes(1, 2).reshape(B, T, -1))
 
 
 class MLP(nn.Module):
@@ -341,7 +404,13 @@ class DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        query_tail: Optional[int] = None,
     ) -> mx.array:
+        if query_tail is not None:
+            # Only the last rows' outputs: every row still feeds the cache.
+            attn = self.self_attn(self.input_layernorm(x), mask, cache, query_tail)
+            h = x[:, -query_tail:] + attn
+            return h + self.mlp(self.post_attention_layernorm(h))
         h = x + self.self_attn(self.input_layernorm(x), mask, cache)
         return h + self.mlp(self.post_attention_layernorm(h))
 
@@ -455,6 +524,7 @@ class MiMoV2Model(PipelineMixin, nn.Module):
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
         return_hidden: bool = False,
+        hidden_tail: Optional[int] = None,
     ) -> Any:
         h = (
             input_embeddings
@@ -503,9 +573,25 @@ class MiMoV2Model(PipelineMixin, nn.Module):
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, pipeline_rank + 1)
 
-        for layer, c in zip(local_layers, cache):
+        # ``hidden_tail``: the caller reads only the last rows of the output
+        # (MTP tail priming), so a full-attention last layer computes its
+        # queries, attention output and MLP for those rows only.
+        tail_layer = (
+            len(local_layers) - 1
+            if hidden_tail is not None
+            and pipeline_size == 1
+            and local_layers
+            and not local_layers[-1].is_sliding_window
+            and h.shape[0] == 1
+            and 8 < hidden_tail < h.shape[1]
+            else None
+        )
+        for i, (layer, c) in enumerate(zip(local_layers, cache)):
             mask = swa_mask if layer.is_sliding_window else full_mask
-            h = layer(h, mask, cache=c)
+            if i == tail_layer:
+                h = layer(h, mask, cache=c, query_tail=hidden_tail)
+            else:
+                h = layer(h, mask, cache=c)
 
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
@@ -567,18 +653,26 @@ class Model(nn.Module):
         # cycles are not blind; see prompt_priming.
         # The MTP activation forward runs with return_hidden=True and must not
         # be folded: take_primed expects the context to stop one token short.
+        # Only the last prefill chunk's tail reaches the heads; earlier chunks
+        # skip the capture so their last layer's outputs are never computed.
         capture = (
             not return_hidden
             and not n_confirmed
             and input_embeddings is None
             and cache is not None
             and prompt_priming.capture_eligible(self, cache)
+            and not prompt_priming.claim_superseded_tail_chunk(self, inputs, cache)
         )
         result = self.model(
             inputs,
             cache,
             input_embeddings,
             return_hidden=return_hidden or capture,
+            hidden_tail=(
+                prompt_priming.tail_hidden_rows(self, inputs)
+                if capture and not return_hidden
+                else None
+            ),
         )
         if return_hidden or capture:
             out, hidden = result
