@@ -1064,6 +1064,20 @@ class Glm5NextSparseAttention(nn.Module):
         else:
             qr, q, compressed_kv, indexer_projected = projected
         q = q.reshape(B, L, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
+        # One token with index selection: embed_q only needs q, so compute it
+        # here and order the indexer's query projection after it; it then runs
+        # beside the selection chain instead of after it (same values).
+        q_latent_early = None
+        if (
+            L == 1
+            and mask is None
+            and indexer_projected is not None
+            and indexer_projected[0] is not None
+        ):
+            q_latent_early = _mla_head_proj(self.embed_q, q)
+            indexer_projected = (
+                mx.depends(indexer_projected[0], [q_latent_early]),
+            ) + tuple(indexer_projected[1:])
         kv_latent = self.kv_a_layernorm(compressed_kv)
         kv_latent = mx.expand_dims(kv_latent, axis=1)
 
@@ -1105,7 +1119,11 @@ class Glm5NextSparseAttention(nn.Module):
             if L == 1 and mask is None:
                 # Exact fused latent attention reading the selected rows in
                 # place (no gathered copy of the latent keys).
-                q_latent = _mla_head_proj(self.embed_q, q)
+                q_latent = (
+                    q_latent_early
+                    if q_latent_early is not None
+                    else _mla_head_proj(self.embed_q, q)
+                )
                 fused_attn = self._decode_latent(
                     q_latent, kv_latent, None, cache, indices=topk_indices[0, 0, 0]
                 )
@@ -1201,7 +1219,11 @@ class Glm5NextSparseAttention(nn.Module):
                     sparse_mask = sparse_mask & mask
                 attn_mask = sparse_mask
         elif L <= 8:
-            q_latent = _mla_head_proj(self.embed_q, q)
+            q_latent = (
+                q_latent_early
+                if q_latent_early is not None
+                else _mla_head_proj(self.embed_q, q)
+            )
             fused_attn = self._decode_latent(q_latent, kv_latent, attn_mask, cache)
 
         if (
