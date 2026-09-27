@@ -390,11 +390,13 @@ def test_rank_exit_detail_waits_for_rank_stderr_forwarded_after_the_exit_line():
     supervisor._readers.append(reader)
     reader.start()
 
+    # Fusion waits for the ranks' load before the warmup readiness event;
+    # both phases share _wait_for_load_condition.
     with pytest.raises(
         launch.DistributedLaunchError,
         match=r"(?s)rank 0 exited with code 1.*side-channel helper stopped",
     ):
-        supervisor._wait_for_ready()
+        supervisor._wait_for_rank_ready(time.monotonic() + supervisor.load_timeout)
 
 
 def test_supervisor_prefers_rank_marker_over_mlx_cleanup_traceback(monkeypatch):
