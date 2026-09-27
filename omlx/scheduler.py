@@ -1891,6 +1891,12 @@ class Scheduler:
                 module-level _default_generation_stream when not provided.
         """
         self.model = model
+        try:
+            from .patches import decode_cbuf_budget
+
+            decode_cbuf_budget.apply(model)
+        except Exception:  # noqa: BLE001
+            logger.debug("decode command-buffer budget not applied", exc_info=True)
         # Deep-copy the tokenizer so the scheduler owns an independent Rust
         # tokenizer backend.  Without this, concurrent access from the asyncio
         # event loop (encode/apply_chat_template in engine handlers) and the
