@@ -2181,6 +2181,20 @@ class VLMBatchedEngine(BaseEngine):
                 )
             except Exception:
                 logger.debug("MoE gate+up fusion not applied", exc_info=True)
+            # oMLX's own SwitchGLU variants (GLM-5.3's DeepSeek V4 experts,
+            # MiMo V2's GLM DSA experts): one gather_qmm over [gate; up].
+            try:
+                from ..patches.moe_gate_up_fusion import (
+                    apply_switch_glu_gate_up_fusion,
+                )
+
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    apply_switch_glu_gate_up_fusion,
+                    self._vlm_model,
+                )
+            except Exception:
+                logger.debug("SwitchGLU gate+up fusion not applied", exc_info=True)
 
         # Qwen ANE prefill compiles its slices from the stock QuantizedLinear
         # layout, so build them before the packed projections replace it. The

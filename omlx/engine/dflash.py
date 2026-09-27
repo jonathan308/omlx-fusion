@@ -603,6 +603,18 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         "DFlash target MoE gate+up fusion not applied",
                         exc_info=True,
                     )
+                # MiMo V2 targets route through oMLX's GLM DSA SwitchGLU.
+                try:
+                    from ..patches.moe_gate_up_fusion import (
+                        apply_switch_glu_gate_up_fusion,
+                    )
+
+                    apply_switch_glu_gate_up_fusion(target_bundle.model)
+                except Exception:
+                    logger.debug(
+                        "DFlash target SwitchGLU gate+up fusion not applied",
+                        exc_info=True,
+                    )
             draft, draft_meta = load_draft_bundle(
                 self._draft_model_path,
                 draft_quant=(
