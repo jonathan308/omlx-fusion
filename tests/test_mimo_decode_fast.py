@@ -677,3 +677,160 @@ def test_expert_kind_rejects_wrapped_switch_modules():
             self.down_proj = glu.down_proj
 
     assert df._expert_kind(OffloadSwitchGLU(sw)) is None
+
+
+def _mimo_dims_model(seed=21, window=None):
+    """GQA 16 with MiMo's full-attention head dims (192 / 128), the shapes
+    MLX's vector SDPA (and the long-context kernels) serve.  ``window``
+    overrides the window layers' sliding window."""
+    m = _mimo()
+    cfg = dict(_TINY)
+    cfg.update(num_attention_heads=16, num_key_value_heads=1, head_dim=192, v_head_dim=128,
+               swa_num_attention_heads=16, swa_num_key_value_heads=2)
+    if window is not None:
+        cfg["sliding_window_size"] = window
+    mx.random.seed(seed)
+    model = m.Model(m.ModelArgs.from_dict(cfg))
+    updates = []
+    for key, value in tree_flatten(model.parameters()):
+        if key.endswith("gate.weight"):
+            updates.append((key, mx.random.normal(value.shape) * 0.05))
+        elif key.endswith("e_score_correction_bias"):
+            updates.append((key, mx.random.normal(value.shape) * 0.02))
+        elif key.endswith("attention_sink_bias"):
+            updates.append((key, mx.random.normal(value.shape)))
+        elif "norm" in key:
+            updates.append((key, 1 + 0.1 * mx.random.normal(value.shape)))
+    model.load_weights(updates, strict=False)
+    nn.quantize(model, group_size=64, bits=8,
+                class_predicate=lambda p, mod: isinstance(mod, nn.Linear) and "switch_mlp" not in p)
+    nn.quantize(model, group_size=32, bits=4, mode="mxfp4",
+                class_predicate=lambda p, mod: "switch_mlp" in p and hasattr(mod, "to_quantized"))
+    model.load_weights([(k, v.astype(BF16)) for k, v in tree_flatten(model.parameters())
+                        if v.dtype == mx.float32 and "e_score_correction_bias" not in k], strict=False)
+    mx.eval(model.parameters())
+    return model
+
+
+def _count_kernel_calls(monkeypatch):
+    from omlx.patches.mimo_v2 import sdpa_flash, sdpa_rows
+
+    calls = {"rows": 0, "flash": 0}
+    orig_rows, orig_flash = sdpa_rows.sdpa_rows, sdpa_flash.sdpa_flash
+
+    def rows(*a, **k):
+        out = orig_rows(*a, **k)
+        calls["rows"] += out is not None
+        return out
+
+    def flash(*a, **k):
+        out = orig_flash(*a, **k)
+        calls["flash"] += out is not None
+        return out
+
+    monkeypatch.setattr(sdpa_rows, "sdpa_rows", rows)
+    monkeypatch.setattr(sdpa_flash, "sdpa_flash", flash)
+    return calls
+
+
+def test_fast_forward_one_pass_rows_kernel_is_bit_exact(monkeypatch):
+    """Verify forwards over a 2-pass-sized KV cache run their attention rows
+    in one pass (sdpa_rows): bit-identical to the row-chunked reference."""
+    m = _mimo()
+    model = _mimo_dims_model()
+    _per_row_router(monkeypatch, m)
+    _chunked_reference(monkeypatch, m)
+    # The chunked reference stands in for MLX's SDPA in the model module.
+    monkeypatch.setattr(df, "_is_mlx_sdpa", lambda fn: True)
+    monkeypatch.setenv("OMLX_MIMO_DECODE_FLASH", "0")
+    calls = _count_kernel_calls(monkeypatch)
+    tokens = mx.random.randint(0, 512, (1, 1130))
+    cache = model.make_cache()
+    _forward(model, tokens[:, :1100], cache, False, monkeypatch)
+    pos = 1100
+    for L in [3, 1, 4, 2, 3]:
+        step = tokens[:, pos : pos + L]
+        ref_cache, fast_cache = _clone(cache), _clone(cache)
+        ref = _forward(model, step, ref_cache, False, monkeypatch)
+        before = calls["rows"]
+        fast = _forward(model, step, fast_cache, True, monkeypatch)
+        if L > 1:
+            assert calls["rows"] > before, f"sdpa_rows did not run at L={L}"
+        assert _mismatches(ref, fast) == 0, f"logits differ at L={L}"
+        cache = fast_cache
+        pos += L
+    assert calls["flash"] == 0
+
+
+def _one_row_quantized_matmuls(monkeypatch):
+    """Evaluate every 2-8 row quantized matmul one row at a time.
+
+    MLX runs an affine quantized matmul of 2+ rows as ``qmv_wide`` on Apple
+    GPU generation 15+ (``dispatch_qmv``, mlx 0.32) and a one-row one as
+    ``qmv``; the two sum each output in another order, so a verify forward's
+    projections (the fast path's and the reference layers' alike) differ from
+    a decode step's in about 1e-4 of their bf16 outputs.  Pinned to one-row
+    calls, every verify row gets the decode step's projections.
+    """
+    orig = mx.quantized_matmul
+
+    def one_row(x, *args, **kwargs):
+        n = x.shape[-2] if x.ndim >= 2 else 1
+        if 1 < n <= df.MAX_ROWS:
+            rows = [orig(x[..., i : i + 1, :], *args, **kwargs) for i in range(n)]
+            return mx.concatenate(rows, axis=-2)
+        return orig(x, *args, **kwargs)
+
+    monkeypatch.setattr(mx, "quantized_matmul", one_row)
+
+
+def test_fast_forward_flash_verify_rows_match_decode_steps(monkeypatch):
+    """With the split-key kernel on, a 3-row verify forward produces, row for
+    row, the logits of three one-row decode steps (bit-identical): the kernel
+    computes each query row like a one-row call, and so do the fast path's
+    other kernels (q/k/v split + RoPE, norms, router, experts).
+
+    Two MLX ops that the fast path shares with the reference layers are not
+    row-invariant (without holding them to one computation, the logits of
+    most seeds differ by an ULP here and there, on the reference path too):
+    quantized matmuls run one row at a time here
+    (``_one_row_quantized_matmuls``), and the window layers' window covers the
+    whole context -- a rotating cache hands a verify its keys in time order
+    but a decode step in ring order, which MLX's SDPA sums in another order --
+    so every layer's attention, in both forwards, is the split-key kernel.
+    (Its closeness to MLX's attention is tested per kernel: in a random tiny
+    MoE a one-ULP attention difference can flip a near-tie expert choice, so
+    final logits are only sanity-checked against the reference here.)"""
+    m = _mimo()
+    model = _mimo_dims_model(seed=22, window=2048)
+    _per_row_router(monkeypatch, m)
+    _one_row_quantized_matmuls(monkeypatch)
+    monkeypatch.setenv("OMLX_MIMO_DECODE_FLASH", "1")
+    monkeypatch.setenv("OMLX_MIMO_DECODE_FLASH_MIN_KEYS", "512")
+    calls = _count_kernel_calls(monkeypatch)
+    n_layers = len(model.model.layers)
+    tokens = mx.random.randint(0, 512, (1, 1110))
+    cache = model.make_cache()
+    _forward(model, tokens[:, :1100], cache, False, monkeypatch)
+    step = tokens[:, 1100:1103]
+    verify_cache, decode_cache, ref_cache = _clone(cache), _clone(cache), _clone(cache)
+    verify = _forward(model, step, verify_cache, True, monkeypatch)
+    assert calls["flash"] == n_layers
+    rows = [_forward(model, step[:, r : r + 1], decode_cache, True, monkeypatch) for r in range(3)]
+    assert calls["flash"] == 4 * n_layers
+    decode = mx.concatenate(rows, axis=1)
+    assert _mismatches(verify, decode) == 0
+    ref = _forward(model, step, ref_cache, False, monkeypatch)
+    a = np.array(verify.astype(mx.float32))
+    b = np.array(ref.astype(mx.float32))
+    assert np.isfinite(a).all()
+    assert (a.argmax(-1) == b.argmax(-1)).mean() >= 2 / 3
+
+
+def test_fast_path_keeps_patched_attention_functions(monkeypatch):
+    """A model-module attention function the fast path does not know keeps
+    serving every call (the one-pass kernels only replace MLX's SDPA)."""
+    from mlx_lm.models.base import scaled_dot_product_attention
+
+    assert df._is_mlx_sdpa(scaled_dot_product_attention)
+    assert not df._is_mlx_sdpa(lambda *a, **k: None)

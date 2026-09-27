@@ -261,9 +261,12 @@ def test_pv_modes_match_fp32_reference(mode, monkeypatch):
     monkeypatch.setattr(sparse_mla_nax, "_KERNEL", None)
     q, kv, idx = _inputs(96, 8192, 2051, seed=7)
     scale = 576**-0.5
+    native = _native(q, kv, idx, scale)
+    if native is None:
+        pytest.skip("native sparse MLA kernel unavailable")
+    native = native.astype(mx.float32)
     out = sparse_mla_nax.sparse_mla_attention_nax(q, kv, idx, scale).astype(mx.float32)
     ref = _reference(q, kv, idx, scale)
-    native = _native(q, kv, idx, scale).astype(mx.float32)
     err = mx.abs(out - ref).mean().item()
     err_native = mx.abs(native - ref).mean().item()
     assert err <= 1.05 * err_native
