@@ -48,6 +48,16 @@ corruption is actually present on this machine/mlx build. Healthy
 setups keep the fast path untouched, and the patch retires itself once
 mlx ships a kernel fix. Kill switch: ``OMLX_M5_GATHER_QMM_FIX=0``; the
 native kernel alone can be disabled with ``OMLX_M5_GATHER_QMM_NATIVE=0``.
+
+On NAX hosts every supported sorted call (``transpose=True`` rhs gather
+of ``[M, 1, K]`` rows, bf16/fp16 activations, affine 4/8-bit or MXFP4
+weights, at least 4 rows per expert) goes to the runtime-compiled kernel
+in ``m5_gather_qmm_nax`` before any of the above: segmented tile
+scheduling (one expert per 64-row tile) on the tensor units, correct for
+any K and row count in one dispatch, bit-identical to mlx's sorted kernel
+wherever that kernel is correct. Each kernel instantiation self-tests
+once; anything unsupported or failing keeps the stock handling above.
+``OMLX_M5_GATHER_QMM_NAX=0`` disables only this route.
 """
 
 from __future__ import annotations
@@ -56,6 +66,8 @@ import logging
 import os
 
 import mlx.core as mx
+
+from . import m5_gather_qmm_nax as _nax
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +78,20 @@ _original_gather_qmm = None
 _defective: bool | None = None
 # Native NAX gather op, resolved on first oversized call (False: unavailable).
 _native_gather = None
+_nax_host: bool | None = None
+
+# Positional parameters of mx.gather_qmm after (x, w).
+_POSITIONAL = (
+    "scales",
+    "biases",
+    "lhs_indices",
+    "rhs_indices",
+    "transpose",
+    "group_size",
+    "bits",
+    "mode",
+)
+_DEFAULT_GROUP_SIZE = {"affine": 64, "mxfp4": 32}
 
 
 def _sorted_gather_qmm_defective() -> bool:
@@ -226,7 +252,66 @@ def _native_sorted_gather_qmm(x, w, args, kwargs):
         return None
 
 
+def _on_nax_host() -> bool:
+    global _nax_host
+    if _nax_host is None:
+        try:
+            from omlx.custom_kernels.nax import is_nax_available
+
+            _nax_host = bool(is_nax_available())
+        except Exception:  # noqa: BLE001
+            _nax_host = False
+    return _nax_host
+
+
+def _nax_sorted_gather_qmm(x, w, args, kwargs):
+    """Route a sorted rhs gather to the NAX kernel; None keeps mlx's path."""
+    params = dict(zip(_POSITIONAL, args))
+    for name in _POSITIONAL:
+        if name in kwargs:
+            params[name] = kwargs[name]
+    rhs = params.get("rhs_indices")
+    if (
+        not isinstance(x, mx.array)
+        or not isinstance(w, mx.array)
+        or not isinstance(rhs, mx.array)
+        or params.get("lhs_indices") is not None
+        or not params.get("transpose", True)
+    ):
+        return None
+    # Same gate as mlx's own choice of the sorted rhs kernel (GatherQMM:
+    # B >= 16 rows and B / E >= 4); fewer rows per expert run the per-row
+    # qmv kernel, which is correct and cheaper there.
+    rows = x.shape[0] if x.ndim == 3 else 0
+    if rows < 16 or w.ndim != 3 or rows // max(int(w.shape[0]), 1) < 4:
+        return None
+    mode = params.get("mode") or "affine"
+    group_size = params.get("group_size")
+    if group_size is None:
+        group_size = _DEFAULT_GROUP_SIZE.get(mode)
+    bits = params.get("bits")
+    if bits is None:
+        bits = 4
+    if group_size is None or "scales" not in params:
+        return None
+    return _nax.sorted_gather_qmm(
+        x,
+        w,
+        params["scales"],
+        params.get("biases"),
+        rhs,
+        group_size=int(group_size),
+        bits=int(bits),
+        mode=mode,
+        stream=kwargs.get("stream"),
+    )
+
+
 def _gather_qmm_rerouted(x, w, *args, **kwargs):
+    if kwargs.get("sorted_indices") and _nax.enabled() and _on_nax_host():
+        out = _nax_sorted_gather_qmm(x, w, args, kwargs)
+        if out is not None:
+            return out
     if _needs_reroute(x, args, kwargs) and _sorted_gather_qmm_defective():
         if x.shape[-1] % 64 == 0:
             out = _native_sorted_gather_qmm(x, w, args, kwargs)
