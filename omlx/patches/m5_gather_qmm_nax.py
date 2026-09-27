@@ -50,29 +50,49 @@ stock kernel reads stale activations there; mlx's fixed kernel still reads
 the weight bytes and scales past the row, which can be NaN at the end of
 the last expert) and row offsets are 32-bit.
 
+``sorted_gather_qmm_swiglu`` is the MoE gate/up projection with its
+activation in the epilogue. The routed experts' gate and up weights are
+concatenated along the output axis (``[E, 2 * n, K]``) and today's path
+writes the ``[M, 2 * n]`` product, splits it and runs a compiled
+elementwise kernel for ``silu(gate) * up`` (GLM-5.3: gate and up clipped
+first). The epilogue variant loads each 64-row weight tile as 16-row blocks
+alternating the gate rows and the up rows of the same 16 output columns
+(same weight layout, same K loop), so every lane holds the fp32 gate and up
+accumulators of the same output element; it rounds both to the activation
+dtype exactly as the plain store does, applies MLX's own elementwise
+functors in that dtype (the op sequence of the compiled kernel, compiled
+like it at runtime) and writes only ``[M, n]``: bit-identical, with one
+elementwise pass and the ``[M, 2 * n]`` write and read removed.
+
 Supported: ``transpose=True``, rhs-indices only, ``x`` of shape
 ``[M, 1, K]`` with a flat sorted ``uint32`` index of length ``M``, bf16/fp16
 activations, affine 4/8-bit with group 32/64/128 (scales and biases in the
-activation dtype) and MXFP4 (group 32). Anything else returns None and the
-caller keeps the stock path. ``OMLX_M5_GATHER_QMM_NAX=0`` disables the
-module; ``OMLX_M5_GATHER_QMM_NAX_PLAN=sched,bm,bk,gx,pad`` (e.g.
+activation dtype) and MXFP4 (group 32); the epilogue additionally needs
+``2 * n % 64 == 0``. Anything else returns None and the caller keeps the
+stock path. ``OMLX_M5_GATHER_QMM_NAX=0`` disables the module,
+``OMLX_M5_GATHER_QMM_NAX_SWIGLU=0`` only the epilogue;
+``OMLX_M5_GATHER_QMM_NAX_PLAN=sched,bm,bk,gx,pad`` (e.g.
 ``seg,128,128,32,8192``) pins a configuration (testing).
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
+from functools import partial
 from pathlib import Path
 from typing import NamedTuple, Optional
 
 import mlx.core as mx
+import mlx.nn as nn
 
 logger = logging.getLogger(__name__)
 
 _ENV_ENABLE = "OMLX_M5_GATHER_QMM_NAX"
 _ENV_PLAN = "OMLX_M5_GATHER_QMM_NAX_PLAN"
+_ENV_SWIGLU = "OMLX_M5_GATHER_QMM_NAX_SWIGLU"
 
 # Output tile width and column simdgroups (fixed; the Metal source assumes
 # them). Tile heights are multiples of 32 rows (one row simdgroup each).
@@ -337,14 +357,34 @@ struct Mxfp4Q {
   }
 };
 
+// Gate/up pairing (activation epilogue): weight rows [gate; up] of one
+// expert, half_n rows each. Row r of a paired kBN x BK weight tile loads
+// weight row pair_row(r) past the tile's first gate row: 16-row blocks
+// alternate the gate and the up rows of the same 16 output columns, so the
+// two 16-column fragments of every simdgroup's 32-column block accumulate
+// gate and up of the same output columns in the same lanes.
+METAL_FUNC int pair_row(const int r, const int half_n) {
+  return ((r >> 4) & 1) * half_n + ((r >> 5) << 4) + (r & 15);
+}
+
+// Activation epilogue of a paired simdgroup block (defined with the
+// activation kernels only; see _ACT_HEADER).
+template <typename T, int EPI, typename DTile>
+METAL_FUNC void store_act(
+    thread const DTile& D,
+    device T* y,
+    const int ld,
+    const int rows,
+    const T limit);
+
 // Weight-tile loader: loader thread lid owns row lid / kTPR of the
 // kBN x BK tile and the kVPT values from column (lid % kTPR) * kVPT, in
 // kNG chunks that each lie in one quantization group. fetch() reads the
 // packed words and group parameters of one K step, store() dequantizes
 // them into threadgroup memory (row stride BKP). The *_tail variants
 // cover a K tail of k_valid (a multiple of 32) columns and never touch a
-// word or group at or past it.
-template <typename Q, typename G>
+// word or group at or past it. PAIR maps tile rows through pair_row().
+template <typename Q, typename G, bool PAIR = false>
 struct TileLoader {
   using WT = typename Q::WT;
   using P = typename Q::P;
@@ -371,13 +411,15 @@ struct TileLoader {
       const device uint8_t* w_tile,
       const int K,
       thread const Q& q_,
-      const uint lid) thread
+      const uint lid,
+      const int half_n = 0) thread
       : q(q_),
         row(short(lid / G::kTPR)),
         col(short((lid % G::kTPR) * kVPT)) {
-    src = (const device uint32_t*)(w_tile + size_t(row) * (K * kBits / 8) +
+    const size_t w_off = PAIR ? size_t(pair_row(row, half_n)) : size_t(row);
+    src = (const device uint32_t*)(w_tile + w_off * (K * kBits / 8) +
                                    col * kBits / 8);
-    q.advance(size_t(row) * (K / Q::kGroup));
+    q.advance(w_off * (K / Q::kGroup));
   }
 
   METAL_FUNC void fetch(const int kb) thread {
@@ -496,7 +538,18 @@ METAL_FUNC void sub_step(
 // threadgroup memory between two barriers. K tail (K % BK, a multiple of
 // 32): only its sub-steps run. N tail: weight rows past N are zero, stores
 // are bounded.
-template <typename T, typename Q, typename G, bool ALIGN_N, bool ALIGN_K>
+//
+// EPI > 0 (activation epilogue; N = 2 * half_n [gate; up] rows, aligned):
+// the tile of fused columns [y_col, y_col + kBN) computes gate and up of
+// output columns [y_col / 2, y_col / 2 + kBN / 2) through the paired row
+// map and writes act(gate, up) to the [M, half_n] output.
+template <
+    typename T,
+    typename Q,
+    typename G,
+    bool ALIGN_N,
+    bool ALIGN_K,
+    int EPI = 0>
 METAL_FUNC void gather_seg(
     const device T* x,
     const device uint8_t* w,
@@ -508,8 +561,11 @@ METAL_FUNC void gather_seg(
     const int K,
     threadgroup typename Q::WT* Ws,
     const uint sgid,
-    const uint lane) {
+    const uint lane,
+    const T limit = T(0)) {
   using WT = typename Q::WT;
+  constexpr bool kPair = EPI != 0;
+  static_assert(!kPair || ALIGN_N, "paired gate/up tiles are full");
   constexpr int BKP = G::kBK + 16 / sizeof(WT);
   const int row_start = int(desc.x);
   const uint32_t expert = desc.y;
@@ -520,15 +576,21 @@ METAL_FUNC void gather_seg(
   const int K_it = K / G::kBK;
   const short tgp_bn = ALIGN_N ? short(kBN) : short(min(kBN, N - y_col));
   const int k_remain = K - K_it * G::kBK;
+  // First weight row of the tile past the expert's rows and the output
+  // row stride (paired: the tile's first output column, half_n columns).
+  const int half_n = N / 2;
+  const int w_col = kPair ? y_col / 2 : y_col;
+  const int ldy = kPair ? half_n : N;
 
-  const size_t w_row = size_t(expert) * N + y_col;
+  const size_t w_row = size_t(expert) * N + w_col;
   q.advance(w_row * K_g);
-  TileLoader<Q, G> loader(w + w_row * K_w, K, q, sgid * 32 + lane);
+  TileLoader<Q, G, kPair> loader(
+      w + w_row * K_w, K, q, sgid * 32 + lane, half_n);
   const bool loads = G::kLT == G::kThreads || sgid * 32 + lane < uint(G::kLT);
   const bool row_live = ALIGN_N || loader.row < tgp_bn;
 
   x += size_t(row_start) * K;
-  y += size_t(row_start) * N + y_col;
+  y += size_t(row_start) * ldy + w_col;
 
   const short tm = kSM * short(sgid / kWN);
   const short tn = kSN * short(sgid % kWN);
@@ -586,7 +648,12 @@ METAL_FUNC void gather_seg(
       }
     }
 
-    if (kAlignedM.value && sgp_sn == kSN) {
+    if constexpr (kPair) {
+      if (sg_active) {
+        store_act<T, EPI>(
+            Dtile, y + tm * ldy + tn / 2, ldy, int(sgp_sm), limit);
+      }
+    } else if (kAlignedM.value && sgp_sn == kSN) {
       Dtile.store(y + tm * N + tn, N);
     } else if (sg_active) {
       Dtile.store_safe(y + tm * N + tn, N, short2(sgp_sn, sgp_sm));
@@ -600,8 +667,9 @@ METAL_FUNC void gather_seg(
 // step has a single barrier. Activation fragments are read straight from
 // device memory (rows past the tile are clamped to its last row and never
 // stored) and 16-row fragments without rows of the tile are skipped.
-// Requires K % 64 == 0 and N % 64 == 0.
-template <typename T, typename Q, typename G>
+// Requires K % 64 == 0 and N % 64 == 0. EPI > 0: the activation epilogue
+// of gather_seg.
+template <typename T, typename Q, typename G, int EPI = 0>
 METAL_FUNC void gather_db(
     const device T* x,
     const device uint8_t* w,
@@ -613,9 +681,11 @@ METAL_FUNC void gather_db(
     const int K,
     threadgroup typename Q::WT* Ws,
     const uint sgid,
-    const uint lane) {
+    const uint lane,
+    const T limit = T(0)) {
   using WT = typename Q::WT;
   static_assert(G::kBK == 64, "db runs 64-deep K steps");
+  constexpr bool kPair = EPI != 0;
   constexpr int BKP = G::kBK + 16 / sizeof(WT);
   constexpr int kTile = kBN * BKP;
   const int row_start = int(desc.x);
@@ -625,10 +695,13 @@ METAL_FUNC void gather_db(
   const int K_w = K * Q::kBits / 8;
   const int K_g = K / Q::kGroup;
   const int K_it = K / G::kBK;
+  const int half_n = N / 2;
+  const int w_col = kPair ? y_col / 2 : y_col;
 
-  const size_t w_row = size_t(expert) * N + y_col;
+  const size_t w_row = size_t(expert) * N + w_col;
   q.advance(w_row * K_g);
-  TileLoader<Q, G> loader(w + w_row * K_w, K, q, sgid * 32 + lane);
+  TileLoader<Q, G, kPair> loader(
+      w + w_row * K_w, K, q, sgid * 32 + lane, half_n);
   const bool loads = G::kLT == G::kThreads || sgid * 32 + lane < uint(G::kLT);
 
   const int m0 = kSM * int(sgid / kWN);
@@ -706,11 +779,22 @@ METAL_FUNC void gather_db(
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
-  device T* yb = y + size_t(row_start + m0) * N + y_col + kSN * (sgid % kWN);
-  if (rows >= kSM) {
-    D.store(yb, N);
-  } else if (rows > 0) {
-    D.store_safe(yb, N, short2(kSN, short(rows)));
+  if constexpr (kPair) {
+    if (rows > 0) {
+      store_act<T, EPI>(
+          D,
+          y + size_t(row_start + m0) * half_n + w_col + (kSN / 2) * (sgid % kWN),
+          half_n,
+          rows,
+          limit);
+    }
+  } else {
+    device T* yb = y + size_t(row_start + m0) * N + y_col + kSN * (sgid % kWN);
+    if (rows >= kSM) {
+      D.store(yb, N);
+    } else if (rows > 0) {
+      D.store_safe(yb, N, short2(kSN, short(rows)));
+    }
   }
 }
 
@@ -785,6 +869,116 @@ _FP_SOURCE = _MM_SOURCE_TMPL.format(
     q_init="Q q{scales};",
 )
 
+# ---------------------------------------------------------------------------
+# Gate/up activation epilogue
+# ---------------------------------------------------------------------------
+
+# MLX's elementwise functors (Sigmoid, Multiply, Minimum, Maximum): the ones
+# its compiled-graph kernels call, from the installed package.
+_MLX_OPS_HEADERS = (
+    "mlx/backend/metal/kernels/unary_ops.h",
+    "mlx/backend/metal/kernels/binary_ops.h",
+)
+
+_ACT_HEADER = """
+namespace omlx_gqmm {
+
+// The unfused path's activation on the two rounded projections, op for op
+// and every intermediate in T like MLX's compiled kernel of
+// nn.silu(gate) * up (Sigmoid, Multiply, Multiply); EPI == 2 first clips
+// like GLM-5.3's clamped SwiGLU: gate = minimum(gate, limit),
+// up = minimum(maximum(up, -limit), limit).
+template <typename T, int EPI>
+METAL_FUNC T act(T g, T u, const T limit) {
+  if constexpr (EPI == 2) {
+    g = Minimum()(g, limit);
+    u = Minimum()(Maximum()(u, T(-limit)), limit);
+  }
+  return Multiply()(Multiply()(g, Sigmoid()(g)), u);
+}
+
+// D.frag_at(i, 0) holds gate and D.frag_at(i, 1) up of the same 16 output
+// columns (pair_row), so each lane holds both projections of its (row,
+// column) elements. Each is rounded to T as the plain store rounds it,
+// then act() writes the [rows, 16] block of the [M, ld] output (y points
+// at its first element).
+template <typename T, int EPI, typename DTile>
+METAL_FUNC void store_act(
+    thread const DTile& D,
+    device T* y,
+    const int ld,
+    const int rows,
+    const T limit) {
+  const short2 sc = BaseNAXFrag::get_coord();
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < DTile::kTileRows; i++) {
+    STEEL_PRAGMA_UNROLL
+    for (short h = 0; h < BaseNAXFrag::kElemRows; h++) {
+      const int r = i * BaseNAXFrag::kFragRows +
+          h * BaseNAXFrag::kElemRowsJump + sc.y;
+      if (r < rows) {
+        vec<T, BaseNAXFrag::kElemCols> v;
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < BaseNAXFrag::kElemCols; j++) {
+          const short e = h * BaseNAXFrag::kElemCols + j;
+          v[j] = act<T, EPI>(
+              static_cast<T>(D.frag_at(i, 0)[e]),
+              static_cast<T>(D.frag_at(i, 1)[e]),
+              limit);
+        }
+        *(device vec<T, BaseNAXFrag::kElemCols>*)(y + size_t(r) * ld + sc.x) =
+            v;
+      }
+    }
+  }
+}
+
+} // namespace omlx_gqmm
+"""
+
+_ACT_SOURCE_TMPL = """
+    {q_type}
+    using G = omlx_gqmm::Geo<BM, BK>;
+    using WT = typename Q::WT;
+    constexpr int BKP = BK + 16 / sizeof(WT);
+    threadgroup WT Ws[(SCHED == 1 ? 2 : 1) * omlx_gqmm::kBN * BKP +
+                      PAD / sizeof(WT)];
+    uint4 desc;
+    int y_col;
+    if (!omlx_gqmm::tile_of<GX>(
+            tiles, tile_count[0], threadgroup_position_in_grid, params[0],
+            desc, y_col)) {{
+        return;
+    }}
+    {q_init}
+    const T limit = lim[0];
+    if constexpr (SCHED == 1) {{
+        omlx_gqmm::gather_db<T, Q, G, EPI>(
+            x, (const device uint8_t*)w, q, desc, y_col, y, params[0],
+            params[1], Ws, simdgroup_index_in_threadgroup,
+            thread_index_in_simdgroup, limit);
+    }} else {{
+        omlx_gqmm::gather_seg<T, Q, G, true, ALIGN_K, EPI>(
+            x, (const device uint8_t*)w, q, desc, y_col, y, params[0],
+            params[1], Ws, simdgroup_index_in_threadgroup,
+            thread_index_in_simdgroup, limit);
+    }}
+"""
+
+_AFFINE_ACT_SOURCE = _ACT_SOURCE_TMPL.format(
+    q_type="using Q = omlx_gqmm::AffineQ<T, GS, BITS>;",
+    q_init="Q q{scales, biases};",
+)
+
+_FP_ACT_SOURCE = _ACT_SOURCE_TMPL.format(
+    q_type="using Q = omlx_gqmm::Mxfp4Q<GS>;",
+    q_init="Q q{scales};",
+)
+
+# Epilogue kinds (the kernel's EPI): silu(gate) * up, and the clamped form.
+_EPI_SWIGLU = 1
+_EPI_CLAMPED = 2
+
 _SCHED_SEG = 0
 _SCHED_DB = 1
 _SCHED_NAMES = {_SCHED_SEG: "seg", _SCHED_DB: "db"}
@@ -816,8 +1010,10 @@ class Plan(NamedTuple):
 _lock = threading.RLock()
 _kernels: dict[str, object] = {}
 _header_failed = False
+_act_header_failed = False
 # Self-test verdict per kernel instantiation:
-# (dtype, mode, bits, group_size, plan, align_n, align_k) -> bool.
+# (dtype, mode, bits, group_size, plan, align_n, align_k) -> bool, and for
+# the activation epilogue the same key + (epi, limit).
 _verified: dict[tuple, bool] = {}
 
 
@@ -830,9 +1026,78 @@ def enabled() -> bool:
     }
 
 
+def swiglu_enabled() -> bool:
+    """False when ``OMLX_M5_GATHER_QMM_NAX_SWIGLU`` (or the module) is off."""
+    return enabled() and os.environ.get(_ENV_SWIGLU, "1").strip().lower() not in {
+        "0",
+        "false",
+        "off",
+    }
+
+
+def _get_act_kernel(kind: str):
+    """Build (once) the ``affine_act`` or ``fp_act`` kernel object."""
+    global _act_header_failed
+    kernel = _kernels.get(kind)
+    if kernel is not None or _act_header_failed:
+        return kernel
+    with _lock:
+        kernel = _kernels.get(kind)
+        if kernel is not None:
+            return kernel
+        mlx_src = _read_mlx_headers(_MLX_MM_HEADERS + _MLX_OPS_HEADERS)
+        if mlx_src is None:
+            _act_header_failed = True
+            logger.warning(
+                "mlx kernel headers not found under %s; NAX gate/up "
+                "activation epilogue disabled",
+                Path(mx.__file__).parent / "include",
+            )
+            return None
+        header = mlx_src + _MM_HEADER + _ACT_HEADER
+        if kind == "affine_act":
+            kernel = mx.fast.metal_kernel(
+                name="omlx_gqmm_affine_swiglu",
+                input_names=[
+                    "x",
+                    "w",
+                    "scales",
+                    "biases",
+                    "tiles",
+                    "tile_count",
+                    "params",
+                    "lim",
+                ],
+                output_names=["y"],
+                header=header,
+                source=_AFFINE_ACT_SOURCE,
+            )
+        else:
+            kernel = mx.fast.metal_kernel(
+                name="omlx_gqmm_mxfp4_swiglu",
+                input_names=[
+                    "x",
+                    "w",
+                    "scales",
+                    "tiles",
+                    "tile_count",
+                    "params",
+                    "lim",
+                ],
+                output_names=["y"],
+                header=header,
+                source=_FP_ACT_SOURCE,
+            )
+        _kernels[kind] = kernel
+        return kernel
+
+
 def _get_kernel(kind: str):
-    """Build (once) the ``scan``, ``affine`` or ``fp`` kernel object."""
+    """Build (once) the ``scan``, ``affine`` or ``fp`` kernel object (and
+    the ``*_act`` epilogue variants)."""
     global _header_failed
+    if kind.endswith("_act"):
+        return _get_act_kernel(kind)
     kernel = _kernels.get(kind)
     if kernel is not None or _header_failed:
         return kernel
@@ -982,9 +1247,26 @@ def supports(
     return scales.shape == (E, N, K // group_size)
 
 
-def _launch(x, w, scales, biases, indices, group_size, bits, mode, plan, stream):
+def _launch(
+    x,
+    w,
+    scales,
+    biases,
+    indices,
+    group_size,
+    bits,
+    mode,
+    plan,
+    stream,
+    epi=0,
+    limit=None,
+):
+    """Tile pre-pass + matmul. ``epi`` > 0 runs the activation epilogue on
+    the ``[gate; up]`` rows of ``w`` (``N % 64 == 0``) and returns
+    ``[M, 1, N / 2]``."""
     scan = _get_kernel("scan")
-    mm = _get_kernel("affine" if mode == "affine" else "fp")
+    kind = "affine" if mode == "affine" else "fp"
+    mm = _get_kernel(f"{kind}_act" if epi else kind)
     if scan is None or mm is None:
         return None
     M, K = int(x.shape[0]), int(x.shape[2])
@@ -1007,9 +1289,16 @@ def _launch(x, w, scales, biases, indices, group_size, bits, mode, plan, stream)
         inputs.append(biases)
         template.append(("BITS", bits))
     inputs += [tiles, tile_count, mx.array([N, K], dtype=mx.int32)]
+    template.append(("SCHED", int(plan.sched)))
+    if epi:
+        # The clip bound converts like the unfused path's Python-float
+        # operand of mx.clip (float, then the activation dtype).
+        bound = 0.0 if limit is None else limit
+        inputs.append(mx.array(bound, dtype=x.dtype).reshape(1))
+        template.append(("EPI", int(epi)))
+    else:
+        template.append(("ALIGN_N", N % _BN == 0))
     template += [
-        ("SCHED", int(plan.sched)),
-        ("ALIGN_N", N % _BN == 0),
         ("ALIGN_K", K % plan.bk == 0),
         ("BM", bm),
         ("BK", plan.bk),
@@ -1026,7 +1315,7 @@ def _launch(x, w, scales, biases, indices, group_size, bits, mode, plan, stream)
         template=template,
         grid=(tg_grid[0] * 32, tg_grid[1] * _WN, bm // 32),
         threadgroup=(32, _WN, bm // 32),
-        output_shapes=[(M, 1, N)],
+        output_shapes=[(M, 1, N // 2 if epi else N)],
         output_dtypes=[x.dtype],
         **kw,
     )[0]
@@ -1047,6 +1336,34 @@ def _stock_gather_qmm():
 _CANARY_COUNTS = (70, 0, 5, 33, 64, 17, 140, 11)
 
 
+def _canary_k(plan: Plan, align_k: bool) -> int:
+    # Aligned: K % BK == 0. Unaligned: a 64-deep tail (bk 128, still
+    # K % 64 == 0) or a 32-deep ragged one (bk 64).
+    return 256 if align_k else (320 if plan.bk == 128 else 160)
+
+
+def _canary_problem(dtype, mode, bits, group_size, N, K, x_scale=0.5):
+    """Quantized [E, N, K] experts, their dequantized weights, and sorted
+    canary rows ``x`` [M, 1, K] (``x_scale``: a scalar or per-row scale)."""
+    E = len(_CANARY_COUNTS)
+    k_w, k_x = mx.random.split(mx.random.key(0x2267), 2)
+    wf = (mx.random.normal((E, N, K), key=k_w) * 0.05).astype(dtype)
+    if mode == "affine":
+        wq, scales, biases = mx.quantize(wf, group_size=group_size, bits=bits)
+        wd = mx.dequantize(wq, scales, biases, group_size=group_size, bits=bits)
+    else:
+        wq, scales = mx.quantize(wf, group_size=group_size, bits=bits, mode=mode)
+        biases = None
+        wd = mx.dequantize(wq, scales, group_size=group_size, bits=bits, mode=mode)
+    idx = mx.array(
+        [e for e, n in enumerate(_CANARY_COUNTS) for _ in range(n)],
+        dtype=mx.uint32,
+    )
+    M = int(idx.shape[0])
+    x = (mx.random.normal((M, 1, K), key=k_x) * x_scale).astype(dtype)
+    return wq, scales, biases, wd, x, idx
+
+
 def _self_test(key: tuple) -> Optional[bool]:
     """Run one kernel instantiation on a small canary.
 
@@ -1057,29 +1374,12 @@ def _self_test(key: tuple) -> Optional[bool]:
     retries.
     """
     dtype, mode, bits, group_size, plan, align_n, align_k = key
-    E = len(_CANARY_COUNTS)
     N = 128 if align_n else 96
-    # Aligned: K % BK == 0. Unaligned: a 64-deep tail (bk 128, still
-    # K % 64 == 0) or a 32-deep ragged one (bk 64).
-    K = 256 if align_k else (320 if plan.bk == 128 else 160)
+    K = _canary_k(plan, align_k)
     try:
-        k_w, k_x = mx.random.split(mx.random.key(0x2267), 2)
-        wf = (mx.random.normal((E, N, K), key=k_w) * 0.05).astype(dtype)
-        if mode == "affine":
-            wq, scales, biases = mx.quantize(wf, group_size=group_size, bits=bits)
-            wd = mx.dequantize(wq, scales, biases, group_size=group_size, bits=bits)
-        else:
-            wq, scales = mx.quantize(wf, group_size=group_size, bits=bits, mode=mode)
-            biases = None
-            wd = mx.dequantize(
-                wq, scales, group_size=group_size, bits=bits, mode=mode
-            )
-        idx = mx.array(
-            [e for e, n in enumerate(_CANARY_COUNTS) for _ in range(n)],
-            dtype=mx.uint32,
+        wq, scales, biases, wd, x, idx = _canary_problem(
+            dtype, mode, bits, group_size, N, K
         )
-        M = int(idx.shape[0])
-        x = (mx.random.normal((M, 1, K), key=k_x) * 0.5).astype(dtype)
         out = _launch(x, wq, scales, biases, idx, group_size, bits, mode, plan, None)
         if out is None:
             return False
@@ -1126,12 +1426,105 @@ def _self_test(key: tuple) -> Optional[bool]:
 
 
 def _describe(key: tuple) -> str:
-    dtype, mode, bits, group_size, plan, align_n, align_k = key
+    dtype, mode, bits, group_size, plan, align_n, align_k = key[:7]
+    epi = ""
+    if len(key) > 7:
+        limit = key[8]
+        epi = " + silu(gate) * up" if limit is None else f" + clamped SwiGLU {limit:g}"
     return (
         f"{str(dtype).rsplit('.', 1)[-1]} {mode} {bits}-bit gs{group_size} "
         f"({plan.describe()}{'' if align_n else ', ragged N'}"
-        f"{'' if align_k else ', K tail'})"
+        f"{'' if align_k else ', K tail'}){epi}"
     )
+
+
+@partial(mx.compile, shapeless=True)
+def _ref_swiglu(x_gate: mx.array, x_up: mx.array) -> mx.array:
+    # mlx-lm's / mlx-vlm's swiglu (SwiGLU of their SwitchGLU and of oMLX's
+    # GLM DSA / DeepSeek V4 SwitchGLU).
+    return nn.silu(x_gate) * x_up
+
+
+@partial(mx.compile, shapeless=True)
+def _ref_clamped_swiglu(x_up: mx.array, x_gate: mx.array, limit: float) -> mx.array:
+    # GLM-5.3's Glm5NextClampedSwiGLU (glm5_next _clamped_swiglu).
+    x_gate = mx.clip(x_gate, a_min=None, a_max=limit)
+    x_up = mx.clip(x_up, a_min=-limit, a_max=limit)
+    return nn.silu(x_gate) * x_up
+
+
+def reference_activation(
+    x_up: mx.array, x_gate: mx.array, limit: Optional[float] = None
+) -> mx.array:
+    """The unfused path's activation: ``silu(gate) * up`` as MLX's compiled
+    kernel computes it, clamped first like GLM-5.3 when ``limit`` is set."""
+    if limit is None:
+        return _ref_swiglu(x_gate, x_up)
+    return _ref_clamped_swiglu(x_up, x_gate, float(limit))
+
+
+def _bits_equal(a: mx.array, b: mx.array) -> bool:
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return False
+    view = {2: mx.uint16, 4: mx.uint32}[a.dtype.size]
+    return bool(mx.array_equal(a.view(view), b.view(view)).item())
+
+
+def _self_test_act(key: tuple) -> Optional[bool]:
+    """Run one activation-epilogue instantiation on a small canary against
+    the unfused path: the plain kernel with the same configuration, split
+    into gate and up, then ``reference_activation`` (bitwise, including the
+    signs of zeros). The canary rows span 0.1x to 16x the plain canary's
+    scale so the projections cover sigmoid's saturated tails and the clip
+    bounds. None: could not be evaluated here (see ``_self_test``)."""
+    dtype, mode, bits, group_size, plan, _, align_k, epi, limit = key
+    K = _canary_k(plan, align_k)
+    try:
+        M = sum(_CANARY_COUNTS)
+        row_scale = mx.power(10.0, mx.linspace(-1.0, 1.2, M)).reshape(M, 1, 1)
+        wq, scales, biases, _, x, idx = _canary_problem(
+            dtype, mode, bits, group_size, 2 * _BN, K, x_scale=row_scale
+        )
+        out = _launch(
+            x, wq, scales, biases, idx, group_size, bits, mode, plan, None,
+            epi=epi, limit=limit,
+        )
+        gate_up = _launch(
+            x, wq, scales, biases, idx, group_size, bits, mode, plan, None
+        )
+        if out is None or gate_up is None:
+            return False
+        x_gate, x_up = mx.split(gate_up, 2, axis=-1)
+        ok = _bits_equal(out, reference_activation(x_up, x_gate, limit))
+    except Exception as e:  # noqa: BLE001
+        if "transformation" in str(e):
+            return None
+        logger.warning(
+            "NAX gate/up activation self-test raised for %s: %s", _describe(key), e
+        )
+        return False
+    if ok:
+        logger.info("NAX gate/up activation epilogue armed for %s", _describe(key))
+    else:
+        logger.warning(
+            "NAX gate/up activation epilogue disabled for %s: canary not "
+            "bit-identical to the unfused path",
+            _describe(key),
+        )
+    return ok
+
+
+def _checked(key: tuple, test) -> bool:
+    """The cached self-test verdict for ``key`` (running ``test`` once)."""
+    ok = _verified.get(key)
+    if ok is None:
+        with _lock:
+            ok = _verified.get(key)
+            if ok is None:
+                ok = test(key)
+                if ok is not None:
+                    _verified[key] = ok
+    return bool(ok)
 
 
 def sorted_gather_qmm(
@@ -1169,14 +1562,71 @@ def sorted_gather_qmm(
         plan = plan._replace(sched=_SCHED_SEG)
     if verify:
         key = (x.dtype, mode, bits, group_size, plan, N % _BN == 0, K % plan.bk == 0)
-        ok = _verified.get(key)
-        if ok is None:
-            with _lock:
-                ok = _verified.get(key)
-                if ok is None:
-                    ok = _self_test(key)
-                    if ok is not None:
-                        _verified[key] = ok
-        if not ok:
+        if not _checked(key, _self_test):
             return None
     return _launch(x, w, scales, biases, indices, group_size, bits, mode, plan, stream)
+
+
+def sorted_gather_qmm_swiglu(
+    x: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    biases: Optional[mx.array],
+    indices: mx.array,
+    *,
+    group_size: int,
+    bits: int,
+    mode: str = "affine",
+    limit: Optional[float] = None,
+    stream=None,
+    plan: Optional[Plan] = None,
+    verify: bool = True,
+) -> Optional[mx.array]:
+    """The SwiGLU of a fused gate/up projection for sorted rows, in one kernel.
+
+    ``w`` (with ``scales``/``biases``) holds each expert's gate rows followed
+    by its up rows, ``[E, 2 * n, K]``. Returns ``[M, 1, n]``: for
+    ``gate, up = split(sorted_gather_qmm(x, w, ...), 2, axis=-1)`` the
+    activation ``silu(gate) * up``, or with ``limit`` GLM-5.3's clamped
+    ``silu(minimum(gate, limit)) * clip(up, -limit, limit)``. The matmul
+    computes gate and up of the same columns in each output tile (weight
+    rows paired in the tile loader) and applies the activation to the
+    rounded projections in its epilogue instead of writing ``[M, 2 * n]``
+    for a separate elementwise pass. Bit-identical to the unfused path:
+    each instantiation must match the plain kernel + split +
+    ``reference_activation`` on a canary (and the plain kernel its own
+    self-test) before it is used.
+
+    Returns None when disabled (``OMLX_M5_GATHER_QMM_NAX_SWIGLU=0`` or the
+    module switch), unsupported (``supports``, or ``2 * n % 64 != 0``), or
+    not verified; the caller then keeps the unfused path.
+    """
+    if not swiglu_enabled() or not supports(
+        x, w, scales, biases, indices, group_size, bits, mode
+    ):
+        return None
+    M, K = int(x.shape[0]), int(x.shape[2])
+    E, N = int(w.shape[0]), int(w.shape[1])
+    if N % _BN:
+        # Every 64-column tile pairs 32 gate with 32 up columns.
+        return None
+    if limit is not None:
+        limit = float(limit)
+        if not math.isfinite(limit):
+            return None
+    if plan is None:
+        plan = _plan(M, E, K, N)
+    if plan.sched == _SCHED_DB and (K % 64 or plan.bk != 64):
+        plan = plan._replace(sched=_SCHED_SEG)
+    epi = _EPI_SWIGLU if limit is None else _EPI_CLAMPED
+    if verify:
+        key = (x.dtype, mode, bits, group_size, plan, True, K % plan.bk == 0)
+        # The plain instantiation (the unfused path's kernel) must hold too.
+        if not _checked(key, _self_test) or not _checked(
+            key + (epi, limit), _self_test_act
+        ):
+            return None
+    return _launch(
+        x, w, scales, biases, indices, group_size, bits, mode, plan, stream,
+        epi=epi, limit=limit,
+    )

@@ -6,6 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm.models.activations import swiglu
+from omlx.patches.m5_gather_qmm import fused_gate_up_activation
 from .kernels import fast as glm_fast
 
 
@@ -216,10 +217,19 @@ class SwitchGLU(nn.Module):
         if self.training:
             idx = mx.stop_gradient(idx)
         if hasattr(self, "gate_up_proj"):
-            x_gate_up = self.gate_up_proj(x, idx, sorted_indices=do_sort)
-            x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+            x_act = None
+            if do_sort and not self.training:
+                # Sorted prefill on M5: the activation in the [gate; up]
+                # matmul's epilogue (bit-identical; None keeps this path).
+                x_act = fused_gate_up_activation(
+                    self.gate_up_proj, x, idx, self.activation
+                )
+            if x_act is None:
+                x_gate_up = self.gate_up_proj(x, idx, sorted_indices=do_sort)
+                x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+                x_act = self.activation(x_up, x_gate)
             x = self.down_proj(
-                self.activation(x_up, x_gate),
+                x_act,
                 idx,
                 sorted_indices=do_sort,
             )
