@@ -284,6 +284,9 @@ class Glm5NextLinearAttention(nn.Module):
         self.o_proj = nn.Linear(self.qkv_dim, self.hidden_size, bias=False)
         self.fuse_in = True
         self._fused_ready = False
+        # Decode-only grouped input projection when q/k/v/f_a/g_a/b do not
+        # share one quantization (None: not built yet, False: not covered).
+        self._decode_groups = None
 
     def _fused_in_proj(self, inputs):
         # q,k,v,f_a,g_a,b all take `inputs`; fuse into one matmul via a lossless
@@ -331,6 +334,74 @@ class Glm5NextLinearAttention(nn.Module):
             out = inputs @ self._fw.T
         return mx.split(out, self._split_pts, axis=-1)
 
+    def _build_decode_groups(self):
+        """One fused weight per quantization for projections that mix bit
+        widths (e.g. a 5-bit v_proj among 8-bit q/k/gates): row blocks in
+        q|k|v|f_a|g_a|b order within each group. False when not covered."""
+        mods = [
+            self.q_proj,
+            self.k_proj,
+            self.v_proj,
+            self.forget_gate.f_a_proj,
+            self.g_a_proj,
+            self.b_proj,
+        ]
+        for m in mods:
+            if (
+                not isinstance(m, nn.QuantizedLinear)
+                or getattr(m, "mode", "affine") != "affine"
+                or "bias" in m
+                or getattr(m, "biases", None) is None
+            ):
+                return False
+        order = {}
+        for i, m in enumerate(mods):
+            order.setdefault((int(m.bits), int(m.group_size)), []).append(i)
+        if len(order) < 2:
+            return False
+        groups = []
+        for (bits, gs), members in order.items():
+            parts = [(mods[i].weight, mods[i].scales, mods[i].biases) for i in members]
+            if len(parts) == 1:
+                w, sc, bi = parts[0]
+            else:
+                w, sc, bi = (mx.concatenate(list(t), axis=0) for t in zip(*parts))
+            groups.append((bits, gs, members, w, sc, bi))
+        # Runs of consecutive projections that sit next to each other in one
+        # group's output: (group index, first row, last row) in q..b order.
+        rows = [m.weight.shape[0] for m in mods]
+        where = {}
+        for g, (_, _, members, *_rest) in enumerate(groups):
+            start = 0
+            for i in members:
+                where[i] = (g, start, start + rows[i])
+                start += rows[i]
+        runs = []
+        for i in range(len(mods)):
+            g, a, b = where[i]
+            if runs and runs[-1][0] == g and runs[-1][2] == a:
+                runs[-1] = (g, runs[-1][1], b)
+            else:
+                runs.append((g, a, b))
+        pts, acc = [], 0
+        for n in rows[:-1]:
+            acc += n
+            pts.append(acc)
+        self._split_pts = pts
+        return (groups, runs)
+
+    def _grouped_in_proj(self, inputs):
+        """``[linear_forward(m, inputs) for m in q..b]`` concatenated, with one
+        matmul per quantization (each row is its own layer's matmul row)."""
+        if not self._decode_groups:
+            return None
+        groups, runs = self._decode_groups
+        outs = [
+            fused_quantized_matmul(inputs, w, sc, bi, bits=bits, group_size=gs)
+            for bits, gs, _, w, sc, bi in groups
+        ]
+        return mx.concatenate([outs[g][..., a:b] for g, a, b in runs], axis=-1)
+
     def _decode_step(self, inputs, mask, cache):
         """Fused layer body for one sequence and S <= 8 tokens (bit-identical).
 
@@ -354,15 +425,20 @@ class Glm5NextLinearAttention(nn.Module):
             or self.conv_kernel_size != 4
         ):
             return None
-        if not self._fused_ready:
+        if not self._fused_ready and self._decode_groups is None:
             self._fused_in_proj(inputs)
             if not self._fused_ready:
+                self._decode_groups = self._build_decode_groups()
+        if self._fused_ready:
+            if not self._fq:
                 return None
-        if not self._fq:
-            return None
-        proj = fused_quantized_matmul(
-            inputs, self._fw, self._fs, self._fb, bits=self._bits, group_size=self._gs
-        )
+            proj = fused_quantized_matmul(
+                inputs, self._fw, self._fs, self._fb, bits=self._bits, group_size=self._gs
+            )
+        else:
+            proj = self._grouped_in_proj(inputs)
+            if proj is None:
+                return None
         _, _, v_end, fa_end, ga_end = self._split_pts
         a_pre = gate_pre = None
         f_b, g_b = fg.f_b_proj, self.g_b_proj

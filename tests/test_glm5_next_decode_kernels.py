@@ -565,7 +565,7 @@ def test_small_model_bitwise_reference_with_nax_tf32():
 # ---------------------------------------------------------------------------
 
 
-def _kda_layer(heads=8, hidden=1024, gate_bits=8, seed=0):
+def _kda_layer(heads=8, hidden=1024, gate_bits=8, seed=0, v_bits=8):
     from mlx_vlm.models import glm5_next
 
     language = _language()
@@ -580,7 +580,8 @@ def _kda_layer(heads=8, hidden=1024, gate_bits=8, seed=0):
         "q_proj": (qkv, hidden), "k_proj": (qkv, hidden), "v_proj": (qkv, hidden),
         "g_a_proj": (128, hidden), "b_proj": (heads, hidden),
     }.items():
-        setattr(layer, name, _quantized_linear(out_dims, in_dims, 8))
+        bits = v_bits if name == "v_proj" else 8
+        setattr(layer, name, _quantized_linear(out_dims, in_dims, bits))
     fg = layer.forget_gate
     fg.f_a_proj = _quantized_linear(128, hidden, 8)
     fg.f_b_proj = _quantized_linear(qkv, 128, gate_bits)
@@ -670,6 +671,34 @@ def test_kda_decode_step_seed_sweep_is_bitwise_reference(seed, monkeypatch):
         mx.eval(reference, fused, fused_cache.cache, reference_cache.cache)
         assert _mismatches(fused, reference) == 0, f"step {step} width {width}"
         assert _mismatches(fused_cache[1], reference_cache[1]) == 0
+
+
+@pytest.mark.parametrize("v_bits", [5, 4])
+def test_kda_decode_step_with_mixed_projection_bits(v_bits, monkeypatch):
+    """GLM-5.3 layer 40 quantizes v_proj to 5 bits and q/k/gates to 8: the
+    decode path runs one projection matmul per quantization instead of the
+    reference layer body."""
+    _skip_under_mtp_runtime()
+    language = _language()
+    layer = _kda_layer(seed=20 + v_bits, v_bits=v_bits)
+    fused_cache, reference_cache = _arrays_cache(), _arrays_cache()
+    prompt = (mx.random.normal((1, 12, 1024)) * 0.8).astype(mx.bfloat16)
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    for cache in (fused_cache, reference_cache):
+        mx.eval(layer(prompt, cache=cache))
+    for step, width in enumerate([1, 1, 4, 1, 8]):
+        x = (mx.random.normal((1, width, 1024)) * (0.5 + step % 3)).astype(mx.bfloat16)
+        monkeypatch.setattr(language, "_DECODE_FUSION", False)
+        reference = layer(x, cache=reference_cache)
+        monkeypatch.setattr(language, "_DECODE_FUSION", True)
+        before = _stats()["kda"]
+        fused = layer(x, cache=fused_cache)
+        assert _stats()["kda"] == before + 1
+        mx.eval(reference, fused, fused_cache.cache, reference_cache.cache)
+        assert _mismatches(fused, reference) == 0, f"step {step} width {width}"
+        assert _mismatches(fused_cache[0], reference_cache[0]) == 0
+        assert _mismatches(fused_cache[1], reference_cache[1]) == 0
+    assert not layer._fused_ready and layer._decode_groups
 
 
 @pytest.mark.parametrize("width", [1, 4])
