@@ -3,18 +3,18 @@ requires = [
     "setuptools>=61.0",
     "wheel",
     "cmake>=3.27",
-    # Pin nanobind to match the ABI version MLX 0.32.2 was built with
-    # (MLX pins nanobind v2.15.0 via FetchContent in its CMakeLists.txt).
+    # Pin nanobind to match the ABI version MLX 0.32.3 was built with
+    # (MLX pins nanobind v3.0.1 via FetchContent in its CMakeLists.txt).
     # A mismatched nanobind isolates the `mlx` NB_DOMAIN, so custom kernel
     # extensions (omlx.custom_kernels.*) reject every mlx.core.array at the
     # type caster with `incompatible function arguments`.
-    "nanobind==2.15.0",
-    # mlx floor admits the custom 0.32.2.dev build (JACCL guards/backports);
-    # an exact ==0.32.2 pin would make a fresh resolve replace it with the
+    "nanobind==3.0.1",
+    # mlx floor admits the custom 0.32.3.dev build (JACCL guards/backports);
+    # an exact ==0.32.3 pin would make a fresh resolve replace it with the
     # stock PyPI wheel and silently drop those fixes. When building with
     # isolation, pre-install the dev wheel with --no-build-isolation or
     # PIP_NO_BUILD_ISOLATION so this floor resolves to it.
-    "mlx>=0.32.2.dev0,<0.33",
+    "mlx>=0.32.3.dev0,<0.33",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -44,18 +44,19 @@ classifiers = [
 ]
 
 dependencies = [
-    # MLX 0.32.2 line; optional custom kernels live under
+    # MLX 0.32.3 line; optional custom kernels live under
     # omlx.custom_kernels.* when built for release. The bundled kernel
     # binaries are ABI-coupled to this mlx version — bumping the pin
     # requires rebuilding them (OMLX_WITH_CUSTOM_KERNEL=1 setup.py build_ext).
-    # The floor admits the custom 0.32.x dev wheel built from
-    # jonathan308/mlx branch fix/v0322-nax-moe-distributed-stability
-    # (JACCL guards/backports, rebased onto ml-explore/mlx main 073d2252,
-    # the 0.32.3 line; tip 2569313d): an exact ==0.32.2 pin made a fresh
+    # The floor admits the custom 0.32.3 dev wheel built from
+    # jonathan308/mlx branch fix/v0323-nax-moe-distributed-stability
+    # (JACCL guards/backports and the #4352 revert on the v0.32.3 tag;
+    # tip fd81f420) and keeps out 0.32.2, whose nanobind 2 ABI the kernels
+    # built for 0.32.3 reject: an exact ==0.32.3 pin would make a fresh
     # resolve reinstall the stock PyPI wheel over the dev build, silently
     # dropping those fixes. Install the dev wheel first with --no-deps
     # (ops/install_mlx_variant.sh) so the resolver keeps it.
-    "mlx>=0.32.2.dev0,<0.33",
+    "mlx>=0.32.3.dev0,<0.33",
     # jonathan308/mlx-lm branch omlx/v0.31.3-perf rebased onto ml-explore
     # mlx-lm main 87b7b58 (0.32.0 line; upstream oMLX needs 872ae88+: full
     # cache state, per-stream stop matchers, and counters) plus the Fusion
