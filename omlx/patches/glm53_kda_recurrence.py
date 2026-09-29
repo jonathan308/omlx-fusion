@@ -47,6 +47,7 @@ import subprocess
 from typing import NamedTuple, Optional, Tuple
 
 import mlx.core as mx
+from omlx.utils.mlx_sigmoid import compiled_sigmoid
 
 
 class RecurrenceConfig(NamedTuple):
@@ -111,12 +112,12 @@ def _reduce_one(rows: int) -> str:
 
 # compute_g_safe: exp(lb * sigmoid(exp(A_log) * (a + dt_bias))) with MLX's
 # Sigmoid functor, rounded like the compiled reference -> bit-identical gate.
-_GATE_EXPR = """{
+_GATE_EXPR = compiled_sigmoid("""{
                 const float x = decay * (static_cast<float>(SRC) + dtb[d]);
                 const float e = 1 / (1 + metal::exp(metal::abs(x)));
                 const float sig = (x < 0) ? e : 1 - e;
                 g_s[r][d] = metal::precise::exp(lb * sig);
-            }"""
+            }""")
 
 
 def _source(cfg: RecurrenceConfig) -> str:
@@ -377,12 +378,12 @@ def _percore_threadgroups(rows: int, cfg: PerCoreConfig) -> Optional[int]:
 
 
 def _pc_gate(src: str, d: str, s: str, dst: str) -> str:
-    return f"""{{
+    return compiled_sigmoid(f"""{{
                 const float x = decay[{s}] * (static_cast<float>({src}) + dtb[{s}][{d}]);
                 const float e = 1 / (1 + metal::exp(metal::abs(x)));
                 const float sig = (x < 0) ? e : 1 - e;
                 {dst} = metal::precise::exp(lb * sig);
-            }}"""
+            }}""")
 
 
 def _pc_reduce_y(t: str) -> str:

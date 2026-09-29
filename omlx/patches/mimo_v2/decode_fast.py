@@ -62,6 +62,7 @@ from functools import lru_cache
 from typing import Optional
 
 import mlx.core as mx
+from omlx.utils.mlx_sigmoid import compiled_sigmoid
 
 logger = logging.getLogger(__name__)
 
@@ -242,7 +243,7 @@ _COMBINE_RMS_SOURCE = r"""
 # Router: sigmoid, + correction bias, top-k by biased score (descending,
 # lower expert id first on exact ties, like MLX's stable sort behind
 # argpartition), gather the unbiased scores, normalise, scale.
-_SELECT_SOURCE = r"""
+_SELECT_SOURCE = compiled_sigmoid(r"""
   threadgroup float biased[NE];
   threadgroup float picked[TOPK];
   uint row = threadgroup_position_in_grid.x;
@@ -274,7 +275,7 @@ _SELECT_SOURCE = r"""
     }
     scores[size_t(row) * TOPK + e] = s * rsf[0];
   }
-"""
+""")
 
 # q/k/v split + partial RoPE (MLX rope.metal, non-traditional, forward) +
 # value scale.  grid: x = lane (head_dim / 2), y = head (q heads, k heads,

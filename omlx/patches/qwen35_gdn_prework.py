@@ -35,6 +35,8 @@ import sys
 import mlx.core as mx
 import mlx.nn as nn
 
+from omlx.utils.mlx_sigmoid import compiled_sigmoid
+
 from . import qwen35_gdn_verify_fused
 
 logger = logging.getLogger(__name__)
@@ -52,7 +54,7 @@ _QWEN4_PREFILL_ENABLED = os.environ.get("OMLX_QWEN4_GDN_PREFILL_FUSED", "1") != 
 _QWEN4_PREFILL_MIN_ROWS = 64
 _VERIFY_REJECT_DIAG = 0
 
-_SOURCE = """
+_SOURCE = compiled_sigmoid("""
     uint lane = thread_position_in_threadgroup.x;
     uint batch_idx = threadgroup_position_in_grid.y / uint(S);
     uint row = threadgroup_position_in_grid.y % uint(S);
@@ -81,8 +83,8 @@ _SOURCE = """
             acc += float(xv) * float(conv_w[channel * 4 + tap]);
         }
         const T conv = T(acc);
-        T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
-        const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
+        auto sy = 1 / (1 + metal::exp(metal::abs(conv)));
+        const T act = conv * T((conv < 0) ? sy : 1 - sy);
         activated[i] = act;
         if (L2) {
             const T sqv = T(float(act) * float(act));
@@ -156,7 +158,7 @@ _SOURCE = """
             conv_out[state_base + i] = qkv[raw_base + i];
         }
     }
-"""
+""")
 
 
 # Copyright (c) 2026 David Dalcu.  The Qwen4 decode prework and norm-gate
@@ -201,7 +203,7 @@ _QWEN4_DECODE_HEADER = """
 """
 
 
-_QWEN4_DECODE_SOURCE = """
+_QWEN4_DECODE_SOURCE = compiled_sigmoid("""
     uint lane = thread_position_in_threadgroup.x;
     uint logical_head = threadgroup_position_in_grid.z;
     constexpr uint q_heads = uint(HK);
@@ -227,8 +229,8 @@ _QWEN4_DECODE_SOURCE = """
         }
         acc += float(qkv[channel]) * float(conv_w[channel * 4 + 3]);
         const T conv = T(acc);
-        T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
-        const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
+        auto sy = 1 / (1 + metal::exp(metal::abs(conv)));
+        const T act = conv * T((conv < 0) ? sy : 1 - sy);
         activated[i] = act;
         float value = float(act);
         sumsq += value * value;
@@ -264,8 +266,8 @@ _QWEN4_DECODE_SOURCE = """
         }
         if (lane == 0) {
             const T bv = b_in[head];
-            T by = T(1) / (T(1) + metal::exp(metal::abs(bv)));
-            beta_out[head] = (bv < T(0)) ? by : T(1) - by;
+            auto by = 1 / (1 + metal::exp(metal::abs(bv)));
+            beta_out[head] = T((bv < 0) ? by : 1 - by);
 
             // compute_g casts A_log to FP32 but keeps softplus(a+dt_bias)
             // in BF16 before the FP32 multiply and outer exp.
@@ -279,7 +281,7 @@ _QWEN4_DECODE_SOURCE = """
             g_out[head] = metal::precise::exp(-(ea * float(sp)));
         }
     }
-"""
+""")
 
 
 _QWEN4_NORM_GATE_SOURCE = """

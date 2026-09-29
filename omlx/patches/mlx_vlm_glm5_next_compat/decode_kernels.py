@@ -37,6 +37,7 @@ from functools import lru_cache
 from typing import Optional
 
 import mlx.core as mx
+from omlx.utils.mlx_sigmoid import compiled_sigmoid
 
 # Successful fused dispatches by kernel family (graph-build time counts; used
 # by tests and profilers to confirm the fused paths engage).
@@ -59,7 +60,7 @@ DISABLED = (
     else set(filter(None, _DISABLE_ENV.split(",")))
 )
 
-_QMV_HEADER = r"""
+_QMV_HEADER = compiled_sigmoid(r"""
 #include <metal_simdgroup>
 #include <metal_stdlib>
 using namespace metal;
@@ -387,7 +388,7 @@ inline T glm_clamped_swiglu(T gate, T up, T limit, T neg_limit) {
   T u = glm_minimum(glm_maximum(up, neg_limit), limit);
   return s * u;
 }
-"""
+""")
 
 
 # Fused routed-expert (+ optional shared-expert) gate/up projection with the
@@ -1755,9 +1756,10 @@ def eager_sigmoid_precise(dtype) -> Optional[bool]:
         same_precise = mx.array_equal(ref.view(view), precise.view(view)).item()
     except Exception:  # traced (mx.compile / vmap): decide on an eager call
         return None
-    result = True if same_precise and not same_default else (
-        False if same_default and not same_precise else None
-    )
+    # On mlx 0.32.3+ both expressions are the precise one (MLX's Sigmoid
+    # always takes metal::precise::exp there; see compiled_sigmoid), so a
+    # match with the precise expression decides.
+    result = True if same_precise else (False if same_default else None)
     _EAGER_SIGMOID[dtype] = result
     return result
 

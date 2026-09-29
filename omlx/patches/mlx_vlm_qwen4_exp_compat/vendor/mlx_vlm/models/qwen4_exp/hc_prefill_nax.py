@@ -56,6 +56,8 @@ from __future__ import annotations
 
 import mlx.core as mx
 
+from omlx.utils.mlx_sigmoid import compiled_sigmoid
+
 from .hc_projection import _HEADER as _QDOT_HEADER
 
 _KERNELS: dict[str, object] = {}
@@ -67,7 +69,7 @@ _BN = 64
 # Hidden columns per stream in one up-projection tile (4 streams x 16 = 64).
 UP_COLS = 16
 
-_NAX_HEADER = r"""
+_NAX_HEADER = compiled_sigmoid(r"""
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 
 using namespace metal;
@@ -319,7 +321,7 @@ inline T hcn_sigmoid(T x) {
   auto y = 1 / (1 + metal::exp(metal::abs(x)));
   return (x < 0) ? y : 1 - y;
 }
-"""
+""")
 
 # hc_projection's hc_load_vector reading from threadgroup memory (same
 # arithmetic on the same bf16 values).

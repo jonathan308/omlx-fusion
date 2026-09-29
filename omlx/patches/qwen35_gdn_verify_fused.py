@@ -32,6 +32,8 @@ import logging
 
 import mlx.core as mx
 
+from omlx.utils.mlx_sigmoid import precise_compiled_sigmoid
+
 from . import qwen35_verify_qmm
 
 logger = logging.getLogger(__name__)
@@ -112,7 +114,10 @@ inline float gdn_decay(half a, half dt, float neg_a) {
     return metal::precise::exp(neg_a * static_cast<float>(sp));
 }
 
-inline float gdn_beta(half x) {
+__GDN_BETA_HALF__"""
+
+# MLX's Sigmoid<half> up to mlx 0.32.2: every half op rounds.
+_GDN_BETA_HALF_0322 = """inline float gdn_beta(half x) {
     half ax = metal::abs(x);
     half e = gdn_h(metal::precise::exp(static_cast<float>(ax)));
     half d = gdn_h(1.0f + static_cast<float>(e));
@@ -121,6 +126,20 @@ inline float gdn_beta(half x) {
     return static_cast<float>(r);
 }
 """
+
+# From mlx 0.32.3 (ml-explore/mlx#4461) Sigmoid calls metal::precise::exp,
+# which has no half overload: the sigmoid runs in float and rounds to half once.
+_GDN_BETA_HALF = """inline float gdn_beta(half x) {
+    float e = metal::precise::exp(static_cast<float>(metal::abs(x)));
+    float y = metal::precise::divide(1.0f, 1.0f + e);
+    return static_cast<float>(static_cast<half>((x < half(0)) ? y : 1.0f - y));
+}
+"""
+
+_HELPERS = _HELPERS.replace(
+    "__GDN_BETA_HALF__",
+    _GDN_BETA_HALF if precise_compiled_sigmoid() else _GDN_BETA_HALF_0322,
+)
 
 _PROLOGUE = """
     constexpr int NK = Dk / 32;

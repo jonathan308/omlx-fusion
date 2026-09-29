@@ -5,6 +5,8 @@ from functools import cache
 
 import mlx.core as mx
 
+from omlx.utils.mlx_sigmoid import compiled_sigmoid
+
 _ROUND = r"""
     // Clamp to 448 * 2^-126 so the power-of-two scale stays normal.
     const float amax = max(simd_max(abs(v)), 0x1.cp-118f);
@@ -25,7 +27,7 @@ _SOURCE = r"""
     const float v = i < n ? float(x[i]) : 0.0f;
 """ + _ROUND
 
-_TAIL_SOURCE = r"""
+_TAIL_SOURCE = compiled_sigmoid(r"""
     const uint i = thread_position_in_grid.x;
     const uint n = N;
     float v = 0.0f;
@@ -36,13 +38,13 @@ _TAIL_SOURCE = r"""
             u = clamp(u, -limit[0], limit[0]);
         }
         // Match MLX sigmoid arithmetic before the intermediate dtype cast.
-        const float neg_sigmoid = 1.0f / (1.0f + exp(abs(g)));
+        const float neg_sigmoid = 1.0f / (1.0f + metal::exp(metal::abs(g)));
         const float sigmoid = g < 0 ? neg_sigmoid : 1.0f - neg_sigmoid;
         float value = (g * sigmoid) * u;
         if (WEIGHTED) value *= weights[i / D];
         v = float(T(value));
     }
-""" + _ROUND
+""" + _ROUND)
 
 
 @cache

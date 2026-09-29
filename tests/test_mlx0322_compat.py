@@ -10,8 +10,10 @@ import mlx.core as mx
 import pytest
 
 
-def test_runtime_uses_exact_mlx_0322():
-    assert mx.__version__ == "0.32.2"
+def test_runtime_uses_the_mlx_0323_line():
+    # The custom kernels are built against mlx 0.32.3 (nanobind 3); the
+    # custom dev wheel (0.32.3.devN) counts as the same line.
+    assert mx.__version__.split(".dev")[0].split("+")[0] == "0.32.3"
 
 
 @pytest.mark.parametrize("static", [False, True])

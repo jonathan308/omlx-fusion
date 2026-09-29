@@ -31,6 +31,8 @@ import os
 
 import mlx.core as mx
 
+from omlx.utils.mlx_sigmoid import compiled_sigmoid
+
 from .glm53_kda_recurrence import kda_recurrence
 
 logger = logging.getLogger(__name__)
@@ -40,7 +42,7 @@ _GLM53_KDA_PREFILL_ENABLED = (
 )
 _GLM53_KDA_PREFILL_MIN_ROWS = 64
 
-_PREWORK_SOURCE = """
+_PREWORK_SOURCE = compiled_sigmoid("""
     uint lane = thread_position_in_threadgroup.x;
     uint row = threadgroup_position_in_grid.y;
     uint lh = threadgroup_position_in_grid.z;
@@ -64,8 +66,8 @@ _PREWORK_SOURCE = """
             acc += float(xv) * float(conv_w[channel * 4 + tap]);
         }
         const T conv = T(acc);
-        T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
-        const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
+        auto sy = 1 / (1 + metal::exp(metal::abs(conv)));
+        const T act = conv * T((conv < 0) ? sy : 1 - sy);
         activated[i] = act;
         if (is_q || is_k) {
             const float f = float(act);
@@ -119,7 +121,7 @@ _PREWORK_SOURCE = """
             conv_out[state_base + i] = qkv[raw_base + i];
         }
     }
-"""
+""")
 
 _NORM_GATE_SOURCE = """
     uint lane = thread_position_in_threadgroup.x;

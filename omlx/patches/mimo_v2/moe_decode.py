@@ -31,9 +31,11 @@ from functools import lru_cache
 
 import mlx.core as mx
 
+from omlx.utils.mlx_sigmoid import compiled_sigmoid
+
 BLOCK = 512  # K values per simdgroup step (16 per lane)
 
-_HEADER = r"""
+_HEADER = compiled_sigmoid(r"""
 // MXFP4 e2m1 nibble -> float exactly like MLX's fp4_e2m1 (via half).
 inline float omlx_fp4(uint v) {
   uint b = v & 0xF;
@@ -69,7 +71,7 @@ struct OmlxSigmoid {
     return (x < 0) ? y : 1 - y;
   }
 };
-"""
+""")
 
 # Pairs p = row * TOPK + k use expert inds[p].  The threadgroup of the first
 # pair that picked an expert computes every pair that picked it; later pairs'

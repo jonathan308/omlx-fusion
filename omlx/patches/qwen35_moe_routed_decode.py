@@ -34,6 +34,8 @@ from functools import cache
 
 import mlx.core as mx
 
+from omlx.utils.mlx_sigmoid import compiled_sigmoid
+
 from .moe_verify_gather import _HEADER as _QMV_HEADER
 
 logger = logging.getLogger(__name__)
@@ -47,14 +49,14 @@ _DOWN_ROWS = 4
 _DISABLED = False
 _PROVEN = False
 
-_SIGMOID = r"""
+_SIGMOID = compiled_sigmoid(r"""
 // MLX 0.32.2 Sigmoid, evaluated in T as the compiled swiglu does.
 template <typename U>
 inline U omlx_mlx_sigmoid(U x) {
   auto y = 1 / (1 + metal::exp(metal::abs(x)));
   return (x < 0) ? y : 1 - y;
 }
-"""
+""")
 
 # One threadgroup per (expert slot z, block of NSG * RPS output rows). Output
 # is [TOP_K, N / 2] = silu(gate) * up.
