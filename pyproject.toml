@@ -187,7 +187,7 @@ audio = [
     "spacy>=3.8.4",
     # WebSocket protocol impl for uvicorn (realtime STT endpoint). Pure
     # python; uvicorn's ws="auto" picks it up when installed.
-    "wsproto==1.2.0",
+    "wsproto==1.3.2",
 ]
 paroquant = [
     # ParoQuant runtime loader for paroquant-quantized models. Installed
@@ -223,7 +223,7 @@ bundle = [
     # [audio] extra on top of pyproject's plain mistral-common>=1.10
     "mistral-common[audio]>=1.10",
     # realtime STT WebSocket endpoint
-    "wsproto==1.2.0",
+    "wsproto==1.3.2",
 ]
 dev = [
     "pytest>=7.0.0",
