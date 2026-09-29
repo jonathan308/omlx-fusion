@@ -34,9 +34,11 @@ template <typename T, int BM, int BK, int BN>
   input += batch * size_t(M) * size_t(K);
   output += batch * size_t(M) * size_t(N);
   const uint3 local_tid = uint3(tid.x, tid.y, 0);
-  fp_qmm_t_impl<T, 32, 8, true, BM, BK, BN>(weight, scales, input, output, Xs,
-                                            Ws, K, N, M, K, local_tid, lid,
-                                            simd_gid, simd_lid);
+  // mlx 0.32.3 added the has_global_scale flag and the global_scale buffer
+  // (both unused for MXFP8).
+  fp_qmm_t_impl<T, 32, 8, true, false, BM, BK, BN>(
+      weight, scales, nullptr, input, output, Xs, Ws, K, N, M, K, local_tid,
+      lid, simd_gid, simd_lid);
 }
 
 #define instantiate_ds4_projection_mxfp8(type, bm, bk, bn)                     \
